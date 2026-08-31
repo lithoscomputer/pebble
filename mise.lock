@@ -8,7 +8,7 @@ backend = "cargo:cargo-nextest"
 locked = "true"
 
 [[tools.rust]]
-version = "1.85.0"
+version = "1.88.0"
 backend = "core:rust"
 
 [tools.rust.options]
