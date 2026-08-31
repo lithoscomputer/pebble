@@ -11,6 +11,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use lithos_llm::middleware::RetryPolicy;
 use lithos_llm::types::{ReasoningEffort, Speed};
 use serde_json::Value;
 
@@ -272,6 +273,21 @@ pub struct SessionOptions {
     pub compaction_preserve_turns: usize,
     /// How long one run may take before the session cancels itself.
     pub wall_clock_timeout: Option<Duration>,
+    /// How the session spaces the turn replays it owns.
+    ///
+    /// A stream that fails **after** the model produced visible output is
+    /// replayed by the session rather than by the client's retry middleware,
+    /// because a middleware reconnect would duplicate what the reader already
+    /// saw. This policy decides the wait before each of those replays.
+    ///
+    /// Set it to the same policy the client's
+    /// [`RetryMiddleware`](lithos_llm::middleware::RetryMiddleware) was built
+    /// with, so one failure is spaced the same way wherever it is handled. Its
+    /// `max_attempts` bounds the session's replays as well: the default of
+    /// four allows the three replays pebble is willing to spend on one turn.
+    ///
+    /// The type is re-exported as [`pebble::RetryPolicy`](crate::RetryPolicy).
+    pub retry_policy: RetryPolicy,
 }
 
 impl fmt::Debug for SessionOptions {
@@ -316,6 +332,7 @@ impl fmt::Debug for SessionOptions {
             )
             .field("compaction_preserve_turns", &self.compaction_preserve_turns)
             .field("wall_clock_timeout", &self.wall_clock_timeout)
+            .field("retry_policy", &self.retry_policy)
             .finish()
     }
 }
@@ -344,9 +361,16 @@ impl Default for SessionOptions {
             compaction_threshold_percent: 80,
             compaction_preserve_turns: 6,
             wall_clock_timeout: None,
+            retry_policy: RetryPolicy::exponential().max_attempts(DEFAULT_RETRY_ATTEMPTS),
         }
     }
 }
+
+/// How many attempts the default [`SessionOptions::retry_policy`] allows.
+///
+/// One opening attempt plus the three replays a session will spend on a turn
+/// whose stream broke after it had already shown output.
+const DEFAULT_RETRY_ATTEMPTS: u32 = 4;
 
 impl SessionOptions {
     /// What the installed policy says about one tool, or
@@ -400,6 +424,7 @@ impl SessionOptions {
 mod tests {
     use std::sync::{Mutex, PoisonError};
 
+    use lithos_llm::types::{Error as LlmError, ErrorKind as LlmErrorKind, RetryClassification};
     use serde_json::json;
 
     use super::*;
@@ -464,6 +489,27 @@ mod tests {
         for options in [openai, gemini, gpt56, anthropic, claude5, kimi] {
             assert_eq!(options.max_command_timeout_ms, 600_000);
         }
+    }
+
+    #[test]
+    fn the_default_retry_policy_allows_the_replays_a_turn_is_worth() {
+        let config = SessionOptions::default();
+        let error = LlmError::new(LlmErrorKind::Network, "connection reset")
+            .with_retry(RetryClassification::Safe);
+
+        for attempt in 1..DEFAULT_RETRY_ATTEMPTS {
+            assert!(
+                config.retry_policy.next_delay(attempt, &error).is_some(),
+                "attempt {attempt} should still be replayed"
+            );
+        }
+        assert!(
+            config
+                .retry_policy
+                .next_delay(DEFAULT_RETRY_ATTEMPTS, &error)
+                .is_none(),
+            "the fourth failure spends the budget"
+        );
     }
 
     #[test]

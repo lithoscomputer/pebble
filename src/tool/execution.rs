@@ -641,7 +641,11 @@ fn text_part_mut(result: &mut ToolResult) -> Option<&mut String> {
 
 /// A result's output as text, which is what hooks read and what the output
 /// fragment carries.
-fn result_text(result: &ToolResult) -> Cow<'_, str> {
+///
+/// Also what the modules that read finished results — file tracking and the
+/// compaction transcript — see, so a tool's output is rendered the same way
+/// everywhere.
+pub(crate) fn result_text(result: &ToolResult) -> Cow<'_, str> {
     match result.content.as_slice() {
         [ContentPart::Text { text }] => Cow::Borrowed(text),
         other => Cow::Owned(serde_json::to_string(other).unwrap_or_default()),

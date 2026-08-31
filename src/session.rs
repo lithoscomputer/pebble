@@ -1,0 +1,1948 @@
+//! One conversation with one model, and the loop that drives it.
+//!
+//! A [`Session`] holds everything one run of a coding agent needs: the model
+//! client, the harness the model expects, the tools it may call, the history it
+//! replays, and the event pipeline an application watches. Build one with
+//! [`Session::builder`], call [`Session::initialize`] once, then
+//! [`Session::run`] for each thing you want done.
+//!
+//! ```no_run
+//! use std::sync::Arc;
+//!
+//! use pebble::{LocalEnvironment, Session, SessionOptions, ShutdownReason};
+//!
+//! # async fn example(client: lithos_llm::Client) -> Result<(), Box<dyn std::error::Error>> {
+//! let mut session = Session::builder(client)
+//!     .model("claude-sonnet-5")
+//!     .environment(Arc::new(LocalEnvironment::new(".")))
+//!     .options(SessionOptions::default())
+//!     .build()?;
+//!
+//! let mut events = session.subscribe();
+//! session.initialize().await?;
+//! let answer = session.run("fix the failing test").await?;
+//! session.shutdown(ShutdownReason::Completed).await?;
+//! # let _ = (events.try_recv(), answer);
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! # Which harness a session runs
+//!
+//! Pebble never guesses. The model selector resolves through the client's
+//! catalog, and the resolved entry's `metadata.pebble.profile` names one of the
+//! six harnesses pebble ships. A model whose catalog entry names none, or names
+//! one pebble does not know, is a build error rather than a session that runs
+//! with the wrong prompt.
+//!
+//! # Steering a run
+//!
+//! [`Session::run`] borrows the session until it returns, so everything an
+//! application says to a live run goes through
+//! [`Session::control_handle`]: a cheap clone that queues steering and
+//! interrupts rounds. [`Session::interrupt`] is the separate, terminal gesture
+//! that ends the run.
+//!
+//! # What the session owns
+//!
+//! The session owns its event pump and, while a run has a wall-clock budget,
+//! the timer watching it. Both are joined — never abandoned — by
+//! [`Session::shutdown`] and by the end of a run, so a failure inside either is
+//! reported rather than lost. The application owns the Tokio runtime.
+
+mod control;
+#[cfg(test)]
+mod loop_tests;
+mod retry;
+#[cfg(test)]
+mod testing;
+mod turn;
+
+use std::collections::{HashMap, VecDeque};
+use std::fmt;
+use std::result::Result as StdResult;
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::time::{Duration, SystemTime};
+
+use lithos_llm::Client;
+use lithos_llm::catalog::{Metadata, MetadataError, ModelHandle};
+use lithos_llm::resolver::{ModelSelectionError, ResolvedRoute};
+use lithos_llm::types::{
+    Error as LlmError, ErrorKind as LlmErrorKind, ReasoningEffort, Request, RequestBuildError,
+    Speed,
+};
+use serde::Deserialize;
+use tokio::sync::{Notify, broadcast};
+use tokio::task::JoinHandle;
+use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, warn};
+
+use self::control::ControlState;
+pub use self::control::{
+    CompletionCoordinator, SessionControlHandle, SteeringItem, SteeringMessage,
+};
+pub use self::retry::RetryEventObserver;
+use crate::config::SessionOptions;
+use crate::environment::{Environment, ExecRequest};
+use crate::error::{Error, ErrorData, InterruptReason, Result};
+use crate::event::{Emitter, EventCapacity, EventOptions, EventPump, EventSink};
+use crate::file_tracker::FileTracker;
+use crate::history::History;
+use crate::human_input::HumanInputProvider;
+use crate::memory::{MEMORY_BUDGET_BYTES, MemoryDocument, load_memory};
+use crate::profile::{AgentProfile, EnvContext, ModelFacts, builtin_profile};
+use crate::record::{SESSION_RECORD_FORMAT_VERSION, SessionRecord};
+use crate::skills::{Skill, SkillExpansion, discover_skills};
+use crate::subagent::SubagentSupervisor;
+use crate::tool::{
+    RegisteredTool, StaticEnvProvider, ToolDefinitionWithSource, ToolEnvProvider, ToolRegistry,
+};
+use crate::types::{
+    Actor, AgentEvent, AgentProfileKind, PermissionLevel, SessionEvent, SessionState, TokenUsage,
+    ToolSummary, rfc3339_millis,
+};
+
+/// The catalog metadata namespace pebble reads.
+const METADATA_NAMESPACE: &str = "pebble";
+
+/// How long a probe run inside the environment may take.
+const PROBE_TIMEOUT_MS: u64 = 5_000;
+
+/// Why a session is being shut down.
+///
+/// Recorded for the application's benefit; it never reaches the event stream,
+/// which reports the end of a session the same way whatever ended it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ShutdownReason {
+    /// The work finished.
+    Completed,
+    /// Someone cancelled the run.
+    Cancelled,
+    /// The run failed.
+    Error,
+}
+
+/// Where one run spent its time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RunTiming {
+    /// Time spent waiting on the model.
+    pub inference: Duration,
+    /// Time spent running tools.
+    pub tool:      Duration,
+}
+
+/// What one call to [`Session::run_with_options`] does differently.
+///
+/// A plain configuration record: name the fields that differ and take the rest
+/// from [`Default`].
+///
+/// ```
+/// # use pebble::RunOptions;
+/// let options = RunOptions {
+///     human_input: None,
+///     ..RunOptions::default()
+/// };
+/// # let _ = options;
+/// ```
+#[derive(Clone, Default)]
+pub struct RunOptions {
+    /// Where this run's questions go, in place of the session's own provider.
+    ///
+    /// An application that reuses one session across stages binds each stage's
+    /// questions here rather than mutating the session between runs.
+    pub human_input: Option<Arc<dyn HumanInputProvider>>,
+}
+
+impl fmt::Debug for RunOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RunOptions")
+            .field(
+                "human_input",
+                &self.human_input.as_ref().map(|_| "<provider>"),
+            )
+            .finish()
+    }
+}
+
+/// What one run accumulated across every input it processed.
+#[derive(Debug, Default)]
+struct RunTotals {
+    timing:          RunTiming,
+    usage:           TokenUsage,
+    cost_usd_micros: Option<u64>,
+}
+
+/// A session could not be built.
+///
+/// Every variant names something the application chose: a missing dependency, a
+/// selector that resolves to nothing, or a model whose catalog entry does not
+/// say which harness it expects.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SessionBuildError {
+    /// No model selector was given.
+    #[error("a session needs a model selector")]
+    MissingModel,
+
+    /// No environment was given, so the tools would have nowhere to act.
+    #[error("a session needs an environment for its tools to act through")]
+    MissingEnvironment,
+
+    /// The selector names no model the client can reach.
+    #[error("model selector `{selector}` resolves to no available model: {source}")]
+    ModelSelection {
+        /// The selector the application gave.
+        selector: String,
+        /// What the client's resolver said.
+        #[source]
+        source:   ModelSelectionError,
+    },
+
+    /// The request pebble resolves the selector with could not be built, which
+    /// an empty or blank selector runs into.
+    #[error("model selector `{selector}` is not usable: {source}")]
+    Selector {
+        /// The selector the application gave.
+        selector: String,
+        /// What request building said.
+        #[source]
+        source:   RequestBuildError,
+    },
+
+    /// Neither the model nor its provider says which harness the model expects.
+    #[error(
+        "model {model} names no agent profile: neither it nor its provider carries \
+         `metadata.pebble.profile`"
+    )]
+    MissingProfileMetadata {
+        /// The model that was resolved.
+        model: String,
+    },
+
+    /// The `pebble` metadata is present but not shaped as pebble reads it.
+    #[error("the `pebble` catalog metadata for model {model} could not be read: {source}")]
+    InvalidProfileMetadata {
+        /// The model that was resolved.
+        model:  String,
+        /// What reading the namespace said.
+        #[source]
+        source: MetadataError,
+    },
+
+    /// The catalog names a harness pebble does not know.
+    #[error("model {model} names agent profile `{profile}`, which pebble does not know")]
+    UnknownProfile {
+        /// The model that was resolved.
+        model:   String,
+        /// The identifier the catalog carried.
+        profile: String,
+    },
+
+    /// The catalog names a harness pebble knows but does not ship yet.
+    #[error("pebble ships no built-in `{profile}` profile yet")]
+    ProfileUnavailable {
+        /// The harness the model expects.
+        profile: AgentProfileKind,
+    },
+
+    /// The stored record was written by a newer pebble.
+    #[error(
+        "session record format version {version} is newer than this build reads (up to {supported})"
+    )]
+    UnsupportedRecord {
+        /// The version the record declares.
+        version:   u32,
+        /// The newest version this build reads.
+        supported: u32,
+    },
+}
+
+/// The `pebble` namespace of a catalog entry.
+///
+/// Unknown keys are ignored, because the namespace grows and an older pebble
+/// must keep reading a catalog a newer one wrote.
+#[derive(Debug, Default, Deserialize)]
+struct PebbleMetadata {
+    /// Which harness the model expects.
+    #[serde(default)]
+    profile:              Option<String>,
+    /// How the model's training data is dated, as a person would write it.
+    #[serde(default)]
+    knowledge_cutoff:     Option<String>,
+    /// Whether the model reasons without being asked to, where the capabilities
+    /// alone do not say.
+    #[serde(default)]
+    reasoning_by_default: Option<bool>,
+}
+
+/// Collects everything a session needs and builds it.
+///
+/// The builder owns the tool registry: it asks the profile for its tools,
+/// merges whatever the application registered, and freezes the result into the
+/// session. Nothing mutates a registry afterwards.
+#[must_use = "a builder does nothing until `build` is called"]
+pub struct SessionBuilder {
+    client:            Client,
+    model:             Option<String>,
+    environment:       Option<Arc<dyn Environment>>,
+    tools:             Vec<RegisteredTool>,
+    human_input:       Option<Arc<dyn HumanInputProvider>>,
+    tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
+    options:           SessionOptions,
+    events:            EventOptions,
+    profile:           Option<Arc<dyn AgentProfile>>,
+}
+
+impl SessionBuilder {
+    /// Starts a session that talks to the model through `client`.
+    fn new(client: Client) -> Self {
+        Self {
+            client,
+            model: None,
+            environment: None,
+            tools: Vec::new(),
+            human_input: None,
+            tool_env_provider: None,
+            options: SessionOptions::default(),
+            events: EventOptions::default(),
+            profile: None,
+        }
+    }
+
+    /// Names the model, as the client's catalog spells it.
+    ///
+    /// Anything the catalog resolver accepts works — a model id, an alias, a
+    /// `provider/model` pair, or `default`. The session pins whatever it
+    /// resolves to, so every round of the run reaches the same model.
+    pub fn model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
+    /// Sets where the session's tools act.
+    pub fn environment(mut self, environment: Arc<dyn Environment>) -> Self {
+        self.environment = Some(environment);
+        self
+    }
+
+    /// Adds tools on top of the ones the profile contributes.
+    ///
+    /// The registry renames pebble's own tools into the profile's vocabulary as
+    /// they arrive, so a built-in registered here still reaches the model under
+    /// the name that model expects.
+    pub fn tools(mut self, tools: impl IntoIterator<Item = RegisteredTool>) -> Self {
+        self.tools.extend(tools);
+        self
+    }
+
+    /// Sets where the session asks a person a question.
+    ///
+    /// Without one, no question tool is registered, so the model cannot park a
+    /// run waiting for an answer nobody will give.
+    pub fn human_input(mut self, provider: Arc<dyn HumanInputProvider>) -> Self {
+        self.human_input = Some(provider);
+        self
+    }
+
+    /// Sets where a tool call's extra environment variables come from.
+    ///
+    /// Resolved once per tool round, so a credential that expires mid-run is
+    /// fetched again rather than reused.
+    pub fn tool_env_provider(mut self, provider: Arc<dyn ToolEnvProvider>) -> Self {
+        self.tool_env_provider = Some(provider);
+        self
+    }
+
+    /// Sets fixed extra environment variables for every tool call.
+    pub fn tool_env(self, env: HashMap<String, String>) -> Self {
+        self.tool_env_provider(Arc::new(StaticEnvProvider(env)))
+    }
+
+    /// Sets how the session behaves.
+    pub fn options(mut self, options: SessionOptions) -> Self {
+        self.options = options;
+        self
+    }
+
+    /// Records every event durably before any subscriber sees it.
+    ///
+    /// A sink that refuses an event stops the run and closes the session: a
+    /// session that cannot record what it did is worse than one that stops. The
+    /// run that noticed reports [`Error::EventSink`]; every call after it
+    /// reports [`Error::SessionClosed`].
+    pub fn event_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
+        self.events.sink = Some(sink);
+        self
+    }
+
+    /// Sets how many events the live stream buffers for each subscriber.
+    pub fn event_capacity(mut self, capacity: impl Into<EventCapacity>) -> Self {
+        self.events.capacity = capacity.into();
+        self
+    }
+
+    /// Overrides the profile the catalog would select.
+    ///
+    /// Crate-internal on purpose: an application picks a harness by picking a
+    /// model, never by naming one, so this exists for pebble's own tests and
+    /// for the built-in profiles to be injected from.
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "the injection hook is exercised by the crate's own tests"
+        )
+    )]
+    pub(crate) fn with_profile(mut self, profile: Arc<dyn AgentProfile>) -> Self {
+        self.profile = Some(profile);
+        self
+    }
+
+    /// Builds the session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionBuildError`] when a dependency is missing, the model
+    /// selector resolves to nothing, or the resolved model's catalog entry
+    /// names no harness pebble can run.
+    pub fn build(self) -> StdResult<Session, SessionBuildError> {
+        self.build_with_id(new_session_id(), SystemTime::now())
+    }
+
+    fn build_with_id(
+        self,
+        id: String,
+        created_at: SystemTime,
+    ) -> StdResult<Session, SessionBuildError> {
+        let selector = self.model.ok_or(SessionBuildError::MissingModel)?;
+        let environment = self
+            .environment
+            .ok_or(SessionBuildError::MissingEnvironment)?;
+
+        let route = resolve_route(&self.client, &selector)?;
+        let handle = route.handle();
+        let metadata = effective_metadata(&route, &handle)?;
+        // The catalog's capabilities say what the model can do; the `pebble`
+        // namespace is where a row says what it does by default, for the
+        // always-reasoning models whose capabilities cannot tell.
+        let mut facts = ModelFacts::from_catalog_model(route.model());
+        if let Some(reasons_by_default) = metadata.reasoning_by_default {
+            facts = facts.with_reasons_by_default(reasons_by_default);
+        }
+        // The catalog decides which harness the model expects whether or not
+        // an implementation was injected, so a model that names none is
+        // refused the same way either way.
+        let kind = profile_kind(&metadata, &handle)?;
+        let profile = match self.profile {
+            Some(profile) => profile,
+            None => builtin_profile(kind)
+                .ok_or(SessionBuildError::ProfileUnavailable { profile: kind })?,
+        };
+
+        let mut registry = ToolRegistry::with_vocabulary(profile.tool_vocabulary());
+        for tool in profile.base_tools() {
+            registry.register(tool);
+        }
+        for tool in self.tools {
+            registry.register(tool);
+        }
+
+        let (emitter, pump) = EventPump::new(self.events);
+        let pump = tokio::spawn(pump.run());
+
+        Ok(Session {
+            root_session_id: id.clone(),
+            id,
+            created_at,
+            config: self.options,
+            history: History::default(),
+            emitter,
+            pump: Some(pump),
+            state: SessionState::Idle,
+            ended: false,
+            client: self.client,
+            profile_kind: profile.profile_kind(),
+            profile,
+            provider: handle.provider().as_str().to_owned(),
+            model: handle.model().as_str().to_owned(),
+            model_selector: handle.to_string(),
+            facts,
+            knowledge_cutoff: metadata.knowledge_cutoff.unwrap_or_default(),
+            registry,
+            env: environment,
+            human_input: self.human_input,
+            tool_env_provider: self.tool_env_provider,
+            control_state: Arc::new(Mutex::new(ControlState::default())),
+            control_notify: Arc::new(Notify::new()),
+            followup_queue: Arc::new(Mutex::new(VecDeque::new())),
+            cancel_token: CancellationToken::new(),
+            round_token: Arc::new(RwLock::new(CancellationToken::new())),
+            interrupt_reason: Arc::new(Mutex::new(None)),
+            memory: Vec::new(),
+            env_context: EnvContext::default(),
+            skills: Vec::new(),
+            system_prompt: String::new(),
+            activated_skill_context_observed: false,
+            file_tracker: FileTracker::default(),
+            subagents: None,
+            completion_coordinator: None,
+            last_run_timing: RunTiming::default(),
+            last_run_usage: TokenUsage::default(),
+            last_run_cost_usd_micros: None,
+        })
+    }
+}
+
+/// Resolves the selector the way the session's own calls will.
+fn resolve_route(client: &Client, selector: &str) -> StdResult<ResolvedRoute, SessionBuildError> {
+    let probe = Request::builder()
+        .model(selector)
+        .user("probe")
+        .build()
+        .map_err(|source| SessionBuildError::Selector {
+            selector: selector.to_owned(),
+            source,
+        })?;
+    client
+        .resolve_route(&probe)
+        .map_err(|source| SessionBuildError::ModelSelection {
+            selector: selector.to_owned(),
+            source,
+        })
+}
+
+/// The `pebble` namespace for a route, with the model's answers taking
+/// precedence over the provider's.
+///
+/// Precedence is per member, not per namespace: a model that carries a
+/// `pebble` block naming only its knowledge cutoff still takes its profile from
+/// the provider.
+fn effective_metadata(
+    route: &ResolvedRoute,
+    handle: &ModelHandle,
+) -> StdResult<PebbleMetadata, SessionBuildError> {
+    let model = read_metadata(route.model().metadata(), handle)?;
+    let provider = read_metadata(route.provider().metadata(), handle)?;
+    Ok(PebbleMetadata {
+        profile:              model.profile.or(provider.profile),
+        knowledge_cutoff:     model.knowledge_cutoff.or(provider.knowledge_cutoff),
+        reasoning_by_default: model.reasoning_by_default.or(provider.reasoning_by_default),
+    })
+}
+
+fn read_metadata(
+    metadata: &Metadata,
+    handle: &ModelHandle,
+) -> StdResult<PebbleMetadata, SessionBuildError> {
+    metadata
+        .namespace::<PebbleMetadata>(METADATA_NAMESPACE)
+        .map(Option::unwrap_or_default)
+        .map_err(|source| SessionBuildError::InvalidProfileMetadata {
+            model: handle.to_string(),
+            source,
+        })
+}
+
+/// The harness the catalog says this model expects.
+fn profile_kind(
+    metadata: &PebbleMetadata,
+    handle: &ModelHandle,
+) -> StdResult<AgentProfileKind, SessionBuildError> {
+    let named =
+        metadata
+            .profile
+            .as_deref()
+            .ok_or_else(|| SessionBuildError::MissingProfileMetadata {
+                model: handle.to_string(),
+            })?;
+    AgentProfileKind::ALL
+        .iter()
+        .copied()
+        .find(|kind| kind.as_str() == named)
+        .ok_or_else(|| SessionBuildError::UnknownProfile {
+            model:   handle.to_string(),
+            profile: named.to_owned(),
+        })
+}
+
+/// A fresh session identifier.
+fn new_session_id() -> String {
+    format!("ses_{}", uuid::Uuid::new_v4())
+}
+
+/// One conversation with one model.
+///
+/// A session is used from one place at a time: [`Session::run`] borrows it for
+/// the length of a run. Everything that has to reach a live run —
+/// steering, interrupts, follow-up input, the event stream — comes from a
+/// handle taken before the run starts.
+#[must_use = "call `shutdown` to stop the session and join what it owns"]
+pub struct Session {
+    id: String,
+    /// The root of this session's tree. A root session names itself; a child
+    /// inherits its parent's root, which is how root-scoped tools — one shared
+    /// todo list across a tree of agents — know where they belong.
+    root_session_id: String,
+    created_at: SystemTime,
+    config: SessionOptions,
+    history: History,
+    emitter: Emitter,
+    /// The event pump, until [`Session::shutdown`] joins it.
+    pump: Option<JoinHandle<Result<()>>>,
+    state: SessionState,
+    ended: bool,
+    client: Client,
+    profile: Arc<dyn AgentProfile>,
+    profile_kind: AgentProfileKind,
+    provider: String,
+    model: String,
+    /// What every request names, which is the resolved `provider/model` pair
+    /// rather than the selector the application gave, so no round can drift to
+    /// a different model than the one whose harness the session is running.
+    model_selector: String,
+    facts: ModelFacts,
+    knowledge_cutoff: String,
+    registry: ToolRegistry,
+    env: Arc<dyn Environment>,
+    human_input: Option<Arc<dyn HumanInputProvider>>,
+    tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
+    control_state: Arc<Mutex<ControlState>>,
+    control_notify: Arc<Notify>,
+    followup_queue: Arc<Mutex<VecDeque<String>>>,
+    /// Ends the whole run. Distinct from the round token, which ends one turn.
+    cancel_token: CancellationToken,
+    /// Ends the current round. The cell is shared with every control handle;
+    /// the loop swaps a fresh token in as each round starts.
+    round_token: Arc<RwLock<CancellationToken>>,
+    interrupt_reason: Arc<Mutex<Option<InterruptReason>>>,
+    memory: Vec<MemoryDocument>,
+    env_context: EnvContext,
+    skills: Vec<Skill>,
+    system_prompt: String,
+    activated_skill_context_observed: bool,
+    file_tracker: FileTracker,
+    subagents: Option<SubagentSupervisor>,
+    completion_coordinator: Option<Arc<dyn CompletionCoordinator>>,
+    last_run_timing: RunTiming,
+    last_run_usage: TokenUsage,
+    last_run_cost_usd_micros: Option<u64>,
+}
+
+impl fmt::Debug for Session {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Session")
+            .field("id", &self.id)
+            .field("root_session_id", &self.root_session_id)
+            .field("provider", &self.provider)
+            .field("model", &self.model)
+            .field("profile", &self.profile_kind)
+            .field("state", &self.state)
+            .field("ended", &self.ended)
+            .field("turns", &self.history.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Session {
+    /// Starts building a session that talks to the model through `client`.
+    pub fn builder(client: Client) -> SessionBuilder {
+        SessionBuilder::new(client)
+    }
+
+    /// Rebuilds a stored session, ready to carry on where it left off.
+    ///
+    /// The record supplies the identity, the conversation, and where the event
+    /// stream had got to; `deps` supplies everything a record cannot hold — the
+    /// client, the environment, the tools, the options. Event numbering
+    /// continues from the record, so one session's events stay uniquely
+    /// numbered across restarts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionBuildError`] for the same reasons
+    /// [`SessionBuilder::build`] does, and
+    /// [`UnsupportedRecord`](SessionBuildError::UnsupportedRecord) for a record
+    /// this build is too old to read.
+    pub fn from_record(
+        record: &SessionRecord,
+        deps: SessionBuilder,
+    ) -> StdResult<Self, SessionBuildError> {
+        if !record.is_supported() {
+            return Err(SessionBuildError::UnsupportedRecord {
+                version:   record.format_version,
+                supported: SESSION_RECORD_FORMAT_VERSION,
+            });
+        }
+
+        let mut deps = deps;
+        deps.events.resume_after_seq = record.last_event_seq;
+        let mut session = deps.build_with_id(record.session_id.clone(), record.created_at)?;
+        session.history = History::from_stored_messages(&record.messages);
+        Ok(session)
+    }
+
+    /// The session as it should be stored.
+    ///
+    /// Everything a resumed session needs and nothing an application could not
+    /// supply again. A child session's root is not recorded: the tree is the
+    /// application's to rebuild.
+    pub fn to_record(&self) -> SessionRecord {
+        let mut record = SessionRecord::new(self.id.clone());
+        record.provider = Some(self.provider.clone());
+        record.model = Some(self.model.clone());
+        record.created_at = self.created_at;
+        record.last_event_seq = self.emitter.last_seq();
+        record.messages = self.history.to_stored_messages();
+        record
+    }
+
+    /// Loads what the session was told, and captures where it is working.
+    ///
+    /// Call this once, before the first run. It publishes
+    /// [`SessionStarted`](AgentEvent::SessionStarted), loads the memory files
+    /// and skill directories the options name, probes the environment for the
+    /// prompt's sake, and asks the profile for the system prompt the whole
+    /// session will use. Naming no memory files and no skill directories is
+    /// normal: pebble looks in no conventional location and guesses no
+    /// filename.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Interrupted`] when the session is cancelled while it is
+    /// initializing, which is checked around every read and every probe.
+    pub async fn initialize(&mut self) -> Result<()> {
+        let cancel = self.cancel_token.clone();
+
+        self.emit(AgentEvent::SessionStarted {
+            provider: Some(self.provider.clone()),
+            model:    Some(self.model.clone()),
+        });
+        if cancel.is_cancelled() {
+            return Err(Error::Interrupted(InterruptReason::Cancelled));
+        }
+
+        let profile = self.profile_kind.as_str().to_owned();
+
+        self.memory = load_memory(self.env.as_ref(), &self.config.memory_files, &cancel).await?;
+        // The files are described, never quoted: the durable stream must not
+        // carry the bytes of a project's own instructions.
+        self.emit(AgentEvent::MemoryLoaded {
+            profile:            profile.clone(),
+            files:              self.memory.iter().map(MemoryDocument::to_summary).collect(),
+            total_loaded_bytes: self
+                .memory
+                .iter()
+                .map(|document| document.loaded_bytes)
+                .sum(),
+            budget_bytes:       MEMORY_BUDGET_BYTES,
+        });
+
+        self.skills = discover_skills(self.env.as_ref(), &self.config.skill_dirs, &cancel).await?;
+        debug!(skill_count = self.skills.len(), "Skills discovered");
+        self.emit(AgentEvent::SkillsDiscovered {
+            profile,
+            source_dirs: self.config.skill_dirs.clone(),
+            skills: self.skills.iter().map(Skill::to_summary).collect(),
+        });
+
+        self.env_context = self.build_env_context(&cancel).await?;
+        debug!(
+            is_git_repo = self.env_context.is_git_repo,
+            model = self.env_context.model.as_str(),
+            "Environment context built"
+        );
+
+        // Built once and fixed for the session's life. Only the loaded text
+        // reaches the profile; the file metadata is already on the stream.
+        let memory: Vec<String> = self
+            .memory
+            .iter()
+            .map(|document| document.content.clone())
+            .collect();
+        self.system_prompt = self.profile.build_system_prompt(
+            &self.env_context,
+            &memory,
+            self.config.user_instructions.as_deref(),
+            &self.skills,
+        );
+
+        Ok(())
+    }
+
+    /// Gathers what the system prompt says about where the session is working.
+    ///
+    /// The three git answers come from running git in the session's own
+    /// environment, so a session working in a container describes that
+    /// container's checkout rather than the machine pebble runs on. A probe
+    /// that fails is simply left out: an environment without git is a working
+    /// environment.
+    async fn build_env_context(&self, cancel: &CancellationToken) -> Result<EnvContext> {
+        stop_if_cancelled(cancel)?;
+        let current_date = self.probe_date(cancel).await;
+
+        stop_if_cancelled(cancel)?;
+        let git_branch = self.probe(cancel, "git rev-parse --abbrev-ref HEAD").await;
+        let is_git_repo = git_branch.is_some();
+
+        stop_if_cancelled(cancel)?;
+        let git_status_short = if is_git_repo {
+            self.probe(cancel, "git status --short").await
+        } else {
+            None
+        };
+
+        stop_if_cancelled(cancel)?;
+        let git_recent_commits = if is_git_repo {
+            self.probe(cancel, "git log --oneline -10").await
+        } else {
+            None
+        };
+
+        stop_if_cancelled(cancel)?;
+        Ok(EnvContext {
+            is_git_repo,
+            git_branch,
+            git_status_short,
+            git_recent_commits,
+            current_date,
+            model: self.model.clone(),
+            knowledge_cutoff: self.knowledge_cutoff.clone(),
+            ..EnvContext::from_environment(self.env.as_ref())
+        })
+    }
+
+    /// Runs one short command in the environment, answering with its trimmed
+    /// output when it succeeded and produced any.
+    async fn probe(&self, cancel: &CancellationToken, command: &str) -> Option<String> {
+        let outcome = self
+            .env
+            .exec(ExecRequest {
+                timeout_ms: Some(PROBE_TIMEOUT_MS),
+                cancel_token: Some(cancel.child_token()),
+                ..ExecRequest::new(command)
+            })
+            .await
+            .ok()?;
+        if !outcome.result.is_success() {
+            return None;
+        }
+        let output = outcome.result.stdout.trim();
+        (!output.is_empty()).then(|| output.to_owned())
+    }
+
+    /// Today's date where the session is working.
+    ///
+    /// Asked of the environment, because a session working somewhere else
+    /// should date its prompt from there. An environment that cannot answer —
+    /// no shell, no `date` — falls back to the UTC date on this machine, which
+    /// is never wrong by more than a day.
+    async fn probe_date(&self, cancel: &CancellationToken) -> String {
+        let reported = self.probe(cancel, "date +%Y-%m-%d").await;
+        match reported {
+            Some(date) if is_iso_date(&date) => date,
+            _ => rfc3339_millis::format(SystemTime::now())
+                .get(..10)
+                .unwrap_or_default()
+                .to_owned(),
+        }
+    }
+
+    /// This session's identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The root of this session's tree, which a root session answers with its
+    /// own [`id`](Self::id).
+    pub fn root_session_id(&self) -> &str {
+        &self.root_session_id
+    }
+
+    /// Places this session under a root, as a child of a tree.
+    pub fn set_root_session_id(&mut self, root: impl Into<String>) {
+        self.root_session_id = root.into();
+    }
+
+    /// Which harness this session runs.
+    pub fn profile_kind(&self) -> AgentProfileKind {
+        self.profile_kind
+    }
+
+    /// The provider the session resolved to.
+    pub fn provider(&self) -> &str {
+        &self.provider
+    }
+
+    /// The catalog identifier of the model the session resolved to.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// What the model is told about its context window and output budget.
+    pub fn model_facts(&self) -> ModelFacts {
+        self.facts
+    }
+
+    /// How hard the model is being asked to think.
+    pub fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.config.reasoning_effort
+    }
+
+    /// Which latency or cost tier the session asks for.
+    pub fn speed(&self) -> Option<Speed> {
+        self.config.speed
+    }
+
+    /// The permission level the application recorded for this session.
+    pub fn permission_level(&self) -> Option<PermissionLevel> {
+        self.config.permission_level
+    }
+
+    /// What the session is doing right now.
+    pub const fn state(&self) -> SessionState {
+        self.state
+    }
+
+    /// The conversation so far.
+    pub const fn history(&self) -> &History {
+        &self.history
+    }
+
+    /// The files this session has read and changed.
+    pub const fn file_tracker(&self) -> &FileTracker {
+        &self.file_tracker
+    }
+
+    /// Where the last run spent its time.
+    pub const fn last_run_timing(&self) -> RunTiming {
+        self.last_run_timing
+    }
+
+    /// What the last run cost in tokens, summed over every response.
+    pub const fn last_run_usage(&self) -> TokenUsage {
+        self.last_run_usage
+    }
+
+    /// What the last run cost in USD micros, where the catalog or the provider
+    /// priced it.
+    pub const fn last_run_cost_usd_micros(&self) -> Option<u64> {
+        self.last_run_cost_usd_micros
+    }
+
+    /// The tools the model is actually shown, after the access policy.
+    ///
+    /// The same filter the session builds its requests with, so what an
+    /// application reads here is what the model was told.
+    pub fn effective_tools(&self) -> Vec<ToolDefinitionWithSource> {
+        self.registry.definitions_with_source_for_policy(
+            self.config.tool_access_policy.as_deref(),
+            self.config.tool_exposure_mode,
+        )
+    }
+
+    /// The tools the model is shown, summarized and sorted by name.
+    pub fn tool_summaries(&self) -> Vec<ToolSummary> {
+        let mut summaries: Vec<_> = self
+            .effective_tools()
+            .iter()
+            .map(ToolDefinitionWithSource::to_tool_summary)
+            .collect();
+        summaries.sort_by(|left, right| left.name.cmp(&right.name));
+        summaries
+    }
+
+    /// Watches the session's events from here on.
+    ///
+    /// The stream is lossy for a subscriber that falls behind; an application
+    /// that must see everything configures
+    /// [`SessionBuilder::event_sink`] instead.
+    pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
+        self.emitter.subscribe()
+    }
+
+    /// A handle that steers and interrupts this session from elsewhere.
+    pub fn control_handle(&self) -> SessionControlHandle {
+        SessionControlHandle::attached(
+            Arc::clone(&self.control_state),
+            Arc::clone(&self.round_token),
+            Arc::clone(&self.control_notify),
+        )
+    }
+
+    /// Queues guidance for the next round.
+    pub fn steer(&self, text: impl Into<String>) {
+        self.control_handle().steer(text, None);
+    }
+
+    /// Abandons the current round, parking the session if nothing is queued.
+    pub fn control_interrupt(&self) {
+        self.control_handle().interrupt();
+    }
+
+    /// Abandons the current round and delivers `text` in its place.
+    pub fn interrupt_then_steer(&self, text: impl Into<String>, actor: Option<Actor>) {
+        self.control_handle().interrupt_then_steer(text, actor);
+    }
+
+    /// Installs the coordinator that decides whether a finished turn really
+    /// ends the run.
+    pub fn set_completion_coordinator(&mut self, coordinator: Arc<dyn CompletionCoordinator>) {
+        self.completion_coordinator = Some(coordinator);
+    }
+
+    /// Queues more input to run once the current input is finished.
+    pub fn follow_up(&self, message: impl Into<String>) {
+        self.followup_queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(message.into());
+    }
+
+    /// The follow-up queue, for a producer outside the session.
+    pub fn followup_queue_handle(&self) -> Arc<Mutex<VecDeque<String>>> {
+        Arc::clone(&self.followup_queue)
+    }
+
+    /// Ends the run.
+    ///
+    /// The loop unwinds through its own checkpoints — every tool call still
+    /// gets its result recorded — and then closes the session. This is the
+    /// terminal gesture; [`SessionControlHandle::interrupt`] is the one that
+    /// only abandons a round.
+    pub fn interrupt(&self) {
+        self.set_interrupt_reason(InterruptReason::Cancelled);
+        self.cancel_token.cancel();
+    }
+
+    /// The token that ends this session's run.
+    pub fn cancel_token(&self) -> CancellationToken {
+        self.cancel_token.clone()
+    }
+
+    /// The reason slot an outside task can fill before cancelling.
+    ///
+    /// First writer wins, so a watchdog that names its own reason before
+    /// cancelling gets that reason reported instead of a plain cancellation.
+    pub fn interrupt_reason_handle(&self) -> Arc<Mutex<Option<InterruptReason>>> {
+        Arc::clone(&self.interrupt_reason)
+    }
+
+    /// Changes how hard the model is asked to think, from the next round on.
+    pub fn set_reasoning_effort(&mut self, effort: Option<ReasoningEffort>) {
+        self.config.reasoning_effort = effort;
+    }
+
+    /// Changes which latency or cost tier the session asks for, from the next
+    /// round on.
+    pub fn set_speed(&mut self, speed: Option<Speed>) {
+        self.config.speed = speed;
+    }
+
+    /// Changes where a tool call's extra environment variables come from.
+    pub fn set_tool_env_provider(&mut self, provider: Arc<dyn ToolEnvProvider>) {
+        self.tool_env_provider = Some(provider);
+    }
+
+    /// Sets fixed extra environment variables for every tool call.
+    pub fn set_tool_env(&mut self, env: HashMap<String, String>) {
+        self.set_tool_env_provider(Arc::new(StaticEnvProvider(env)));
+    }
+
+    /// Runs one input to completion, answering with the assistant's final text
+    /// when it ended with any.
+    ///
+    /// Questions go to the provider the session was built with.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::SessionClosed`] for a session that has ended,
+    /// [`Error::Interrupted`] when the run was cancelled or ran out of
+    /// wall-clock time, [`Error::Llm`] when the model call failed for good, and
+    /// [`Error::EventSink`] when the configured sink refused an event.
+    pub async fn run(&mut self, input: &str) -> Result<Option<String>> {
+        self.run_with_options(input, RunOptions::default()).await
+    }
+
+    /// Runs one input with per-run overrides.
+    ///
+    /// # Errors
+    ///
+    /// The same failures as [`Session::run`].
+    pub async fn run_with_options(
+        &mut self,
+        input: &str,
+        options: RunOptions,
+    ) -> Result<Option<String>> {
+        self.last_run_timing = RunTiming::default();
+        self.last_run_usage = TokenUsage::default();
+        self.last_run_cost_usd_micros = None;
+        if self.state == SessionState::Closed {
+            return Err(Error::SessionClosed);
+        }
+
+        let human_input = options
+            .human_input
+            .clone()
+            .or_else(|| self.human_input.clone());
+        let timer = self.start_wall_clock_timer();
+        let mut totals = RunTotals::default();
+
+        let mut result = self
+            .run_single_input(
+                input,
+                SkillExpansion::Apply,
+                human_input.as_ref(),
+                &mut totals,
+            )
+            .await;
+
+        if result.is_ok() {
+            self.drain_boundary_queue(human_input.as_ref(), &mut totals, &mut result)
+                .await;
+        }
+
+        let mut task_failure = stop_wall_clock_timer(timer).await;
+
+        if self.state == SessionState::Closed {
+            let reason = if self.cancel_token.is_cancelled() {
+                ShutdownReason::Cancelled
+            } else {
+                ShutdownReason::Error
+            };
+            if let Err(error) = self.shutdown(reason).await {
+                task_failure = task_failure.or(Some(error));
+            }
+        } else {
+            self.transition(SessionState::Idle);
+            // A sink that refused an event during this run is this run's
+            // failure, even where the loop got to a boundary too late to
+            // notice it.
+            if let Err(error) = self.check_pump().await {
+                task_failure = task_failure.or(Some(error));
+            }
+        }
+
+        self.last_run_timing = totals.timing;
+        self.last_run_usage = totals.usage;
+        self.last_run_cost_usd_micros = totals.cost_usd_micros;
+
+        match (result, task_failure) {
+            // The run's own failure is the story; a task that also failed on
+            // the way out is reported rather than returned.
+            (Err(error), Some(task)) => {
+                warn!(%task, "A session task failed while the run was already failing");
+                Err(error)
+            }
+            (Err(error), None) => Err(error),
+            (Ok(_), Some(task)) => Err(task),
+            (Ok(output), None) => Ok(output),
+        }
+    }
+
+    /// Runs whatever queued up while the last input was being answered.
+    ///
+    /// Follow-up input first, then one turn carrying every background result
+    /// that is ready. Background results never interrupt inference or a tool
+    /// call, and the ones ready at a boundary arrive together in one turn.
+    async fn drain_boundary_queue(
+        &mut self,
+        human_input: Option<&Arc<dyn HumanInputProvider>>,
+        totals: &mut RunTotals,
+        result: &mut Result<Option<String>>,
+    ) {
+        loop {
+            let followup = self
+                .followup_queue
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front();
+
+            let next = if let Some(followup) = followup {
+                Some((followup, SkillExpansion::Apply))
+            } else if let Some(supervisor) = self.subagents.clone() {
+                match supervisor
+                    .next_parent_notification_turn(&self.cancel_token)
+                    .await
+                {
+                    Ok(Some(turn)) => Some((turn, SkillExpansion::Skip)),
+                    Ok(None) => None,
+                    // A cancelled wait may have a more specific reason
+                    // recorded than "cancelled", so ask the session.
+                    Err(Error::Interrupted(InterruptReason::Cancelled)) => {
+                        *result = Err(self.interrupted_error());
+                        return;
+                    }
+                    Err(error) => {
+                        *result = Err(error);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Nothing queued: whatever the last input answered stands.
+            let Some((input, skill_expansion)) = next else {
+                return;
+            };
+            *result = self
+                .run_single_input(&input, skill_expansion, human_input, totals)
+                .await;
+            if result.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Starts the task that ends a run which has taken too long.
+    ///
+    /// The timer cancels the session rather than dropping the run, so the loop
+    /// unwinds through its own checkpoints and every tool call still has its
+    /// result recorded.
+    fn start_wall_clock_timer(&self) -> Option<WallClockTimer> {
+        let duration = self.config.wall_clock_timeout?;
+        let stop = CancellationToken::new();
+        let cancel = self.cancel_token.clone();
+        let reason = Arc::clone(&self.interrupt_reason);
+        let watched = stop.clone();
+        let task = tokio::spawn(async move {
+            tokio::select! {
+                () = watched.cancelled() => {}
+                () = sleep(duration) => {
+                    let mut guard = reason.lock().unwrap_or_else(PoisonError::into_inner);
+                    if guard.is_none() {
+                        *guard = Some(InterruptReason::WallClockTimeout);
+                    }
+                    drop(guard);
+                    cancel.cancel();
+                }
+            }
+        });
+        Some(WallClockTimer { stop, task })
+    }
+
+    /// Closes the session, joining everything it owns.
+    ///
+    /// Only the first call does anything, which is what lets the loop close a
+    /// cancelled session at whichever checkpoint reaches it first. Children are
+    /// closed before this session publishes its own end, so a reader sees a
+    /// tree unwind from the leaves.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::EventSink`] when the configured sink had refused an
+    /// event, and [`Error::InvalidState`] when a task the session owned failed
+    /// outright. The session is closed either way.
+    pub async fn shutdown(&mut self, reason: ShutdownReason) -> Result<bool> {
+        if self.ended {
+            return Ok(false);
+        }
+        if reason == ShutdownReason::Cancelled {
+            self.set_interrupt_reason(InterruptReason::Cancelled);
+            self.cancel_token.cancel();
+        }
+        self.transition(SessionState::Closed);
+        if let Some(supervisor) = &self.subagents {
+            supervisor.shutdown_all().await;
+        }
+        self.ended = true;
+        self.emit(AgentEvent::SessionEnded);
+        self.join_pump().await?;
+        Ok(true)
+    }
+
+    /// Publishes everything queued, then joins the pump.
+    async fn join_pump(&mut self) -> Result<()> {
+        let Some(pump) = self.pump.take() else {
+            return Ok(());
+        };
+        self.emitter.close();
+        match pump.await {
+            Ok(result) => result,
+            Err(error) => Err(Error::InvalidState(format!(
+                "the event pump task failed: {error}"
+            ))),
+        }
+    }
+
+    /// Reports a pump that has already stopped, which only a refusing sink
+    /// does while a run is in progress.
+    ///
+    /// Checked at round boundaries so a run ends promptly once its events stop
+    /// being recorded, rather than working on against a stream nobody has.
+    ///
+    /// A sink failure closes the session as well as ending the run. The
+    /// pipeline stops for good when the pump does — nothing is recorded, and no
+    /// subscriber is served — so a session that kept answering would be working
+    /// where nobody could see it. The application gets the failure from the run
+    /// that found it, and [`Error::SessionClosed`] from every call after.
+    async fn check_pump(&mut self) -> Result<()> {
+        let Some(pump) = self.pump.as_ref() else {
+            return Ok(());
+        };
+        if !pump.is_finished() {
+            return Ok(());
+        }
+        let outcome = self.join_pump().await;
+        if outcome.is_err() {
+            self.transition(SessionState::Closed);
+        }
+        outcome
+    }
+
+    /// Closes a cancelled session and answers with the error the run ends on.
+    async fn close_cancelled(&mut self) -> Error {
+        let interrupted = self.interrupted_error();
+        match self.shutdown(ShutdownReason::Cancelled).await {
+            Ok(_) => interrupted,
+            Err(error) => error,
+        }
+    }
+
+    fn set_interrupt_reason(&self, reason: InterruptReason) {
+        let mut guard = self
+            .interrupt_reason
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if guard.is_none() {
+            *guard = Some(reason);
+        }
+    }
+
+    /// The error an interrupted run ends with, naming whatever reason was
+    /// recorded first.
+    fn interrupted_error(&self) -> Error {
+        let reason = *self
+            .interrupt_reason
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .unwrap_or(&InterruptReason::Cancelled);
+        Error::Interrupted(reason)
+    }
+
+    /// Publishes one event on this session's stream.
+    fn emit(&self, event: AgentEvent) {
+        self.emitter.emit(self.id.clone(), event);
+    }
+
+    /// Publishes a model failure, closing the session when the credential is
+    /// the problem.
+    ///
+    /// An authentication failure will not fix itself between rounds, so the
+    /// session stops rather than spending the rest of the run failing the same
+    /// way.
+    fn emit_llm_error(&mut self, error: LlmError) -> Error {
+        let credential_failure = is_auth_error(&error);
+        // Projected from the error the caller receives, so what a reader sees
+        // and what the run returns say the same thing.
+        let error = Error::Llm(error);
+        self.emit(AgentEvent::Error {
+            error: ErrorData::from(&error),
+        });
+        if credential_failure {
+            self.transition(SessionState::Closed);
+        }
+        error
+    }
+
+    /// Moves the session's state machine, publishing the end of a processing
+    /// cycle where one ends.
+    ///
+    /// Valid moves: Idle or Executing to Thinking, Thinking to Executing or
+    /// Idle, anything to Closed. Ending the session belongs to
+    /// [`Session::shutdown`], never here.
+    fn transition(&mut self, to: SessionState) {
+        let from = self.state;
+        if from == to {
+            return;
+        }
+
+        debug_assert!(
+            matches!(
+                (from, to),
+                (
+                    SessionState::Idle | SessionState::Executing,
+                    SessionState::Thinking
+                ) | (
+                    SessionState::Thinking,
+                    SessionState::Executing | SessionState::Idle
+                ) | (_, SessionState::Closed)
+            ),
+            "invalid session state transition: {from:?} -> {to:?}"
+        );
+
+        if matches!(from, SessionState::Thinking | SessionState::Executing)
+            && to == SessionState::Idle
+        {
+            self.emit(AgentEvent::ProcessingEnd);
+        }
+
+        self.state = to;
+    }
+}
+
+/// The task watching one run's wall-clock budget.
+struct WallClockTimer {
+    stop: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+/// Stops the timer and joins it, reporting a task that failed outright.
+async fn stop_wall_clock_timer(timer: Option<WallClockTimer>) -> Option<Error> {
+    let timer = timer?;
+    timer.stop.cancel();
+    timer
+        .task
+        .await
+        .err()
+        .map(|error| Error::InvalidState(format!("the wall-clock timer task failed: {error}")))
+}
+
+/// Stops a step that a cancelled session should not take.
+fn stop_if_cancelled(cancel: &CancellationToken) -> Result<()> {
+    if cancel.is_cancelled() {
+        return Err(Error::Interrupted(InterruptReason::Cancelled));
+    }
+    Ok(())
+}
+
+/// Whether a model failure means the credential, rather than the call.
+fn is_auth_error(error: &LlmError) -> bool {
+    matches!(
+        error.kind(),
+        LlmErrorKind::Authentication | LlmErrorKind::AccessDenied
+    )
+}
+
+/// Whether a probe's answer looks like the `YYYY-MM-DD` it was asked for.
+fn is_iso_date(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() == 10
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            4 | 7 => *byte == b'-',
+            _ => byte.is_ascii_digit(),
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::result::Result as StdResult;
+
+    use async_trait::async_trait;
+    use tokio::task::yield_now;
+
+    use super::testing::{TestProfile, TestSession, builder, event_names, settled};
+    use super::*;
+    use crate::error::ErrorKind;
+    use crate::event::EventSinkError;
+    use crate::test_support::{
+        MockEnvironment, ScriptedCall, ScriptedFailure, scripted_client, text_response,
+    };
+    use crate::types::Message;
+
+    /// A client that answers every round with the same text.
+    fn client() -> Client {
+        let (client, _provider) =
+            scripted_client(vec![ScriptedCall::response(text_response("done"))]);
+        client
+    }
+
+    /// A session that answers every round with the same text.
+    fn session() -> Session {
+        let (session, _provider) =
+            TestSession::answering(vec![ScriptedCall::response(text_response("done"))]);
+        session
+    }
+
+    // --- Building ---
+
+    #[tokio::test]
+    async fn a_session_needs_a_model() {
+        let error = Session::builder(client())
+            .environment(Arc::new(MockEnvironment::linux()))
+            .build()
+            .expect_err("no model was named");
+
+        assert!(matches!(error, SessionBuildError::MissingModel));
+    }
+
+    #[tokio::test]
+    async fn a_session_needs_an_environment() {
+        let error = Session::builder(client())
+            .model("test/model")
+            .build()
+            .expect_err("no environment was given");
+
+        assert!(matches!(error, SessionBuildError::MissingEnvironment));
+    }
+
+    #[tokio::test]
+    async fn a_selector_that_names_nothing_is_refused() {
+        let error = Session::builder(client())
+            .model("no-such-model")
+            .environment(Arc::new(MockEnvironment::linux()))
+            .build()
+            .expect_err("the selector names nothing");
+
+        assert!(matches!(
+            error,
+            SessionBuildError::ModelSelection { ref selector, .. } if selector == "no-such-model"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_blank_selector_is_refused() {
+        let error = Session::builder(client())
+            .model("   ")
+            .environment(Arc::new(MockEnvironment::linux()))
+            .build()
+            .expect_err("a blank selector names nothing");
+
+        assert!(matches!(error, SessionBuildError::Selector { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_model_that_names_no_profile_is_refused() {
+        let error = Session::builder(client())
+            .model("bare/plain")
+            .environment(Arc::new(MockEnvironment::linux()))
+            .with_profile(TestProfile::shared())
+            .build()
+            .expect_err("nothing names a harness");
+
+        assert!(matches!(
+            error,
+            SessionBuildError::MissingProfileMetadata { ref model } if model == "bare/plain"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_profile_pebble_does_not_know_is_refused() {
+        let error = Session::builder(client())
+            .model("test/strange")
+            .environment(Arc::new(MockEnvironment::linux()))
+            .build()
+            .expect_err("`nonesuch` is not a pebble profile");
+
+        assert!(matches!(
+            error,
+            SessionBuildError::UnknownProfile { ref profile, .. } if profile == "nonesuch"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_models_profile_beats_its_providers() {
+        let model = Session::builder(client())
+            .model("test/model")
+            .environment(Arc::new(MockEnvironment::linux()))
+            .build()
+            .expect_err("pebble ships no profiles yet");
+        let inherited = Session::builder(client())
+            .model("test/inherited")
+            .environment(Arc::new(MockEnvironment::linux()))
+            .build()
+            .expect_err("pebble ships no profiles yet");
+
+        assert!(matches!(model, SessionBuildError::ProfileUnavailable {
+            profile: AgentProfileKind::Anthropic,
+        }));
+        assert!(matches!(inherited, SessionBuildError::ProfileUnavailable {
+            profile: AgentProfileKind::OpenAi,
+        }));
+    }
+
+    #[tokio::test]
+    async fn a_built_session_pins_what_it_resolved() {
+        let session = session();
+
+        assert_eq!(session.provider(), "test");
+        assert_eq!(session.model(), "model");
+        assert_eq!(session.model_selector, "test/model");
+        assert_eq!(session.profile_kind(), AgentProfileKind::Anthropic);
+        assert_eq!(session.model_facts().context_window_tokens, 200_000);
+        assert_eq!(session.state(), SessionState::Idle);
+        assert!(session.id().starts_with("ses_"));
+        assert_eq!(session.root_session_id(), session.id());
+    }
+
+    #[tokio::test]
+    async fn the_catalog_says_which_models_reason_without_being_asked() {
+        let facts = |selector: &str| {
+            Session::builder(client())
+                .model(selector)
+                .environment(Arc::new(MockEnvironment::linux()))
+                .with_profile(TestProfile::shared())
+                .build()
+                .expect("the session builds")
+                .model_facts()
+                .reasons_by_default
+        };
+
+        assert!(!facts("test/model"), "a model that cannot reason");
+        assert!(facts("test/thinking"), "a model that takes an effort level");
+        assert!(
+            facts("test/always-thinking"),
+            "a row that says so itself, where the capabilities cannot"
+        );
+    }
+
+    // --- Initializing ---
+
+    #[tokio::test]
+    async fn initializing_reports_what_it_loaded_and_where_it_is_working() {
+        let mut session = session();
+        let mut events = session.subscribe();
+
+        session.initialize().await.expect("initialization succeeds");
+
+        let published = settled(&mut session, &mut events).await;
+        assert_eq!(event_names(&published), [
+            "started", "memory", "skills", "ended"
+        ]);
+        assert!(matches!(
+            &published[1],
+            AgentEvent::MemoryLoaded {
+                files,
+                total_loaded_bytes: 0,
+                budget_bytes: MEMORY_BUDGET_BYTES,
+                ..
+            } if files.is_empty()
+        ));
+        assert!(
+            session
+                .system_prompt
+                .contains("test assistant working in /home/test")
+        );
+        assert_eq!(session.env_context.knowledge_cutoff, "May 2026");
+        assert_eq!(session.env_context.model, "model");
+        assert_eq!(session.env_context.platform, "linux");
+        assert_eq!(
+            session.env_context.current_date.len(),
+            10,
+            "an environment that cannot date itself still dates the prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn initializing_a_cancelled_session_stops() {
+        let mut session = session();
+        session.interrupt();
+
+        let error = session
+            .initialize()
+            .await
+            .expect_err("a cancelled session initializes nothing");
+
+        assert!(matches!(
+            error,
+            Error::Interrupted(InterruptReason::Cancelled)
+        ));
+    }
+
+    // --- Running ---
+
+    #[tokio::test]
+    async fn a_text_answer_ends_the_run() {
+        let (mut session, _provider) =
+            TestSession::answering(vec![ScriptedCall::response(text_response("all done"))]);
+        let mut events = session.subscribe();
+        session.initialize().await.expect("initialization succeeds");
+
+        let answer = session.run("fix the test").await.expect("the run succeeds");
+
+        assert_eq!(answer.as_deref(), Some("all done"));
+        assert_eq!(session.history().len(), 2, "the input and the answer");
+        assert_eq!(session.state(), SessionState::Idle);
+        assert_eq!(event_names(&settled(&mut session, &mut events).await), [
+            "started",
+            "memory",
+            "skills",
+            "input",
+            "request",
+            "first_output",
+            "delta",
+            "message",
+            "processing_end",
+            "ended",
+        ]);
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_is_announced_once_and_its_steer_follows_it() {
+        let mut session = session();
+        let mut events = session.subscribe();
+        // Two gestures before the loop ever runs: one round to settle, two
+        // generations to announce.
+        let handle = session.control_handle();
+        handle.interrupt();
+        handle.interrupt_then_steer("do this instead", None);
+
+        session.run("do a thing").await.expect("the run succeeds");
+
+        let published = settled(&mut session, &mut events).await;
+        let interrupts: Vec<u64> = published
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::RoundInterrupted { generation } => Some(*generation),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(interrupts, [1, 2], "one announcement per gesture");
+        let position = |matcher: fn(&AgentEvent) -> bool| {
+            published
+                .iter()
+                .position(&matcher)
+                .expect("the event was published")
+        };
+        assert!(
+            position(|event| matches!(event, AgentEvent::RoundInterrupted { generation: 2 }))
+                < position(|event| matches!(event, AgentEvent::SteeringInjected { .. })),
+            "the interrupt settles before its steer is delivered"
+        );
+        assert!(matches!(
+            session.history().turns()[1],
+            Message::Steering { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_closed_session_refuses_input() {
+        let mut session = session();
+        session
+            .shutdown(ShutdownReason::Completed)
+            .await
+            .expect("the shutdown succeeds");
+
+        let error = session
+            .run("anything")
+            .await
+            .expect_err("the session ended");
+
+        assert!(matches!(error, Error::SessionClosed));
+    }
+
+    // --- Shutting down ---
+
+    #[tokio::test]
+    async fn only_the_first_shutdown_does_anything() {
+        let mut session = session();
+        let mut events = session.subscribe();
+
+        assert!(
+            session
+                .shutdown(ShutdownReason::Completed)
+                .await
+                .expect("the shutdown succeeds")
+        );
+        assert!(
+            !session
+                .shutdown(ShutdownReason::Completed)
+                .await
+                .expect("a second shutdown does nothing")
+        );
+
+        let mut published = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            published.push(event.event);
+        }
+        assert_eq!(
+            published
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::SessionEnded))
+                .count(),
+            1
+        );
+        assert_eq!(session.state(), SessionState::Closed);
+    }
+
+    /// A sink that records nothing, so the pump stops on the first event.
+    struct RefusingSink;
+
+    #[async_trait]
+    impl EventSink for RefusingSink {
+        async fn record(&self, _event: &SessionEvent) -> StdResult<(), EventSinkError> {
+            Err(EventSinkError::new("the disk is full"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusing_sink_stops_the_run() {
+        let (client, _provider) =
+            scripted_client(vec![ScriptedCall::response(text_response("done"))]);
+        let mut session = builder(client)
+            .event_sink(Arc::new(RefusingSink))
+            .build()
+            .expect("the session builds");
+
+        // The pump stops on the first event it is given, which the loop
+        // notices at its next round boundary.
+        let first = session.run("do a thing").await;
+        yield_now().await;
+        let second = session.run("do another thing").await;
+        let ((Err(failure), _) | (Ok(_), Err(failure))) = (first, second) else {
+            panic!("a refusing sink must stop the run");
+        };
+
+        assert_eq!(failure.kind(), ErrorKind::EventSink);
+        assert!(failure.to_string().contains("the disk is full"));
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_sink_refused_takes_no_further_input() {
+        let (client, provider) =
+            scripted_client(vec![ScriptedCall::response(text_response("done"))]);
+        let mut session = builder(client)
+            .event_sink(Arc::new(RefusingSink))
+            .build()
+            .expect("the session builds");
+        let mut events = session.subscribe();
+
+        // The failure surfaces at whichever checkpoint first finds the pump
+        // stopped, which is the end of the first run or the start of the
+        // second.
+        let mut failure = None;
+        for _ in 0..2 {
+            match session.run("do a thing").await {
+                Ok(_) => yield_now().await,
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            }
+        }
+        let calls_before = provider.call_count();
+
+        let failure = failure.expect("a refusing sink stops a run");
+        assert_eq!(failure.kind(), ErrorKind::EventSink);
+        assert_eq!(
+            session.state(),
+            SessionState::Closed,
+            "a session whose events go nowhere stops"
+        );
+        assert!(
+            matches!(session.run("and another").await, Err(Error::SessionClosed)),
+            "the next run is refused rather than run blind"
+        );
+        assert_eq!(
+            provider.call_count(),
+            calls_before,
+            "the refused run asks the model nothing"
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "nothing reached a subscriber after the sink refused"
+        );
+    }
+
+    // --- Storing and resuming ---
+
+    #[tokio::test]
+    async fn a_session_round_trips_through_its_record() {
+        let mut session = session();
+        session.run("do a thing").await.expect("the run succeeds");
+        // Sequence numbers are assigned as events are published, so the record
+        // is taken once the pipeline has caught up.
+        session
+            .shutdown(ShutdownReason::Completed)
+            .await
+            .expect("the shutdown succeeds");
+        let record = session.to_record();
+
+        let resumed =
+            Session::from_record(&record, builder(client())).expect("the record restores");
+
+        assert_eq!(resumed.id(), session.id());
+        assert_eq!(resumed.root_session_id(), session.id());
+        assert_eq!(resumed.history().turns(), session.history().turns());
+        assert_eq!(record.provider.as_deref(), Some("test"));
+        assert_eq!(record.model.as_deref(), Some("model"));
+        assert!(record.last_event_seq > 0);
+        assert_eq!(
+            resumed.state(),
+            SessionState::Idle,
+            "a resumed session is idle whatever ended the last one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resumed_session_keeps_numbering_where_it_left_off() {
+        let mut session = session();
+        session.run("do a thing").await.expect("the run succeeds");
+        session
+            .shutdown(ShutdownReason::Completed)
+            .await
+            .expect("the shutdown succeeds");
+        let record = session.to_record();
+        let last_seq = record.last_event_seq;
+
+        let resumed =
+            Session::from_record(&record, builder(client())).expect("the record restores");
+        let mut events = resumed.subscribe();
+        resumed.emit(AgentEvent::LoopDetected);
+
+        assert_eq!(
+            events.recv().await.expect("the event is published").seq,
+            last_seq + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_from_a_newer_pebble_is_refused() {
+        let mut record = SessionRecord::new("ses_1");
+        record.format_version = SESSION_RECORD_FORMAT_VERSION + 1;
+
+        let error = Session::from_record(&record, builder(client()))
+            .expect_err("this build is too old for the record");
+
+        assert!(matches!(
+            error,
+            SessionBuildError::UnsupportedRecord { version, supported }
+                if version == SESSION_RECORD_FORMAT_VERSION + 1
+                    && supported == SESSION_RECORD_FORMAT_VERSION
+        ));
+    }
+
+    // --- Small parts ---
+
+    #[test]
+    fn a_date_is_recognized_by_its_shape() {
+        assert!(is_iso_date("2026-08-31"));
+        assert!(!is_iso_date("mock output"));
+        assert!(!is_iso_date("2026-08-3"));
+        assert!(!is_iso_date("2026/08/31"));
+        assert!(!is_iso_date(""));
+    }
+
+    #[test]
+    fn only_a_credential_failure_closes_a_session() {
+        for kind in [LlmErrorKind::Authentication, LlmErrorKind::AccessDenied] {
+            assert!(is_auth_error(&LlmError::new(kind, "no")));
+        }
+        for kind in [
+            LlmErrorKind::RateLimit,
+            LlmErrorKind::Server,
+            LlmErrorKind::Network,
+        ] {
+            assert!(!is_auth_error(&LlmError::new(kind, "no")));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_scripted_failure_reaches_the_session_as_the_error_it_names() {
+        let (mut session, _provider) = TestSession::answering(vec![ScriptedCall::Failure(
+            ScriptedFailure::terminal(LlmErrorKind::Server, "the provider is down"),
+        )]);
+
+        let error = session.run("anything").await.expect_err("the call failed");
+
+        assert!(
+            matches!(&error, Error::Llm(inner) if inner.kind() == LlmErrorKind::Server),
+            "{error:?}"
+        );
+    }
+}

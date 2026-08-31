@@ -11,7 +11,9 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::result::Result as StdResult;
 
-use lithos_llm::types::{Error as LlmError, ErrorKind as LlmErrorKind, RetryClassification};
+use lithos_llm::types::{
+    Error as LlmError, ErrorKind as LlmErrorKind, RequestBuildError, RetryClassification,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::event::EventSinkError;
@@ -48,6 +50,11 @@ impl fmt::Display for InterruptReason {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CompactionError {
+    /// The summarization request could not be built, which a session with an
+    /// unusable model selector runs into before any call is made.
+    #[error("summary request could not be built: {0}")]
+    Request(#[source] RequestBuildError),
+
     /// The summarization request to the model failed.
     #[error("summary request failed: {0}")]
     Llm(#[source] LlmError),
@@ -130,7 +137,9 @@ impl Error {
     pub fn llm_source(&self) -> Option<&LlmError> {
         match self {
             Self::Llm(error) | Self::Compaction(CompactionError::Llm(error)) => Some(error),
-            Self::Compaction(CompactionError::EmptySummary { .. })
+            Self::Compaction(
+                CompactionError::EmptySummary { .. } | CompactionError::Request(_),
+            )
             | Self::SessionClosed
             | Self::InvalidState(_)
             | Self::ToolExecution(_)

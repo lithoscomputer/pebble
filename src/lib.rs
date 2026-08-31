@@ -3,6 +3,46 @@
 //! state, and the events an application observes — and leaves transport,
 //! storage, and process isolation to the embedding application.
 //!
+//! # Running one
+//!
+//! [`Session`] is the whole loop. [`Session::builder`] resolves a model through
+//! the client's catalog, picks the harness that model expects, and freezes the
+//! tools the session may call; [`Session::initialize`] loads what the session
+//! was told and captures where it is working; [`Session::run`] answers one
+//! input, however many rounds of model calls and tool calls that takes. A
+//! [`SessionControlHandle`] steers or interrupts a run already in progress, and
+//! [`Session::shutdown`] closes the session and joins everything it owns.
+//!
+//! # Repeating a failed call
+//!
+//! Pebble replays a turn only when it must: a stream that fails after the model
+//! has already shown output cannot be reconnected underneath a reader without
+//! showing that output twice, so the session withdraws it and replays. Every
+//! other retry belongs to the client, which means the application has to
+//! install one when it builds the client:
+//!
+//! ```no_run
+//! # use lithos_llm::Client;
+//! use lithos_llm::middleware::{RetryMiddleware, RetryPolicy};
+//! use pebble::RetryEventObserver;
+//!
+//! # fn build(catalog: lithos_llm::catalog::Catalog) -> Result<(), Box<dyn std::error::Error>> {
+//! let policy = RetryPolicy::exponential().max_attempts(4);
+//! let build = Client::builder()
+//!     .catalog(catalog)
+//!     .middleware(RetryMiddleware::new(policy).observer(RetryEventObserver))
+//!     .build()?;
+//! # let _ = build;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! [`RetryEventObserver`] is what puts the client's own retries on the
+//! session's event stream; without it a session still runs correctly and simply
+//! never reports one. Give
+//! [`SessionOptions::retry_policy`](SessionOptions::retry_policy) the same
+//! policy, so one failure is spaced the same way whichever layer handles it.
+//!
 //! # Where the work lands
 //!
 //! Tools act through one seam, [`Environment`]: file access, content search,
@@ -40,6 +80,26 @@
 //! [`HumanInputProvider`]. Without one no question tool is registered, so a
 //! model cannot block a run waiting for an answer that will never come.
 //!
+//! # What the session is told
+//!
+//! Two kinds of written instruction reach a session, and pebble finds neither
+//! by convention. [`load_memory`] reads the project instructions an application
+//! names, within a fixed byte budget; [`discover_skills`] searches the
+//! directories it is given for `SKILL.md` files. Name nothing and a session
+//! carries neither, because guessing at a filename or walking up to a
+//! repository root is the application's decision, not the library's.
+//!
+//! # Staying inside the window
+//!
+//! A long run outgrows the model's context window.
+//! [`build_local_snapshot`] measures where a request stands, attributing tokens
+//! to the prompt, the tools, memory, skills, and the conversation, and
+//! [`check_context_usage`] says when the session is close enough to the edge to
+//! act. [`compact_context`] then spends one call summarizing the older turns
+//! and replaces them with the summary, keeping the file work a
+//! [`FileTracker`] recorded. [`detect_loop`] catches the other way a run stops
+//! progressing: the same tool calls, round after round.
+//!
 //! # Stability
 //!
 //! The serialized form of [`SessionEvent`] and [`AgentEvent`] is public API.
@@ -66,16 +126,25 @@
 //! methods.
 
 mod char_boundary;
+mod compaction;
 mod config;
+mod context_window;
 mod environment;
 mod error;
 mod event;
+mod file_tracker;
 mod history;
 mod human_input;
+mod loop_detection;
+mod memory;
 mod profile;
 mod reasoning;
 mod record;
 mod redact;
+mod session;
+mod skills;
+mod subagent;
+mod task_reminder;
 mod tool;
 mod truncation;
 mod types;
@@ -83,6 +152,14 @@ mod types;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_support;
 
+/// How a failed model call is spaced before it is tried again, carried by
+/// [`SessionOptions::retry_policy`].
+///
+/// The same type the client's
+/// [`RetryMiddleware`](lithos_llm::middleware::RetryMiddleware) is built with,
+/// so one policy can be given to both.
+#[doc(inline)]
+pub use lithos_llm::middleware::RetryPolicy;
 /// One part of a message or of a tool's result.
 #[doc(inline)]
 pub use lithos_llm::types::ContentPart;
@@ -111,9 +188,17 @@ pub use lithos_llm::types::{ToolCall, ToolCallKind};
 #[doc(inline)]
 pub use lithos_llm::types::{ToolDefinition, ToolDefinitionKind};
 
+pub use self::compaction::{
+    CompactionRequest, ContextEstimate, ContextEstimateMethod, check_context_usage,
+    compact_context, estimate_active_context_usage, render_turns_for_summary,
+};
 pub use self::config::{
     NativeToolOptions, SessionOptions, ToolAccess, ToolAccessPolicy, ToolApprovalAdapter,
     ToolApprovalFn, ToolExposureMode, ToolHookCallback, ToolHookDecision,
+};
+pub use self::context_window::{
+    ACTIVATED_SKILL_WARNING, ContextWindowInput, build_local_snapshot,
+    context_window_from_response_usage, scaled_snapshot,
 };
 pub use self::environment::{
     CallerEnvPolicy, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, EnvResult, Environment,
@@ -125,17 +210,29 @@ pub use self::event::{
     DEFAULT_EVENT_CAPACITY, Emitter, EventCapacity, EventOptions, EventPump, EventSink,
     EventSinkError, OutputCaptureStats, SessionBoundEmitter,
 };
+pub use self::file_tracker::FileTracker;
 pub use self::history::History;
 pub use self::human_input::{
     Answer, AnswerStatus, HumanInputError, HumanInputProvider, Question, QuestionKind,
     QuestionOption, is_question_tool,
 };
+pub use self::loop_detection::detect_loop;
+pub use self::memory::{MEMORY_BUDGET_BYTES, MemoryDocument, load_memory};
 pub use self::profile::{
-    AgentProfile, DEFAULT_CONTEXT_WINDOW_TOKENS, EnvContext, ModelFacts, Skill, SubagentSupport,
+    AgentProfile, DEFAULT_CONTEXT_WINDOW_TOKENS, EnvContext, ModelFacts, SubagentSupport,
 };
 pub use self::reasoning::ReasoningOutput;
 pub use self::record::{SESSION_RECORD_FORMAT_VERSION, SessionRecord, StoredMessage};
 pub use self::redact::{NoRedaction, Redactor};
+pub use self::session::{
+    CompletionCoordinator, RetryEventObserver, RunOptions, RunTiming, Session, SessionBuildError,
+    SessionBuilder, SessionControlHandle, ShutdownReason, SteeringItem, SteeringMessage,
+};
+pub use self::skills::{
+    ExpandedInput, Skill, SkillExpansion, SkillExpansionError, SkillParseError, discover_skills,
+    expand_skill, format_skills_prompt_section, parse_skill,
+};
+pub use self::task_reminder::{TASK_REMINDER_TEXT, maybe_task_reminder};
 pub use self::tool::{
     AgentEventEmitter, NativeTool, RegisteredTool, StaticEnvProvider, ToolContext,
     ToolDefinitionWithSource, ToolDispatch, ToolEnvProvider, ToolError, ToolExecutor, ToolRegistry,

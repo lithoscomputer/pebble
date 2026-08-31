@@ -41,7 +41,8 @@ pub const DEFAULT_EVENT_CAPACITY: usize = 1024;
 /// and the pump waits for each call to return before the event reaches live
 /// subscribers. A slow sink therefore slows the whole session, and a failing
 /// sink stops it: the pump returns [`crate::Error::EventSink`] and publishes
-/// nothing further.
+/// nothing further, and the session it belongs to closes rather than run on
+/// with nothing recording it.
 ///
 /// Implementations must be cheap enough to run on the session's critical path
 /// and must not call back into the session that owns them.
@@ -233,10 +234,17 @@ impl From<usize> for EventCapacity {
 /// [`EventPump`] publishes it.
 #[derive(Clone, Debug)]
 pub struct Emitter {
-    outbox:    mpsc::UnboundedSender<SessionEvent>,
+    outbox:    mpsc::UnboundedSender<Queued>,
     published: broadcast::Sender<SessionEvent>,
     sequence:  Arc<EventSequence>,
 }
+
+/// One item on the queue between the emitters and the pump.
+///
+/// `None` is the stop signal a session sends at shutdown, so the pump can be
+/// joined without waiting for every [`Emitter`] clone to be dropped. Anything
+/// queued before it is still published.
+type Queued = Option<SessionEvent>;
 
 impl Emitter {
     /// Publishes an event this session produced.
@@ -303,12 +311,21 @@ impl Emitter {
         self.outbox.is_closed()
     }
 
+    /// Stops the pump once everything already queued has been published.
+    ///
+    /// The session sends this at shutdown so it can join the pump task without
+    /// having to drop every emitter clone first. Events queued afterwards are
+    /// discarded, which is what emitting into a session that has ended means.
+    pub(crate) fn close(&self) {
+        let _ = self.outbox.send(None);
+    }
+
     /// Queues an event, dropping it when the pump has already stopped.
     ///
     /// A session that has shut down still holds emitter clones — a tool task
     /// unwinding, say — and emitting from one must not panic.
     fn queue(&self, event: SessionEvent) {
-        let _ = self.outbox.send(event);
+        let _ = self.outbox.send(Some(event));
     }
 }
 
@@ -319,7 +336,7 @@ impl Emitter {
 /// reported rather than lost.
 #[must_use = "a pipeline publishes nothing until its pump runs"]
 pub struct EventPump {
-    inbox:     mpsc::UnboundedReceiver<SessionEvent>,
+    inbox:     mpsc::UnboundedReceiver<Queued>,
     published: broadcast::Sender<SessionEvent>,
     sequence:  Arc<EventSequence>,
     sink:      Option<Arc<dyn EventSink>>,
@@ -364,13 +381,17 @@ impl EventPump {
         (emitter, pump)
     }
 
-    /// Publishes queued events until every [`Emitter`] has been dropped.
+    /// Publishes queued events until the session stops the pipeline or every
+    /// [`Emitter`] has been dropped.
     ///
     /// Returns [`crate::Error::EventSink`] as soon as the sink refuses an
     /// event. The refused event, and anything still queued, is not published,
     /// because the run is over.
     pub async fn run(mut self) -> Result<()> {
-        while let Some(event) = self.inbox.recv().await {
+        while let Some(message) = self.inbox.recv().await {
+            let Some(event) = message else {
+                break;
+            };
             self.publish(event).await?;
         }
         Ok(())
@@ -750,6 +771,28 @@ mod tests {
     fn a_zero_capacity_is_raised_to_one() {
         assert_eq!(EventCapacity::new(0).get(), 1);
         assert_eq!(EventCapacity::default().get(), DEFAULT_EVENT_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn closing_publishes_what_was_queued_and_then_stops() {
+        let sink = Arc::new(RecordingSink::default());
+        let (emitter, pump) = spawn_pipeline(EventOptions {
+            sink: Some(Arc::clone(&sink) as Arc<dyn EventSink>),
+            ..EventOptions::default()
+        });
+
+        emitter.emit("ses_1", AgentEvent::UserInput { text: "one".into() });
+        emitter.close();
+        emitter.emit("ses_1", AgentEvent::UserInput { text: "two".into() });
+
+        pump.await.unwrap().unwrap();
+
+        let recorded = sink.recorded();
+        assert_eq!(recorded.len(), 1, "only the event queued before the stop");
+        assert!(
+            emitter.is_closed(),
+            "a stopped pump leaves its emitters closed"
+        );
     }
 
     #[tokio::test]

@@ -16,9 +16,12 @@
 //! gathers what the prompt needs once, and a profile turns it into text without
 //! running anything.
 
+use std::sync::Arc;
+
 use lithos_llm::catalog::CatalogModel;
 
 use crate::environment::Environment;
+use crate::skills::Skill;
 use crate::tool::{RegisteredTool, ToolVocabulary};
 use crate::types::AgentProfileKind;
 
@@ -76,22 +79,6 @@ impl EnvContext {
     }
 }
 
-/// A prompt a person wrote for the model to follow on demand.
-///
-/// A skill is discovered as a file, named in conversation, and expanded into
-/// the model's context by the skill tool. Pebble carries the three parts every
-/// profile's prompt assembly needs: what to call it, when to reach for it, and
-/// what it says.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Skill {
-    /// What the skill is named, and what a person types to invoke it.
-    pub name:        String,
-    /// When to use the skill, written for the model.
-    pub description: String,
-    /// The prompt the skill expands into.
-    pub template:    String,
-}
-
 /// What a session's subagent support hands a profile.
 ///
 /// Subagent tools differ by profile — pebble's own set spawns and waits on
@@ -110,32 +97,95 @@ pub struct SubagentSupport {
     pub depth: usize,
 }
 
-/// The token budgets one model works within.
+/// What the machinery around a session needs to know about its model.
 ///
 /// Fabro's profiles answered these from their own catalog; pebble reads them
 /// from the lithos-llm catalog the session resolved its model through, so a
 /// profile carries no model facts at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ModelFacts {
     /// How many tokens the model's context window holds.
     pub context_window_tokens: usize,
     /// The most tokens the model may produce in one response, when the catalog
     /// says.
     pub max_output_tokens:     Option<u64>,
+    /// Whether the model spends output tokens on reasoning without being asked
+    /// to.
+    ///
+    /// A provider's output limit covers reasoning and visible text together, so
+    /// a budget sized for the text alone can be spent entirely on thinking and
+    /// return an empty response. Compaction adds headroom where this is set.
+    pub reasons_by_default:    bool,
 }
 
 impl ModelFacts {
+    /// The facts pebble assumes for a model nothing is known about.
+    ///
+    /// The same as [`ModelFacts::default`], and the starting point for building
+    /// a set by hand: name what is known with the `with_*` methods and leave
+    /// the rest.
+    ///
+    /// ```
+    /// # use pebble::ModelFacts;
+    /// let facts = ModelFacts::new()
+    ///     .with_context_window_tokens(128_000)
+    ///     .with_max_output_tokens(Some(8_192));
+    /// # let _ = facts;
+    /// ```
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// The facts the catalog records about one model.
     ///
     /// A model the catalog describes without limits — a passthrough entry, say
     /// — falls back to [`DEFAULT_CONTEXT_WINDOW_TOKENS`] and no output limit,
     /// which is what fabro assumed for a model it could not look up.
+    ///
+    /// `reasons_by_default` is read from the catalog the way fabro read its
+    /// own: a model that takes a named reasoning effort level reasons unless it
+    /// is told not to, and one that only takes a thinking budget does not. A
+    /// catalog row that knows better says so with
+    /// `metadata.pebble.reasoning_by_default`, which
+    /// [`SessionBuilder`](crate::SessionBuilder) applies on top of this.
     #[must_use]
     pub fn from_catalog_model(model: &CatalogModel) -> Self {
-        model.limits().map_or_else(Self::default, |limits| Self {
-            context_window_tokens: usize::try_from(limits.context_tokens).unwrap_or(usize::MAX),
-            max_output_tokens:     Some(limits.max_output_tokens),
-        })
+        let capabilities = model.capabilities();
+        let reasons_by_default = capabilities.reasoning && capabilities.reasoning_effort_levels;
+        model.limits().map_or(
+            Self {
+                reasons_by_default,
+                ..Self::default()
+            },
+            |limits| Self {
+                context_window_tokens: usize::try_from(limits.context_tokens).unwrap_or(usize::MAX),
+                max_output_tokens: Some(limits.max_output_tokens),
+                reasons_by_default,
+            },
+        )
+    }
+
+    /// The same facts, with the context window set.
+    #[must_use]
+    pub fn with_context_window_tokens(mut self, tokens: usize) -> Self {
+        self.context_window_tokens = tokens;
+        self
+    }
+
+    /// The same facts, with the output limit set.
+    #[must_use]
+    pub fn with_max_output_tokens(mut self, tokens: Option<u64>) -> Self {
+        self.max_output_tokens = tokens;
+        self
+    }
+
+    /// The same facts, saying whether the model reasons without being asked to.
+    #[must_use]
+    pub fn with_reasons_by_default(mut self, reasons_by_default: bool) -> Self {
+        self.reasons_by_default = reasons_by_default;
+        self
     }
 }
 
@@ -144,6 +194,7 @@ impl Default for ModelFacts {
         Self {
             context_window_tokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
             max_output_tokens:     None,
+            reasons_by_default:    false,
         }
     }
 }
@@ -197,10 +248,25 @@ pub trait AgentProfile: Send + Sync {
     }
 }
 
+/// The profile pebble ships for `kind`, or `None` where it ships none yet.
+///
+/// This is the one place a session turns a catalog profile identifier into a
+/// profile. It is crate-internal on purpose: an application selects a profile
+/// by choosing a model, never by naming one, so widening this signature later
+/// — the built-in profiles will want the session's tool options and its
+/// subagent support — costs nothing outside the crate.
+///
+/// The six built-ins land with the profile port. Until then a session whose
+/// model resolves to a profile pebble has no implementation of is refused at
+/// build time rather than started without a harness.
+pub(crate) fn builtin_profile(kind: AgentProfileKind) -> Option<Arc<dyn AgentProfile>> {
+    let _ = kind;
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use std::fmt::Write as _;
-    use std::sync::Arc;
 
     use lithos_llm::catalog::Catalog;
     use lithos_llm::types::ToolDefinition;
@@ -357,11 +423,22 @@ mod tests {
     }
 
     #[test]
+    fn pebble_ships_no_built_in_profiles_yet() {
+        for kind in AgentProfileKind::ALL {
+            assert!(
+                builtin_profile(*kind).is_none(),
+                "{kind} has no implementation until the profiles are ported"
+            );
+        }
+    }
+
+    #[test]
     fn a_model_the_catalog_says_nothing_about_gets_the_default_window() {
         let facts = ModelFacts::default();
 
         assert_eq!(facts.context_window_tokens, DEFAULT_CONTEXT_WINDOW_TOKENS);
         assert_eq!(facts.max_output_tokens, None);
+        assert!(!facts.reasons_by_default);
     }
 
     #[test]
@@ -383,6 +460,7 @@ mod tests {
                 display_name = "Described"
                 api_model = "described"
                 limits = { context_tokens = 128000, max_output_tokens = 8192 }
+                capabilities = { text = true, reasoning = true, reasoning_effort_levels = true }
 
                 [providers.mock.models.undescribed]
                 display_name = "Undescribed"
@@ -396,13 +474,86 @@ mod tests {
         let described = catalog.model("mock", "described").expect("a known model");
         let undescribed = catalog.model("mock", "undescribed").expect("a known model");
 
-        assert_eq!(ModelFacts::from_catalog_model(described), ModelFacts {
-            context_window_tokens: 128_000,
-            max_output_tokens:     Some(8192),
-        });
+        assert_eq!(
+            ModelFacts::from_catalog_model(described),
+            ModelFacts::new()
+                .with_context_window_tokens(128_000)
+                .with_max_output_tokens(Some(8192))
+                .with_reasons_by_default(true)
+        );
         assert_eq!(
             ModelFacts::from_catalog_model(undescribed),
             ModelFacts::default()
         );
+    }
+
+    /// A catalog naming one model, with whatever capabilities the case needs.
+    fn catalog_with(capabilities: &str) -> Catalog {
+        Catalog::builder()
+            .toml_layer(
+                "test",
+                &format!(
+                    r#"
+                    schema_version = 1
+
+                    [providers.mock]
+                    display_name = "Mock"
+                    adapter = "openai"
+                    codec = "openai-chat"
+                    base_url = "https://example.invalid"
+                    auth = {{ type = "none" }}
+
+                    [providers.mock.models.plain]
+                    display_name = "Plain"
+                    api_model = "plain"
+                    limits = {{ context_tokens = 8000, max_output_tokens = 1024 }}
+                    capabilities = {{ {capabilities} }}
+                    "#
+                ),
+            )
+            .expect("the layer parses")
+            .build()
+            .expect("the catalog validates")
+    }
+
+    /// Whether the one model of a catalog built from `capabilities` reasons
+    /// without being asked to.
+    fn reasons_by_default(capabilities: &str) -> bool {
+        let catalog = catalog_with(capabilities);
+        let model = catalog.model("mock", "plain").expect("a known model");
+        ModelFacts::from_catalog_model(model).reasons_by_default
+    }
+
+    #[test]
+    fn a_model_that_cannot_reason_says_so() {
+        assert!(!reasons_by_default("text = true"));
+    }
+
+    #[test]
+    fn only_a_model_that_takes_an_effort_level_reasons_by_default() {
+        // Fabro's own rule: a model the request can set an effort level on
+        // reasons unless it is told not to, while one that only takes a
+        // thinking budget reasons when it is asked to. The second case is the
+        // one a `reasoning` capability alone gets wrong.
+        assert!(reasons_by_default(
+            "text = true, reasoning = true, reasoning_effort_levels = true"
+        ));
+        assert!(!reasons_by_default("text = true, reasoning = true"));
+        assert!(
+            !reasons_by_default("text = true, reasoning_effort_levels = true"),
+            "an effort level means nothing without reasoning behind it"
+        );
+    }
+
+    #[test]
+    fn facts_can_be_built_by_hand() {
+        let facts = ModelFacts::new()
+            .with_context_window_tokens(64_000)
+            .with_max_output_tokens(Some(4_096))
+            .with_reasons_by_default(true);
+
+        assert_eq!(facts.context_window_tokens, 64_000);
+        assert_eq!(facts.max_output_tokens, Some(4_096));
+        assert!(facts.reasons_by_default);
     }
 }

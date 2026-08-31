@@ -95,6 +95,12 @@ pub struct ToolContext {
     /// Fires when this call should stop. Composed from the session's terminal
     /// cancellation and the current round's interrupt, so a tool that watches
     /// it observes both.
+    ///
+    /// Watching it is the tool's own responsibility, and the session waits for
+    /// the answer either way: a cancelled call is never dropped, because a call
+    /// with no result is a conversation the provider will refuse. A tool that
+    /// ignores this token therefore holds its round — and the run ending it —
+    /// open until it returns, so long work must watch it and answer.
     pub cancel:              CancellationToken,
     /// Extra environment variables for a command this call runs.
     pub tool_env_provider:   Option<Arc<dyn ToolEnvProvider>>,

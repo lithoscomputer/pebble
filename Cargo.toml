@@ -27,6 +27,9 @@ tokio = { version = "1.49.0", features = [
 ] }
 tokio-util = "0.7.19"
 tracing = "0.1.41"
+# Session identifiers. Pinned to the version lithos-llm already resolves, so
+# the shared lockfile gains no entry.
+uuid = { version = "1.18.1", features = ["v4"] }
 
 # Signalling a command's process group without writing unsafe code.
 [target.'cfg(unix)'.dependencies]
@@ -34,6 +37,9 @@ rustix = { version = "1.1.4", features = ["process"] }
 
 [dev-dependencies]
 insta = { version = "1.48.0", features = ["json"] }
+# `start_paused` test runtimes, so a test that waits out a retry delay does not
+# actually wait. Adds no package to the lockfile: tokio is already a dependency.
+tokio = { version = "1.49.0", features = ["test-util"] }
 
 [lints.rust]
 unsafe_code = "deny"
