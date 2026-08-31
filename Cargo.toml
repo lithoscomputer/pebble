@@ -1,0 +1,42 @@
+[package]
+name = "pebble"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[lints.rust]
+unsafe_code = "deny"
+unreachable_pub = "warn"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -2 }
+allow_attributes_without_reason = "warn"
+
+implicit_hasher = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+similar_names = "allow"
+struct_excessive_bools = "allow"
+too_many_arguments = "allow"
+too_many_lines = "allow"
+cast_precision_loss = "allow"
+doc_markdown = "allow"
+
+print_stdout = "warn"
+print_stderr = "warn"
+dbg_macro = "warn"
+empty_drop = "warn"
+empty_structs_with_brackets = "warn"
+disallowed_methods = "deny"
+exit = "warn"
+get_unwrap = "warn"
+unwrap_used = "deny"
+rc_buffer = "warn"
+rc_mutex = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+use_self = "warn"
+wildcard_imports = "warn"
+absolute_paths = "warn"
