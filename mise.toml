@@ -41,7 +41,7 @@ run = "cargo nextest run --locked --all-targets --all-features --no-tests=pass"
 
 [tasks."test:doc"]
 description = "Run the documentation tests, which Nextest does not cover"
-run = "cargo test --doc --locked"
+run = "cargo test --doc --locked --all-features"
 
 [tasks."test:release"]
 description = "Run all Rust tests in release mode"

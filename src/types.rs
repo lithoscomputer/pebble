@@ -555,7 +555,10 @@ pub enum AgentProfileKind {
 
 impl AgentProfileKind {
     /// Every profile pebble ships.
-    pub const ALL: [Self; 6] = [
+    ///
+    /// A slice rather than an array, so a profile added later does not change
+    /// this constant's type.
+    pub const ALL: &'static [Self] = &[
         Self::Anthropic,
         Self::Claude5,
         Self::OpenAi,
@@ -1917,7 +1920,7 @@ mod tests {
 
     #[test]
     fn every_profile_identifier_round_trips() {
-        for profile in AgentProfileKind::ALL {
+        for profile in AgentProfileKind::ALL.iter().copied() {
             let value = serde_json::to_value(profile).expect("serializes");
             assert_eq!(value, json!(profile.as_str()));
             assert_eq!(
