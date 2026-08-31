@@ -1,0 +1,241 @@
+//! Contract tests for the stored session record.
+//!
+//! A record is written by one build of pebble and read by another, so its JSON
+//! form is reviewed like a specification. The snapshot pins the shape this
+//! build writes. `fixtures/session_record_v1.json` is a frozen version 1
+//! document: it is never regenerated, and the test that reads it fails the day
+//! a change stops older records from resuming.
+
+use std::collections::BTreeMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use lithos_llm::types::{
+    ContentPart, Message as LlmMessage, ReasoningContent, Role, ToolCall, ToolCallKind, ToolResult,
+};
+use pebble::{
+    History, Message, SESSION_RECORD_FORMAT_VERSION, SessionRecord, StoredMessage, TokenUsage,
+};
+use serde_json::json;
+
+/// The frozen version 1 record. Read by the resume test; never rewritten.
+const SAMPLE_RECORD_V1: &str = include_str!("fixtures/session_record_v1.json");
+
+fn moment() -> SystemTime {
+    UNIX_EPOCH + Duration::from_millis(1_767_225_600_500)
+}
+
+fn usage() -> TokenUsage {
+    TokenUsage {
+        input:       1_200,
+        output:      340,
+        reasoning:   96,
+        cache_read:  800,
+        cache_write: 64,
+    }
+}
+
+fn tool_call() -> ToolCall {
+    ToolCall {
+        id:                "call_1".into(),
+        name:              "read_file".into(),
+        arguments:         json!({ "path": "src/lib.rs" }),
+        kind:              ToolCallKind::Function,
+        raw_arguments:     Some("{\"path\":\"src/lib.rs\"}".into()),
+        provider_metadata: BTreeMap::from([("openai".to_owned(), json!({ "id": "fc_1" }))]),
+    }
+}
+
+fn every_turn() -> Vec<Message> {
+    vec![
+        Message::User {
+            content:   "read the crate root".into(),
+            timestamp: moment(),
+        },
+        Message::Assistant {
+            content:        "Reading it now.".into(),
+            tool_calls:     vec![tool_call()],
+            provider_parts: vec![
+                ContentPart::Reasoning(ReasoningContent {
+                    text:             "the root is a facade".into(),
+                    signature:        Some("sig_1".into()),
+                    signature_origin: Some("anthropic".into()),
+                    redacted:         false,
+                }),
+                ContentPart::opaque("openai.reasoning", json!({ "id": "rs_1" })),
+            ],
+            usage:          usage(),
+            response_id:    "resp_1".into(),
+            timestamp:      moment(),
+        },
+        Message::ToolResults {
+            results:   vec![ToolResult {
+                tool_call_id: "call_1".into(),
+                name:         Some("read_file".into()),
+                content:      vec![ContentPart::Text {
+                    text: "//! Pebble is a coding-agent loop library.".into(),
+                }],
+                is_error:     false,
+            }],
+            timestamp: moment(),
+        },
+        Message::System {
+            content:   "[Context Summary]\nThe session read the crate root.".into(),
+            timestamp: moment(),
+        },
+        Message::Steering {
+            content:   "also update the changelog".into(),
+            timestamp: moment(),
+        },
+    ]
+}
+
+fn sample_record() -> SessionRecord {
+    let mut record = SessionRecord::new("ses_root");
+    record.provider = Some("anthropic".into());
+    record.model = Some("claude-sonnet-5".into());
+    record.created_at = moment();
+    record.updated_at = moment();
+    record.last_event_seq = 41;
+    record.messages = every_turn()
+        .iter()
+        .map(Message::to_stored_message)
+        .collect();
+    record
+}
+
+#[test]
+fn the_session_record_keeps_its_serialized_shape() {
+    let rendered = serde_json::to_string_pretty(&sample_record()).expect("record serializes");
+    insta::assert_snapshot!("session_record", rendered);
+}
+
+#[test]
+fn the_stored_version_one_record_still_resumes() {
+    let record: SessionRecord =
+        serde_json::from_str(SAMPLE_RECORD_V1).expect("a version 1 record still parses");
+
+    assert_eq!(record.format_version, 1);
+    assert!(record.is_supported());
+    assert_eq!(record.session_id, "ses_root");
+    assert_eq!(record.last_event_seq, 41);
+    assert_eq!(
+        record,
+        sample_record(),
+        "the frozen version 1 document no longer matches what this build writes"
+    );
+
+    let history = History::from_stored_messages(&record.messages);
+    assert_eq!(history.len(), 5);
+
+    // The assistant turn restores its exact accounting, not a default.
+    let Message::Assistant {
+        usage: restored_usage,
+        tool_calls,
+        provider_parts,
+        response_id,
+        ..
+    } = &history.turns()[1]
+    else {
+        panic!("expected an assistant turn");
+    };
+    assert_eq!(*restored_usage, usage());
+    assert_eq!(tool_calls, &[tool_call()]);
+    assert_eq!(provider_parts.len(), 2);
+    assert_eq!(response_id, "resp_1");
+
+    // The restored conversation still replays as a valid exchange.
+    let messages = history.to_llm_messages();
+    let roles: Vec<Role> = messages.iter().map(LlmMessage::role).collect();
+    assert_eq!(roles, vec![
+        Role::User,
+        Role::Assistant,
+        Role::Tool,
+        Role::System,
+        Role::User,
+    ]);
+    assert_eq!(messages[2].tool_call_id(), Some("call_1"));
+}
+
+#[test]
+fn a_record_with_unknown_members_still_parses() {
+    let mut document: serde_json::Value =
+        serde_json::from_str(SAMPLE_RECORD_V1).expect("the fixture parses as JSON");
+    let object = document.as_object_mut().expect("a record is an object");
+    object.insert("workspace".to_owned(), json!("/work/pebble"));
+    object.insert("future_field".to_owned(), json!({ "nested": [1, 2, 3] }));
+    let messages = object
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("a record has messages");
+    for message in messages.iter_mut() {
+        let member = message.as_object_mut().expect("a message is an object");
+        member.insert("token_estimate".to_owned(), json!(42));
+    }
+
+    let record: SessionRecord =
+        serde_json::from_value(document).expect("unknown members are ignored");
+
+    assert_eq!(record, sample_record());
+}
+
+#[test]
+fn a_record_missing_its_optional_members_still_parses() {
+    let record: SessionRecord = serde_json::from_value(json!({
+        "session_id": "ses_root",
+        "created_at": "2026-01-01T00:00:00.500Z",
+        "updated_at": "2026-01-01T00:00:00.500Z",
+    }))
+    .expect("a minimal record parses");
+
+    assert_eq!(record.format_version, SESSION_RECORD_FORMAT_VERSION);
+    assert_eq!(record.last_event_seq, 0);
+    assert!(record.messages.is_empty());
+    assert!(History::from_stored_messages(&record.messages).is_empty());
+}
+
+#[test]
+fn a_record_whose_members_are_null_still_resumes() {
+    let record: SessionRecord = serde_json::from_value(json!({
+        "format_version": 1,
+        "session_id": "ses_root",
+        "created_at": "2026-01-01T00:00:00.500Z",
+        "updated_at": "2026-01-01T00:00:00.500Z",
+        "last_event_seq": null,
+        "messages": [
+            {
+                "kind": "assistant",
+                "content": "hello",
+                "tool_calls": null,
+                "provider_parts": null,
+                "usage": null,
+                "response_id": "resp_1",
+                "timestamp": "2026-01-01T00:00:00.500Z",
+            },
+        ],
+    }))
+    .expect("null members read as their defaults");
+
+    assert_eq!(record.last_event_seq, 0);
+    assert_eq!(record.messages, vec![StoredMessage::Assistant {
+        content:        "hello".into(),
+        tool_calls:     Vec::new(),
+        provider_parts: Vec::new(),
+        usage:          TokenUsage::default(),
+        response_id:    "resp_1".into(),
+        timestamp:      moment(),
+    }]);
+}
+
+#[test]
+fn a_record_newer_than_this_build_is_refused() {
+    let mut record = sample_record();
+    record.format_version = SESSION_RECORD_FORMAT_VERSION + 1;
+
+    let json = serde_json::to_string(&record).expect("record serializes");
+    let restored: SessionRecord = serde_json::from_str(&json).expect("record parses");
+
+    assert!(
+        !restored.is_supported(),
+        "a record from a newer format must not be treated as resumable"
+    );
+}

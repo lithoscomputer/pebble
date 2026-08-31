@@ -1,0 +1,35 @@
+---
+source: tests/event_contract.rs
+expression: render(&summaries)
+---
+[
+  {
+    "name": "read_file",
+    "description": "Read a file from the workspace",
+    "source": {
+      "kind": "native"
+    },
+    "category": "read",
+    "invoked": false
+  },
+  {
+    "name": "mcp__filesystem__read_text_file",
+    "description": "Read a text file",
+    "source": {
+      "kind": "mcp",
+      "server_name": "filesystem",
+      "original_name": "read_text_file"
+    },
+    "category": "read",
+    "invoked": true
+  },
+  {
+    "name": "use_skill",
+    "description": "Activate a skill",
+    "source": {
+      "kind": "skill"
+    },
+    "category": "other",
+    "invoked": false
+  }
+]

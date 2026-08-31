@@ -1,0 +1,843 @@
+//! The event pipeline: how a session publishes what it does.
+//!
+//! One session owns one pipeline. Every producer — the turn loop, a running
+//! tool, the retry observer, a subagent forwarding its child stream — holds a
+//! cheap [`Emitter`] clone and calls [`Emitter::emit`] from ordinary
+//! synchronous code, which queues the event and returns. The session drives
+//! one [`EventPump`], and the pump alone publishes: it stamps each event with
+//! the next per-session sequence number, hands it to the configured
+//! [`EventSink`] and waits for that to succeed, and only then broadcasts it to
+//! live subscribers.
+//!
+//! That ordering is the point. The sink and every subscriber observe the same
+//! events in the same order, and a sink failure stops the run rather than
+//! losing an event.
+//!
+//! Live delivery is lossy by design. [`Emitter::subscribe`] hands out a
+//! bounded broadcast receiver holding [`DEFAULT_EVENT_CAPACITY`] events, and a
+//! subscriber that falls behind observes `RecvError::Lagged` instead of
+//! stalling the session. An application that must see every event configures
+//! an [`EventSink`].
+
+use std::error::Error as StdError;
+use std::fmt;
+use std::result::Result as StdResult;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::SystemTime;
+
+use async_trait::async_trait;
+use tokio::sync::{broadcast, mpsc};
+
+use crate::error::Result;
+use crate::types::{AgentEvent, SessionEvent};
+
+/// The broadcast capacity a pipeline uses when the caller names none.
+pub const DEFAULT_EVENT_CAPACITY: usize = 1024;
+
+/// A durable recorder of one session's event stream.
+///
+/// Implementors receive every published event exactly once, in sequence order,
+/// and the pump waits for each call to return before the event reaches live
+/// subscribers. A slow sink therefore slows the whole session, and a failing
+/// sink stops it: the pump returns [`crate::Error::EventSink`] and publishes
+/// nothing further.
+///
+/// Implementations must be cheap enough to run on the session's critical path
+/// and must not call back into the session that owns them.
+#[async_trait]
+pub trait EventSink: Send + Sync {
+    /// Records one event durably.
+    ///
+    /// Returning an error stops the run, so report only failures that make
+    /// the recorded stream untrustworthy.
+    async fn record(&self, event: &SessionEvent) -> StdResult<(), EventSinkError>;
+}
+
+/// A failure reported by an [`EventSink`].
+///
+/// The message is rendered into [`crate::ErrorData`] on the way to consumers,
+/// so keep it free of credentials and provider payloads. An optional source is
+/// retained for logging and is not projected.
+#[derive(Debug)]
+pub struct EventSinkError {
+    message: String,
+    source:  Option<Box<dyn StdError + Send + Sync>>,
+}
+
+impl EventSinkError {
+    /// Reports a sink failure with a message safe to show a consumer.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            source:  None,
+        }
+    }
+
+    /// Attaches the underlying failure, which is kept for logging only.
+    #[must_use]
+    pub fn with_source(mut self, source: impl Into<Box<dyn StdError + Send + Sync>>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    /// The failure rendered for a human.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
+
+impl fmt::Display for EventSinkError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl StdError for EventSinkError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| &**source as &(dyn StdError + 'static))
+    }
+}
+
+/// The monotonic sequence numbers stamped on one session's events.
+///
+/// Numbering starts at 1, so a `seq` of 0 means an event was built but never
+/// published. A resumed session continues where the stored record left off, so
+/// sequence numbers stay unique for the life of a session across restarts.
+///
+/// Crate-private: no public signature takes or returns one. The numbers
+/// themselves reach an application through
+/// [`SessionEvent::seq`](crate::SessionEvent::seq), [`Emitter::last_seq`], and
+/// [`EventOptions::resume_after_seq`].
+#[derive(Debug)]
+pub(crate) struct EventSequence {
+    last: AtomicU64,
+}
+
+impl EventSequence {
+    /// Starts a fresh session's numbering, so the first event is 1.
+    pub(crate) const fn new() -> Self {
+        Self {
+            last: AtomicU64::new(0),
+        }
+    }
+
+    /// Continues numbering after the last event a previous run published.
+    pub(crate) const fn resuming_after(last_seq: u64) -> Self {
+        Self {
+            last: AtomicU64::new(last_seq),
+        }
+    }
+
+    /// Reserves the next sequence number.
+    pub(crate) fn assign(&self) -> u64 {
+        self.last.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+    }
+
+    /// The last number [`EventSequence::assign`] handed out.
+    ///
+    /// Read from outside the publishing task this is a snapshot: the pump may
+    /// assign another number before the caller acts on it.
+    pub(crate) fn last_assigned(&self) -> u64 {
+        self.last.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for EventSequence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// How one session's event pipeline is wired.
+///
+/// A plain configuration record: name the fields that differ and take the rest
+/// from [`Default`].
+///
+/// ```
+/// # use pebble::{EventCapacity, EventOptions};
+/// let options = EventOptions {
+///     capacity: EventCapacity::new(64),
+///     ..EventOptions::default()
+/// };
+/// ```
+#[derive(Clone, Default)]
+pub struct EventOptions {
+    /// How many events the broadcast channel buffers for live subscribers.
+    ///
+    /// A subscriber that falls further behind than this observes
+    /// `RecvError::Lagged`.
+    pub capacity: EventCapacity,
+
+    /// The durable recorder, when the application configured one.
+    pub sink: Option<Arc<dyn EventSink>>,
+
+    /// The last sequence number a previous run of this session published.
+    ///
+    /// Zero for a new session; [`crate::SessionRecord::last_event_seq`] for a
+    /// resumed one.
+    pub resume_after_seq: u64,
+}
+
+impl fmt::Debug for EventOptions {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EventOptions")
+            .field("capacity", &self.capacity)
+            .field("sink", &self.sink.as_ref().map(|_| "<sink>"))
+            .field("resume_after_seq", &self.resume_after_seq)
+            .finish()
+    }
+}
+
+/// How many events a pipeline buffers for live subscribers.
+///
+/// Defaults to [`DEFAULT_EVENT_CAPACITY`]; a capacity of zero is raised to one
+/// because a tokio broadcast channel rejects an empty buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventCapacity(usize);
+
+impl EventCapacity {
+    /// Buffers `events` for each live subscriber.
+    #[must_use]
+    pub const fn new(events: usize) -> Self {
+        Self(if events == 0 { 1 } else { events })
+    }
+
+    /// The buffered event count.
+    #[must_use]
+    pub const fn get(self) -> usize {
+        self.0
+    }
+}
+
+impl Default for EventCapacity {
+    fn default() -> Self {
+        Self(DEFAULT_EVENT_CAPACITY)
+    }
+}
+
+impl From<usize> for EventCapacity {
+    fn from(events: usize) -> Self {
+        Self::new(events)
+    }
+}
+
+/// The publishing handle every event producer holds.
+///
+/// Cloning is cheap and every clone feeds the same pipeline. Emitting is
+/// synchronous and never blocks: the event is queued and the owning
+/// [`EventPump`] publishes it.
+#[derive(Clone, Debug)]
+pub struct Emitter {
+    outbox:    mpsc::UnboundedSender<SessionEvent>,
+    published: broadcast::Sender<SessionEvent>,
+    sequence:  Arc<EventSequence>,
+}
+
+impl Emitter {
+    /// Publishes an event this session produced.
+    pub fn emit(&self, session_id: impl Into<String>, event: AgentEvent) {
+        self.emit_with_tool_call_id(session_id, event, None);
+    }
+
+    /// Publishes an event produced while a tool call was running.
+    ///
+    /// The event is traced as it is queued, so the tracing order is the order
+    /// producers emitted in rather than the published order.
+    pub fn emit_with_tool_call_id(
+        &self,
+        session_id: impl Into<String>,
+        event: AgentEvent,
+        tool_call_id: Option<String>,
+    ) {
+        let session_id = session_id.into();
+        event.trace(&session_id);
+        self.queue(SessionEvent {
+            seq: 0,
+            event,
+            timestamp: SystemTime::now(),
+            session_id,
+            parent_session_id: None,
+            tool_call_id,
+        });
+    }
+
+    /// Republishes an envelope another session built.
+    ///
+    /// The child's `session_id`, `parent_session_id`, and timestamp pass
+    /// through untouched; only the sequence number is reassigned, because a
+    /// forwarded event takes its place in the parent's stream.
+    pub fn forward(&self, event: SessionEvent) {
+        self.queue(event);
+    }
+
+    /// Subscribes to the live event stream.
+    ///
+    /// The receiver observes only events published after this call, and misses
+    /// events if it falls more than the configured capacity behind.
+    #[must_use]
+    pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
+        self.published.subscribe()
+    }
+
+    /// The last sequence number the pump assigned.
+    ///
+    /// This is a snapshot taken from outside the publishing task, so the pump
+    /// may assign another number before the caller acts on it. It counts
+    /// assignment, not delivery: the number is stamped before the sink sees
+    /// the event, so mid-publish it runs one ahead of what subscribers have
+    /// observed, and after a sink refusal it names an event that was never
+    /// published.
+    #[must_use]
+    pub fn last_seq(&self) -> u64 {
+        self.sequence.last_assigned()
+    }
+
+    /// Whether the pump has stopped, so nothing further will be published.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.outbox.is_closed()
+    }
+
+    /// Queues an event, dropping it when the pump has already stopped.
+    ///
+    /// A session that has shut down still holds emitter clones — a tool task
+    /// unwinding, say — and emitting from one must not panic.
+    fn queue(&self, event: SessionEvent) {
+        let _ = self.outbox.send(event);
+    }
+}
+
+/// The publishing half of one session's event pipeline.
+///
+/// The session owns the pump and decides where it runs, normally by spawning
+/// [`EventPump::run`] and joining the handle at shutdown so a sink failure is
+/// reported rather than lost.
+#[must_use = "a pipeline publishes nothing until its pump runs"]
+pub struct EventPump {
+    inbox:     mpsc::UnboundedReceiver<SessionEvent>,
+    published: broadcast::Sender<SessionEvent>,
+    sequence:  Arc<EventSequence>,
+    sink:      Option<Arc<dyn EventSink>>,
+}
+
+impl fmt::Debug for EventPump {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EventPump")
+            .field("inbox", &self.inbox)
+            .field("published", &self.published)
+            .field("sequence", &self.sequence)
+            .field("sink", &self.sink.as_ref().map(|_| "<sink>"))
+            .finish()
+    }
+}
+
+impl EventPump {
+    /// Creates one session's pipeline.
+    ///
+    /// The [`Emitter`] is cloned to every producer; the pump is driven once.
+    pub fn new(options: EventOptions) -> (Emitter, Self) {
+        let EventOptions {
+            capacity,
+            sink,
+            resume_after_seq,
+        } = options;
+        let (outbox, inbox) = mpsc::unbounded_channel();
+        let (published, _) = broadcast::channel(capacity.get());
+        let sequence = Arc::new(EventSequence::resuming_after(resume_after_seq));
+        let emitter = Emitter {
+            outbox,
+            published: published.clone(),
+            sequence: Arc::clone(&sequence),
+        };
+        let pump = Self {
+            inbox,
+            published,
+            sequence,
+            sink,
+        };
+        (emitter, pump)
+    }
+
+    /// Publishes queued events until every [`Emitter`] has been dropped.
+    ///
+    /// Returns [`crate::Error::EventSink`] as soon as the sink refuses an
+    /// event. The refused event, and anything still queued, is not published,
+    /// because the run is over.
+    pub async fn run(mut self) -> Result<()> {
+        while let Some(event) = self.inbox.recv().await {
+            self.publish(event).await?;
+        }
+        Ok(())
+    }
+
+    async fn publish(&mut self, mut event: SessionEvent) -> Result<()> {
+        event.seq = self.sequence.assign();
+        if let Some(sink) = self.sink.as_ref() {
+            sink.record(&event).await?;
+        }
+        // Having no live subscriber is the normal case, not a failure.
+        let _ = self.published.send(event);
+        Ok(())
+    }
+}
+
+/// Byte counts for the output one tool call produced.
+///
+/// A tool observes every byte, retains what the output budget allows, and
+/// omits the rest; the three counters land on
+/// [`AgentEvent::ToolCallCompleted`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutputCaptureStats {
+    /// Bytes the tool produced.
+    pub observed_bytes: usize,
+    /// Bytes kept for the model and for history.
+    pub retained_bytes: usize,
+    /// Bytes the budget dropped.
+    pub omitted_bytes:  usize,
+}
+
+impl OutputCaptureStats {
+    /// Counts output that was kept whole.
+    #[must_use]
+    pub const fn complete(byte_count: usize) -> Self {
+        Self {
+            observed_bytes: byte_count,
+            retained_bytes: byte_count,
+            omitted_bytes:  0,
+        }
+    }
+
+    /// Sums two captures, as when a process reports stdout and stderr apart.
+    #[must_use]
+    pub const fn combine(self, other: Self) -> Self {
+        Self {
+            observed_bytes: self.observed_bytes.saturating_add(other.observed_bytes),
+            retained_bytes: self.retained_bytes.saturating_add(other.retained_bytes),
+            omitted_bytes:  self.omitted_bytes.saturating_add(other.omitted_bytes),
+        }
+    }
+}
+
+/// A session- and tool-bound view of an [`Emitter`], handed to a running tool.
+///
+/// It stamps the session identity and the active tool call on every event, so
+/// a tool never has to know either, and it carries the side channel a tool
+/// uses to report how much output it produced.
+#[derive(Clone, Debug)]
+pub struct SessionBoundEmitter {
+    emitter:      Emitter,
+    session_id:   String,
+    tool_call_id: Option<String>,
+    output_stats: Arc<Mutex<Option<OutputCaptureStats>>>,
+}
+
+impl SessionBoundEmitter {
+    /// Binds an emitter to one session and, when there is one, one tool call.
+    #[must_use]
+    pub fn new(
+        emitter: Emitter,
+        session_id: impl Into<String>,
+        tool_call_id: Option<String>,
+    ) -> Self {
+        Self {
+            emitter,
+            session_id: session_id.into(),
+            tool_call_id,
+            output_stats: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Publishes an event stamped with the bound identities.
+    pub fn emit(&self, event: AgentEvent) {
+        self.emitter.emit_with_tool_call_id(
+            self.session_id.clone(),
+            event,
+            self.tool_call_id.clone(),
+        );
+    }
+
+    /// Reports how much output the running tool produced.
+    ///
+    /// The last report wins; the execution layer drains it once the tool
+    /// returns.
+    pub fn record_tool_output_stats(&self, stats: OutputCaptureStats) {
+        *self
+            .output_stats
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(stats);
+    }
+
+    /// Takes the reported output counts, leaving none behind.
+    pub fn take_tool_output_stats(&self) -> Option<OutputCaptureStats> {
+        self.output_stats
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// The session this view is bound to.
+    #[must_use]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// The tool call this view is bound to, when it is bound to one.
+    #[must_use]
+    pub fn tool_call_id(&self) -> Option<&str> {
+        self.tool_call_id.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use tokio::sync::broadcast::error::TryRecvError;
+    use tokio::task::{JoinHandle, yield_now};
+
+    use super::*;
+    use crate::error::ErrorKind;
+
+    /// Records every event it is handed, and can be told to fail once it has
+    /// seen a given number of them.
+    #[derive(Debug, Default)]
+    struct RecordingSink {
+        recorded: Mutex<Vec<SessionEvent>>,
+        fail_at:  Option<usize>,
+    }
+
+    impl RecordingSink {
+        fn failing_at(count: usize) -> Self {
+            Self {
+                recorded: Mutex::new(Vec::new()),
+                fail_at:  Some(count),
+            }
+        }
+
+        fn recorded(&self) -> Vec<SessionEvent> {
+            self.recorded
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+    }
+
+    #[async_trait]
+    impl EventSink for RecordingSink {
+        async fn record(&self, event: &SessionEvent) -> StdResult<(), EventSinkError> {
+            let mut recorded = self.recorded.lock().unwrap_or_else(PoisonError::into_inner);
+            if self.fail_at == Some(recorded.len()) {
+                return Err(EventSinkError::new("disk is full"));
+            }
+            recorded.push(event.clone());
+            Ok(())
+        }
+    }
+
+    fn pipeline() -> (Emitter, JoinHandle<Result<()>>) {
+        spawn_pipeline(EventOptions::default())
+    }
+
+    fn spawn_pipeline(options: EventOptions) -> (Emitter, JoinHandle<Result<()>>) {
+        let (emitter, pump) = EventPump::new(options);
+        (emitter, tokio::spawn(pump.run()))
+    }
+
+    fn session_started() -> AgentEvent {
+        AgentEvent::SessionStarted {
+            provider: Some("anthropic".into()),
+            model:    Some("claude-sonnet-5".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_and_receive_event() {
+        let (emitter, _pump) = pipeline();
+        let mut receiver = emitter.subscribe();
+
+        emitter.emit("ses_1", session_started());
+
+        let event = receiver.recv().await.unwrap();
+        assert!(matches!(event.event, AgentEvent::SessionStarted {
+            provider: Some(_),
+            model:    Some(_),
+        }));
+        assert_eq!(event.session_id, "ses_1");
+        assert_eq!(event.parent_session_id, None);
+        assert_eq!(event.seq, 1);
+    }
+
+    #[tokio::test]
+    async fn emit_carries_its_payload() {
+        let (emitter, _pump) = pipeline();
+        let mut receiver = emitter.subscribe();
+
+        emitter.emit("ses_2", AgentEvent::UserInput {
+            text: "fix the failing test".into(),
+        });
+
+        let event = receiver.recv().await.unwrap();
+        assert!(
+            matches!(&event.event, AgentEvent::UserInput { text } if text == "fix the failing test")
+        );
+    }
+
+    #[tokio::test]
+    async fn multiple_subscribers_each_see_every_event() {
+        let (emitter, _pump) = pipeline();
+        let mut first = emitter.subscribe();
+        let mut second = emitter.subscribe();
+
+        emitter.emit("ses_3", AgentEvent::SessionEnded);
+
+        let from_first = first.recv().await.unwrap();
+        let from_second = second.recv().await.unwrap();
+        assert!(matches!(from_first.event, AgentEvent::SessionEnded));
+        assert!(matches!(from_second.event, AgentEvent::SessionEnded));
+        assert_eq!(from_first.session_id, "ses_3");
+        assert_eq!(from_second.session_id, "ses_3");
+    }
+
+    #[tokio::test]
+    async fn emitting_without_subscribers_is_not_a_failure() {
+        let (emitter, pump) = pipeline();
+
+        emitter.emit("ses_4", AgentEvent::LoopDetected);
+        drop(emitter);
+
+        pump.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn emitting_after_the_pump_stops_is_ignored() {
+        let (emitter, pump) = EventPump::new(EventOptions::default());
+        drop(pump);
+
+        emitter.emit("ses_5", AgentEvent::LoopDetected);
+
+        assert!(emitter.is_closed());
+    }
+
+    #[tokio::test]
+    async fn forward_preserves_the_child_envelope() {
+        let (emitter, _pump) = pipeline();
+        let mut receiver = emitter.subscribe();
+        let stamped = SystemTime::UNIX_EPOCH;
+
+        emitter.forward(SessionEvent {
+            seq:               17,
+            event:             session_started(),
+            timestamp:         stamped,
+            session_id:        "ses_child".into(),
+            parent_session_id: Some("ses_root".into()),
+            tool_call_id:      None,
+        });
+
+        let event = receiver.recv().await.unwrap();
+        assert_eq!(event.session_id, "ses_child");
+        assert_eq!(event.parent_session_id.as_deref(), Some("ses_root"));
+        assert_eq!(event.timestamp, stamped);
+        assert_eq!(
+            event.seq, 1,
+            "a forwarded event is renumbered into the parent stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn sequence_numbers_are_monotonic_from_one() {
+        let (emitter, _pump) = pipeline();
+        let mut receiver = emitter.subscribe();
+
+        for _ in 0..3 {
+            emitter.emit("ses_1", AgentEvent::LoopDetected);
+        }
+
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(receiver.recv().await.unwrap().seq);
+        }
+        assert_eq!(seen, vec![1, 2, 3]);
+        assert_eq!(emitter.last_seq(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_resumed_session_continues_its_numbering() {
+        let (emitter, _pump) = spawn_pipeline(EventOptions {
+            resume_after_seq: 41,
+            ..EventOptions::default()
+        });
+        let mut receiver = emitter.subscribe();
+
+        emitter.emit("ses_1", AgentEvent::LoopDetected);
+
+        assert_eq!(receiver.recv().await.unwrap().seq, 42);
+    }
+
+    #[tokio::test]
+    async fn the_sink_sees_every_event_in_order() {
+        let sink = Arc::new(RecordingSink::default());
+        let (emitter, pump) = spawn_pipeline(EventOptions {
+            sink: Some(Arc::clone(&sink) as Arc<dyn EventSink>),
+            ..EventOptions::default()
+        });
+
+        emitter.emit("ses_1", AgentEvent::UserInput { text: "one".into() });
+        emitter.emit("ses_1", AgentEvent::UserInput { text: "two".into() });
+        drop(emitter);
+        pump.await.unwrap().unwrap();
+
+        let recorded = sink.recorded();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[0].seq, 1);
+        assert_eq!(recorded[1].seq, 2);
+    }
+
+    #[tokio::test]
+    async fn a_sink_failure_stops_the_run_and_withholds_the_event() {
+        let sink = Arc::new(RecordingSink::failing_at(1));
+        let (emitter, pump) = spawn_pipeline(EventOptions {
+            sink: Some(Arc::clone(&sink) as Arc<dyn EventSink>),
+            ..EventOptions::default()
+        });
+        let mut receiver = emitter.subscribe();
+
+        emitter.emit("ses_1", AgentEvent::UserInput { text: "one".into() });
+        emitter.emit("ses_1", AgentEvent::UserInput { text: "two".into() });
+
+        let error = pump.await.unwrap().expect_err("the sink refused an event");
+        assert_eq!(error.kind(), ErrorKind::EventSink);
+        assert!(error.to_string().contains("disk is full"));
+
+        assert_eq!(receiver.recv().await.unwrap().seq, 1);
+        assert!(
+            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
+            "the refused event never reaches subscribers"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_subscriber_lags_instead_of_stalling_the_session() {
+        let (emitter, _pump) = spawn_pipeline(EventOptions {
+            capacity: EventCapacity::new(2),
+            ..EventOptions::default()
+        });
+        let mut receiver = emitter.subscribe();
+
+        for _ in 0..4 {
+            emitter.emit("ses_1", AgentEvent::LoopDetected);
+        }
+        // Let the pump drain the queue before the subscriber reads.
+        yield_now().await;
+
+        let mut lagged = false;
+        for _ in 0..4 {
+            match receiver.try_recv() {
+                Err(TryRecvError::Lagged(_)) => lagged = true,
+                Err(TryRecvError::Empty) => break,
+                _ => {}
+            }
+        }
+        assert!(lagged, "a capacity of 2 cannot buffer 4 events");
+    }
+
+    #[test]
+    fn a_zero_capacity_is_raised_to_one() {
+        assert_eq!(EventCapacity::new(0).get(), 1);
+        assert_eq!(EventCapacity::default().get(), DEFAULT_EVENT_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn the_pump_finishes_once_every_emitter_is_dropped() {
+        let (emitter, pump) = pipeline();
+        let clone = emitter.clone();
+
+        drop(emitter);
+        drop(clone);
+
+        pump.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_bound_emitter_stamps_its_session_and_tool_call() {
+        let (emitter, _pump) = pipeline();
+        let mut receiver = emitter.subscribe();
+        let bound = SessionBoundEmitter::new(emitter, "ses_1", Some("call_1".into()));
+
+        bound.emit(AgentEvent::ToolCallOutputDelta {
+            delta: "running".into(),
+        });
+
+        let event = receiver.recv().await.unwrap();
+        assert_eq!(event.session_id, "ses_1");
+        assert_eq!(event.tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(bound.session_id(), "ses_1");
+        assert_eq!(bound.tool_call_id(), Some("call_1"));
+    }
+
+    #[test]
+    fn output_stats_are_taken_once() {
+        let (emitter, _pump) = EventPump::new(EventOptions::default());
+        let bound = SessionBoundEmitter::new(emitter, "ses_1", None);
+
+        assert_eq!(bound.take_tool_output_stats(), None);
+        bound.record_tool_output_stats(OutputCaptureStats::complete(64));
+
+        assert_eq!(
+            bound.take_tool_output_stats(),
+            Some(OutputCaptureStats {
+                observed_bytes: 64,
+                retained_bytes: 64,
+                omitted_bytes:  0,
+            })
+        );
+        assert_eq!(bound.take_tool_output_stats(), None);
+    }
+
+    #[test]
+    fn output_stats_combine_by_summing() {
+        let combined = OutputCaptureStats::complete(10).combine(OutputCaptureStats {
+            observed_bytes: 30,
+            retained_bytes: 5,
+            omitted_bytes:  25,
+        });
+
+        assert_eq!(combined, OutputCaptureStats {
+            observed_bytes: 40,
+            retained_bytes: 15,
+            omitted_bytes:  25,
+        });
+    }
+
+    #[test]
+    fn a_sink_error_keeps_its_source_for_logging() {
+        let error = EventSinkError::new("write failed")
+            .with_source(io::Error::other("no space left on device"));
+
+        assert_eq!(error.message(), "write failed");
+        assert_eq!(error.to_string(), "write failed");
+        assert!(
+            error
+                .source()
+                .is_some_and(|source| source.to_string().contains("no space left"))
+        );
+    }
+
+    #[test]
+    fn sequence_assignment_is_shared_across_handles() {
+        let sequence = Arc::new(EventSequence::new());
+        let shared = Arc::clone(&sequence);
+
+        let first = sequence.assign();
+        let second = shared.assign();
+
+        assert_eq!((first, second), (1, 2));
+        assert_eq!(sequence.last_assigned(), 2);
+        assert_eq!(EventSequence::resuming_after(7).assign(), 8);
+    }
+}

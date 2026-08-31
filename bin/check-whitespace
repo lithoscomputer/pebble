@@ -1,0 +1,36 @@
+#!/bin/sh
+# Check the working tree for whitespace errors.
+#
+# `git diff --check` reads tracked changes only, so a file that has never been
+# committed is invisible to it. Untracked files are compared against an empty
+# file instead: `git diff --no-index` reports exit status 1 for "the files
+# differ", which every new file does, and a higher status when it also found a
+# whitespace error.
+set -eu
+
+git diff --check
+git diff --cached --check
+
+untracked=$(git ls-files --others --exclude-standard)
+if [ -z "$untracked" ]; then
+  exit 0
+fi
+
+status=0
+IFS='
+'
+set -f
+# shellcheck disable=SC2086
+set -- $untracked
+set +f
+unset IFS
+
+for file in "$@"; do
+  code=0
+  git diff --check --no-index -- /dev/null "$file" || code=$?
+  if [ "$code" -gt 1 ]; then
+    status=1
+  fi
+done
+
+exit "$status"

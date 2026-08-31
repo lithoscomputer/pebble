@@ -1,0 +1,91 @@
+---
+source: tests/record_contract.rs
+expression: rendered
+---
+{
+  "format_version": 1,
+  "session_id": "ses_root",
+  "provider": "anthropic",
+  "model": "claude-sonnet-5",
+  "created_at": "2026-01-01T00:00:00.500Z",
+  "updated_at": "2026-01-01T00:00:00.500Z",
+  "last_event_seq": 41,
+  "messages": [
+    {
+      "kind": "user",
+      "content": "read the crate root",
+      "timestamp": "2026-01-01T00:00:00.500Z"
+    },
+    {
+      "kind": "assistant",
+      "content": "Reading it now.",
+      "tool_calls": [
+        {
+          "id": "call_1",
+          "name": "read_file",
+          "arguments": {
+            "path": "src/lib.rs"
+          },
+          "kind": "function",
+          "raw_arguments": "{\"path\":\"src/lib.rs\"}",
+          "provider_metadata": {
+            "openai": {
+              "id": "fc_1"
+            }
+          }
+        }
+      ],
+      "provider_parts": [
+        {
+          "type": "reasoning",
+          "text": "the root is a facade",
+          "signature": "sig_1",
+          "signature_origin": "anthropic"
+        },
+        {
+          "type": "opaque",
+          "kind": "openai.reasoning",
+          "data": {
+            "id": "rs_1"
+          }
+        }
+      ],
+      "usage": {
+        "input": 1200,
+        "output": 340,
+        "reasoning": 96,
+        "cache_read": 800,
+        "cache_write": 64
+      },
+      "response_id": "resp_1",
+      "timestamp": "2026-01-01T00:00:00.500Z"
+    },
+    {
+      "kind": "tool_results",
+      "results": [
+        {
+          "tool_call_id": "call_1",
+          "name": "read_file",
+          "content": [
+            {
+              "type": "text",
+              "text": "//! Pebble is a coding-agent loop library."
+            }
+          ],
+          "is_error": false
+        }
+      ],
+      "timestamp": "2026-01-01T00:00:00.500Z"
+    },
+    {
+      "kind": "system",
+      "content": "[Context Summary]\nThe session read the crate root.",
+      "timestamp": "2026-01-01T00:00:00.500Z"
+    },
+    {
+      "kind": "steering",
+      "content": "also update the changelog",
+      "timestamp": "2026-01-01T00:00:00.500Z"
+    }
+  ]
+}

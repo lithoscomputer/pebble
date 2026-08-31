@@ -1,0 +1,24 @@
+---
+source: tests/event_contract.rs
+expression: render(&events)
+---
+[
+  {
+    "seq": 1,
+    "event": "SessionEnded",
+    "timestamp": "2026-01-01T00:00:00.500Z",
+    "session_id": "ses_root"
+  },
+  {
+    "seq": 42,
+    "event": {
+      "ToolCallOutputDelta": {
+        "delta": "running"
+      }
+    },
+    "timestamp": "2026-01-01T00:00:00.500Z",
+    "session_id": "ses_child",
+    "parent_session_id": "ses_root",
+    "tool_call_id": "call_1"
+  }
+]

@@ -1,0 +1,9 @@
+---
+source: tests/event_contract.rs
+expression: "render(&[PermissionLevel::ReadOnly, PermissionLevel::ReadWrite,\nPermissionLevel::Full,])"
+---
+[
+  "read-only",
+  "read-write",
+  "full"
+]

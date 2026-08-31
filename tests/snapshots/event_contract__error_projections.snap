@@ -1,0 +1,49 @@
+---
+source: tests/event_contract.rs
+expression: render(&projections)
+---
+[
+  {
+    "kind": "session_closed",
+    "message": "session is closed"
+  },
+  {
+    "kind": "invalid_state",
+    "message": "invalid state: no active round"
+  },
+  {
+    "kind": "tool_execution",
+    "message": "tool execution error: shell exited 1"
+  },
+  {
+    "kind": "interrupted",
+    "message": "interrupted: cancelled"
+  },
+  {
+    "kind": "event_sink",
+    "message": "event sink failed: the run log is not writable",
+    "source_chain": [
+      "the run log is not writable"
+    ]
+  },
+  {
+    "kind": "compaction",
+    "message": "context compaction failed",
+    "provider": "anthropic",
+    "model": "claude-sonnet-5"
+  },
+  {
+    "kind": "llm",
+    "message": "slow down",
+    "llm_kind": "rate_limit",
+    "retry": {
+      "type": "after",
+      "after_millis": 2000
+    },
+    "provider": "openai",
+    "model": "gpt-5",
+    "status": 429,
+    "provider_code": "rate_limit_exceeded",
+    "provider_retry_after_millis": 2000
+  }
+]

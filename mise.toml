@@ -39,6 +39,10 @@ run = "cargo clippy --locked --all-targets --all-features -- -D warnings"
 description = "Run all Rust tests with Nextest"
 run = "cargo nextest run --locked --all-targets --all-features --no-tests=pass"
 
+[tasks."test:doc"]
+description = "Run the documentation tests, which Nextest does not cover"
+run = "cargo test --doc --locked"
+
 [tasks."test:release"]
 description = "Run all Rust tests in release mode"
 run = "cargo nextest run --locked --release --all-targets --all-features --no-tests=pass"
@@ -53,12 +57,12 @@ description = "Audit GitHub Actions workflows"
 run = "zizmor .github/workflows"
 
 [tasks."check:whitespace"]
-description = "Check tracked and untracked patches for whitespace errors"
-run = ["git diff --check", "git diff --cached --check"]
+description = "Check tracked and untracked work for whitespace errors"
+run = "bin/check-whitespace"
 
 [tasks.check]
 description = "Run the complete routine verification gate"
-depends = ["fmt:check", "lint", "test", "check:actions", "check:whitespace"]
+depends = ["fmt:check", "lint", "test", "test:doc", "check:actions", "check:whitespace"]
 
 [tasks."check:nightly"]
 description = "Run the extended nightly verification gate"

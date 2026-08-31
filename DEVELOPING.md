@@ -31,6 +31,7 @@ mise run setup
 | `mise run fmt:check` | Check formatting without changing files |
 | `mise run lint` | Run Clippy with warnings denied |
 | `mise run test` | Run the test suite |
+| `mise run test:doc` | Run the documentation tests |
 | `mise run check` | Run the routine verification gate |
 | `mise run check:nightly` | Run the extended verification gate |
 
@@ -67,6 +68,12 @@ lockfile. Pebble builds `lithos-llm` from source, so the two projects must
 agree. Pin new dependencies to the version that the `lithos-llm` or `fabro`
 lockfile already contains, and use `cargo update --precise` to keep the
 versions aligned.
+
+The rule covers every entry in the lockfile, not only the packages this
+project builds today. Cargo records the optional dependencies of a dependency
+even when no feature enables them, and enabling that feature later would build
+whatever version the lockfile named. A dependency that drags in entries no
+`lithos-llm` version covers is the wrong dependency.
 
 ## Releases
 

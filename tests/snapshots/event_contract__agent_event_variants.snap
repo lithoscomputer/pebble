@@ -1,0 +1,324 @@
+---
+source: tests/event_contract.rs
+expression: render(&every_variant())
+---
+[
+  {
+    "SessionStarted": {
+      "provider": "anthropic",
+      "model": "claude-sonnet-5"
+    }
+  },
+  "SessionEnded",
+  "ProcessingEnd",
+  {
+    "UserInput": {
+      "text": "fix the failing test"
+    }
+  },
+  {
+    "LlmRequestStarted": {
+      "requested_model": "claude-sonnet-5"
+    }
+  },
+  {
+    "LlmFirstOutput": {
+      "kind": "reasoning"
+    }
+  },
+  {
+    "AssistantOutputReplace": {
+      "text": ""
+    }
+  },
+  {
+    "AssistantMessage": {
+      "text": "I updated the parser.",
+      "model": "claude-sonnet-5",
+      "usage": {
+        "input": 1200,
+        "output": 340,
+        "reasoning": 96,
+        "cache_read": 800,
+        "cache_write": 64
+      },
+      "cost_usd_micros": 12500,
+      "cost_source": "catalog",
+      "tool_call_count": 2,
+      "context_window": {
+        "provider": "anthropic",
+        "model": "claude-sonnet-5",
+        "context_window_tokens": 200000,
+        "input_tokens": 52000,
+        "usage_percent": 26.0,
+        "count_method": "response_usage_scaled_breakdown",
+        "staleness": "live",
+        "generated_at": "2026-01-01T00:00:00.500Z",
+        "event_seq": 41,
+        "breakdown": [
+          {
+            "category": "system_prompt",
+            "tokens": 2000,
+            "usage_percent": 1.0
+          },
+          {
+            "category": "conversation",
+            "tokens": 50000,
+            "usage_percent": 25.0
+          }
+        ],
+        "warnings": [
+          {
+            "code": "scaled_estimate",
+            "message": "per-category counts are scaled from the reported total"
+          }
+        ]
+      },
+      "reasoning": {
+        "summary": "checked the parser",
+        "trace": "step one"
+      }
+    }
+  },
+  {
+    "TextDelta": {
+      "delta": "I up"
+    }
+  },
+  {
+    "ReasoningDelta": {
+      "delta": "weighing"
+    }
+  },
+  {
+    "ToolCallStarted": {
+      "tool_name": "shell",
+      "tool_call_id": "call_1",
+      "arguments": {
+        "command": "cargo test"
+      }
+    }
+  },
+  {
+    "ToolCallOutputDelta": {
+      "delta": "running 1 test"
+    }
+  },
+  {
+    "ToolCallCompleted": {
+      "tool_name": "shell",
+      "tool_call_id": "call_1",
+      "output": "test result: ok",
+      "is_error": false,
+      "output_bytes_observed": 4096,
+      "output_bytes_retained": 1024,
+      "output_bytes_omitted": 3072
+    }
+  },
+  {
+    "ToolCallCompleted": {
+      "tool_name": "write_file",
+      "tool_call_id": "call_2",
+      "output": "permission denied",
+      "is_error": true,
+      "error_kind": "denied",
+      "output_bytes_observed": 17,
+      "output_bytes_retained": 17,
+      "output_bytes_omitted": 0
+    }
+  },
+  {
+    "ToolProcessCompleted": {
+      "exit_code": 101,
+      "termination": "exited",
+      "duration_ms": 1432,
+      "streams_separated": true,
+      "exec_output_tail": {
+        "stdout": "test result: FAILED",
+        "stdout_truncated": true
+      },
+      "output_bytes_observed": 4096,
+      "output_bytes_retained": 1024,
+      "output_bytes_omitted": 3072
+    }
+  },
+  {
+    "Error": {
+      "error": {
+        "kind": "interrupted",
+        "message": "interrupted: wall clock timeout"
+      }
+    }
+  },
+  {
+    "Warning": {
+      "kind": "context_budget",
+      "message": "the prompt is close to the context window",
+      "details": {
+        "usage_percent": 92.5
+      }
+    }
+  },
+  "LoopDetected",
+  {
+    "SteeringInjected": {
+      "text": "also update the changelog",
+      "actor": {
+        "kind": "user",
+        "id": "u_1",
+        "display_name": "Ada"
+      }
+    }
+  },
+  {
+    "RoundInterrupted": {
+      "generation": 3
+    }
+  },
+  {
+    "CompactionStarted": {
+      "estimated_tokens": 180000,
+      "context_window_size": 200000
+    }
+  },
+  {
+    "CompactionCompleted": {
+      "original_turn_count": 64,
+      "preserved_turn_count": 12,
+      "summary_token_estimate": 900,
+      "tracked_file_count": 7
+    }
+  },
+  {
+    "LlmRetry": {
+      "provider": "openai",
+      "model": "gpt-5",
+      "attempt": 0,
+      "delay_secs": 2.0,
+      "error": {
+        "kind": "llm",
+        "message": "rate limited",
+        "provider": "openai",
+        "model": "gpt-5"
+      },
+      "phase": "open"
+    }
+  },
+  {
+    "SubAgentSpawned": {
+      "agent_id": "sa_1",
+      "depth": 1,
+      "task": "survey the test suite",
+      "generation": 1
+    }
+  },
+  {
+    "SubAgentTurnStarted": {
+      "agent_id": "sa_1",
+      "depth": 1,
+      "task": "survey the test suite",
+      "generation": 2
+    }
+  },
+  {
+    "SubAgentCompleted": {
+      "agent_id": "sa_1",
+      "depth": 1,
+      "generation": 2,
+      "success": true,
+      "turns_used": 4
+    }
+  },
+  {
+    "SubAgentFailed": {
+      "agent_id": "sa_2",
+      "depth": 1,
+      "generation": 1,
+      "error": {
+        "kind": "session_closed",
+        "message": "session is closed"
+      }
+    }
+  },
+  {
+    "SubAgentClosed": {
+      "agent_id": "sa_1",
+      "depth": 1,
+      "generation": 2
+    }
+  },
+  {
+    "MemoryLoaded": {
+      "profile": "claude-5",
+      "files": [
+        {
+          "path": "/work/AGENTS.md",
+          "byte_count": 4096,
+          "loaded_bytes": 2048,
+          "truncated": true
+        }
+      ],
+      "total_loaded_bytes": 2048,
+      "budget_bytes": 8192
+    }
+  },
+  {
+    "SkillsDiscovered": {
+      "profile": "claude-5",
+      "source_dirs": [
+        "/work/.skills"
+      ],
+      "skills": [
+        {
+          "name": "review",
+          "description": "Review a diff"
+        }
+      ]
+    }
+  },
+  {
+    "SkillActivated": {
+      "skill_name": "review",
+      "source": "slash"
+    }
+  },
+  {
+    "TodoCreated": {
+      "list_id": "openai_plan:ses_1",
+      "list_kind": "openai_plan",
+      "todo_id": "todo_1",
+      "status": "pending",
+      "order": 0,
+      "subject": "read the failing test",
+      "description": "start from the assertion",
+      "active_form": "reading the failing test",
+      "owner": "agent",
+      "blocks": [
+        "todo_2"
+      ],
+      "metadata": {
+        "origin": "plan"
+      }
+    }
+  },
+  {
+    "TodoUpdated": {
+      "list_id": "openai_plan:ses_1",
+      "list_kind": "openai_plan",
+      "todo_id": "todo_1",
+      "status": "in_progress",
+      "active_form": null,
+      "owner": "agent",
+      "metadata_patch": {
+        "origin": null
+      }
+    }
+  },
+  {
+    "TodoDeleted": {
+      "list_id": "openai_plan:ses_1",
+      "list_kind": "openai_plan",
+      "todo_id": "todo_1"
+    }
+  }
+]
