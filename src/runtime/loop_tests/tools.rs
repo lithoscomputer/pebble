@@ -22,8 +22,8 @@ use async_trait::async_trait;
 use super::*;
 use crate::environment::{Environment, ExecResult};
 use crate::redact::Redactor;
+use crate::runtime::testing::{TestProfile, builder};
 use crate::search::{SearchError, SearchProvider, SearchRequest, SearchResult};
-use crate::session::testing::{TestProfile, builder};
 use crate::subagent::{ChildSessionSpec, SessionFactory};
 use crate::test_support::{
     MockEnvironment, MutableMockEnvironment, ScriptedCompletion, ScriptedProvider, client_from,
@@ -271,7 +271,7 @@ fn environment_with_skills(files: Vec<(&str, &str)>, globs: Vec<&str>) -> Arc<Mo
 }
 
 /// A session whose one discovered skill is `commit`, answering `calls`.
-fn session_with_a_skill(calls: Vec<ScriptedCall>) -> (Session, Arc<ScriptedProvider>) {
+fn session_with_a_skill(calls: Vec<ScriptedCall>) -> (CodingRuntime, Arc<ScriptedProvider>) {
     TestSession::new(calls)
         .environment(environment_with_skills(
             vec![(

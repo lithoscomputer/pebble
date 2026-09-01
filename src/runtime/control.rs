@@ -1,8 +1,8 @@
 //! Steering a session that is already running.
 //!
 //! A running session is busy inside
-//! [`Session::prompt`](crate::advanced::Session::prompt), so everything an
-//! application wants to say to it mid-prompt arrives through a
+//! [`CodingRuntime::prompt`](crate::advanced::CodingRuntime::prompt), so
+//! everything an application wants to say to it mid-prompt arrives through a
 //! [`SessionControlHandle`]. The handle queues messages and asks the active
 //! provider-neutral agent to interrupt its current model turn. The coding
 //! bridge commits the queued message and its durable event at the next turn
@@ -11,7 +11,7 @@
 //! Two gestures are distinct and often confused. [`SessionControlHandle`]
 //! *interrupts a round*: the current turn is abandoned and the session picks up
 //! whatever is queued.
-//! [`Session::interrupt`](crate::advanced::Session::interrupt) ends
+//! [`CodingRuntime::interrupt`](crate::advanced::CodingRuntime::interrupt) ends
 //! the whole prompt. Only the second closes the session.
 
 use std::collections::VecDeque;
@@ -157,7 +157,7 @@ pub trait CompletionCoordinator: Send + Sync {
 /// The handle that steers and interrupts a running session.
 ///
 /// Cloning is cheap, and every clone drives the same session:
-/// [`Session::control_handle`](crate::advanced::Session::control_handle) builds
+/// [`CodingRuntime::control_handle`](crate::advanced::CodingRuntime::control_handle) builds
 /// one from the state the session itself holds. An unattached handle from
 /// [`SessionControlHandle::new`] drives nothing, which is what a test or a
 /// half-built application wants.
@@ -219,7 +219,8 @@ impl SessionControlHandle {
     /// it.
     ///
     /// This does not end the prompt.
-    /// [`Session::interrupt`](crate::advanced::Session::interrupt) does that.
+    /// [`CodingRuntime::interrupt`](crate::advanced::CodingRuntime::interrupt)
+    /// does that.
     ///
     /// No author is taken, because nothing records one: an interrupt is
     /// announced as a generation, not as something somebody said. Where the

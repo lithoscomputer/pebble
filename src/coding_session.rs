@@ -17,11 +17,11 @@ use crate::event::{EventCapacity, EventSink};
 use crate::history::History;
 use crate::human_input::HumanInputProvider;
 use crate::redact::Redactor;
-use crate::search::SearchProvider;
-use crate::session::{
-    InterruptReasonHandle, PromptTiming, Session, SessionBuildError, SessionBuilder,
-    SessionControlHandle, ShutdownReason,
+use crate::runtime::{
+    CodingRuntime, CodingRuntimeBuildError, CodingRuntimeBuilder, InterruptReasonHandle,
+    PromptTiming, SessionControlHandle, ShutdownReason,
 };
+use crate::search::SearchProvider;
 use crate::subagent::{SessionFactory, SubagentLimits};
 use crate::tool::{RegisteredTool, ToolEnvProvider};
 use crate::types::{CodingSessionEvent, Message, SessionState, TokenUsage};
@@ -35,7 +35,7 @@ pub enum CodingSessionBuildError {
     Configuration {
         /// The configuration failure.
         #[source]
-        source: SessionBuildError,
+        source: CodingRuntimeBuildError,
     },
     /// Resource discovery or system-prompt construction failed.
     #[error("initializing the coding session")]
@@ -91,13 +91,13 @@ impl PromptOutcome {
 /// Builds an initialized [`CodingSession`].
 #[must_use = "a builder does nothing until `build().await` is called"]
 pub struct CodingSessionBuilder {
-    inner: SessionBuilder,
+    inner: CodingRuntimeBuilder,
 }
 
 impl CodingSessionBuilder {
     fn new(client: Client, environment: Arc<dyn Environment>) -> Self {
         Self {
-            inner: Session::builder(client).environment(environment),
+            inner: CodingRuntime::builder(client).environment(environment),
         }
     }
 
@@ -216,7 +216,7 @@ struct CodingControl {
 }
 
 impl CodingControl {
-    fn new(session: &Session) -> Arc<Self> {
+    fn new(session: &CodingRuntime) -> Arc<Self> {
         Arc::new(Self {
             session:          session.control_handle(),
             follow_up:        session.followup_queue_handle(),
@@ -375,7 +375,7 @@ impl fmt::Debug for CodingSessionControlHandle {
 /// compaction policy, and subagents. Use [`pebble::agent`](crate::agent) when
 /// those coding-specific facilities are not needed.
 pub struct CodingSession {
-    inner:   Session,
+    inner:   CodingRuntime,
     control: Arc<CodingControl>,
 }
 
@@ -389,7 +389,7 @@ impl CodingSession {
     ///
     /// # Errors
     ///
-    /// Returns the same prompt failures as [`Session::prompt`].
+    /// Returns the same prompt failures as [`CodingRuntime::prompt`].
     pub async fn prompt(&mut self, input: &str) -> Result<PromptOutcome, Error> {
         self.control.begin_prompt();
         let result = self.inner.prompt(input).await;
@@ -485,27 +485,11 @@ impl CodingSession {
         self.inner.history()
     }
 
-    /// Gives advanced callers access to the underlying coding session.
-    pub const fn as_session(&self) -> &Session {
-        &self.inner
-    }
-
-    /// Gives advanced callers mutable access to the underlying coding session.
-    pub const fn as_session_mut(&mut self) -> &mut Session {
-        &mut self.inner
-    }
-
     /// Closes the session and joins its owned tasks.
     pub async fn shutdown(&mut self, reason: ShutdownReason) -> Result<bool, Error> {
         let result = self.inner.shutdown(reason).await;
         self.control.mark_closed();
         result
-    }
-
-    /// Consumes the facade and returns the initialized lower-level session.
-    pub fn into_session(self) -> Session {
-        self.control.mark_closed();
-        self.inner
     }
 }
 
@@ -529,7 +513,7 @@ mod tests {
 
         assert_eq!(outcome.text(), Some("done"));
         assert!(outcome.final_message().is_some());
-        assert_eq!(outcome.usage(), session.as_session().last_prompt_usage());
+        assert_eq!(outcome.usage(), session.inner.last_prompt_usage());
         session
             .shutdown(ShutdownReason::Completed)
             .await

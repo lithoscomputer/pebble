@@ -462,9 +462,9 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::advanced::Session;
+    use crate::advanced::CodingRuntime;
     use crate::profiles::tests::UnusedSearch;
-    use crate::session::testing::TestSession;
+    use crate::runtime::testing::TestSession;
     use crate::test_support::{MockEnvironment, ScriptedCall, text_response};
     use crate::tool::ToolContext;
     use crate::tools::testing::{context, schema_of};
@@ -619,7 +619,7 @@ mod tests {
     ///
     /// The parent never runs itself, so the whole script belongs to the
     /// children it spawns.
-    fn parent_answering(report: &str) -> Session {
+    fn parent_answering(report: &str) -> CodingRuntime {
         let (session, _provider) = TestSession::new(vec![
             ScriptedCall::response(text_response(report)),
             ScriptedCall::response(text_response(report)),
@@ -630,7 +630,7 @@ mod tests {
     }
 
     /// The supervisor `parent` drives its children with.
-    fn supervisor_of(parent: &Session) -> SubagentSupervisor {
+    fn supervisor_of(parent: &CodingRuntime) -> SubagentSupervisor {
         parent
             .subagent_supervisor()
             .expect("the test session was given a factory")
@@ -638,7 +638,7 @@ mod tests {
     }
 
     /// A call made from inside `parent`.
-    fn call_in(parent: &Session) -> ToolContext {
+    fn call_in(parent: &CodingRuntime) -> ToolContext {
         context(MockEnvironment::linux()).with_session(parent.id(), parent.root_session_id())
     }
 

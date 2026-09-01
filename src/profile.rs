@@ -193,8 +193,8 @@ impl ModelFacts {
     /// is told not to, and one that only takes a thinking budget does not. A
     /// catalog row that knows better says so with
     /// `metadata.pebble.reasoning_by_default`, which
-    /// [`SessionBuilder`](crate::advanced::SessionBuilder) applies on top of
-    /// this.
+    /// [`CodingRuntimeBuilder`](crate::advanced::CodingRuntimeBuilder) applies
+    /// on top of this.
     #[must_use]
     pub fn from_catalog_model(model: &CatalogModel) -> Self {
         let capabilities = model.capabilities();

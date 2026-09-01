@@ -1,19 +1,19 @@
-//! One conversation with one model, and the loop that drives it.
+//! Lower-level state and adapters for one coding conversation.
 //!
-//! A [`Session`] holds everything one prompt of a coding agent needs: the model
-//! client, the harness the model expects, the tools it may call, the history it
-//! replays, and the event pipeline an application watches. Build one with
-//! [`Session::builder`], call [`Session::initialize`] once, then
-//! [`Session::prompt`] for each thing you want done.
+//! A [`CodingRuntime`] owns the coding-specific state around a persistent
+//! [`Agent`]: the model client, coding profile, tools, history, compaction,
+//! subagents, and durable event projection. Build one with
+//! [`CodingRuntime::builder`], call [`CodingRuntime::initialize`] once, then
+//! [`CodingRuntime::prompt`] for each prompt you want processed.
 //!
 //! ```no_run
 //! use std::sync::Arc;
 //!
-//! use pebble::advanced::Session;
+//! use pebble::advanced::CodingRuntime;
 //! use pebble::{CodingSessionOptions, LocalEnvironment, ShutdownReason};
 //!
 //! # async fn example(client: lithos_llm::Client) -> Result<(), Box<dyn std::error::Error>> {
-//! let mut session = Session::builder(client)
+//! let mut session = CodingRuntime::builder(client)
 //!     .model("claude-sonnet-5")
 //!     .environment(Arc::new(LocalEnvironment::new(".")))
 //!     .options(CodingSessionOptions::default())
@@ -38,20 +38,20 @@
 //!
 //! # Steering a prompt
 //!
-//! [`Session::prompt`] borrows the session until it returns, so everything an
-//! application says to a live prompt goes through
-//! [`Session::control_handle`]: a cheap clone that queues steering and
-//! interrupts rounds. [`Session::interrupt`] is the separate, terminal gesture
-//! that ends the prompt.
+//! [`CodingRuntime::prompt`] borrows the session until it returns, so
+//! everything an application says to a live prompt goes through
+//! [`CodingRuntime::control_handle`]: a cheap clone that queues steering and
+//! interrupts rounds. [`CodingRuntime::interrupt`] is the separate, terminal
+//! gesture that ends the prompt.
 //!
 //! # What the session owns
 //!
 //! The session owns its event pump and, while a prompt has a wall-clock budget,
 //! the timer watching it. Both are joined — never abandoned — by
-//! [`Session::shutdown`] and by the end of a prompt, so a failure inside either
-//! is reported rather than lost. The application owns the Tokio runtime.
+//! [`CodingRuntime::shutdown`] and by the end of a prompt, so a failure inside
+//! either is reported rather than lost. The application owns the Tokio runtime.
 //!
-//! Joining the pump is also what ends every stream [`Session::subscribe`]
+//! Joining the pump is also what ends every stream [`CodingRuntime::subscribe`]
 //! handed out. A reader looping until `RecvError::Closed` therefore finishes
 //! once `shutdown` returns, with the session still alive, so an application
 //! can join its renderer before letting the session go.
@@ -168,7 +168,7 @@ struct PromptTotals {
 /// say which harness it expects.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
-pub enum SessionBuildError {
+pub enum CodingRuntimeBuildError {
     /// No model selector was given.
     #[error("a session needs a model selector")]
     MissingModel,
@@ -263,7 +263,7 @@ struct PebbleMetadata {
 /// merges whatever the application registered, and freezes the result into the
 /// session. Nothing mutates a registry afterwards.
 #[must_use = "a builder does nothing until `build` is called"]
-pub struct SessionBuilder {
+pub struct CodingRuntimeBuilder {
     client:               Client,
     model:                Option<String>,
     environment:          Option<Arc<dyn Environment>>,
@@ -281,7 +281,7 @@ pub struct SessionBuilder {
     child:                Option<ChildIdentity>,
 }
 
-impl SessionBuilder {
+impl CodingRuntimeBuilder {
     /// Starts a session that talks to the model through `client`.
     fn new(client: Client) -> Self {
         Self {
@@ -473,10 +473,10 @@ impl SessionBuilder {
     ///
     /// # Errors
     ///
-    /// Returns [`SessionBuildError`] when a dependency is missing, the model
-    /// selector resolves to nothing, or the resolved model's catalog entry
-    /// names no harness pebble can run.
-    pub fn build(self) -> StdResult<Session, SessionBuildError> {
+    /// Returns [`CodingRuntimeBuildError`] when a dependency is missing, the
+    /// model selector resolves to nothing, or the resolved model's catalog
+    /// entry names no harness pebble can run.
+    pub fn build(self) -> StdResult<CodingRuntime, CodingRuntimeBuildError> {
         self.build_with_id(new_session_id(), SystemTime::now())
     }
 
@@ -484,11 +484,11 @@ impl SessionBuilder {
         self,
         id: String,
         created_at: SystemTime,
-    ) -> StdResult<Session, SessionBuildError> {
-        let selector = self.model.ok_or(SessionBuildError::MissingModel)?;
+    ) -> StdResult<CodingRuntime, CodingRuntimeBuildError> {
+        let selector = self.model.ok_or(CodingRuntimeBuildError::MissingModel)?;
         let environment = self
             .environment
-            .ok_or(SessionBuildError::MissingEnvironment)?;
+            .ok_or(CodingRuntimeBuildError::MissingEnvironment)?;
 
         let route = resolve_route(&self.client, &selector)?;
         let handle = route.handle();
@@ -601,7 +601,7 @@ impl SessionBuilder {
         let (emitter, pump) = EventPump::new(self.events);
         let pump = tokio::spawn(pump.run());
 
-        let session = Session {
+        let session = CodingRuntime {
             root_session_id,
             parent_session_id,
             built_from,
@@ -672,18 +672,21 @@ fn child_options(parent: &CodingSessionOptions) -> CodingSessionOptions {
 }
 
 /// Resolves the selector the way the session's own calls will.
-fn resolve_route(client: &Client, selector: &str) -> StdResult<ResolvedRoute, SessionBuildError> {
+fn resolve_route(
+    client: &Client,
+    selector: &str,
+) -> StdResult<ResolvedRoute, CodingRuntimeBuildError> {
     let probe = Request::builder()
         .model(selector)
         .user("probe")
         .build()
-        .map_err(|source| SessionBuildError::Selector {
+        .map_err(|source| CodingRuntimeBuildError::Selector {
             selector: selector.to_owned(),
             source,
         })?;
     client
         .resolve_route(&probe)
-        .map_err(|source| SessionBuildError::ModelSelection {
+        .map_err(|source| CodingRuntimeBuildError::ModelSelection {
             selector: selector.to_owned(),
             source,
         })
@@ -698,7 +701,7 @@ fn resolve_route(client: &Client, selector: &str) -> StdResult<ResolvedRoute, Se
 fn effective_metadata(
     route: &ResolvedRoute,
     handle: &ModelHandle,
-) -> StdResult<PebbleMetadata, SessionBuildError> {
+) -> StdResult<PebbleMetadata, CodingRuntimeBuildError> {
     let model = read_metadata(route.model().metadata(), handle)?;
     let provider = read_metadata(route.provider().metadata(), handle)?;
     Ok(PebbleMetadata {
@@ -711,11 +714,11 @@ fn effective_metadata(
 fn read_metadata(
     metadata: &Metadata,
     handle: &ModelHandle,
-) -> StdResult<PebbleMetadata, SessionBuildError> {
+) -> StdResult<PebbleMetadata, CodingRuntimeBuildError> {
     metadata
         .namespace::<PebbleMetadata>(METADATA_NAMESPACE)
         .map(Option::unwrap_or_default)
-        .map_err(|source| SessionBuildError::InvalidProfileMetadata {
+        .map_err(|source| CodingRuntimeBuildError::InvalidProfileMetadata {
             model: handle.to_string(),
             source,
         })
@@ -725,19 +728,17 @@ fn read_metadata(
 fn profile_kind(
     metadata: &PebbleMetadata,
     handle: &ModelHandle,
-) -> StdResult<AgentProfileKind, SessionBuildError> {
-    let named =
-        metadata
-            .profile
-            .as_deref()
-            .ok_or_else(|| SessionBuildError::MissingProfileMetadata {
-                model: handle.to_string(),
-            })?;
+) -> StdResult<AgentProfileKind, CodingRuntimeBuildError> {
+    let named = metadata.profile.as_deref().ok_or_else(|| {
+        CodingRuntimeBuildError::MissingProfileMetadata {
+            model: handle.to_string(),
+        }
+    })?;
     AgentProfileKind::ALL
         .iter()
         .copied()
         .find(|kind| kind.as_str() == named)
-        .ok_or_else(|| SessionBuildError::UnknownProfile {
+        .ok_or_else(|| CodingRuntimeBuildError::UnknownProfile {
             model:   handle.to_string(),
             profile: named.to_owned(),
         })
@@ -750,9 +751,9 @@ fn new_session_id() -> String {
 
 /// Where an outside task names why it is about to cancel a prompt.
 ///
-/// [`Session::interrupt_reason_handle`] hands one out before the prompt starts,
-/// so a watchdog holding it can say what it is doing — a budget spent, a
-/// deadline passed — and the prompt then ends with that reason rather than a
+/// [`CodingRuntime::interrupt_reason_handle`] hands one out before the prompt
+/// starts, so a watchdog holding it can say what it is doing — a budget spent,
+/// a deadline passed — and the prompt then ends with that reason rather than a
 /// plain cancellation. Cloning is cheap and every clone names the same session.
 ///
 /// First writer wins: the reason a prompt reports is the first one recorded,
@@ -783,12 +784,12 @@ impl InterruptReasonHandle {
 
 /// One conversation with one model.
 ///
-/// A session is used from one place at a time: [`Session::prompt`] borrows it
-/// for the length of a prompt. Everything that has to reach a live prompt —
-/// steering, interrupts, follow-up input, the event stream — comes from a
-/// handle taken before the prompt starts.
+/// A session is used from one place at a time: [`CodingRuntime::prompt`]
+/// borrows it for the length of a prompt. Everything that has to reach a live
+/// prompt — steering, interrupts, follow-up input, the event stream — comes
+/// from a handle taken before the prompt starts.
 #[must_use = "call `shutdown` to stop the session and join what it owns"]
-pub struct Session {
+pub struct CodingRuntime {
     id: String,
     /// The root of this session's tree. A root session names itself; a child
     /// inherits its parent's root, which is how root-scoped tools — one shared
@@ -803,7 +804,7 @@ pub struct Session {
     config: CodingSessionOptions,
     history: History,
     emitter: Emitter,
-    /// The event pump, until [`Session::shutdown`] joins it.
+    /// The event pump, until [`CodingRuntime::shutdown`] joins it.
     pump: Option<JoinHandle<Result<()>>>,
     state: SessionState,
     ended: bool,
@@ -850,10 +851,10 @@ pub struct Session {
     coding_bridge: Option<CodingAgentBridge>,
 }
 
-impl fmt::Debug for Session {
+impl fmt::Debug for CodingRuntime {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("Session")
+            .debug_struct("CodingRuntime")
             .field("id", &self.id)
             .field("root_session_id", &self.root_session_id)
             .field("provider", &self.provider)
@@ -866,10 +867,10 @@ impl fmt::Debug for Session {
     }
 }
 
-impl Session {
+impl CodingRuntime {
     /// Starts building a session that talks to the model through `client`.
-    pub fn builder(client: Client) -> SessionBuilder {
-        SessionBuilder::new(client)
+    pub fn builder(client: Client) -> CodingRuntimeBuilder {
+        CodingRuntimeBuilder::new(client)
     }
 
     /// Rebuilds a stored session, ready to carry on where it left off.
@@ -882,16 +883,16 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns [`SessionBuildError`] for the same reasons
-    /// [`SessionBuilder::build`] does, and
-    /// [`UnsupportedRecord`](SessionBuildError::UnsupportedRecord) for a record
-    /// this build is too old to read.
+    /// Returns [`CodingRuntimeBuildError`] for the same reasons
+    /// [`CodingRuntimeBuilder::build`] does, and
+    /// [`UnsupportedRecord`](CodingRuntimeBuildError::UnsupportedRecord) for a
+    /// record this build is too old to read.
     pub fn from_record(
         record: &SessionRecord,
-        deps: SessionBuilder,
-    ) -> StdResult<Self, SessionBuildError> {
+        deps: CodingRuntimeBuilder,
+    ) -> StdResult<Self, CodingRuntimeBuildError> {
         if !record.is_supported() {
-            return Err(SessionBuildError::UnsupportedRecord {
+            return Err(CodingRuntimeBuildError::UnsupportedRecord {
                 version:   record.format_version,
                 supported: SESSION_RECORD_FORMAT_VERSION,
             });
@@ -1115,7 +1116,7 @@ impl Session {
     /// The root of this session's tree, which a root session answers with its
     /// own [`id`](Self::id).
     ///
-    /// Read-only for the same reason [`SessionBuilder`]'s `child_of` is
+    /// Read-only for the same reason [`CodingRuntimeBuilder`]'s `child_of` is
     /// crate-internal: a session's place in its tree is settled when it is
     /// built, by whoever spawned it. Root-scoped tools, forwarded events and
     /// stored records all key on this, so a session that could be re-rooted
@@ -1216,14 +1217,15 @@ impl Session {
     ///
     /// The stream is lossy for a subscriber that falls behind; an application
     /// that must see everything configures
-    /// [`SessionBuilder::event_sink`] instead.
+    /// [`CodingRuntimeBuilder::event_sink`] instead.
     ///
     /// The stream ends with the session, not with the value: once
-    /// [`Session::shutdown`] has returned, the receiver reads out whatever it
-    /// still holds and then observes `RecvError::Closed`, with the session
-    /// still alive. So a reader that loops until the stream closes can be
-    /// joined before the session is dropped, which is the order an application
-    /// wants — the renderer's summary is the last thing printed.
+    /// [`CodingRuntime::shutdown`] has returned, the receiver reads out
+    /// whatever it still holds and then observes `RecvError::Closed`, with
+    /// the session still alive. So a reader that loops until the stream
+    /// closes can be joined before the session is dropped, which is the
+    /// order an application wants — the renderer's summary is the last
+    /// thing printed.
     pub fn subscribe(&self) -> broadcast::Receiver<CodingSessionEvent> {
         self.emitter.subscribe()
     }
@@ -1459,10 +1461,10 @@ impl Session {
     /// closed before this session publishes its own end, so a reader sees a
     /// tree unwind from the leaves.
     ///
-    /// Every stream [`Session::subscribe`] handed out ends by the time this
-    /// returns: joining the pump is what closes them, so a reader looping
-    /// until `RecvError::Closed` finishes without the session having to be
-    /// dropped first.
+    /// Every stream [`CodingRuntime::subscribe`] handed out ends by the time
+    /// this returns: joining the pump is what closes them, so a reader
+    /// looping until `RecvError::Closed` finishes without the session
+    /// having to be dropped first.
     ///
     /// # Errors
     ///
@@ -1587,7 +1589,7 @@ impl Session {
     ///
     /// Valid moves: Idle or Executing to Thinking, Thinking to Executing or
     /// Idle, anything to Closed. Ending the session belongs to
-    /// [`Session::shutdown`], never here.
+    /// [`CodingRuntime::shutdown`], never here.
     fn transition(&mut self, to: SessionState) {
         let from = self.state;
         if from == to {
@@ -1687,7 +1689,7 @@ mod tests {
     }
 
     /// A session that answers every round with the same text.
-    fn session() -> Session {
+    fn session() -> CodingRuntime {
         let (session, _provider) =
             TestSession::answering(vec![ScriptedCall::response(text_response("done"))]);
         session
@@ -1697,27 +1699,27 @@ mod tests {
 
     #[tokio::test]
     async fn a_session_needs_a_model() {
-        let error = Session::builder(client())
+        let error = CodingRuntime::builder(client())
             .environment(Arc::new(MockEnvironment::linux()))
             .build()
             .expect_err("no model was named");
 
-        assert!(matches!(error, SessionBuildError::MissingModel));
+        assert!(matches!(error, CodingRuntimeBuildError::MissingModel));
     }
 
     #[tokio::test]
     async fn a_session_needs_an_environment() {
-        let error = Session::builder(client())
+        let error = CodingRuntime::builder(client())
             .model("test/model")
             .build()
             .expect_err("no environment was given");
 
-        assert!(matches!(error, SessionBuildError::MissingEnvironment));
+        assert!(matches!(error, CodingRuntimeBuildError::MissingEnvironment));
     }
 
     #[tokio::test]
     async fn a_selector_that_names_nothing_is_refused() {
-        let error = Session::builder(client())
+        let error = CodingRuntime::builder(client())
             .model("no-such-model")
             .environment(Arc::new(MockEnvironment::linux()))
             .build()
@@ -1725,24 +1727,24 @@ mod tests {
 
         assert!(matches!(
             error,
-            SessionBuildError::ModelSelection { ref selector, .. } if selector == "no-such-model"
+            CodingRuntimeBuildError::ModelSelection { ref selector, .. } if selector == "no-such-model"
         ));
     }
 
     #[tokio::test]
     async fn a_blank_selector_is_refused() {
-        let error = Session::builder(client())
+        let error = CodingRuntime::builder(client())
             .model("   ")
             .environment(Arc::new(MockEnvironment::linux()))
             .build()
             .expect_err("a blank selector names nothing");
 
-        assert!(matches!(error, SessionBuildError::Selector { .. }));
+        assert!(matches!(error, CodingRuntimeBuildError::Selector { .. }));
     }
 
     #[tokio::test]
     async fn a_model_that_names_no_profile_is_refused() {
-        let error = Session::builder(client())
+        let error = CodingRuntime::builder(client())
             .model("bare/plain")
             .environment(Arc::new(MockEnvironment::linux()))
             .with_profile(TestProfile::shared())
@@ -1751,13 +1753,13 @@ mod tests {
 
         assert!(matches!(
             error,
-            SessionBuildError::MissingProfileMetadata { ref model } if model == "bare/plain"
+            CodingRuntimeBuildError::MissingProfileMetadata { ref model } if model == "bare/plain"
         ));
     }
 
     #[tokio::test]
     async fn a_profile_pebble_does_not_know_is_refused() {
-        let error = Session::builder(client())
+        let error = CodingRuntime::builder(client())
             .model("test/strange")
             .environment(Arc::new(MockEnvironment::linux()))
             .build()
@@ -1765,14 +1767,14 @@ mod tests {
 
         assert!(matches!(
             error,
-            SessionBuildError::UnknownProfile { ref profile, .. } if profile == "nonesuch"
+            CodingRuntimeBuildError::UnknownProfile { ref profile, .. } if profile == "nonesuch"
         ));
     }
 
     #[tokio::test]
     async fn a_models_profile_beats_its_providers() {
         let resolved = |selector: &str| {
-            Session::builder(client())
+            CodingRuntime::builder(client())
                 .model(selector)
                 .environment(Arc::new(MockEnvironment::linux()))
                 .build()
@@ -1803,7 +1805,7 @@ mod tests {
     #[tokio::test]
     async fn the_catalog_says_which_models_reason_without_being_asked() {
         let facts = |selector: &str| {
-            Session::builder(client())
+            CodingRuntime::builder(client())
                 .model(selector)
                 .environment(Arc::new(MockEnvironment::linux()))
                 .with_profile(TestProfile::shared())
@@ -2140,7 +2142,7 @@ mod tests {
         let record = session.to_record();
 
         let resumed =
-            Session::from_record(&record, builder(client())).expect("the record restores");
+            CodingRuntime::from_record(&record, builder(client())).expect("the record restores");
 
         assert_eq!(resumed.id(), session.id());
         assert_eq!(resumed.root_session_id(), session.id());
@@ -2170,7 +2172,7 @@ mod tests {
         let last_seq = record.last_event_seq;
 
         let resumed =
-            Session::from_record(&record, builder(client())).expect("the record restores");
+            CodingRuntime::from_record(&record, builder(client())).expect("the record restores");
         let mut events = resumed.subscribe();
         resumed.emit(CodingEvent::LoopDetected);
 
@@ -2222,12 +2224,12 @@ mod tests {
         let mut record = SessionRecord::new("ses_1");
         record.format_version = SESSION_RECORD_FORMAT_VERSION + 1;
 
-        let error = Session::from_record(&record, builder(client()))
+        let error = CodingRuntime::from_record(&record, builder(client()))
             .expect_err("this build is too old for the record");
 
         assert!(matches!(
             error,
-            SessionBuildError::UnsupportedRecord { version, supported }
+            CodingRuntimeBuildError::UnsupportedRecord { version, supported }
                 if version == SESSION_RECORD_FORMAT_VERSION + 1
                     && supported == SESSION_RECORD_FORMAT_VERSION
         ));

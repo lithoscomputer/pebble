@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::control::SteeringItem;
 use super::retry::RetryEventBridge;
-use super::{PromptTotals, Session};
+use super::{CodingRuntime, PromptTotals};
 use crate::compaction::{CompactionRequest, check_context_usage, compact_context};
 use crate::config::CodingSessionOptions;
 use crate::context_window::{
@@ -101,43 +101,43 @@ struct CodingAgentState {
 }
 
 impl CodingAgentBridge {
-    fn from_session(session: &mut Session) -> Self {
+    fn from_runtime(runtime: &mut CodingRuntime) -> Self {
         Self {
             state:                  Arc::new(Mutex::new(CodingAgentState {
-                history: mem::take(&mut session.history),
-                file_tracker: mem::take(&mut session.file_tracker),
+                history: mem::take(&mut runtime.history),
+                file_tracker: mem::take(&mut runtime.file_tracker),
                 totals: PromptTotals::default(),
-                activated_skill_context_observed: session.activated_skill_context_observed,
+                activated_skill_context_observed: runtime.activated_skill_context_observed,
                 compaction_failed: false,
                 pending_task_reminder: None,
                 local_context_window: None,
                 inference_start: None,
                 boundary_error: None,
             })),
-            client:                 session.client.clone(),
-            model_selector:         session.model_selector.clone(),
-            model:                  session.model.clone(),
-            provider:               session.provider.clone(),
-            system_prompt:          session.system_prompt.clone(),
-            facts:                  session.facts,
-            config:                 session.config.clone(),
-            registry:               session.registry.clone(),
-            env:                    Arc::clone(&session.env),
-            human_input:            session.human_input.clone(),
-            tool_env_provider:      Arc::new(Mutex::new(session.tool_env_provider.clone())),
-            redactor:               Arc::clone(&session.redactor),
-            emitter:                session.emitter.clone(),
-            session_id:             session.id.clone(),
-            root_session_id:        session.root_session_id.clone(),
-            memory_tokens:          session.memory_tokens,
-            skills_tokens:          session.skills_tokens,
-            control_state:          Arc::clone(&session.control_state),
-            control_notify:         Arc::clone(&session.control_notify),
-            terminal_cancel:        session.cancel_token.clone(),
-            completion_coordinator: Arc::new(Mutex::new(session.completion_coordinator.clone())),
-            followup_queue:         Arc::clone(&session.followup_queue),
-            subagents:              session.subagents.clone(),
-            skills:                 session.skills.clone(),
+            client:                 runtime.client.clone(),
+            model_selector:         runtime.model_selector.clone(),
+            model:                  runtime.model.clone(),
+            provider:               runtime.provider.clone(),
+            system_prompt:          runtime.system_prompt.clone(),
+            facts:                  runtime.facts,
+            config:                 runtime.config.clone(),
+            registry:               runtime.registry.clone(),
+            env:                    Arc::clone(&runtime.env),
+            human_input:            runtime.human_input.clone(),
+            tool_env_provider:      Arc::new(Mutex::new(runtime.tool_env_provider.clone())),
+            redactor:               Arc::clone(&runtime.redactor),
+            emitter:                runtime.emitter.clone(),
+            session_id:             runtime.id.clone(),
+            root_session_id:        runtime.root_session_id.clone(),
+            memory_tokens:          runtime.memory_tokens,
+            skills_tokens:          runtime.skills_tokens,
+            control_state:          Arc::clone(&runtime.control_state),
+            control_notify:         Arc::clone(&runtime.control_notify),
+            terminal_cancel:        runtime.cancel_token.clone(),
+            completion_coordinator: Arc::new(Mutex::new(runtime.completion_coordinator.clone())),
+            followup_queue:         Arc::clone(&runtime.followup_queue),
+            subagents:              runtime.subagents.clone(),
+            skills:                 runtime.skills.clone(),
         }
     }
 
@@ -151,13 +151,13 @@ impl CodingAgentBridge {
         state.boundary_error = None;
     }
 
-    fn restore_session(&self, session: &mut Session) {
+    fn restore_runtime(&self, runtime: &mut CodingRuntime) {
         self.finish_inference();
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        session.history = state.history.clone();
-        session.file_tracker = state.file_tracker.clone();
-        session.activated_skill_context_observed = state.activated_skill_context_observed;
-        session.last_prompt = state.totals;
+        runtime.history = state.history.clone();
+        runtime.file_tracker = state.file_tracker.clone();
+        runtime.activated_skill_context_observed = state.activated_skill_context_observed;
+        runtime.last_prompt = state.totals;
     }
 
     pub(super) fn set_tool_env_provider(&self, provider: Arc<dyn ToolEnvProvider>) {
@@ -728,7 +728,7 @@ impl ModelService for CodingModelService {
     }
 }
 
-impl Session {
+impl CodingRuntime {
     /// Processes one input through the shared generic agent loop.
     pub(super) async fn process_input(
         &mut self,
@@ -767,7 +767,7 @@ impl Session {
             .await;
         self.clear_agent_control();
         self.coding_agent = Some(agent);
-        bridge.restore_session(self);
+        bridge.restore_runtime(self);
         if let Some(error) = bridge.take_boundary_error() {
             return Err(error);
         }
@@ -793,7 +793,7 @@ impl Session {
             return Ok(());
         }
 
-        let bridge = CodingAgentBridge::from_session(self);
+        let bridge = CodingAgentBridge::from_runtime(self);
         let model_service = CodingModelService {
             client:     self.client.clone(),
             emitter:    self.emitter.clone(),

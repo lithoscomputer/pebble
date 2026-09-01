@@ -8,7 +8,7 @@
 //!
 //! Pebble keeps its root API small. Durable event types are in [`events`]. Tool
 //! contracts and built-in tools are in [`tools`]. History and other session
-//! resources are in [`resources`]. The lower-level session API is in
+//! resources are in [`resources`]. Lower-level runtime APIs are in
 //! [`advanced`].
 
 pub mod advanced;
@@ -32,8 +32,8 @@ mod reasoning;
 mod record;
 mod redact;
 pub mod resources;
+mod runtime;
 mod search;
-mod session;
 mod skills;
 mod subagent;
 mod task_reminder;
@@ -79,4 +79,4 @@ pub use self::environment::{
     LocalEnvironment, format_lines_numbered,
 };
 pub use self::error::{Error, InterruptReason, Result};
-pub use self::session::ShutdownReason;
+pub use self::runtime::ShutdownReason;

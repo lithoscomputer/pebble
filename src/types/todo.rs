@@ -62,7 +62,7 @@ pub enum TodoListKind {
     #[serde(rename = "anthropic_tasks")]
     AnthropicTasks,
     /// Kimi's `TodoList`. Like [`Self::OpenAiPlan`] it replaces the whole list
-    /// in one call, but with Kimi's field names. Session-scoped.
+    /// in one call, but with Kimi's field names. CodingRuntime-scoped.
     #[serde(rename = "kimi_todos")]
     KimiTodos,
 }

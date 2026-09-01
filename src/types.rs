@@ -723,7 +723,8 @@ pub enum CodingEvent {
     ///
     /// Emitted before its owning [`CodingEvent::ToolCallCompleted`], which
     /// stays the single tool-protocol completion and the authoritative owner
-    /// of `is_error`. Session and tool-call identity come from the envelope.
+    /// of `is_error`. CodingRuntime and tool-call identity come from the
+    /// envelope.
     ToolProcessCompleted {
         /// The process's exit status, when it reported one.
         #[serde(default, skip_serializing_if = "Option::is_none")]

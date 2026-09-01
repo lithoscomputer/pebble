@@ -6,7 +6,7 @@ pub use crate::event::{
     EventSinkError, OutputCaptureStats, SessionBoundEmitter,
 };
 pub use crate::reasoning::ReasoningOutput;
-pub use crate::session::RetryEventObserver;
+pub use crate::runtime::RetryEventObserver;
 pub use crate::types::{
     Actor, AgentProfileKind, CodingEvent, CodingSessionEvent, CommandTermination,
     ContextWindowBreakdownItem, ContextWindowCategory, ContextWindowCountMethod,

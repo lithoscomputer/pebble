@@ -499,7 +499,7 @@ mod tests {
     use crate::error::Error;
     use crate::event::{EventOptions, EventPump};
     use crate::record::StoredMessage;
-    use crate::session::testing::history_from;
+    use crate::runtime::testing::history_from;
     use crate::test_support::{
         ScriptedCompletion, ScriptedFailure, ScriptedProvider, client_from, message_text,
         test_catalog, text_response,

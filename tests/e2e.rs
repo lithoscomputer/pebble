@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, process};
 
 use lithos_llm::types::ToolDefinition;
-use pebble::advanced::Session;
+use pebble::advanced::CodingRuntime;
 use pebble::events::{CodingEvent, CodingSessionEvent, ToolSource};
 use pebble::resources::Message;
 use pebble::test_support::{
@@ -336,7 +336,7 @@ async fn a_finished_prompt_reports_what_it_used() {
 fn coding_session(
     workspace: &Workspace,
     calls: Vec<ScriptedCall>,
-) -> (Session, Arc<ScriptedProvider>) {
+) -> (CodingRuntime, Arc<ScriptedProvider>) {
     session_with(workspace, calls, Vec::new())
 }
 
@@ -345,9 +345,9 @@ fn session_with(
     workspace: &Workspace,
     calls: Vec<ScriptedCall>,
     tools: Vec<RegisteredTool>,
-) -> (Session, Arc<ScriptedProvider>) {
+) -> (CodingRuntime, Arc<ScriptedProvider>) {
     let (client, provider) = client_from(ScriptedProvider::new(calls));
-    let session = Session::builder(client)
+    let session = CodingRuntime::builder(client)
         .model("test/model")
         .environment(Arc::new(LocalEnvironment::new(workspace.path())))
         .tools(tools)
@@ -383,7 +383,7 @@ fn checkpoint_tool(reached: Arc<Notify>, release: Arc<Notify>) -> RegisteredTool
 /// task the session owns, and that task stops only when the session tells it
 /// to.
 async fn settled(
-    session: &mut Session,
+    session: &mut CodingRuntime,
     events: &mut broadcast::Receiver<CodingSessionEvent>,
 ) -> Vec<CodingEvent> {
     session

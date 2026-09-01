@@ -49,7 +49,7 @@ fn answers(text: &str) -> Vec<ScriptedCall> {
 }
 
 /// The tool results of the turn at `index`.
-fn tool_results(session: &Session, index: usize) -> Vec<ToolResult> {
+fn tool_results(session: &CodingRuntime, index: usize) -> Vec<ToolResult> {
     match session.history().turns().get(index) {
         Some(Message::ToolResults { results, .. }) => results.clone(),
         other => panic!("turn {index} should carry tool results, found {other:?}"),

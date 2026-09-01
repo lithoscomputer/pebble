@@ -115,7 +115,7 @@ fn person_probe(seen: Arc<Mutex<Vec<bool>>>) -> RegisteredTool {
 /// Answers with the session, its supervisor, and the token the child watches,
 /// which is what a test asserts the close reached.
 fn parent_waiting_on_a_blocked_child() -> (
-    Session,
+    CodingRuntime,
     SubagentSupervisor,
     CancellationToken,
     JoinHandle<()>,

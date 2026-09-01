@@ -56,8 +56,8 @@ use crate::error::{Error, ErrorData, ErrorKind, InterruptReason, Result};
 use crate::event::EventCapacity;
 use crate::profile::AgentProfile;
 use crate::redact::Redactor;
+use crate::runtime::{CodingRuntime, CodingRuntimeBuildError, ShutdownReason};
 use crate::search::SearchProvider;
-use crate::session::{Session, SessionBuildError, ShutdownReason};
 use crate::tool::{RegisteredTool, ToolEnvProvider, ToolError};
 use crate::types::{
     CodingEvent, CodingSessionEvent, INITIAL_SUBAGENT_GENERATION, SessionState, ToolErrorKind,
@@ -202,7 +202,7 @@ impl Drop for SessionSlot {
 /// Builds one child session from the dependencies pebble hands it.
 ///
 /// Registering a factory is what turns subagents on:
-/// [`SessionBuilder::subagents`](crate::advanced::SessionBuilder::subagents)
+/// [`CodingRuntimeBuilder::subagents`](crate::advanced::CodingRuntimeBuilder::subagents)
 /// registers the profile's subagent tools only when there is one, and a session
 /// without one answers every spawn with a tool error.
 ///
@@ -221,8 +221,9 @@ impl Drop for SessionSlot {
 /// let factory: SessionFactory = Arc::new(|spec: ChildSessionSpec| spec.build());
 /// # let _ = factory;
 /// ```
-pub type SessionFactory =
-    Arc<dyn Fn(ChildSessionSpec) -> StdResult<Session, SessionBuildError> + Send + Sync>;
+pub type SessionFactory = Arc<
+    dyn Fn(ChildSessionSpec) -> StdResult<CodingRuntime, CodingRuntimeBuildError> + Send + Sync,
+>;
 
 /// Everything a child session is built from.
 ///
@@ -294,8 +295,8 @@ impl ChildSessionSpec {
     ///
     /// # What a factory may still change
     ///
-    /// The session comes back owned, so the mutators [`Session`] exposes are
-    /// the factory's to use before it hands the child over — the tool
+    /// The session comes back owned, so the mutators [`CodingRuntime`] exposes
+    /// are the factory's to use before it hands the child over — the tool
     /// environment, the completion coordinator, how hard the model is asked to
     /// think. None of them widens a child: a tool, a permission, a hook, an
     /// environment, or a person to ask can reach a child only through this
@@ -307,13 +308,13 @@ impl ChildSessionSpec {
     ///
     /// # Errors
     ///
-    /// Returns [`SessionBuildError`] for the same reasons
-    /// [`SessionBuilder::build`](crate::advanced::SessionBuilder::build) does.
+    /// Returns [`CodingRuntimeBuildError`] for the same reasons
+    /// [`CodingRuntimeBuilder::build`](crate::advanced::CodingRuntimeBuilder::build) does.
     /// A parent that built successfully normally means its child does too,
     /// because the selector and the harness are the parent's own.
-    pub fn build(self) -> StdResult<Session, SessionBuildError> {
+    pub fn build(self) -> StdResult<CodingRuntime, CodingRuntimeBuildError> {
         let deps = Arc::clone(&self.deps);
-        let mut builder = Session::builder(deps.client.clone())
+        let mut builder = CodingRuntime::builder(deps.client.clone())
             .model(deps.model_selector.clone())
             .environment(Arc::clone(&deps.environment))
             .with_profile(Arc::clone(&deps.profile))
@@ -899,7 +900,7 @@ impl SubagentHandle {
 
 /// Runs one child session for as long as its supervisor keeps giving it turns.
 async fn run_subagent_session(
-    mut session: Session,
+    mut session: CodingRuntime,
     handle: SubagentHandle,
     initial_prompt: String,
     mut command_rx: mpsc::Receiver<StartTurn>,
@@ -982,7 +983,7 @@ async fn run_subagent_session(
 ///
 /// Cancellation always wins as the reported reason; otherwise a session that
 /// failed to start reports an error and one that ran reports completion.
-async fn shutdown_child(session: &mut Session, failed_to_start: bool) {
+async fn shutdown_child(session: &mut CodingRuntime, failed_to_start: bool) {
     let reason = if session.cancel_token().is_cancelled() {
         ShutdownReason::Cancelled
     } else if failed_to_start {
@@ -1173,7 +1174,7 @@ impl SubagentSupervisor {
     /// Puts a built child session under supervision and starts its turn.
     fn supervise(
         &self,
-        session: Session,
+        session: CodingRuntime,
         task_prompt: String,
         child_depth: usize,
         parent_notification_description: Option<String>,
@@ -1259,7 +1260,7 @@ impl SubagentSupervisor {
     /// the stream would sit out the whole grace period on every close.
     fn spawn_event_forwarder(
         &self,
-        session: &Session,
+        session: &CodingRuntime,
         stop: CancellationToken,
     ) -> Option<JoinHandle<()>> {
         if self
@@ -1912,8 +1913,8 @@ mod tests {
     use crate::error::ErrorKind;
     use crate::human_input::{Answer, HumanInputError, HumanInputProvider, Question};
     use crate::record::SessionRecord;
-    use crate::session::testing;
-    use crate::session::testing::{TestSession, noop_tool};
+    use crate::runtime::testing;
+    use crate::runtime::testing::{TestSession, noop_tool};
     use crate::test_support::{
         MockEnvironment, ScriptedCall, message_text, scripted_client, text_response,
     };
@@ -1975,7 +1976,7 @@ mod tests {
 
     /// The tools a session shows its model, by name, sorted so two sessions can
     /// be compared however their registries happen to iterate.
-    fn tool_names(session: &Session) -> Vec<String> {
+    fn tool_names(session: &CodingRuntime) -> Vec<String> {
         let mut names: Vec<String> = session
             .effective_tools()
             .iter()
@@ -1987,7 +1988,7 @@ mod tests {
 
     /// A parent session that may spawn children, and the supervisor it drives
     /// them with. Every child answers from the same script.
-    fn parent_over(answers: Vec<&str>) -> (Session, SubagentSupervisor) {
+    fn parent_over(answers: Vec<&str>) -> (CodingRuntime, SubagentSupervisor) {
         let calls = answers
             .into_iter()
             .map(|text| ScriptedCall::response(text_response(text)))
@@ -1997,14 +1998,14 @@ mod tests {
         (session, supervisor)
     }
 
-    fn supervisor_of(session: &Session) -> SubagentSupervisor {
+    fn supervisor_of(session: &CodingRuntime) -> SubagentSupervisor {
         session
             .subagent_supervisor()
             .expect("the test session was given a factory")
             .clone()
     }
 
-    fn spawn(supervisor: &SubagentSupervisor, parent: &Session, task: &str) -> String {
+    fn spawn(supervisor: &SubagentSupervisor, parent: &CodingRuntime, task: &str) -> String {
         supervisor
             .spawn(parent.id(), parent.root_session_id(), task.to_owned())
             .expect("the spawn succeeds")
@@ -2012,7 +2013,7 @@ mod tests {
 
     fn spawn_notifying(
         supervisor: &SubagentSupervisor,
-        parent: &Session,
+        parent: &CodingRuntime,
         task: &str,
         description: &str,
     ) -> String {
@@ -2042,7 +2043,11 @@ mod tests {
     /// children.
     fn parent_over_recording_children(
         answers: Vec<&str>,
-    ) -> (Session, SubagentSupervisor, Arc<Mutex<Vec<ChildHandle>>>) {
+    ) -> (
+        CodingRuntime,
+        SubagentSupervisor,
+        Arc<Mutex<Vec<ChildHandle>>>,
+    ) {
         let recorded: Arc<Mutex<Vec<ChildHandle>>> = Arc::new(Mutex::new(Vec::new()));
         let recorder = Arc::clone(&recorded);
         let factory: SessionFactory = Arc::new(move |spec: ChildSessionSpec| {
@@ -3488,7 +3493,7 @@ mod tests {
         // though the tree above it is the application's to rebuild.
         let (client, _resumed_provider) =
             scripted_client(vec![ScriptedCall::response(text_response("resumed"))]);
-        let mut resumed = Session::from_record(&record, testing::builder(client))
+        let mut resumed = CodingRuntime::from_record(&record, testing::builder(client))
             .expect("the child's record resumes");
         assert_eq!(
             resumed.to_record().parent_session_id.as_deref(),
@@ -4073,7 +4078,7 @@ mod tests {
 
     /// A parent whose one child takes a whole minute to answer, so the child is
     /// reliably still running when the parent reaches a boundary.
-    fn parent_over_a_slow_child() -> (Session, SubagentSupervisor) {
+    fn parent_over_a_slow_child() -> (CodingRuntime, SubagentSupervisor) {
         let (session, _provider) =
             TestSession::new(vec![ScriptedCall::response(text_response("late result"))])
                 .delayed(Duration::from_secs(60))

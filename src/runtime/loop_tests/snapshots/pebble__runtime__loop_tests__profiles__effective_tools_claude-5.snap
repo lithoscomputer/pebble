@@ -1,5 +1,5 @@
 ---
-source: src/session/loop_tests/profiles.rs
+source: src/runtime/loop_tests/profiles.rs
 expression: rendered
 ---
 nothing configured:

@@ -1,7 +1,7 @@
 //! What the session's own tests are built from.
 //!
 //! Every test here injects a profile through
-//! [`SessionBuilder::with_profile`](super::SessionBuilder::with_profile),
+//! [`CodingRuntimeBuilder::with_profile`](super::CodingRuntimeBuilder::with_profile),
 //! rather than taking the built-in one its model resolves to: what these tests
 //! are about is the loop, and a harness that contributes nothing keeps a tool
 //! list or a prompt from a shipped profile out of every assertion. The tests
@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tokio::task::yield_now;
 
-use super::{RetryEventObserver, Session, SessionBuilder, ShutdownReason};
+use super::{CodingRuntime, CodingRuntimeBuilder, RetryEventObserver, ShutdownReason};
 use crate::config::CodingSessionOptions;
 use crate::environment::Environment;
 use crate::history::History;
@@ -174,7 +174,7 @@ impl TestSession {
     }
 
     /// A session whose provider answers every round with one response.
-    pub(crate) fn answering(calls: Vec<ScriptedCall>) -> (Session, Arc<ScriptedProvider>) {
+    pub(crate) fn answering(calls: Vec<ScriptedCall>) -> (CodingRuntime, Arc<ScriptedProvider>) {
         Self::new(calls).build()
     }
 
@@ -233,7 +233,7 @@ impl TestSession {
     }
 
     /// Builds the session, and the provider handle its script is read from.
-    pub(crate) fn build(self) -> (Session, Arc<ScriptedProvider>) {
+    pub(crate) fn build(self) -> (CodingRuntime, Arc<ScriptedProvider>) {
         let provider = ScriptedProvider::new(self.calls)
             .completing(self.completions)
             .delayed(self.delay);
@@ -256,7 +256,7 @@ impl TestSession {
         let environment = self
             .environment
             .unwrap_or_else(|| Arc::new(MockEnvironment::linux()));
-        let mut builder = Session::builder(client)
+        let mut builder = CodingRuntime::builder(client)
             .model(self.model)
             .environment(environment)
             .with_profile(TestProfile::with_tools(self.tools))
@@ -280,8 +280,8 @@ impl TestSession {
 }
 
 /// A builder for a session on `client`, with nothing scripted.
-pub(crate) fn builder(client: Client) -> SessionBuilder {
-    Session::builder(client)
+pub(crate) fn builder(client: Client) -> CodingRuntimeBuilder {
+    CodingRuntime::builder(client)
         .model("test/model")
         .environment(Arc::new(MockEnvironment::linux()))
         .with_profile(TestProfile::shared())
@@ -302,7 +302,7 @@ pub(crate) fn history_from(turns: Vec<Message>) -> History {
 /// Shutting down first is what makes the list complete: nothing is published
 /// until the pump runs, and the pump stops only when the session tells it to.
 pub(crate) async fn settled(
-    session: &mut Session,
+    session: &mut CodingRuntime,
     receiver: &mut broadcast::Receiver<CodingSessionEvent>,
 ) -> Vec<CodingEvent> {
     session

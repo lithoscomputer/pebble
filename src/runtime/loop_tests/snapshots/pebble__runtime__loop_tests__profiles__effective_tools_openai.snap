@@ -1,79 +1,74 @@
 ---
-source: src/session/loop_tests/profiles.rs
+source: src/runtime/loop_tests/profiles.rs
 expression: rendered
 ---
 nothing configured:
-  edit_file
+  apply_patch
   glob
   grep
-  list_dir
   read_file
-  read_many_files
   shell
+  update_plan
   web_fetch
   write_file
 search:
-  edit_file
+  apply_patch
   glob
   grep
-  list_dir
   read_file
-  read_many_files
   shell
+  update_plan
   web_fetch
   web_search
   write_file
 subagents:
+  apply_patch
   close_agent
-  edit_file
   glob
   grep
-  list_dir
   read_file
-  read_many_files
   send_input
   shell
   spawn_agent
+  update_plan
   wait
   web_fetch
   write_file
 search + subagents (also what a child is shown):
+  apply_patch
   close_agent
-  edit_file
   glob
   grep
-  list_dir
   read_file
-  read_many_files
   send_input
   shell
   spawn_agent
+  update_plan
   wait
   web_fetch
   web_search
   write_file
 a skill was discovered:
-  edit_file
+  apply_patch
   glob
   grep
-  list_dir
   read_file
-  read_many_files
   shell
+  update_plan
   use_skill
   web_fetch
   write_file
 everything, root only:
+  apply_patch
   close_agent
-  edit_file
   glob
   grep
-  list_dir
   read_file
-  read_many_files
+  request_user_input
   send_input
   shell
   spawn_agent
+  update_plan
   use_skill
   wait
   web_fetch

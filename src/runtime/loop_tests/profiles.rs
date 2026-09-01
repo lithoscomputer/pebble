@@ -60,8 +60,8 @@ fn shipped_client() -> Client {
 }
 
 /// The harness a session on the shipped catalog resolves `selector` to.
-fn resolved_profile(selector: &str) -> StdResult<AgentProfileKind, SessionBuildError> {
-    Session::builder(shipped_client())
+fn resolved_profile(selector: &str) -> StdResult<AgentProfileKind, CodingRuntimeBuildError> {
+    CodingRuntime::builder(shipped_client())
         .model(selector)
         .environment(Arc::new(MockEnvironment::linux()))
         .build()
@@ -106,7 +106,7 @@ async fn the_shipped_catalog_says_which_models_reason_without_being_asked() {
     // takes only a thinking budget reasons when it is asked to, and a row
     // that knows better says so itself.
     let reasons = |selector: &str| {
-        Session::builder(shipped_client())
+        CodingRuntime::builder(shipped_client())
             .model(selector)
             .environment(Arc::new(MockEnvironment::linux()))
             .with_profile(TestProfile::shared())
@@ -138,7 +138,7 @@ async fn a_model_naming_a_profile_pebble_does_not_know_is_refused() {
     assert!(
         matches!(
             error,
-            SessionBuildError::UnknownProfile { ref profile, .. } if profile == "nonesuch"
+            CodingRuntimeBuildError::UnknownProfile { ref profile, .. } if profile == "nonesuch"
         ),
         "{error:?}"
     );
@@ -195,7 +195,7 @@ fn one_skill() -> Arc<MockEnvironment> {
 
 /// An initialized session on the shipped catalog, so its prompt is built and
 /// the tools `initialize` adds for itself are registered.
-async fn initialized(selector: &str, configured: Configured) -> Session {
+async fn initialized(selector: &str, configured: Configured) -> CodingRuntime {
     let (environment, options) = if configured.skills {
         (one_skill(), CodingSessionOptions {
             skill_dirs: vec!["/skills".to_owned()],
@@ -207,7 +207,7 @@ async fn initialized(selector: &str, configured: Configured) -> Session {
             CodingSessionOptions::default(),
         )
     };
-    let mut builder = Session::builder(shipped_client())
+    let mut builder = CodingRuntime::builder(shipped_client())
         .model(selector)
         .environment(environment)
         .options(options);
@@ -226,7 +226,7 @@ async fn initialized(selector: &str, configured: Configured) -> Session {
 }
 
 /// Whether `session` advertises a tool called `name`.
-fn advertises(session: &Session, name: &str) -> bool {
+fn advertises(session: &CodingRuntime, name: &str) -> bool {
     session
         .effective_tools()
         .iter()
@@ -234,7 +234,7 @@ fn advertises(session: &Session, name: &str) -> bool {
 }
 
 /// Every tool `session` shows its model, sorted.
-fn tool_names(session: &Session) -> Vec<String> {
+fn tool_names(session: &CodingRuntime) -> Vec<String> {
     let mut names: Vec<String> = session
         .effective_tools()
         .into_iter()
@@ -264,7 +264,7 @@ const SHIPPED: [(&str, AgentProfileKind, bool); 6] = [
 ];
 
 /// What `session`'s model calls the search tool.
-fn search_tool_name(session: &Session) -> &'static str {
+fn search_tool_name(session: &CodingRuntime) -> &'static str {
     NativeTool::WebSearch.name(session.registry.vocabulary())
 }
 
@@ -344,7 +344,7 @@ async fn the_route_decides_which_file_editor_the_openai_harness_offers() {
 /// tool it was never given if the two came apart.
 #[tokio::test]
 async fn the_route_decides_which_file_editor_the_gpt56_harness_offers() {
-    let describe_shell = |session: &Session| {
+    let describe_shell = |session: &CodingRuntime| {
         session
             .effective_tools()
             .into_iter()
@@ -562,7 +562,7 @@ async fn a_child_is_shown_its_parents_tools_without_the_person_to_ask() {
     });
 
     let (client, _provider) = scripted_client(answers("done"));
-    let mut parent = Session::builder(client)
+    let mut parent = CodingRuntime::builder(client)
         .model("test/model")
         .environment(Arc::new(MockEnvironment::linux()))
         .search_provider(Arc::new(Unused))
@@ -689,7 +689,7 @@ async fn a_child_is_never_told_to_ask_the_user_a_question() {
     });
 
     let (client, provider) = claude5_scripted_client(answers("done"));
-    let mut parent = Session::builder(client)
+    let mut parent = CodingRuntime::builder(client)
         .model("test/claude-5")
         .environment(Arc::new(MockEnvironment::linux()))
         .search_provider(Arc::new(Unused))
@@ -755,7 +755,7 @@ async fn a_model_naming_no_profile_anywhere_is_refused() {
     // exists in a catalog an application wrote: the scripted `bare` provider.
     let (client, _provider) = scripted_client(answers("done"));
 
-    let error = Session::builder(client)
+    let error = CodingRuntime::builder(client)
         .model("bare/plain")
         .environment(Arc::new(MockEnvironment::linux()))
         .build()
@@ -764,7 +764,7 @@ async fn a_model_naming_no_profile_anywhere_is_refused() {
     assert!(
         matches!(
             error,
-            SessionBuildError::MissingProfileMetadata { ref model } if model == "bare/plain"
+            CodingRuntimeBuildError::MissingProfileMetadata { ref model } if model == "bare/plain"
         ),
         "{error:?}"
     );

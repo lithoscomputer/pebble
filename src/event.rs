@@ -25,7 +25,8 @@
 //! stopped and been joined, every live receiver reads out whatever it still
 //! holds and then observes `RecvError::Closed`, however many emitter clones
 //! are still alive. That is what lets a reader loop until `Closed` and end,
-//! and it is the guarantee [`crate::advanced::Session::shutdown`] rests on.
+//! and it is the guarantee [`crate::advanced::CodingRuntime::shutdown`] rests
+//! on.
 
 use std::error::Error as StdError;
 use std::fmt;

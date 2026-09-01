@@ -127,7 +127,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::session::testing::history_from;
+    use crate::runtime::testing::history_from;
     use crate::types::TokenUsage;
 
     fn assistant(tool_name: Option<&str>) -> Message {
