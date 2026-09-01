@@ -200,7 +200,7 @@ impl CodingSessionBuilder {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 struct CodingPromptState {
     running: bool,
     closed:  bool,
@@ -256,14 +256,10 @@ impl CodingControl {
     }
 
     fn state(&self) -> CodingPromptState {
-        let state = self
+        *self
             .prompt_state
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        CodingPromptState {
-            running: state.running,
-            closed:  state.closed,
-        }
+            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 

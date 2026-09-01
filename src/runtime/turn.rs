@@ -44,7 +44,7 @@ use crate::tool::{
 };
 use crate::types::{
     CodingEvent, ContextWindowSnapshot, CostSource, LlmOutputKind, LlmRetryPhase, Message,
-    SessionState, SkillActivationSource, TokenUsage, ToolErrorKind,
+    SessionState, SkillActivationSource, TokenUsage, ToolErrorKind, message_text,
 };
 
 /// How many failed response streams Pebble replays after the first attempt.
@@ -246,24 +246,28 @@ impl CodingAgentBridge {
     }
 
     async fn compact_if_needed(&self) -> bool {
-        let (mut history, file_tracker) = {
+        let estimate = {
             let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            (state.history.clone(), state.file_tracker.clone())
+            check_context_usage(
+                &self.system_prompt,
+                &state.history,
+                self.facts.context_window_tokens,
+                self.config.compaction_threshold_percent,
+                &self.emitter,
+                &self.session_id,
+            )
         };
-        let Some(estimate) = check_context_usage(
-            &self.system_prompt,
-            &history,
-            self.facts.context_window_tokens,
-            self.config.compaction_threshold_percent,
-            &self.emitter,
-            &self.session_id,
-        ) else {
+        let Some(estimate) = estimate else {
             return false;
         };
         if !self.config.enable_context_compaction {
             return false;
         }
 
+        let (mut history, file_tracker) = {
+            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            (state.history.clone(), state.file_tracker.clone())
+        };
         let request = CompactionRequest {
             model: &self.model_selector,
             facts: self.facts,
@@ -290,6 +294,21 @@ impl CodingAgentBridge {
             .unwrap_or_else(PoisonError::into_inner)
             .history = history;
         false
+    }
+
+    /// Compacts once per prompt, remembering a failure so it is not retried.
+    async fn compact_once_if_needed(&self) {
+        let compaction_failed = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .compaction_failed;
+        if !compaction_failed && self.compact_if_needed().await {
+            self.state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .compaction_failed = true;
+        }
     }
 
     fn stage_task_reminder(&self) {
@@ -502,10 +521,11 @@ impl agent::EventProjection for CodingAgentBridge {
 
 impl agent::ToolProvider for CodingAgentBridge {
     fn tools_for_turn(&self, _context: agent::TurnContext<'_>) -> Vec<agent::Tool> {
+        let executor: Arc<dyn agent::ToolExecutor> = Arc::new(UnusedToolExecutor);
         self.registry
             .definitions_with_source()
             .into_iter()
-            .map(|tool| agent::Tool::new(tool.definition, Arc::new(UnusedToolExecutor)))
+            .map(|tool| agent::Tool::new(tool.definition, Arc::clone(&executor)))
             .collect()
     }
 }
@@ -660,17 +680,7 @@ impl agent::TurnBoundaryHooks for CodingAgentBridge {
             return Ok(());
         }
 
-        let compaction_failed = self
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .compaction_failed;
-        if !compaction_failed && self.compact_if_needed().await {
-            self.state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .compaction_failed = true;
-        }
+        self.compact_once_if_needed().await;
         self.stage_task_reminder();
         self.sync_messages(&mut context, true);
         Ok(())
@@ -682,17 +692,7 @@ impl agent::TurnBoundaryHooks for CodingAgentBridge {
         _response: &Response,
         _cancel: &CancellationToken,
     ) -> StdResult<(), agent::TurnBoundaryError> {
-        let compaction_failed = self
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .compaction_failed;
-        if !compaction_failed && self.compact_if_needed().await {
-            self.state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .compaction_failed = true;
-        }
+        self.compact_once_if_needed().await;
         self.sync_messages(&mut context, false);
         Ok(())
     }
@@ -855,7 +855,7 @@ impl CodingRuntime {
             return Ok(());
         }
 
-        let bridge = CodingAgentBridge::from_runtime(self);
+        let bridge = Arc::new(CodingAgentBridge::from_runtime(self));
         let model_service = CodingModelService {
             client:     self.client.clone(),
             emitter:    self.emitter.clone(),
@@ -880,12 +880,12 @@ impl CodingRuntime {
         let agent = agent::Agent::builder(model_service, self.model_selector.clone())
             .system_prompt(self.system_prompt.clone())
             .messages(messages)
-            .tool_provider(Arc::new(bridge.clone()))
-            .tool_access_policy(Arc::new(bridge.clone()))
-            .tool_call_hooks(Arc::new(bridge.clone()))
-            .tool_round_executor(Arc::new(bridge.clone()))
-            .turn_boundary_hooks(Arc::new(bridge.clone()))
-            .event_projection(Arc::new(bridge.clone()))
+            .tool_provider(bridge.clone())
+            .tool_access_policy(bridge.clone())
+            .tool_call_hooks(bridge.clone())
+            .tool_round_executor(bridge.clone())
+            .turn_boundary_hooks(bridge.clone())
+            .event_projection(bridge.clone())
             .config(config)
             .build()
             .map_err(|error| Error::InvalidState(format!("building the coding agent: {error}")))?;
@@ -942,17 +942,6 @@ impl CodingRuntime {
             .or_else(from_catalog)
             .filter(|tokens| *tokens > 0)
     }
-}
-
-fn message_text(message: &LlmMessage) -> String {
-    message
-        .content()
-        .iter()
-        .filter_map(|part| match part {
-            ContentPart::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect()
 }
 
 fn tool_calls_of(response: &Response) -> Vec<ToolCall> {

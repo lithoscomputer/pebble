@@ -38,6 +38,18 @@ use crate::error::ErrorData;
 use crate::reasoning::ReasoningOutput;
 use crate::record::StoredMessage;
 
+/// The concatenated text of one message's `Text` content parts.
+pub(crate) fn message_text(message: &LlmMessage) -> String {
+    message
+        .content()
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 /// The generation of a subagent's first turn.
 pub const INITIAL_SUBAGENT_GENERATION: u64 = 1;
 

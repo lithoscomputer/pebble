@@ -38,6 +38,8 @@ use serde_json::{Value, json};
 use tokio::sync::Notify;
 use tokio::time::sleep;
 
+use crate::types::message_text as message_text_of;
+
 /// The catalog the scripted client resolves against.
 ///
 /// Two providers, because a session's harness is chosen from catalog metadata
@@ -668,12 +670,5 @@ pub fn scripted_client_builder(
 /// The concatenated text of one request message.
 #[must_use]
 pub fn message_text(message: &Message) -> String {
-    message
-        .content()
-        .iter()
-        .filter_map(|part| match part {
-            ContentPart::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect()
+    message_text_of(message)
 }

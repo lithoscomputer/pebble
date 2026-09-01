@@ -43,7 +43,6 @@
 //! ```
 
 mod agent;
-mod context;
 mod control;
 mod error;
 mod event;
@@ -57,7 +56,6 @@ pub use self::agent::{
     Agent, AgentBuilder, AgentConfig, AgentSnapshot, AgentState, PromptOutcome, ToolExecution,
     UserMessage,
 };
-pub use self::context::{ContextTransform, ContextTransformError, TransformContext};
 pub use self::control::AgentControlHandle;
 pub use self::error::{AgentBuildError, AgentError, Result};
 pub use self::event::{AgentEvent, EventProjection, FirstOutputKind};

@@ -233,6 +233,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::types::message_text;
 
     fn now() -> SystemTime {
         SystemTime::now()
@@ -285,17 +286,6 @@ mod tests {
             signature_origin: signature.map(|_| "anthropic".to_owned()),
             redacted:         false,
         })
-    }
-
-    fn text_of(message: &LlmMessage) -> String {
-        message
-            .content()
-            .iter()
-            .filter_map(|part| match part {
-                ContentPart::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect()
     }
 
     #[test]
@@ -430,7 +420,7 @@ mod tests {
 
         let messages = history.to_llm_messages();
         assert_eq!(messages[0].role(), Role::System);
-        assert!(text_of(&messages[0]).contains("[Context Summary]"));
+        assert!(message_text(&messages[0]).contains("[Context Summary]"));
     }
 
     #[test]
@@ -451,7 +441,7 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role(), Role::User);
-        assert_eq!(text_of(&messages[0]), "Hello");
+        assert_eq!(message_text(&messages[0]), "Hello");
     }
 
     #[test]
@@ -463,7 +453,7 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role(), Role::Assistant);
-        assert_eq!(text_of(&messages[0]), "Hi there");
+        assert_eq!(message_text(&messages[0]), "Hi there");
     }
 
     #[test]
@@ -592,7 +582,7 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role(), Role::System);
-        assert_eq!(text_of(&messages[0]), "You are a coding assistant");
+        assert_eq!(message_text(&messages[0]), "You are a coding assistant");
     }
 
     #[test]
@@ -607,7 +597,7 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role(), Role::User);
-        assert_eq!(text_of(&messages[0]), "Focus on the main task");
+        assert_eq!(message_text(&messages[0]), "Focus on the main task");
     }
 
     #[test]

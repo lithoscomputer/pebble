@@ -848,7 +848,7 @@ pub struct CodingRuntime {
     /// the first prompt and retained for the rest of the session.
     coding_agent: Option<Agent>,
     /// Coding state and durable projection shared with `coding_agent`.
-    coding_bridge: Option<CodingAgentBridge>,
+    coding_bridge: Option<Arc<CodingAgentBridge>>,
 }
 
 impl fmt::Debug for CodingRuntime {

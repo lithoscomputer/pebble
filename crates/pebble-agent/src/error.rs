@@ -5,7 +5,6 @@ use std::result::Result as StdResult;
 use lithos_llm::types::{Error as LlmError, RequestBuildError};
 use thiserror::Error;
 
-use crate::context::ContextTransformError;
 use crate::turn::TurnBoundaryError;
 
 /// A result returned while an agent processes a prompt.
@@ -61,13 +60,6 @@ pub enum AgentError {
         /// The model-layer failure.
         #[source]
         source: LlmError,
-    },
-    /// The configured context transformation failed.
-    #[error("preparing the next model turn")]
-    ContextTransform {
-        /// The transformation failure.
-        #[source]
-        source: ContextTransformError,
     },
     /// A configured turn-boundary hook failed.
     #[error("processing a model-turn boundary")]

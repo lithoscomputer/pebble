@@ -15,7 +15,6 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::advanced::{StreamObserver, StreamOutcome, stream_response};
-use crate::context::{ContextTransform, TransformContext};
 use crate::control::{AgentControlHandle, Control};
 use crate::error::{AgentBuildError, AgentError, Result};
 use crate::event::{AgentEvent, EventHub, EventProjection, FirstOutputKind};
@@ -122,37 +121,35 @@ impl Default for AgentConfig {
 /// Collects the required model service and optional agent behavior.
 #[must_use = "a builder does nothing until `build` is called"]
 pub struct AgentBuilder {
-    model_service:     Arc<dyn ModelService>,
-    model:             String,
-    system_prompt:     String,
-    messages:          Vec<Message>,
-    tools:             Vec<Tool>,
-    tool_provider:     Option<Arc<dyn ToolProvider>>,
-    tool_access:       Option<Arc<dyn ToolAccessPolicy>>,
-    tool_hooks:        Option<Arc<dyn ToolCallHooks>>,
-    tool_round:        Option<Arc<dyn ToolRoundExecutor>>,
-    context_transform: Option<Arc<dyn ContextTransform>>,
-    turn_hooks:        Option<Arc<dyn TurnBoundaryHooks>>,
-    event_projection:  Option<Arc<dyn EventProjection>>,
-    config:            AgentConfig,
+    model_service:    Arc<dyn ModelService>,
+    model:            String,
+    system_prompt:    String,
+    messages:         Vec<Message>,
+    tools:            Vec<Tool>,
+    tool_provider:    Option<Arc<dyn ToolProvider>>,
+    tool_access:      Option<Arc<dyn ToolAccessPolicy>>,
+    tool_hooks:       Option<Arc<dyn ToolCallHooks>>,
+    tool_round:       Option<Arc<dyn ToolRoundExecutor>>,
+    turn_hooks:       Option<Arc<dyn TurnBoundaryHooks>>,
+    event_projection: Option<Arc<dyn EventProjection>>,
+    config:           AgentConfig,
 }
 
 impl AgentBuilder {
     fn new(service: impl ModelService + 'static, model: impl Into<String>) -> Self {
         Self {
-            model_service:     Arc::new(service),
-            model:             model.into(),
-            system_prompt:     String::new(),
-            messages:          Vec::new(),
-            tools:             Vec::new(),
-            tool_provider:     None,
-            tool_access:       None,
-            tool_hooks:        None,
-            tool_round:        None,
-            context_transform: None,
-            turn_hooks:        None,
-            event_projection:  None,
-            config:            AgentConfig::default(),
+            model_service:    Arc::new(service),
+            model:            model.into(),
+            system_prompt:    String::new(),
+            messages:         Vec::new(),
+            tools:            Vec::new(),
+            tool_provider:    None,
+            tool_access:      None,
+            tool_hooks:       None,
+            tool_round:       None,
+            turn_hooks:       None,
+            event_projection: None,
+            config:           AgentConfig::default(),
         }
     }
 
@@ -198,12 +195,6 @@ impl AgentBuilder {
     /// Replaces the default generic executor for complete tool rounds.
     pub fn tool_round_executor(mut self, executor: Arc<dyn ToolRoundExecutor>) -> Self {
         self.tool_round = Some(executor);
-        self
-    }
-
-    /// Sets the transformation run before each model request.
-    pub fn context_transform(mut self, transform: Arc<dyn ContextTransform>) -> Self {
-        self.context_transform = Some(transform);
         self
     }
 
@@ -257,7 +248,6 @@ impl AgentBuilder {
             tool_access: self.tool_access,
             tool_hooks: self.tool_hooks,
             tool_round: self.tool_round,
-            context_transform: self.context_transform,
             turn_hooks: self.turn_hooks,
             config: self.config,
             events,
@@ -348,20 +338,19 @@ impl PromptOutcome {
 
 /// One provider-neutral active conversation.
 pub struct Agent {
-    model_service:     Arc<dyn ModelService>,
-    model:             String,
-    system_prompt:     String,
-    messages:          Vec<Message>,
-    tools:             Vec<Tool>,
-    tool_provider:     Option<Arc<dyn ToolProvider>>,
-    tool_access:       Option<Arc<dyn ToolAccessPolicy>>,
-    tool_hooks:        Option<Arc<dyn ToolCallHooks>>,
-    tool_round:        Option<Arc<dyn ToolRoundExecutor>>,
-    context_transform: Option<Arc<dyn ContextTransform>>,
-    turn_hooks:        Option<Arc<dyn TurnBoundaryHooks>>,
-    config:            AgentConfig,
-    events:            EventHub,
-    control:           Arc<Control>,
+    model_service: Arc<dyn ModelService>,
+    model:         String,
+    system_prompt: String,
+    messages:      Vec<Message>,
+    tools:         Vec<Tool>,
+    tool_provider: Option<Arc<dyn ToolProvider>>,
+    tool_access:   Option<Arc<dyn ToolAccessPolicy>>,
+    tool_hooks:    Option<Arc<dyn ToolCallHooks>>,
+    tool_round:    Option<Arc<dyn ToolRoundExecutor>>,
+    turn_hooks:    Option<Arc<dyn TurnBoundaryHooks>>,
+    config:        AgentConfig,
+    events:        EventHub,
+    control:       Arc<Control>,
 }
 
 impl Agent {
@@ -567,18 +556,6 @@ impl Agent {
                         continue;
                     }
                     prepared.map_err(|source| AgentError::TurnBoundary { source })?;
-                }
-                if let Some(transform) = &self.context_transform {
-                    let context = TransformContext::new(&self.model, &mut self.messages);
-                    let transformed = transform.transform(context, &round_cancel).await;
-                    if prompt_cancel.is_cancelled() {
-                        return Err(AgentError::Aborted);
-                    }
-                    if round_cancel.is_cancelled() {
-                        self.emit(AgentEvent::TurnInterrupted);
-                        continue;
-                    }
-                    transformed.map_err(|source| AgentError::ContextTransform { source })?;
                 }
 
                 let tools = self.resolve_tools(turn_count)?;
@@ -846,64 +823,8 @@ impl Agent {
         let resolved = tools
             .iter()
             .find(|tool| tool.tool.definition().name == call.name);
-        let denied = resolved.and_then(|resolved| match &resolved.access {
-            ToolAccess::Allowed => None,
-            ToolAccess::Denied { reason } => Some(reason.clone()),
-        });
-        let (result, error_kind, call_after_hook) = if let Some(reason) = denied {
-            (error_tool_result(call, reason), None, false)
-        } else {
-            let hook_context = ToolCallContext::new(turn, call);
-            let decision = match &self.tool_hooks {
-                Some(hooks) => hooks.before_tool_call(hook_context, cancel).await,
-                None => BeforeToolCall::Proceed,
-            };
-            match decision {
-                BeforeToolCall::Block { reason } => (error_tool_result(call, reason), None, false),
-                BeforeToolCall::Proceed => {
-                    let (result, error_kind) = match resolved {
-                        Some(resolved) => {
-                            if let Err(error) = validate_tool_arguments(
-                                &resolved.tool.definition().kind,
-                                &call.arguments,
-                            ) {
-                                (
-                                    error_tool_result(call, error.to_string()),
-                                    Some(ToolErrorKind::InvalidArguments),
-                                )
-                            } else {
-                                let context = ToolContext::new(
-                                    call.id.clone(),
-                                    call.name.clone(),
-                                    cancel.clone(),
-                                    self.events.clone(),
-                                );
-                                match resolved.tool.execute(context, call.arguments.clone()).await {
-                                    Ok(output) => (
-                                        ToolResult {
-                                            tool_call_id: call.id.clone(),
-                                            name:         Some(call.name.clone()),
-                                            content:      nonempty_content(output.into_content()),
-                                            is_error:     false,
-                                        },
-                                        None,
-                                    ),
-                                    Err(error) => (
-                                        error_tool_result(call, error.to_string()),
-                                        Some(ToolErrorKind::Execution),
-                                    ),
-                                }
-                            }
-                        }
-                        None => (
-                            error_tool_result(call, format!("unknown tool `{}`", call.name)),
-                            Some(ToolErrorKind::Unavailable),
-                        ),
-                    };
-                    (result, error_kind, true)
-                }
-            }
-        };
+        let (result, error_kind, call_after_hook) =
+            self.run_tool_call(turn, call, resolved, cancel).await;
         self.emit(AgentEvent::ToolCompleted {
             result: result.clone(),
         });
@@ -917,6 +838,78 @@ impl Agent {
                 .await;
         }
         result
+    }
+
+    /// Produces the tool result and whether the after-call hook should run.
+    ///
+    /// Returns `call_after_hook = false` when access was denied or a
+    /// before-call hook blocked the call, so the after-call hook only sees
+    /// calls that were allowed to proceed.
+    async fn run_tool_call(
+        &self,
+        turn: usize,
+        call: &ToolCall,
+        resolved: Option<&ResolvedTool>,
+        cancel: &CancellationToken,
+    ) -> (ToolResult, Option<ToolErrorKind>, bool) {
+        if let Some(resolved) = resolved
+            && let ToolAccess::Denied { reason } = &resolved.access
+        {
+            return (error_tool_result(call, reason.clone()), None, false);
+        }
+
+        let decision = match &self.tool_hooks {
+            Some(hooks) => {
+                hooks
+                    .before_tool_call(ToolCallContext::new(turn, call), cancel)
+                    .await
+            }
+            None => BeforeToolCall::Proceed,
+        };
+        if let BeforeToolCall::Block { reason } = decision {
+            return (error_tool_result(call, reason), None, false);
+        }
+
+        let Some(resolved) = resolved else {
+            return (
+                error_tool_result(call, format!("unknown tool `{}`", call.name)),
+                Some(ToolErrorKind::Unavailable),
+                true,
+            );
+        };
+        if let Err(error) =
+            validate_tool_arguments(&resolved.tool.definition().kind, &call.arguments)
+        {
+            return (
+                error_tool_result(call, error.to_string()),
+                Some(ToolErrorKind::InvalidArguments),
+                true,
+            );
+        }
+
+        let context = ToolContext::new(
+            call.id.clone(),
+            call.name.clone(),
+            cancel.clone(),
+            self.events.clone(),
+        );
+        match resolved.tool.execute(context, call.arguments.clone()).await {
+            Ok(output) => (
+                ToolResult {
+                    tool_call_id: call.id.clone(),
+                    name:         Some(call.name.clone()),
+                    content:      nonempty_content(output.into_content()),
+                    is_error:     false,
+                },
+                None,
+                true,
+            ),
+            Err(error) => (
+                error_tool_result(call, error.to_string()),
+                Some(ToolErrorKind::Execution),
+                true,
+            ),
+        }
     }
 
     fn emit(&self, event: AgentEvent) {
