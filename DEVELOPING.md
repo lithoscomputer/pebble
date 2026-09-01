@@ -1,6 +1,8 @@
 # Developing
 
-TODO: Replace this introduction with project-specific development notes.
+Pebble is a library crate with one example binary. Most work is a change to
+`src/`, its unit tests beside it, and the contract tests in `tests/`. The
+example is how a change is seen working against a real model.
 
 ## Setup
 
@@ -26,7 +28,7 @@ mise run setup
 
 | Command | Purpose |
 | --- | --- |
-| `mise run dev` | Check the library |
+| `mise run dev` | Run the coding-agent example against a live provider |
 | `mise run fmt` | Format Rust code |
 | `mise run fmt:check` | Check formatting without changing files |
 | `mise run lint` | Run Clippy with warnings denied |
@@ -36,6 +38,52 @@ mise run setup
 | `mise run check:nightly` | Run the extended verification gate |
 
 Run `mise run check` before opening a pull request.
+
+## Running the example
+
+`examples/coding_agent.rs` runs a real session: it builds a client, works in a
+new directory under the system temporary directory, steers one run, interrupts
+another, and prints what the session used. It is the only thing in the
+repository that calls a provider.
+
+```sh
+# The default model, claude-sonnet-5.
+mise run dev
+
+# Any selector the built-in catalog knows.
+cargo run --locked --example coding_agent -- gpt-5.6
+```
+
+It needs a key for whichever provider the model resolves to, in the variable
+lithos-llm reads for that provider: `ANTHROPIC_API_KEY` for the default model,
+`OPENAI_API_KEY`, `GEMINI_API_KEY`, and so on. Credentials are resolved per
+call, so a missing key fails the first model call rather than the build.
+
+The example prints the directory it worked in and leaves it behind, so the
+files the model wrote can be read afterwards. Nothing removes them; they are
+under the system temporary directory.
+
+## Running the tests
+
+```sh
+# Every test, through Nextest.
+mise run test
+
+# The documentation tests, which Nextest does not run.
+mise run test:doc
+
+# Just the end-to-end suite.
+cargo nextest run --locked --all-features --test e2e
+```
+
+Unit tests live beside the code they cover. `tests/` holds the contract tests:
+the serialized event stream and record format (`event_contract.rs`,
+`record_contract.rs`), message conversion, tool dispatch, the event pipeline,
+and `e2e.rs` — the example's own flow, driven through the scripted provider
+and a real temporary directory, so it needs no credentials and no network.
+
+Tests that reach `pebble::test_support` need the `test-util` feature, which is
+why the test tasks pass `--all-features`.
 
 ## Rust policy
 

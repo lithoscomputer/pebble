@@ -190,6 +190,15 @@ mod types;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_support;
 
+// The README's session is the snippet most readers start from, so the
+// verification gate compiles it: `cargo test --doc` builds every Rust block in
+// the file, and the one there is marked `no_run` because it would call a
+// provider. Nothing else compiles this module and it appears in no
+// documentation — rustdoc defines `doctest` only while it collects them.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+mod readme {}
+
 /// How a failed model call is spaced before it is tried again, carried by
 /// [`SessionOptions::retry_policy`].
 ///

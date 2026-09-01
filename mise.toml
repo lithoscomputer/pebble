@@ -19,8 +19,8 @@ description = "Prepare the pinned Rust style guide"
 run = "bin/style-guides prepare"
 
 [tasks.dev]
-description = "Check the library"
-run = "cargo check --locked"
+description = "Run the coding-agent example against a live provider"
+run = "cargo run --locked --example coding_agent"
 
 [tasks.fmt]
 description = "Format Rust with the pinned nightly formatter"
