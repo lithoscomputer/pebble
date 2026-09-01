@@ -16,6 +16,8 @@ pub enum ToolSource {
     /// A tool pebble itself implements.
     #[default]
     Native,
+    /// A tool implemented directly by the embedding application.
+    Application,
     /// A tool proxied from an MCP server by the embedding application.
     Mcp {
         /// The server the tool came from.
@@ -155,6 +157,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ToolSource::Native).expect("serializes"),
             json!({"kind": "native"})
+        );
+        assert_eq!(
+            serde_json::to_value(ToolSource::Application).expect("serializes"),
+            json!({"kind": "application"})
         );
         assert_eq!(
             serde_json::to_value(ToolSource::Mcp {

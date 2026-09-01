@@ -316,6 +316,13 @@ fn the_supporting_vocabulary_keeps_its_serialized_shape() {
             invoked:     false,
         },
         ToolSummary {
+            name:        "inspect".into(),
+            description: "Inspect an application value".into(),
+            source:      ToolSource::Application,
+            category:    ToolCategory::Other,
+            invoked:     true,
+        },
+        ToolSummary {
             name:        "mcp__filesystem__read_text_file".into(),
             description: "Read a text file".into(),
             source:      ToolSource::Mcp {
@@ -353,7 +360,7 @@ fn error_projections_keep_their_serialized_shape() {
         ErrorData::from(&Error::ToolExecution("shell exited 1".into())),
         ErrorData::from(&Error::Interrupted(InterruptReason::Cancelled)),
         ErrorData::from(&Error::EventSink(EventSinkError::new(
-            "the run log is not writable",
+            "the event log is not writable",
         ))),
         ErrorData::new(ErrorKind::Compaction, "context compaction failed")
             .with_provider("anthropic")

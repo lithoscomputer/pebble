@@ -431,7 +431,7 @@ pub(crate) fn noop_tool(name: &str) -> RegisteredTool {
     }
 }
 
-/// A tool that waits until the round or the run is cancelled.
+/// A tool that waits until the round or the prompt is cancelled.
 pub(crate) fn blocking_tool(name: &'static str) -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(

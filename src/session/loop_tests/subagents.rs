@@ -208,9 +208,9 @@ async fn background_agent_notifications_are_batched_into_one_parent_turn() {
         .expect("the second child answers");
 
     let output = parent
-        .run("Delegate both tasks")
+        .prompt("Delegate both tasks")
         .await
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
 
     assert_eq!(output.as_deref(), Some("Synthesized both results"));
     let turns = parent.history().turns();
@@ -278,9 +278,9 @@ async fn background_agent_output_is_not_parsed_for_skill_references() {
     // A child that mentions a bare path must not fail the parent turn on
     // `Unknown skill: /tmp`, nor have its report replaced by a skill body.
     let output = parent
-        .run("Delegate the cleanup")
+        .prompt("Delegate the cleanup")
         .await
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
 
     assert_eq!(output.as_deref(), Some("Acknowledged"));
     let turns = parent.history().turns();
@@ -322,10 +322,10 @@ async fn control_interrupt_during_subagent_wait_closes_child_and_resumes_after_s
         controller.steer("resume after interrupt", None);
     });
 
-    let output = timeout(Duration::from_secs(5), session.run("wait for the child"))
+    let output = timeout(Duration::from_secs(5), session.prompt("wait for the child"))
         .await
         .expect("an interrupt unblocks the subagent wait")
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
     interrupter.await.expect("the controller finishes");
 
     assert_eq!(output.as_deref(), Some("resumed"));
@@ -371,7 +371,7 @@ async fn terminal_cancel_during_subagent_wait_closes_child_and_session() {
         cancel.cancel();
     });
 
-    let result = timeout(Duration::from_secs(5), session.run("wait for the child"))
+    let result = timeout(Duration::from_secs(5), session.prompt("wait for the child"))
         .await
         .expect("a terminal cancellation unblocks the subagent wait");
     canceller.await.expect("the controller finishes");
@@ -470,9 +470,9 @@ async fn a_child_cannot_ask_a_person_a_question() {
         .clone();
 
     parent
-        .run("probe")
+        .prompt("probe")
         .await
-        .expect("the parent's run succeeds");
+        .expect("the parent's prompt succeeds");
     let agent_id = supervisor
         .spawn(
             parent.id(),
@@ -514,9 +514,9 @@ async fn a_spawn_the_tree_has_no_room_for_is_answered_and_the_parent_carries_on(
     let mut events = parent.subscribe();
 
     let output = parent
-        .run("delegate the review")
+        .prompt("delegate the review")
         .await
-        .expect("a refused spawn is the tool's answer, not the run's failure");
+        .expect("a refused spawn is the tool's answer, not the prompt's failure");
 
     assert_eq!(output.as_deref(), Some("I reviewed it myself"));
     let results = tool_results(&parent, 2);
@@ -709,7 +709,7 @@ async fn a_session_with_no_factory_answers_a_spawn_as_a_tool_it_does_not_have() 
     let mut events = parent.subscribe();
 
     let output = parent
-        .run("delegate the review")
+        .prompt("delegate the review")
         .await
         .expect("a tool the session does not have is the model's mistake, not a failure");
 

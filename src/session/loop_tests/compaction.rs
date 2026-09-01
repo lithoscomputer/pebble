@@ -1,9 +1,9 @@
 //! Filling the window, and what the session loads before it starts.
 //!
-//! A long run outgrows the model's context window: the session warns about it
-//! whatever it is configured to do, and summarizes the older turns where it is
-//! allowed to. What it summarizes with — the prompt, the file list — is part of
-//! the contract, because a summary that loses the files loses the run's
+//! A long prompt outgrows the model's context window: the session warns about
+//! it whatever it is configured to do, and summarizes the older turns where it
+//! is allowed to. What it summarizes with — the prompt, the file list — is part
+//! of the contract, because a summary that loses the files loses the prompt's
 //! progress.
 //!
 //! Initialization is here too, since it is what fills the prompt the window is
@@ -35,7 +35,7 @@ fn summary() -> Vec<ScriptedCompletion> {
     ))]
 }
 
-/// The `context_window` warnings a run published.
+/// The `context_window` warnings a prompt published.
 fn warnings(events: &[AgentEvent]) -> Vec<serde_json::Value> {
     events
         .iter()
@@ -55,7 +55,10 @@ async fn crossing_the_threshold_warns_the_application() {
     let (mut session, _provider) = TestSession::new(answers("OK")).model("test/small").build();
     let mut events = session.subscribe();
 
-    session.run(&large_input()).await.expect("the run succeeds");
+    session
+        .prompt(&large_input())
+        .await
+        .expect("the prompt succeeds");
 
     let published = settled(&mut session, &mut events).await;
     let warned = warnings(&published);
@@ -64,11 +67,11 @@ async fn crossing_the_threshold_warns_the_application() {
 }
 
 #[tokio::test]
-async fn a_run_well_inside_the_window_warns_about_nothing() {
+async fn a_prompt_well_inside_the_window_warns_about_nothing() {
     let (mut session, _provider) = TestSession::answering(answers("OK"));
     let mut events = session.subscribe();
 
-    session.run("Hi").await.expect("the run succeeds");
+    session.prompt("Hi").await.expect("the prompt succeeds");
 
     let published = settled(&mut session, &mut events).await;
     assert!(warnings(&published).is_empty());
@@ -94,7 +97,10 @@ async fn crossing_the_threshold_summarizes_the_older_turns() {
     .build();
     let mut events = session.subscribe();
 
-    session.run(&large_input()).await.expect("the run succeeds");
+    session
+        .prompt(&large_input())
+        .await
+        .expect("the prompt succeeds");
 
     let published = settled(&mut session, &mut events).await;
     assert!(
@@ -132,7 +138,7 @@ async fn the_reported_usage_of_the_last_turn_is_the_baseline() {
     .build();
     let mut events = session.subscribe();
 
-    session.run("hi").await.expect("the run succeeds");
+    session.prompt("hi").await.expect("the prompt succeeds");
 
     let published = settled(&mut session, &mut events).await;
     let started = published.iter().find_map(|event| match event {
@@ -157,7 +163,7 @@ async fn the_reported_usage_of_the_last_turn_is_the_baseline() {
 #[tokio::test]
 async fn a_summary_that_never_arrives_outlasts_an_interrupt() {
     // Summarization has no cancellation of its own — fabro's had none either —
-    // so a call that never answers holds the run open however the session is
+    // so a call that never answers holds the prompt open however the session is
     // ended. This pins the contract rather than endorsing it: an application
     // that must stop while a summary is in flight needs the model call itself
     // to time out.
@@ -187,7 +193,7 @@ async fn a_summary_that_never_arrives_outlasts_an_interrupt() {
         cancel.cancel();
     });
 
-    let outcome = timeout(Duration::from_millis(200), session.run(&large_input())).await;
+    let outcome = timeout(Duration::from_millis(200), session.prompt(&large_input())).await;
     controller.await.expect("the controller finishes");
 
     assert!(
@@ -209,7 +215,10 @@ async fn a_compaction_with_nothing_to_summarize_announces_nothing() {
         .build();
     let mut events = session.subscribe();
 
-    session.run(&large_input()).await.expect("the run succeeds");
+    session
+        .prompt(&large_input())
+        .await
+        .expect("the prompt succeeds");
 
     let published = settled(&mut session, &mut events).await;
     assert_eq!(
@@ -239,7 +248,10 @@ async fn compaction_that_is_turned_off_never_runs() {
         .build();
     let mut events = session.subscribe();
 
-    session.run(&large_input()).await.expect("the run succeeds");
+    session
+        .prompt(&large_input())
+        .await
+        .expect("the prompt succeeds");
 
     let published = settled(&mut session, &mut events).await;
     assert_eq!(
@@ -266,7 +278,7 @@ async fn a_session_that_never_compacts_still_reports_what_the_provider_counted()
     .build();
     let mut events = session.subscribe();
 
-    session.run("hi").await.expect("the run succeeds");
+    session.prompt("hi").await.expect("the prompt succeeds");
 
     let published = settled(&mut session, &mut events).await;
     assert!(
@@ -287,7 +299,7 @@ async fn a_session_that_never_compacts_still_reports_what_the_provider_counted()
 }
 
 #[tokio::test]
-async fn a_failed_compaction_neither_stops_the_run_nor_repeats() {
+async fn a_failed_compaction_neither_stops_the_prompt_nor_repeats() {
     let (mut session, provider) = TestSession::new(vec![
         ScriptedCall::response(with_input_tokens(
             tool_call_response("nonexistent_tool", "call_1", json!({})),
@@ -308,9 +320,9 @@ async fn a_failed_compaction_neither_stops_the_run_nor_repeats() {
     let mut events = session.subscribe();
 
     session
-        .run(&large_input())
+        .prompt(&large_input())
         .await
-        .expect("a failed summary does not fail the run");
+        .expect("a failed summary does not fail the prompt");
 
     assert_eq!(
         provider.completion_count(),
@@ -323,7 +335,7 @@ async fn a_failed_compaction_neither_stops_the_run_nor_repeats() {
             event,
             AgentEvent::Error { error } if error.kind == ErrorKind::Compaction
         )),
-        "the failure is reported as compaction's, not as the run's"
+        "the failure is reported as compaction's, not as the prompt's"
     );
 }
 
@@ -363,9 +375,9 @@ async fn the_summarizing_call_carries_the_prompt_and_the_files() {
     let mut events = session.subscribe();
 
     session
-        .run("Read the file")
+        .prompt("Read the file")
         .await
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
     assert_eq!(
         session.file_tracker().file_count(),
         1,
@@ -373,9 +385,9 @@ async fn the_summarizing_call_carries_the_prompt_and_the_files() {
     );
 
     session
-        .run(&large_input())
+        .prompt(&large_input())
         .await
-        .expect("the second run succeeds");
+        .expect("the second prompt succeeds");
 
     let requests = provider.completion_requests();
     let request = requests.first().expect("compaction asked the model");
@@ -547,9 +559,9 @@ async fn a_slash_command_activates_the_skill_it_names() {
     let mut events = session.subscribe();
 
     session
-        .run("/commit fix things")
+        .prompt("/commit fix things")
         .await
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
 
     let published = settled(&mut session, &mut events).await;
     assert!(

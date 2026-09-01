@@ -5,22 +5,43 @@ edition = "2024"
 rust-version = "1.88"
 publish = false
 
+[workspace]
+members = [".", "crates/pebble-agent"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[workspace.dependencies]
+async-trait = "0.1.89"
+futures-util = "0.3.32"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+thiserror = "2.0.16"
+tokio = { version = "1.49.0", features = ["sync", "time"] }
+tokio-util = "0.7.19"
+tracing = "0.1.41"
+
 [features]
 # Test doubles (`pebble::test_support`) for applications that embed pebble.
 test-util = []
 
 [dependencies]
-async-trait = "0.1.89"
-futures-util = "0.3.32"
+async-trait.workspace = true
+futures-util.workspace = true
 lithos-llm = { path = "../lithos-llm" }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
+pebble-agent = { path = "crates/pebble-agent" }
+serde.workspace = true
+serde_json.workspace = true
 # Deterministic todo identities: a whole-list tool identifies an item by its
 # text, so the id is a hash of it. Pinned to the version lithos-llm already
 # resolves, along with every crate underneath it.
 sha2 = "0.10.9"
-thiserror = "2.0.16"
-tokio = { version = "1.49.0", features = [
+thiserror.workspace = true
+tokio = { workspace = true, features = [
   "fs",
   "io-util",
   "macros",
@@ -29,8 +50,8 @@ tokio = { version = "1.49.0", features = [
   "sync",
   "time",
 ] }
-tokio-util = "0.7.19"
-tracing = "0.1.41"
+tokio-util.workspace = true
+tracing.workspace = true
 # Session identifiers. Pinned to the version lithos-llm already resolves, so
 # the shared lockfile gains no entry.
 uuid = { version = "1.18.1", features = ["v4"] }
@@ -46,11 +67,14 @@ insta = { version = "1.48.0", features = ["json"] }
 # asks for. Adds no package to the lockfile: tokio is already a dependency.
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "test-util"] }
 
-[lints.rust]
+[lints]
+workspace = true
+
+[workspace.lints.rust]
 unsafe_code = "deny"
 unreachable_pub = "warn"
 
-[lints.clippy]
+[workspace.lints.clippy]
 pedantic = { level = "warn", priority = -2 }
 allow_attributes_without_reason = "warn"
 

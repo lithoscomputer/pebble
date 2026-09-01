@@ -592,7 +592,7 @@ const fn unanswered_kind(status: AnswerStatus) -> ToolErrorKind {
     match status {
         // A person who declines has refused the call.
         AnswerStatus::Skipped => ToolErrorKind::Denied,
-        // Nothing else was a decision about the question: the run stopped
+        // Nothing else was a decision about the question: the prompt stopped
         // waiting for it.
         _ => ToolErrorKind::Cancelled,
     }

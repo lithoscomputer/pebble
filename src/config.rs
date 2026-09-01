@@ -273,7 +273,7 @@ pub struct SessionOptions {
     /// the newest turn whatever this says, because it may hold tool calls that
     /// have not been answered yet.
     pub compaction_preserve_turns: usize,
-    /// How long one run may take before the session cancels itself.
+    /// How long one prompt may take before the session cancels itself.
     pub wall_clock_timeout: Option<Duration>,
     /// How the session spaces the turn replays it owns.
     ///
@@ -282,14 +282,16 @@ pub struct SessionOptions {
     /// because a middleware reconnect would duplicate what the reader already
     /// saw. This policy decides the wait before each of those replays.
     ///
-    /// Set it to the same policy the client's
-    /// [`RetryMiddleware`](lithos_llm::middleware::RetryMiddleware) was built
-    /// with, so one failure is spaced the same way wherever it is handled. Its
-    /// `max_attempts` bounds the session's replays as well: the default of
-    /// four allows the three replays pebble is willing to spend on one turn.
+    /// This is separate from the client's
+    /// [`RetryMiddleware`](lithos_llm::middleware::RetryMiddleware) policy.
+    /// Reuse that policy when identical spacing is useful, or configure the
+    /// two independently. `max_attempts` bounds the session's replays: the
+    /// default of four allows the three replays Pebble is willing to spend on
+    /// one turn.
     ///
-    /// The type is re-exported as [`pebble::RetryPolicy`](crate::RetryPolicy).
-    pub retry_policy: RetryPolicy,
+    /// The type is available as
+    /// [`pebble::llm::middleware::RetryPolicy`](crate::llm::middleware::RetryPolicy).
+    pub turn_replay: RetryPolicy,
 }
 
 impl fmt::Debug for SessionOptions {
@@ -334,7 +336,7 @@ impl fmt::Debug for SessionOptions {
             )
             .field("compaction_preserve_turns", &self.compaction_preserve_turns)
             .field("wall_clock_timeout", &self.wall_clock_timeout)
-            .field("retry_policy", &self.retry_policy)
+            .field("turn_replay", &self.turn_replay)
             .finish()
     }
 }
@@ -363,12 +365,12 @@ impl Default for SessionOptions {
             compaction_threshold_percent: 80,
             compaction_preserve_turns: 6,
             wall_clock_timeout: None,
-            retry_policy: RetryPolicy::exponential().max_attempts(DEFAULT_RETRY_ATTEMPTS),
+            turn_replay: RetryPolicy::exponential().max_attempts(DEFAULT_RETRY_ATTEMPTS),
         }
     }
 }
 
-/// How many attempts the default [`SessionOptions::retry_policy`] allows.
+/// How many attempts the default [`SessionOptions::turn_replay`] allows.
 ///
 /// One opening attempt plus the three replays a session will spend on a turn
 /// whose stream broke after it had already shown output.
@@ -494,20 +496,20 @@ mod tests {
     }
 
     #[test]
-    fn the_default_retry_policy_allows_the_replays_a_turn_is_worth() {
+    fn the_default_turn_replay_allows_the_replays_a_turn_is_worth() {
         let config = SessionOptions::default();
         let error = LlmError::new(LlmErrorKind::Network, "connection reset")
             .with_retry(RetryClassification::Safe);
 
         for attempt in 1..DEFAULT_RETRY_ATTEMPTS {
             assert!(
-                config.retry_policy.next_delay(attempt, &error).is_some(),
+                config.turn_replay.next_delay(attempt, &error).is_some(),
                 "attempt {attempt} should still be replayed"
             );
         }
         assert!(
             config
-                .retry_policy
+                .turn_replay
                 .next_delay(DEFAULT_RETRY_ATTEMPTS, &error)
                 .is_none(),
             "the fourth failure spends the budget"

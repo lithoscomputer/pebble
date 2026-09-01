@@ -39,7 +39,7 @@ impl EventSink for RunLog {
     async fn record(&self, event: &SessionEvent) -> Result<(), EventSinkError> {
         let mut recorded = self.recorded.lock().expect("the log lock is held");
         if self.refuse_from == Some(recorded.len()) {
-            return Err(EventSinkError::new("the run log is not writable"));
+            return Err(EventSinkError::new("the event log is not writable"));
         }
         recorded.push((event.seq, event.session_id.clone()));
         Ok(())
@@ -87,7 +87,7 @@ async fn an_application_records_and_watches_the_same_ordered_stream() {
 }
 
 #[tokio::test]
-async fn a_refusing_sink_stops_the_run_with_a_typed_error() {
+async fn a_refusing_sink_stops_the_prompt_with_a_typed_error() {
     let log = Arc::new(RunLog::refusing_from(1));
     let (emitter, pump) = EventPump::new(EventOptions {
         sink: Some(Arc::clone(&log) as Arc<dyn EventSink>),
@@ -104,7 +104,7 @@ async fn a_refusing_sink_stops_the_run_with_a_typed_error() {
         .expect_err("the sink refused the second event");
 
     assert_eq!(error.kind(), ErrorKind::EventSink);
-    assert!(error.to_string().contains("the run log is not writable"));
+    assert!(error.to_string().contains("the event log is not writable"));
     assert_eq!(log.recorded().len(), 1);
 }
 

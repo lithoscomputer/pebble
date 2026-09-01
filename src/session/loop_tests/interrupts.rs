@@ -7,7 +7,7 @@
 //! tests interrupt the loop everywhere it can be interrupted: before it starts,
 //! while it waits on the model, and while a tool is running.
 //!
-//! What the session owns is here too, because a run that ends — however it
+//! What the session owns is here too, because a prompt that ends — however it
 //! ends — has to leave nothing behind: the wall-clock timer stops, the event
 //! pump is joined, and a session restored from its record carries on where the
 //! last one stopped.
@@ -32,7 +32,7 @@ use crate::test_support::{
 };
 use crate::types::LlmOutputKind;
 
-/// How long a test waits for a run that another task has to unblock.
+/// How long a test waits for a prompt that another task has to unblock.
 const PATIENCE: Duration = Duration::from_secs(1);
 
 // --- Steering ---
@@ -42,7 +42,10 @@ async fn a_steer_lands_as_its_own_turn() {
     let (mut session, _provider) = TestSession::answering(answers("OK"));
     session.steer("Focus on the task");
 
-    session.run("Do something").await.expect("the run succeeds");
+    session
+        .prompt("Do something")
+        .await
+        .expect("the prompt succeeds");
 
     let turns = session.history().turns();
     assert_eq!(turns.len(), 3, "input, steer, answer");
@@ -59,7 +62,10 @@ async fn a_steer_is_announced_with_its_text() {
     let mut events = session.subscribe();
     session.steer("hi there");
 
-    session.run("Do something").await.expect("the run succeeds");
+    session
+        .prompt("Do something")
+        .await
+        .expect("the prompt succeeds");
 
     let published = settled(&mut session, &mut events).await;
     let steered = published.iter().find_map(|event| match event {
@@ -81,10 +87,10 @@ async fn a_bare_interrupt_parks_the_session_until_a_steer_arrives() {
         sleep(Duration::from_millis(10)).await;
         waker.steer("resume now", None);
     });
-    timeout(PATIENCE, session.run("start"))
+    timeout(PATIENCE, session.prompt("start"))
         .await
         .expect("the parked session wakes when steering arrives")
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
     steering.await.expect("the steering task finishes");
 
     assert!(matches!(
@@ -122,10 +128,10 @@ async fn an_interrupt_that_lands_while_the_session_is_parked_is_announced_too() 
         control.steer("carry on", None);
     });
 
-    timeout(PATIENCE, session.run("start"))
+    timeout(PATIENCE, session.prompt("start"))
         .await
         .expect("the steer wakes the parked session")
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
     controller.await.expect("the controller finishes");
 
     let published = settled(&mut session, &mut recorded).await;
@@ -169,7 +175,7 @@ async fn a_gesture_whose_round_cancel_was_lost_is_still_announced() {
         control.interrupt_generation = control.interrupt_generation.saturating_add(1);
     }
 
-    session.run("start").await.expect("the run succeeds");
+    session.prompt("start").await.expect("the prompt succeeds");
 
     let published = settled(&mut session, &mut events).await;
     let generations: Vec<u64> = published
@@ -189,7 +195,7 @@ async fn an_interrupt_settles_before_the_steer_that_replaces_it() {
     let handle = session.control_handle();
     handle.interrupt_then_steer("stop now", None);
 
-    session.run("start").await.expect("the run succeeds");
+    session.prompt("start").await.expect("the prompt succeeds");
 
     assert!(!handle.is_waiting_for_steer());
     let published = settled(&mut session, &mut events).await;
@@ -227,10 +233,10 @@ async fn an_interrupt_while_the_model_is_thinking_settles_once() {
         control
     });
 
-    timeout(PATIENCE, session.run("start"))
+    timeout(PATIENCE, session.prompt("start"))
         .await
         .expect("the interrupt unblocks the hanging call")
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
     let control = controller.await.expect("the controller finishes");
 
     assert_eq!(provider.call_count(), 2, "the round was asked again");
@@ -274,9 +280,9 @@ async fn an_interrupted_round_leaves_no_task_reminder_behind() {
         .build();
     for index in 0..10 {
         session
-            .run(&format!("turn {index}"))
+            .prompt(&format!("turn {index}"))
             .await
-            .expect("the run succeeds");
+            .expect("the prompt succeeds");
     }
 
     let control = session.control_handle();
@@ -296,10 +302,10 @@ async fn an_interrupted_round_leaves_no_task_reminder_behind() {
         control.steer("wrap up now", None);
     });
 
-    timeout(PATIENCE, session.run("continue"))
+    timeout(PATIENCE, session.prompt("continue"))
         .await
         .expect("the interrupted session resumes after steering")
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
     controller.await.expect("the controller finishes");
 
     let requests = provider.requests();
@@ -354,10 +360,10 @@ async fn an_interrupt_mid_stream_withdraws_what_the_turn_showed_and_commits_noth
         control.interrupt_then_steer("say it differently", None);
     });
 
-    let answer = timeout(PATIENCE, session.run("say something"))
+    let answer = timeout(PATIENCE, session.prompt("say something"))
         .await
         .expect("the interrupt unblocks the hanging stream")
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
     controller.await.expect("the controller finishes");
 
     assert_eq!(answer.as_deref(), Some("the answer after the steer"));
@@ -404,15 +410,15 @@ async fn an_interrupt_mid_stream_withdraws_what_the_turn_showed_and_commits_noth
 }
 
 #[tokio::test]
-async fn ending_the_run_while_a_replay_waits_ends_it_as_a_cancellation() {
-    // The wait between replays is one of the places a run can be ended, and a
-    // run ended anywhere ends the same way: interrupted, and closed.
+async fn ending_the_prompt_while_a_replay_waits_ends_it_as_a_cancellation() {
+    // The wait between replays is one of the places a prompt can be ended, and
+    // a prompt ended anywhere ends the same way: interrupted, and closed.
     let (mut session, _provider) = TestSession::new(vec![ScriptedCall::fails_after(
         "partial",
         ScriptedFailure::retryable(LlmErrorKind::Network, "connection reset"),
     )])
     .options(SessionOptions {
-        retry_policy: RetryPolicy::exponential()
+        turn_replay: RetryPolicy::exponential()
             .max_attempts(4)
             .initial_delay(Duration::from_secs(30)),
         ..SessionOptions::default()
@@ -428,15 +434,15 @@ async fn ending_the_run_while_a_replay_waits_ends_it_as_a_cancellation() {
         cancel.cancel();
     });
 
-    let error = timeout(PATIENCE, session.run("Hello"))
+    let error = timeout(PATIENCE, session.prompt("Hello"))
         .await
-        .expect("ending the run does not wait out the backoff")
-        .expect_err("the run was ended");
+        .expect("ending the prompt does not wait out the backoff")
+        .expect_err("the prompt was ended");
     controller.await.expect("the controller finishes");
 
     assert!(
         matches!(error, Error::Interrupted(InterruptReason::Cancelled)),
-        "a cancelled run reports a cancellation, not a stream failure: {error:?}"
+        "a cancelled prompt reports a cancellation, not a stream failure: {error:?}"
     );
     assert_eq!(session.state(), SessionState::Closed);
 }
@@ -463,10 +469,10 @@ async fn an_interrupted_parallel_round_answers_every_call_it_made() {
         control.interrupt_then_steer("stop all of that", None);
     });
 
-    timeout(PATIENCE, session.run("run three tools"))
+    timeout(PATIENCE, session.prompt("run three tools"))
         .await
         .expect("the interrupt unblocks every call")
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
     controller.await.expect("the controller finishes");
 
     let results = tool_results(&session, 2);
@@ -496,7 +502,7 @@ async fn a_tool_that_ignores_its_cancellation_holds_the_round_open() {
     // Tool cancellation is cooperative, and the session waits for the call it
     // made rather than dropping it, which is what keeps every call paired with
     // a result. The cost is pinned here: a tool that never watches its token
-    // holds the round, and the run ending it, open until it returns.
+    // holds the round, and the prompt ending it, open until it returns.
     let stubborn = RegisteredTool {
         definition: ToolDefinition::function(
             "stubborn",
@@ -526,7 +532,7 @@ async fn a_tool_that_ignores_its_cancellation_holds_the_round_open() {
         cancel.cancel();
     });
 
-    let outcome = timeout(Duration::from_millis(200), session.run("use the tool")).await;
+    let outcome = timeout(Duration::from_millis(200), session.prompt("use the tool")).await;
     controller.await.expect("the controller finishes");
 
     assert!(
@@ -565,7 +571,7 @@ async fn a_coordinator_can_send_the_loop_round_again() {
         handle,
     }));
 
-    session.run("hi").await.expect("the run succeeds");
+    session.prompt("hi").await.expect("the prompt succeeds");
 
     let turns = session.history().turns();
     assert_eq!(turns.len(), 4, "input, answer, steer, answer");
@@ -581,7 +587,7 @@ async fn a_coordinator_can_send_the_loop_round_again() {
 // --- The wall clock ---
 
 #[tokio::test]
-async fn a_run_that_outlasts_its_budget_ends_with_the_budget_as_its_reason() {
+async fn a_prompt_that_outlasts_its_budget_ends_with_the_budget_as_its_reason() {
     let (mut session, _provider) = TestSession::new(vec![
         ScriptedCall::response(tool_call_response("slow_tool", "call_1", json!({}))),
         ScriptedCall::response(text_response("Should not reach this")),
@@ -594,10 +600,10 @@ async fn a_run_that_outlasts_its_budget_ends_with_the_budget_as_its_reason() {
     })
     .build();
 
-    let error = timeout(PATIENCE, session.run("Do something slow"))
+    let error = timeout(PATIENCE, session.prompt("Do something slow"))
         .await
-        .expect("the budget ends the run")
-        .expect_err("the run ran out of time");
+        .expect("the budget ends the prompt")
+        .expect_err("the prompt ran out of time");
 
     assert!(
         matches!(error, Error::Interrupted(InterruptReason::WallClockTimeout)),
@@ -608,7 +614,7 @@ async fn a_run_that_outlasts_its_budget_ends_with_the_budget_as_its_reason() {
 
 #[tokio::test]
 async fn the_reason_an_outside_task_recorded_first_is_the_one_reported() {
-    // What the handle is for: a watchdog names why it is stopping the run, and
+    // What the handle is for: a watchdog names why it is stopping the prompt, and
     // the cancellation that follows does not overwrite it.
     let (mut session, _provider) = TestSession::answering(answers("never reached"));
     let reason = session.interrupt_reason_handle();
@@ -621,9 +627,9 @@ async fn the_reason_an_outside_task_recorded_first_is_the_one_reported() {
     session.interrupt();
 
     let error = session
-        .run("Do something")
+        .prompt("Do something")
         .await
-        .expect_err("the run was cancelled");
+        .expect_err("the prompt was cancelled");
 
     assert!(
         matches!(error, Error::Interrupted(InterruptReason::WallClockTimeout)),
@@ -633,7 +639,7 @@ async fn the_reason_an_outside_task_recorded_first_is_the_one_reported() {
 }
 
 #[tokio::test]
-async fn a_run_inside_its_budget_is_untouched() {
+async fn a_prompt_inside_its_budget_is_untouched() {
     let (mut session, _provider) = TestSession::new(answers("Fast response"))
         .options(SessionOptions {
             wall_clock_timeout: Some(Duration::from_secs(10)),
@@ -641,7 +647,7 @@ async fn a_run_inside_its_budget_is_untouched() {
         })
         .build();
 
-    session.run("Hello").await.expect("the run succeeds");
+    session.prompt("Hello").await.expect("the prompt succeeds");
 
     assert_eq!(session.state(), SessionState::Idle);
     let turns = session.history().turns();
@@ -650,7 +656,7 @@ async fn a_run_inside_its_budget_is_untouched() {
 }
 
 #[tokio::test]
-async fn a_finished_run_leaves_no_timer_behind() {
+async fn a_finished_prompt_leaves_no_timer_behind() {
     let (mut session, _provider) = TestSession::new(vec![
         ScriptedCall::response(text_response("first")),
         ScriptedCall::response(text_response("second")),
@@ -661,16 +667,19 @@ async fn a_finished_run_leaves_no_timer_behind() {
     })
     .build();
 
-    session.run("one").await.expect("the first run succeeds");
-    // Well past the budget the finished run was given: a timer left running
+    session
+        .prompt("one")
+        .await
+        .expect("the first prompt succeeds");
+    // Well past the budget the finished prompt was given: a timer left running
     // would cancel the session here.
     sleep(Duration::from_millis(60)).await;
 
     assert!(!session.cancel_token().is_cancelled());
     session
-        .run("two")
+        .prompt("two")
         .await
-        .expect("the next run is unaffected by the last run's budget");
+        .expect("the next prompt is unaffected by the last prompt's budget");
 }
 
 // --- What the session owns ---
@@ -684,7 +693,10 @@ async fn a_shutdown_joins_everything_the_session_owns() {
         })
         .build();
 
-    session.run("do a thing").await.expect("the run succeeds");
+    session
+        .prompt("do a thing")
+        .await
+        .expect("the prompt succeeds");
     assert!(
         Handle::current().metrics().num_alive_tasks() > 0,
         "the event pump is still running"
@@ -744,7 +756,10 @@ async fn the_sink_sees_every_event_in_order_and_so_does_a_subscriber() {
     let mut events = session.subscribe();
 
     session.initialize().await.expect("initialization succeeds");
-    session.run("do a thing").await.expect("the run succeeds");
+    session
+        .prompt("do a thing")
+        .await
+        .expect("the prompt succeeds");
     let published = settled(&mut session, &mut events).await;
 
     let observed: Vec<&'static str> = published.iter().map(event_name).collect();
@@ -769,7 +784,10 @@ async fn the_sink_sees_every_event_in_order_and_so_does_a_subscriber() {
 #[tokio::test]
 async fn a_resumed_session_carries_on_the_conversation_and_the_numbering() {
     let (mut session, _provider) = TestSession::answering(answers("first answer"));
-    session.run("first input").await.expect("the run succeeds");
+    session
+        .prompt("first input")
+        .await
+        .expect("the prompt succeeds");
     session
         .shutdown(ShutdownReason::Completed)
         .await
@@ -783,9 +801,9 @@ async fn a_resumed_session_carries_on_the_conversation_and_the_numbering() {
     let mut events = resumed.subscribe();
 
     let answer = resumed
-        .run("second input")
+        .prompt("second input")
         .await
-        .expect("the resumed run succeeds");
+        .expect("the resumed prompt succeeds");
 
     assert_eq!(answer.as_deref(), Some("second answer"));
     assert_eq!(resumed.id(), session.id());
@@ -855,10 +873,10 @@ async fn a_tool_that_ends_the_round_is_still_answered_before_the_next_one() {
         control.interrupt_then_steer("stop that", None);
     });
 
-    let answer = timeout(PATIENCE, session.run("watch something"))
+    let answer = timeout(PATIENCE, session.prompt("watch something"))
         .await
         .expect("the interrupt unblocks the tool")
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
     controller.await.expect("the controller finishes");
 
     assert_eq!(answer.as_deref(), Some("after the interrupt"));

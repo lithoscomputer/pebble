@@ -935,7 +935,7 @@ async fn run_subagent_session(
 
         loop {
             let result = session
-                .run(&prompt)
+                .prompt(&prompt)
                 .await
                 .and_then(|output| {
                     output.ok_or_else(|| {

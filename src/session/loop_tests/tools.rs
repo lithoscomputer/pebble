@@ -5,8 +5,8 @@
 //! and the skills a `use_skill` call loads from — configured on the builder,
 //! with the skills discovered by `initialize` — plus the summarizer a
 //! `web_fetch` tool captures at construction. Each reaches a tool only
-//! through the whole chain, so they are tested through a real run rather than
-//! by reading a field back.
+//! through the whole chain, so they are tested through a real prompt rather
+//! than by reading a field back.
 //!
 //! The two `apply_patch` tests here are the pair fabro ran through its own
 //! executor: a custom tool call is free-form text rather than JSON, and it
@@ -88,7 +88,7 @@ async fn a_sessions_redactor_reaches_the_process_tail_its_shell_tool_publishes()
     .build();
     let mut events = session.subscribe();
 
-    let output = session.run("run it").await.expect("the run succeeds");
+    let output = session.prompt("run it").await.expect("the prompt succeeds");
     let published = settled(&mut session, &mut events).await;
 
     assert_eq!(output.as_deref(), Some("done"));
@@ -116,7 +116,7 @@ async fn a_session_without_a_redactor_publishes_what_the_process_wrote() {
     .build();
     let mut events = session.subscribe();
 
-    session.run("run it").await.expect("the run succeeds");
+    session.prompt("run it").await.expect("the prompt succeeds");
     let published = settled(&mut session, &mut events).await;
 
     let stderr = process_tail(&published)
@@ -160,9 +160,9 @@ async fn the_fetch_tools_summarizer_answers_a_web_fetch_prompt() {
         .expect("the session builds");
 
     session
-        .run("read that page")
+        .prompt("read that page")
         .await
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
 
     let results = tool_results(&session, 2);
     assert_eq!(results.len(), 1);
@@ -199,9 +199,9 @@ async fn a_fetch_tool_without_a_summarizer_returns_the_page_instead() {
     .build();
 
     session
-        .run("read that page")
+        .prompt("read that page")
         .await
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
 
     let results = tool_results(&session, 2);
     assert_eq!(
@@ -212,7 +212,7 @@ async fn a_fetch_tool_without_a_summarizer_returns_the_page_instead() {
 }
 
 /// The environment variables a session resolves per call reach a command the
-/// model asked for, which is how a run-scoped credential gets to a tool
+/// model asked for, which is how a prompt-scoped credential gets to a tool
 /// without living in the session's own environment.
 #[tokio::test]
 async fn a_sessions_tool_environment_reaches_the_command_a_tool_runs() {
@@ -235,7 +235,7 @@ async fn a_sessions_tool_environment_reaches_the_command_a_tool_runs() {
         .build()
         .expect("the session builds");
 
-    session.run("run it").await.expect("the run succeeds");
+    session.prompt("run it").await.expect("the prompt succeeds");
 
     assert_eq!(
         *environment
@@ -349,9 +349,9 @@ async fn use_skill_tool_success_emits_skill_activated_with_tool_source() {
     let mut events = session.subscribe();
 
     session
-        .run("please commit")
+        .prompt("please commit")
         .await
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
 
     let results = tool_results(&session, 2);
     assert_eq!(result_text(&results[0]), "Run commit.");
@@ -376,9 +376,9 @@ async fn use_skill_tool_failed_lookup_does_not_emit_activation() {
     let mut events = session.subscribe();
 
     session
-        .run("please commit")
+        .prompt("please commit")
         .await
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
 
     let results = tool_results(&session, 2);
     assert!(results[0].is_error, "the call failed");
@@ -434,9 +434,9 @@ async fn a_custom_patch_call_reaches_the_tool_and_changes_the_files() {
     .build();
 
     let output = session
-        .run("Update the greeting functions")
+        .prompt("Update the greeting functions")
         .await
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
 
     assert_eq!(
         output.as_deref(),
@@ -469,7 +469,8 @@ async fn a_custom_patch_call_reaches_the_tool_and_changes_the_files() {
 }
 
 /// A patch that does not match is the model's to repair, so the failure goes
-/// back into the conversation as the call's result rather than ending the run.
+/// back into the conversation as the call's result rather than ending the
+/// prompt.
 #[tokio::test]
 async fn failed_custom_tool_call_returns_codex_style_error_to_session_history() {
     let patch = "\
@@ -492,9 +493,9 @@ async fn failed_custom_tool_call_returns_codex_style_error_to_session_history() 
     .build();
 
     session
-        .run("Patch a missing function")
+        .prompt("Patch a missing function")
         .await
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
 
     let results = tool_results(&session, 2);
     assert_eq!(results.len(), 1);
@@ -574,7 +575,10 @@ async fn a_configured_search_provider_reaches_the_registered_tool() {
             .any(|tool| tool.definition.name == "web_search"),
         "a session that can search says so"
     );
-    session.run("look it up").await.expect("the run succeeds");
+    session
+        .prompt("look it up")
+        .await
+        .expect("the prompt succeeds");
 
     let results = tool_results(&session, 2);
     assert_eq!(

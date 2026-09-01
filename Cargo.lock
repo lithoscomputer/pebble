@@ -763,6 +763,7 @@ dependencies = [
  "futures-util",
  "insta",
  "lithos-llm",
+ "pebble-agent",
  "rustix",
  "serde",
  "serde_json",
@@ -772,6 +773,21 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "pebble-agent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "lithos-llm",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

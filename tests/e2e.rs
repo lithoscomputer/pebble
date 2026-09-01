@@ -1,7 +1,7 @@
 //! The coding agent's flow, end to end, without a provider.
 //!
 //! `examples/coding_agent.rs` shows what embedding pebble looks like: a prompt
-//! becomes tool calls that touch a real directory, a run is steered while it
+//! becomes tool calls that touch a real directory, a prompt is steered while it
 //! works, another is interrupted, and the session reports what it used. That
 //! example needs credentials and a model that cooperates. These tests drive the
 //! same flow against the scripted provider and a `LocalEnvironment` over a
@@ -30,17 +30,17 @@ use serde_json::json;
 use tokio::sync::{Notify, broadcast};
 use tokio::time::timeout;
 
-/// How long a test waits for a run another task has to unblock.
+/// How long a test waits for a prompt another task has to unblock.
 const PATIENCE: Duration = Duration::from_secs(10);
 
-/// The three lines the scripted run writes.
+/// The three lines the scripted prompt writes.
 const ORIGINAL: &str = "one\ntwo\nthree\n";
 
 /// The same file after the scripted edit.
 const EDITED: &str = "one\nedited by pebble\nthree\n";
 
 #[tokio::test]
-async fn a_run_writes_edits_reads_and_runs_a_command_in_its_workspace() {
+async fn a_prompt_writes_edits_reads_and_runs_a_command_in_its_workspace() {
     let workspace = Workspace::new("tools");
     let (mut session, provider) = coding_session(&workspace, vec![
         ScriptedCall::response(tool_call_response(
@@ -79,10 +79,10 @@ async fn a_run_writes_edits_reads_and_runs_a_command_in_its_workspace() {
     let mut events = session.subscribe();
 
     session.initialize().await.expect("initialization succeeds");
-    let answer = timeout(PATIENCE, session.run("set up greeting.txt"))
+    let answer = timeout(PATIENCE, session.prompt("set up greeting.txt"))
         .await
-        .expect("the run finishes")
-        .expect("the run succeeds");
+        .expect("the prompt finishes")
+        .expect("the prompt succeeds");
 
     assert_eq!(answer.as_deref(), Some("greeting.txt has three lines"));
     assert_eq!(
@@ -146,10 +146,10 @@ async fn every_tool_call_is_answered_before_the_next_round() {
     ]);
 
     session.initialize().await.expect("initialization succeeds");
-    timeout(PATIENCE, session.run("write and read it back"))
+    timeout(PATIENCE, session.prompt("write and read it back"))
         .await
-        .expect("the run finishes")
-        .expect("the run succeeds");
+        .expect("the prompt finishes")
+        .expect("the prompt succeeds");
 
     let mut asked = 0;
     let mut answered = 0;
@@ -191,10 +191,10 @@ async fn a_steer_sent_while_a_tool_runs_arrives_as_the_next_turn() {
     });
 
     session.initialize().await.expect("initialization succeeds");
-    let answer = timeout(PATIENCE, session.run("start the job"))
+    let answer = timeout(PATIENCE, session.prompt("start the job"))
         .await
-        .expect("the run finishes")
-        .expect("the run succeeds");
+        .expect("the prompt finishes")
+        .expect("the prompt succeeds");
     steering.await.expect("the steering task finishes");
 
     assert_eq!(answer.as_deref(), Some("noted, and done"));
@@ -230,7 +230,7 @@ async fn an_interrupt_abandons_the_round_and_a_steer_resumes_it() {
     // The second half of the example: the model is part-way through an answer,
     // the operator stops it, and what they say next replaces the abandoned
     // round. The first scripted call never ends, so the interrupt is what moves
-    // the run on.
+    // the prompt on.
     let workspace = Workspace::new("interrupt");
     let (mut session, provider) = coding_session(&workspace, vec![
         ScriptedCall::EventsThenPending(text_delta_events("a long description of")),
@@ -257,10 +257,10 @@ async fn an_interrupt_abandons_the_round_and_a_steer_resumes_it() {
     });
 
     session.initialize().await.expect("initialization succeeds");
-    let answer = timeout(PATIENCE, session.run("describe every file"))
+    let answer = timeout(PATIENCE, session.prompt("describe every file"))
         .await
         .expect("the interrupt unblocks the hanging stream")
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
     controller.await.expect("the controller finishes");
 
     assert_eq!(answer.as_deref(), Some("DONE"));
@@ -299,7 +299,7 @@ async fn an_interrupt_abandons_the_round_and_a_steer_resumes_it() {
 }
 
 #[tokio::test]
-async fn a_finished_run_reports_what_it_used() {
+async fn a_finished_prompt_reports_what_it_used() {
     // What the example prints in its summary comes from these three, so they
     // are pinned here against the scripted response's own numbers.
     let workspace = Workspace::new("usage");
@@ -308,16 +308,16 @@ async fn a_finished_run_reports_what_it_used() {
     )]);
 
     session.initialize().await.expect("initialization succeeds");
-    timeout(PATIENCE, session.run("say something"))
+    timeout(PATIENCE, session.prompt("say something"))
         .await
-        .expect("the run finishes")
-        .expect("the run succeeds");
+        .expect("the prompt finishes")
+        .expect("the prompt succeeds");
 
-    let usage = session.last_run_usage();
+    let usage = session.last_prompt_usage();
     assert_eq!(usage.input, 10);
     assert_eq!(usage.output, 5);
     assert_eq!(usage.total(), 15);
-    assert_eq!(session.last_run_cost_usd_micros(), Some(12_500));
+    assert_eq!(session.last_prompt_cost_usd_micros(), Some(12_500));
     assert_eq!(
         session.history().turns().len(),
         2,

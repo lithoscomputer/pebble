@@ -1,10 +1,10 @@
 //! One conversation with one model, and the loop that drives it.
 //!
-//! A [`Session`] holds everything one run of a coding agent needs: the model
+//! A [`Session`] holds everything one prompt of a coding agent needs: the model
 //! client, the harness the model expects, the tools it may call, the history it
 //! replays, and the event pipeline an application watches. Build one with
 //! [`Session::builder`], call [`Session::initialize`] once, then
-//! [`Session::run`] for each thing you want done.
+//! [`Session::prompt`] for each thing you want done.
 //!
 //! ```no_run
 //! use std::sync::Arc;
@@ -20,7 +20,7 @@
 //!
 //! let mut events = session.subscribe();
 //! session.initialize().await?;
-//! let answer = session.run("fix the failing test").await?;
+//! let answer = session.prompt("fix the failing test").await?;
 //! session.shutdown(ShutdownReason::Completed).await?;
 //! # let _ = (events.try_recv(), answer);
 //! # Ok(())
@@ -35,20 +35,20 @@
 //! one pebble does not know, is a build error rather than a session that runs
 //! with the wrong prompt.
 //!
-//! # Steering a run
+//! # Steering a prompt
 //!
-//! [`Session::run`] borrows the session until it returns, so everything an
-//! application says to a live run goes through
+//! [`Session::prompt`] borrows the session until it returns, so everything an
+//! application says to a live prompt goes through
 //! [`Session::control_handle`]: a cheap clone that queues steering and
 //! interrupts rounds. [`Session::interrupt`] is the separate, terminal gesture
-//! that ends the run.
+//! that ends the prompt.
 //!
 //! # What the session owns
 //!
-//! The session owns its event pump and, while a run has a wall-clock budget,
+//! The session owns its event pump and, while a prompt has a wall-clock budget,
 //! the timer watching it. Both are joined — never abandoned — by
-//! [`Session::shutdown`] and by the end of a run, so a failure inside either is
-//! reported rather than lost. The application owns the Tokio runtime.
+//! [`Session::shutdown`] and by the end of a prompt, so a failure inside either
+//! is reported rather than lost. The application owns the Tokio runtime.
 //!
 //! Joining the pump is also what ends every stream [`Session::subscribe`]
 //! handed out. A reader looping until `RecvError::Closed` therefore finishes
@@ -135,25 +135,25 @@ const PROBE_TIMEOUT_MS: u64 = 5_000;
 pub enum ShutdownReason {
     /// The work finished.
     Completed,
-    /// Someone cancelled the run.
+    /// Someone cancelled the prompt.
     Cancelled,
-    /// The run failed.
+    /// The prompt failed.
     Error,
 }
 
-/// Where one run spent its time.
+/// Where one prompt spent its time.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RunTiming {
+pub struct PromptTiming {
     /// Time spent waiting on the model.
     pub inference: Duration,
     /// Time spent running tools.
     pub tool:      Duration,
 }
 
-/// What one run accumulated across every input it processed.
+/// What one prompt accumulated across every input it processed.
 #[derive(Debug, Default)]
-struct RunTotals {
-    timing:          RunTiming,
+struct PromptTotals {
+    timing:          PromptTiming,
     usage:           TokenUsage,
     cost_usd_micros: Option<u64>,
 }
@@ -304,7 +304,7 @@ impl SessionBuilder {
     ///
     /// Anything the catalog resolver accepts works — a model id, an alias, a
     /// `provider/model` pair, or `default`. The session pins whatever it
-    /// resolves to, so every round of the run reaches the same model.
+    /// resolves to, so every round of the prompt reaches the same model.
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
         self
@@ -329,7 +329,7 @@ impl SessionBuilder {
     /// Sets where the session asks a person a question.
     ///
     /// Without one, no question tool is registered, so the model cannot park a
-    /// run waiting for an answer nobody will give.
+    /// prompt waiting for an answer nobody will give.
     pub fn human_input(mut self, provider: Arc<dyn HumanInputProvider>) -> Self {
         self.human_input = Some(provider);
         self
@@ -337,7 +337,7 @@ impl SessionBuilder {
 
     /// Sets where a tool call's extra environment variables come from.
     ///
-    /// Resolved once per tool round, so a credential that expires mid-run is
+    /// Resolved once per tool round, so a credential that expires mid-prompt is
     /// fetched again rather than reused.
     pub fn tool_env_provider(mut self, provider: Arc<dyn ToolEnvProvider>) -> Self {
         self.tool_env_provider = Some(provider);
@@ -364,7 +364,7 @@ impl SessionBuilder {
     /// Lets `web_fetch` answer a prompt about a page by asking `model`.
     ///
     /// The selector is resolved through this session's client, so the
-    /// summarizing model can be smaller and cheaper than the one running the
+    /// summarizing model can be smaller and cheaper than the one promptning the
     /// session. Without one, a `web_fetch` call carrying a prompt returns the
     /// page and says the summary was unavailable.
     ///
@@ -401,9 +401,9 @@ impl SessionBuilder {
 
     /// Records every event durably before any subscriber sees it.
     ///
-    /// A sink that refuses an event stops the run and closes the session: a
+    /// A sink that refuses an event stops the prompt and closes the session: a
     /// session that cannot record what it did is worse than one that stops. The
-    /// run that noticed reports [`Error::EventSink`]; every call after it
+    /// prompt that noticed reports [`Error::EventSink`]; every call after it
     /// reports [`Error::SessionClosed`].
     pub fn event_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
         self.events.sink = Some(sink);
@@ -634,7 +634,7 @@ impl SessionBuilder {
             file_tracker: FileTracker::default(),
             subagents: supervisor,
             completion_coordinator: None,
-            last_run: RunTotals::default(),
+            last_prompt: PromptTotals::default(),
         };
 
         // Wired here rather than by the application: a supervisor with no
@@ -741,23 +741,23 @@ fn new_session_id() -> String {
     format!("ses_{}", uuid::Uuid::new_v4())
 }
 
-/// Where an outside task names why it is about to cancel a run.
+/// Where an outside task names why it is about to cancel a prompt.
 ///
-/// [`Session::interrupt_reason_handle`] hands one out before the run starts, so
-/// a watchdog holding it can say what it is doing — a budget spent, a deadline
-/// passed — and the run then ends with that reason rather than a plain
-/// cancellation. Cloning is cheap and every clone names the same session.
+/// [`Session::interrupt_reason_handle`] hands one out before the prompt starts,
+/// so a watchdog holding it can say what it is doing — a budget spent, a
+/// deadline passed — and the prompt then ends with that reason rather than a
+/// plain cancellation. Cloning is cheap and every clone names the same session.
 ///
-/// First writer wins: the reason a run reports is the first one recorded, and
-/// [`record`](Self::record) is the only way to write, so a later task cannot
-/// overwrite what already explains the interrupt.
+/// First writer wins: the reason a prompt reports is the first one recorded,
+/// and [`record`](Self::record) is the only way to write, so a later task
+/// cannot overwrite what already explains the interrupt.
 #[derive(Clone, Debug)]
 pub struct InterruptReasonHandle(Arc<Mutex<Option<InterruptReason>>>);
 
 impl InterruptReasonHandle {
     /// Records `reason` unless one is already recorded.
     ///
-    /// Answers whether this call is the one the run will report.
+    /// Answers whether this call is the one the prompt will report.
     pub fn record(&self, reason: InterruptReason) -> bool {
         let mut recorded = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         if recorded.is_some() {
@@ -776,10 +776,10 @@ impl InterruptReasonHandle {
 
 /// One conversation with one model.
 ///
-/// A session is used from one place at a time: [`Session::run`] borrows it for
-/// the length of a run. Everything that has to reach a live run —
+/// A session is used from one place at a time: [`Session::prompt`] borrows it
+/// for the length of a prompt. Everything that has to reach a live prompt —
 /// steering, interrupts, follow-up input, the event stream — comes from a
-/// handle taken before the run starts.
+/// handle taken before the prompt starts.
 #[must_use = "call `shutdown` to stop the session and join what it owns"]
 pub struct Session {
     id: String,
@@ -819,7 +819,8 @@ pub struct Session {
     control_state: Arc<Mutex<ControlState>>,
     control_notify: Arc<Notify>,
     followup_queue: Arc<Mutex<VecDeque<String>>>,
-    /// Ends the whole run. Distinct from the round token, which ends one turn.
+    /// Ends the whole prompt. Distinct from the round token, which ends one
+    /// turn.
     cancel_token: CancellationToken,
     /// Ends the current round. The cell is shared with every control handle;
     /// the loop swaps a fresh token in as each round starts.
@@ -836,7 +837,7 @@ pub struct Session {
     file_tracker: FileTracker,
     subagents: Option<SubagentSupervisor>,
     completion_coordinator: Option<Arc<dyn CompletionCoordinator>>,
-    last_run: RunTotals,
+    last_prompt: PromptTotals,
 }
 
 impl fmt::Debug for Session {
@@ -907,7 +908,7 @@ impl Session {
     /// can be read back in shape; the tree itself is the application's to
     /// rebuild, because a child's supervisor is not stored.
     ///
-    /// A record can be taken at any time, including mid-run as a crash
+    /// A record can be taken at any time, including mid-prompt as a crash
     /// checkpoint: the event numbering it stores covers every event emitted
     /// before the call, whether or not the pipeline has published it yet, so a
     /// session resumed from the record never reuses a number.
@@ -924,7 +925,7 @@ impl Session {
 
     /// Loads what the session was told, and captures where it is working.
     ///
-    /// Call this once, before the first run. It publishes
+    /// Call this once, before the first prompt. It publishes
     /// [`SessionStarted`](AgentEvent::SessionStarted), loads the memory files
     /// and skill directories the options name, probes the environment for the
     /// prompt's sake, and asks the profile for the system prompt the whole
@@ -1163,20 +1164,20 @@ impl Session {
         &self.file_tracker
     }
 
-    /// Where the last run spent its time.
-    pub const fn last_run_timing(&self) -> RunTiming {
-        self.last_run.timing
+    /// Where the last prompt spent its time.
+    pub const fn last_prompt_timing(&self) -> PromptTiming {
+        self.last_prompt.timing
     }
 
-    /// What the last run cost in tokens, summed over every response.
-    pub const fn last_run_usage(&self) -> TokenUsage {
-        self.last_run.usage
+    /// What the last prompt cost in tokens, summed over every response.
+    pub const fn last_prompt_usage(&self) -> TokenUsage {
+        self.last_prompt.usage
     }
 
-    /// What the last run cost in USD micros, where the catalog or the provider
-    /// priced it.
-    pub const fn last_run_cost_usd_micros(&self) -> Option<u64> {
-        self.last_run.cost_usd_micros
+    /// What the last prompt cost in USD micros, where the catalog or the
+    /// provider priced it.
+    pub const fn last_prompt_cost_usd_micros(&self) -> Option<u64> {
+        self.last_prompt.cost_usd_micros
     }
 
     /// The tools the model is actually shown, after the access policy.
@@ -1242,12 +1243,12 @@ impl Session {
     }
 
     /// Installs the coordinator that decides whether a finished turn really
-    /// ends the run.
+    /// ends the prompt.
     pub fn set_completion_coordinator(&mut self, coordinator: Arc<dyn CompletionCoordinator>) {
         self.completion_coordinator = Some(coordinator);
     }
 
-    /// Queues more input to run once the current input is finished.
+    /// Queues more input to process once the current input is finished.
     pub fn follow_up(&self, message: impl Into<String>) {
         self.followup_queue
             .lock()
@@ -1260,7 +1261,7 @@ impl Session {
         Arc::clone(&self.followup_queue)
     }
 
-    /// Ends the run.
+    /// Ends the prompt.
     ///
     /// The loop unwinds through its own checkpoints — every tool call still
     /// gets its result recorded — and then closes the session. This is the
@@ -1271,7 +1272,7 @@ impl Session {
         self.cancel_token.cancel();
     }
 
-    /// The token that ends this session's run.
+    /// The token that ends this session's prompt.
     pub fn cancel_token(&self) -> CancellationToken {
         self.cancel_token.clone()
     }
@@ -1352,29 +1353,29 @@ impl Session {
         self.set_tool_env_provider(Arc::new(StaticEnvProvider(env)));
     }
 
-    /// Runs one input to completion, answering with the assistant's final text
-    /// when it ended with any.
+    /// Processes one input to completion, answering with the assistant's final
+    /// text when it ended with any.
     ///
     /// Questions go to the provider the session was built with.
     ///
     /// # Errors
     ///
     /// Returns [`Error::SessionClosed`] for a session that has ended,
-    /// [`Error::Interrupted`] when the run was cancelled or ran out of
+    /// [`Error::Interrupted`] when the prompt was cancelled or ran out of
     /// wall-clock time, [`Error::Llm`] when the model call failed for good, and
     /// [`Error::EventSink`] when the configured sink refused an event.
-    pub async fn run(&mut self, input: &str) -> Result<Option<String>> {
-        self.last_run = RunTotals::default();
+    pub async fn prompt(&mut self, input: &str) -> Result<Option<String>> {
+        self.last_prompt = PromptTotals::default();
         if self.state == SessionState::Closed {
             return Err(Error::SessionClosed);
         }
 
         let human_input = self.human_input.clone();
         let timer = self.start_wall_clock_timer();
-        let mut totals = RunTotals::default();
+        let mut totals = PromptTotals::default();
 
         let mut result = self
-            .run_single_input(
+            .process_input(
                 input,
                 SkillExpansion::Apply,
                 human_input.as_ref(),
@@ -1400,7 +1401,7 @@ impl Session {
             }
         } else {
             self.transition(SessionState::Idle);
-            // A sink that refused an event during this run is this run's
+            // A sink that refused an event during this prompt is this prompt's
             // failure, even where the loop got to a boundary too late to
             // notice it.
             if let Err(error) = self.check_pump().await {
@@ -1408,13 +1409,13 @@ impl Session {
             }
         }
 
-        self.last_run = totals;
+        self.last_prompt = totals;
 
         match (result, task_failure) {
-            // The run's own failure is the story; a task that also failed on
+            // The prompt's own failure is the story; a task that also failed on
             // the way out is reported rather than returned.
             (Err(error), Some(task)) => {
-                warn!(%task, "A session task failed while the run was already failing");
+                warn!(%task, "A session task failed while the prompt was already failing");
                 Err(error)
             }
             (Err(error), None) => Err(error),
@@ -1431,7 +1432,7 @@ impl Session {
     async fn drain_boundary_queue(
         &mut self,
         human_input: Option<&Arc<dyn HumanInputProvider>>,
-        totals: &mut RunTotals,
+        totals: &mut PromptTotals,
         result: &mut Result<Option<String>>,
     ) {
         loop {
@@ -1470,7 +1471,7 @@ impl Session {
                 return;
             };
             *result = self
-                .run_single_input(&input, skill_expansion, human_input, totals)
+                .process_input(&input, skill_expansion, human_input, totals)
                 .await;
             if result.is_err() {
                 return;
@@ -1478,11 +1479,11 @@ impl Session {
         }
     }
 
-    /// Starts the task that ends a run which has taken too long.
+    /// Starts the task that ends a prompt which has taken too long.
     ///
-    /// The timer cancels the session rather than dropping the run, so the loop
-    /// unwinds through its own checkpoints and every tool call still has its
-    /// result recorded.
+    /// The timer cancels the session rather than dropping the prompt, so the
+    /// loop unwinds through its own checkpoints and every tool call still
+    /// has its result recorded.
     fn start_wall_clock_timer(&self) -> Option<WallClockTimer> {
         let duration = self.config.wall_clock_timeout?;
         let stop = CancellationToken::new();
@@ -1551,16 +1552,18 @@ impl Session {
     }
 
     /// Reports a pump that has already stopped, which only a refusing sink
-    /// does while a run is in progress.
+    /// does while a prompt is in progress.
     ///
-    /// Checked at round boundaries so a run ends promptly once its events stop
-    /// being recorded, rather than working on against a stream nobody has.
+    /// Checked at round boundaries so a prompt ends promptly once its events
+    /// stop being recorded, rather than working on against a stream nobody
+    /// has.
     ///
-    /// A sink failure closes the session as well as ending the run. The
+    /// A sink failure closes the session as well as ending the prompt. The
     /// pipeline stops for good when the pump does — nothing is recorded, and no
     /// subscriber is served — so a session that kept answering would be working
-    /// where nobody could see it. The application gets the failure from the run
-    /// that found it, and [`Error::SessionClosed`] from every call after.
+    /// where nobody could see it. The application gets the failure from the
+    /// prompt that found it, and [`Error::SessionClosed`] from every call
+    /// after.
     async fn check_pump(&mut self) -> Result<()> {
         let Some(pump) = self.pump.as_ref() else {
             return Ok(());
@@ -1575,7 +1578,8 @@ impl Session {
         outcome
     }
 
-    /// Closes a cancelled session and answers with the error the run ends on.
+    /// Closes a cancelled session and answers with the error the prompt ends
+    /// on.
     async fn close_cancelled(&mut self) -> Error {
         let interrupted = self.interrupted_error();
         match self.shutdown(ShutdownReason::Cancelled).await {
@@ -1588,7 +1592,7 @@ impl Session {
         self.interrupt_reason_handle().record(reason);
     }
 
-    /// The error an interrupted run ends with, naming whatever reason was
+    /// The error an interrupted prompt ends with, naming whatever reason was
     /// recorded first.
     fn interrupted_error(&self) -> Error {
         let reason = *self
@@ -1609,12 +1613,12 @@ impl Session {
     /// the problem.
     ///
     /// An authentication failure will not fix itself between rounds, so the
-    /// session stops rather than spending the rest of the run failing the same
-    /// way.
+    /// session stops rather than spending the rest of the prompt failing the
+    /// same way.
     fn emit_llm_error(&mut self, error: LlmError) -> Error {
         let credential_failure = is_auth_error(&error);
         // Projected from the error the caller receives, so what a reader sees
-        // and what the run returns say the same thing.
+        // and what the prompt returns say the same thing.
         let error = Error::Llm(error);
         self.emit(AgentEvent::Error {
             error: ErrorData::from(&error),
@@ -1661,7 +1665,7 @@ impl Session {
     }
 }
 
-/// The task watching one run's wall-clock budget.
+/// The task watching one prompt's wall-clock budget.
 struct WallClockTimer {
     stop: CancellationToken,
     task: JoinHandle<()>,
@@ -1924,13 +1928,16 @@ mod tests {
     // --- Running ---
 
     #[tokio::test]
-    async fn a_text_answer_ends_the_run() {
+    async fn a_text_answer_ends_the_prompt() {
         let (mut session, _provider) =
             TestSession::answering(vec![ScriptedCall::response(text_response("all done"))]);
         let mut events = session.subscribe();
         session.initialize().await.expect("initialization succeeds");
 
-        let answer = session.run("fix the test").await.expect("the run succeeds");
+        let answer = session
+            .prompt("fix the test")
+            .await
+            .expect("the prompt succeeds");
 
         assert_eq!(answer.as_deref(), Some("all done"));
         assert_eq!(session.history().len(), 2, "the input and the answer");
@@ -1959,7 +1966,10 @@ mod tests {
         handle.interrupt();
         handle.interrupt_then_steer("do this instead", None);
 
-        session.run("do a thing").await.expect("the run succeeds");
+        session
+            .prompt("do a thing")
+            .await
+            .expect("the prompt succeeds");
 
         let published = settled(&mut session, &mut events).await;
         let interrupts: Vec<u64> = published
@@ -1996,7 +2006,7 @@ mod tests {
             .expect("the shutdown succeeds");
 
         let error = session
-            .run("anything")
+            .prompt("anything")
             .await
             .expect_err("the session ended");
 
@@ -2054,7 +2064,10 @@ mod tests {
             }
             seen
         });
-        session.run("do a thing").await.expect("the run succeeds");
+        session
+            .prompt("do a thing")
+            .await
+            .expect("the prompt succeeds");
 
         session
             .shutdown(ShutdownReason::Completed)
@@ -2065,7 +2078,7 @@ mod tests {
             .await
             .expect("the stream ends when the session is shut down, not when it is dropped")
             .expect("the renderer finishes");
-        assert!(seen > 0, "the renderer read the run it was watching");
+        assert!(seen > 0, "the renderer read the prompt it was watching");
         // Read after the join on purpose: the session is still alive here,
         // which is the order an application works in — wait for the renderer,
         // then let the session go.
@@ -2087,7 +2100,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_refusing_sink_stops_the_run() {
+    async fn a_refusing_sink_stops_the_prompt() {
         let (client, _provider) =
             scripted_client(vec![ScriptedCall::response(text_response("done"))]);
         let mut session = builder(client)
@@ -2097,11 +2110,11 @@ mod tests {
 
         // The pump stops on the first event it is given, which the loop
         // notices at its next round boundary.
-        let first = session.run("do a thing").await;
+        let first = session.prompt("do a thing").await;
         yield_now().await;
-        let second = session.run("do another thing").await;
+        let second = session.prompt("do another thing").await;
         let ((Err(failure), _) | (Ok(_), Err(failure))) = (first, second) else {
-            panic!("a refusing sink must stop the run");
+            panic!("a refusing sink must stop the prompt");
         };
 
         assert_eq!(failure.kind(), ErrorKind::EventSink);
@@ -2119,11 +2132,11 @@ mod tests {
         let mut events = session.subscribe();
 
         // The failure surfaces at whichever checkpoint first finds the pump
-        // stopped, which is the end of the first run or the start of the
+        // stopped, which is the end of the first prompt or the start of the
         // second.
         let mut failure = None;
         for _ in 0..2 {
-            match session.run("do a thing").await {
+            match session.prompt("do a thing").await {
                 Ok(_) => yield_now().await,
                 Err(error) => {
                     failure = Some(error);
@@ -2133,7 +2146,7 @@ mod tests {
         }
         let calls_before = provider.call_count();
 
-        let failure = failure.expect("a refusing sink stops a run");
+        let failure = failure.expect("a refusing sink stops a prompt");
         assert_eq!(failure.kind(), ErrorKind::EventSink);
         assert_eq!(
             session.state(),
@@ -2141,13 +2154,16 @@ mod tests {
             "a session whose events go nowhere stops"
         );
         assert!(
-            matches!(session.run("and another").await, Err(Error::SessionClosed)),
-            "the next run is refused rather than run blind"
+            matches!(
+                session.prompt("and another").await,
+                Err(Error::SessionClosed)
+            ),
+            "the next prompt is refused rather than run blind"
         );
         assert_eq!(
             provider.call_count(),
             calls_before,
-            "the refused run asks the model nothing"
+            "the refused prompt asks the model nothing"
         );
         assert!(
             events.try_recv().is_err(),
@@ -2160,7 +2176,10 @@ mod tests {
     #[tokio::test]
     async fn a_session_round_trips_through_its_record() {
         let mut session = session();
-        session.run("do a thing").await.expect("the run succeeds");
+        session
+            .prompt("do a thing")
+            .await
+            .expect("the prompt succeeds");
         session
             .shutdown(ShutdownReason::Completed)
             .await
@@ -2186,7 +2205,10 @@ mod tests {
     #[tokio::test]
     async fn a_resumed_session_keeps_numbering_where_it_left_off() {
         let mut session = session();
-        session.run("do a thing").await.expect("the run succeeds");
+        session
+            .prompt("do a thing")
+            .await
+            .expect("the prompt succeeds");
         session
             .shutdown(ShutdownReason::Completed)
             .await
@@ -2212,7 +2234,10 @@ mod tests {
         // event this one has already emitted, published or not.
         let mut session = session();
         let mut events = session.subscribe();
-        session.run("do a thing").await.expect("the run succeeds");
+        session
+            .prompt("do a thing")
+            .await
+            .expect("the prompt succeeds");
 
         let record = session.to_record();
 
@@ -2225,12 +2250,12 @@ mod tests {
         }
         assert!(
             !published.is_empty(),
-            "the run published events for the record to cover"
+            "the prompt published events for the record to cover"
         );
         assert!(
             published.iter().all(|seq| *seq <= record.last_event_seq),
             "a record taken while the pipeline is behind still covers what the \
-             run emitted: {published:?} against {}",
+             prompt emitted: {published:?} against {}",
             record.last_event_seq
         );
         session
@@ -2286,7 +2311,10 @@ mod tests {
             ScriptedFailure::terminal(LlmErrorKind::Server, "the provider is down"),
         )]);
 
-        let error = session.run("anything").await.expect_err("the call failed");
+        let error = session
+            .prompt("anything")
+            .await
+            .expect_err("the call failed");
 
         assert!(
             matches!(&error, Error::Llm(inner) if inner.kind() == LlmErrorKind::Server),

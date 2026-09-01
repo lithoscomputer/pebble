@@ -10,7 +10,7 @@
 //! live subscribers.
 //!
 //! That ordering is the point. The sink and every subscriber observe the same
-//! events in the same order, and a sink failure stops the run rather than
+//! events in the same order, and a sink failure stops the prompt rather than
 //! losing an event.
 //!
 //! Live delivery is lossy by design. [`Emitter::subscribe`] hands out a
@@ -58,7 +58,7 @@ pub const DEFAULT_EVENT_CAPACITY: usize = 1024;
 pub trait EventSink: Send + Sync {
     /// Records one event durably.
     ///
-    /// Returning an error stops the run, so report only failures that make
+    /// Returning an error stops the prompt, so report only failures that make
     /// the recorded stream untrustworthy.
     async fn record(&self, event: &SessionEvent) -> StdResult<(), EventSinkError>;
 }
@@ -136,7 +136,7 @@ impl EventSequence {
         }
     }
 
-    /// Continues numbering after the last event a previous run published.
+    /// Continues numbering after the last event a previous prompt published.
     pub(crate) const fn resuming_after(last_seq: u64) -> Self {
         Self {
             stamped:  AtomicU64::new(last_seq),
@@ -200,7 +200,7 @@ pub struct EventOptions {
     /// The durable recorder, when the application configured one.
     pub sink: Option<Arc<dyn EventSink>>,
 
-    /// The last sequence number a previous run of this session published.
+    /// The last sequence number a previous prompt of this session published.
     ///
     /// Zero for a new session; [`crate::SessionRecord::last_event_seq`] for a
     /// resumed one.
@@ -456,7 +456,7 @@ impl EventPump {
     ///
     /// Returns [`crate::Error::EventSink`] as soon as the sink refuses an
     /// event. The refused event, and anything still queued, is not published,
-    /// because the run is over.
+    /// because the prompt is over.
     pub async fn run(mut self) -> Result<()> {
         while let Some(message) = self.inbox.recv().await {
             let Some(event) = message else {
@@ -553,7 +553,7 @@ impl SessionBoundEmitter {
         );
     }
 
-    /// Reports how much output the running tool produced.
+    /// Reports how much output the promptning tool produced.
     ///
     /// The last report wins; the execution layer drains it once the tool
     /// returns.
@@ -790,7 +790,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_sink_failure_stops_the_run_and_withholds_the_event() {
+    async fn a_sink_failure_stops_the_prompt_and_withholds_the_event() {
         let sink = Arc::new(RecordingSink::failing_at(1));
         let (emitter, pump) = spawn_pipeline(EventOptions {
             sink: Some(Arc::clone(&sink) as Arc<dyn EventSink>),

@@ -54,7 +54,7 @@ async fn the_system_prompt_carries_the_application_instructions() {
         .build();
     session.initialize().await.expect("initialization succeeds");
 
-    session.run("test").await.expect("the run succeeds");
+    session.prompt("test").await.expect("the prompt succeeds");
 
     let requests = provider.requests();
     let request = requests.first().expect("the round was requested");
@@ -75,7 +75,7 @@ async fn a_session_with_no_prompt_sends_no_system_message() {
     // Deliberately not initialized, so the system prompt is still empty.
     let (mut session, provider) = TestSession::answering(answers("captured"));
 
-    session.run("test").await.expect("the run succeeds");
+    session.prompt("test").await.expect("the prompt succeeds");
 
     let requests = provider.requests();
     let request = requests.first().expect("the round was requested");
@@ -99,7 +99,7 @@ async fn every_registered_tool_is_exposed_when_no_policy_says_otherwise() {
         .tools([noop_tool("read_file"), noop_tool("write_file")])
         .build();
 
-    session.run("test").await.expect("the run succeeds");
+    session.prompt("test").await.expect("the prompt succeeds");
 
     let requests = provider.requests();
     let request = requests.first().expect("the round was requested");
@@ -122,7 +122,7 @@ async fn a_denied_tool_is_never_advertised() {
         })
         .build();
 
-    session.run("test").await.expect("the run succeeds");
+    session.prompt("test").await.expect("the prompt succeeds");
 
     let requests = provider.requests();
     let request = requests.first().expect("the round was requested");
@@ -143,7 +143,7 @@ async fn an_approval_required_tool_is_advertised_where_the_mode_allows_it() {
         })
         .build();
 
-    session.run("test").await.expect("the run succeeds");
+    session.prompt("test").await.expect("the prompt succeeds");
 
     let requests = provider.requests();
     let request = requests.first().expect("the round was requested");
@@ -190,9 +190,9 @@ async fn ten_unused_assistant_turns_bring_back_the_task_reminder() {
 
     for index in 0..=10 {
         session
-            .run(&format!("turn {index}"))
+            .prompt(&format!("turn {index}"))
             .await
-            .expect("the run succeeds");
+            .expect("the prompt succeeds");
     }
 
     let requests = provider.requests();
@@ -213,7 +213,7 @@ async fn the_reasoning_effort_a_session_is_given_reaches_the_request() {
         .build();
     session.set_reasoning_effort(Some(ReasoningEffort::High));
 
-    session.run("test").await.expect("the run succeeds");
+    session.prompt("test").await.expect("the prompt succeeds");
 
     let requests = provider.requests();
     let request = requests.first().expect("the round was requested");
@@ -247,7 +247,10 @@ async fn a_refused_call_answers_the_model_with_the_reason() {
         .build();
     let mut events = session.subscribe();
 
-    session.run("Use echo").await.expect("the run succeeds");
+    session
+        .prompt("Use echo")
+        .await
+        .expect("the prompt succeeds");
 
     assert_eq!(session.state(), SessionState::Idle);
     assert_eq!(session.history().turns().len(), 4);
@@ -282,7 +285,10 @@ async fn an_approved_call_runs() {
         })
         .build();
 
-    session.run("Use echo").await.expect("the run succeeds");
+    session
+        .prompt("Use echo")
+        .await
+        .expect("the prompt succeeds");
 
     let results = tool_results(&session, 2);
     assert!(!results[0].is_error);
@@ -314,7 +320,10 @@ async fn the_approval_hook_sees_the_call_the_model_asked_for() {
     })
     .build();
 
-    session.run("Use echo").await.expect("the run succeeds");
+    session
+        .prompt("Use echo")
+        .await
+        .expect("the prompt succeeds");
 
     let seen = captured.lock().unwrap_or_else(PoisonError::into_inner);
     let (name, arguments) = seen.as_ref().expect("the hook was called");
@@ -332,7 +341,10 @@ async fn a_session_with_no_hook_runs_the_call_unchecked() {
         })
         .build();
 
-    session.run("Use echo").await.expect("the run succeeds");
+    session
+        .prompt("Use echo")
+        .await
+        .expect("the prompt succeeds");
 
     let results = tool_results(&session, 2);
     assert!(!results[0].is_error);
@@ -361,7 +373,10 @@ async fn a_subscriber_sees_the_round_while_it_runs() {
         .await;
     });
 
-    session.run("Use echo").await.expect("the run succeeds");
+    session
+        .prompt("Use echo")
+        .await
+        .expect("the prompt succeeds");
 
     watcher.await.expect("the watcher saw the whole call");
 }

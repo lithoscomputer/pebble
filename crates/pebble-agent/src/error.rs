@@ -1,0 +1,65 @@
+//! Errors returned by the agent boundary.
+
+use std::result::Result as StdResult;
+
+use lithos_llm::types::{Error as LlmError, RequestBuildError};
+use thiserror::Error;
+
+use crate::context::ContextTransformError;
+
+/// A result returned by a running agent.
+pub type Result<T> = StdResult<T, AgentError>;
+
+/// Why an agent could not be built.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum AgentBuildError {
+    /// The model selector was blank.
+    #[error("the model selector must not be blank")]
+    EmptyModel,
+    /// The event buffer cannot hold an event.
+    #[error("the event capacity must be greater than zero")]
+    ZeroEventCapacity,
+    /// Two tools use the same model-visible name.
+    #[error("tool `{name}` was registered more than once")]
+    DuplicateTool {
+        /// The duplicated name.
+        name: String,
+    },
+}
+
+/// Why an agent operation failed.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum AgentError {
+    /// The agent has been shut down.
+    #[error("the agent is closed")]
+    Closed,
+    /// The input carried no content.
+    #[error("the user message must contain at least one content part")]
+    EmptyInput,
+    /// The current prompt was aborted.
+    #[error("the agent prompt was aborted")]
+    Aborted,
+    /// The request could not be built from the current conversation.
+    #[error("building the model request")]
+    Request {
+        /// The request validation failure.
+        #[source]
+        source: RequestBuildError,
+    },
+    /// The model call failed.
+    #[error("calling the model")]
+    Model {
+        /// The model-layer failure.
+        #[source]
+        source: LlmError,
+    },
+    /// The configured context transformation failed.
+    #[error("preparing the next model turn")]
+    ContextTransform {
+        /// The transformation failure.
+        #[source]
+        source: ContextTransformError,
+    },
+}

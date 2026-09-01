@@ -1,6 +1,7 @@
 # Pebble
 
-Pebble is the loop a coding agent runs on, as a library.
+Pebble is a coding agent as a library. The workspace also contains
+`pebble-agent`, its provider-neutral agent loop.
 
 It owns the turn loop between a model and a machine: it calls the model,
 streams what comes back, runs the tools the model asks for, keeps the history
@@ -11,24 +12,30 @@ application that embeds it.
 
 ## How the pieces sit
 
-Three layers, each with one job.
+Four layers, each with one job.
 
 At the bottom is [lithos-llm](https://github.com/lithoscomputer/lithos-llm):
 the `Client`, the provider adapters and codecs, the catalog of models, and the
 retry middleware. It knows how to talk to a provider.
 
-In the middle is pebble: the session loop, history and compaction, the context
-window accounting, the tool registry and dispatch, the event stream, the
-steering and interrupt control plane, subagents, the coding tools, skills,
-memory, and the six agent profiles. It knows how to run an agent.
+Above it is `pebble-agent`: model turns, generic tool execution, conversation
+history, steering, follow-up, cancellation, and a small lifecycle event stream.
+It accepts a model service and tools from its caller. It knows how to run an
+agent, but it knows nothing about coding.
+
+Above that is `pebble`: coding profiles, filesystem and shell tools, memory,
+skills, context compaction policy, subagents, and the durable coding event
+stream. It knows how to turn an agent into a coding agent.
 
 On top is the application — a CLI, a server, a workflow engine, the example in
 this repository. It builds the `Client`, supplies the `Environment` the tools
 act through, subscribes to events or installs a sink for them, decides what the
 agent is allowed to do, and drives the input. It knows what the agent is for.
 
-Nothing reaches around a layer. Pebble never builds a client and never opens a
-socket; an application never sees a provider's wire format.
+Dependencies point down. `pebble` depends on `pebble-agent`, which depends on
+the `lithos-llm` runtime without enabling provider features. The coding layer
+also uses `lithos-llm` directly for model selection and coding-specific summary
+calls. Pebble never builds a client and never opens a socket.
 
 ## A session
 
@@ -40,7 +47,7 @@ use lithos_llm::Client;
 use lithos_llm::catalog::Catalog;
 use lithos_llm::credentials::EnvironmentCredentials;
 use lithos_llm::middleware::{RetryMiddleware, RetryPolicy};
-use pebble::{LocalEnvironment, RetryEventObserver, Session, ShutdownReason};
+use pebble::{CodingSession, LocalEnvironment, RetryEventObserver, ShutdownReason};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -52,23 +59,35 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .build()?
         .client;
 
-    let mut session = Session::builder(client)
+    let mut session = CodingSession::builder(
+        client,
+        Arc::new(LocalEnvironment::new("/path/to/work")),
+    )
         .model("claude-sonnet-5")
-        .environment(Arc::new(LocalEnvironment::new("/path/to/work")))
-        .build()?;
+        .build()
+        .await?;
 
     let mut events = session.subscribe();
-    session.initialize().await?;
-    let answer = session.run("fix the failing test").await?;
+    let outcome = session.prompt("fix the failing test").await?;
     session.shutdown(ShutdownReason::Completed).await?;
 
-    println!("{answer:?} — first event: {:?}", events.try_recv());
+    println!("{:?} — first event: {:?}", outcome.text(), events.try_recv());
     Ok(())
 }
 ```
 
+`CodingSessionBuilder::build().await` returns a ready session. Resource loading
+and system-prompt construction happen inside the build. There is no separate
+initialization step to remember. `prompt` returns a `PromptOutcome` with the final
+message, text, token usage, cost, and timing.
+
+Take a `CodingSessionControlHandle` before calling `prompt` when another task
+must `steer`, `follow_up`, `abort`, or `wait_for_idle` while the prompt holds
+the mutable session borrow. These are the same control verbs as the generic
+agent API.
+
 `examples/coding_agent.rs` is the same thing at full size: it renders the event
-stream, steers one run while it works, interrupts the next, and reports what
+stream, steers one prompt while it works, interrupts the next, and reports what
 the session used. Run it with `mise run dev`.
 
 ## What an application has to supply
@@ -78,16 +97,14 @@ and cannot add middleware to one, so the application installs the retry
 middleware when it builds the client, with pebble's `RetryEventObserver` on it.
 The observer is what puts the client's own retries onto the session's event
 stream; without it a session still runs correctly and simply never reports one.
-Give `SessionOptions::retry_policy` the same policy: pebble replays a turn
-itself only when a stream fails *after* the model produced visible output,
-which no middleware can reconnect underneath a reader, and one failure should
-be spaced the same way whichever layer handles it.
+`CodingSessionOptions::turn_replay` controls the separate replay that happens
+after a response stream opens. The two policies can share settings, but they
+have different ownership and do not have to match.
 
-The model layer is re-exported as `pebble::lithos_llm`, along with the
+The model layer is available under one namespace, `pebble::llm`, along with the
 `async_trait` attribute the seams are written with and `CancellationToken`, so
-an application needs `pebble` alone in its manifest. Naming lithos-llm again
-works, but a copy that resolves apart from pebble's builds a `Client` a session
-will not take.
+an application can use `pebble` alone in its manifest. A direct `lithos-llm`
+dependency is also appropriate when the application configures providers.
 
 **Credentials.** They belong to the client, and lithos-llm resolves them per
 call — `EnvironmentCredentials::conventional()` reads the usual variables
@@ -103,16 +120,16 @@ the trait over that instead, and nothing else in the crate changes.
 `pebble::test_support::MockEnvironment` stands in for a machine in tests,
 behind the `test-util` feature.
 
-**Somewhere for the events to go, if they matter.** `Session::subscribe` hands
-out a bounded broadcast receiver, which is lossy for a reader that falls
-behind: right for a terminal, wrong for a ledger. The stream ends with the
-session rather than with the session value: once `Session::shutdown` has
-returned, a reader looping until `RecvError::Closed` finishes, so a renderer
-task can be joined before the session is dropped. An application that must see
-every event installs an `EventSink` instead — each event is recorded there, in
-sequence, before any subscriber sees it, and a sink that refuses one stops the
-run, because a session that cannot record what it did is worse than one that
-stops.
+**Somewhere for the events to go, if they matter.**
+`CodingSession::subscribe` hands out a bounded broadcast receiver, which is
+lossy for a reader that falls behind: right for a terminal, wrong for a ledger.
+The stream ends with the session rather than with the session value: once
+`CodingSession::shutdown` has returned, a reader looping until
+`RecvError::Closed` finishes, so a renderer task can be joined before the
+session is dropped. An application that must see every event installs an
+`EventSink` instead — each event is recorded there, in sequence, before any
+subscriber sees it, and a sink that refuses one stops the prompt, because a
+session that cannot record what it did is worse than one that stops.
 
 **A policy, if the agent should not do everything.** Pebble installs none: with
 no `ToolAccessPolicy` and no `ToolHookCallback`, every registered tool is
@@ -124,6 +141,65 @@ advertises no tool without one: a `HumanInputProvider` (no provider, no
 question tool), a `SearchProvider` (no provider, no `web_search`), a `Redactor`
 for the process output the event stream carries, and a `SessionFactory` for
 subagents.
+
+## The generic agent API
+
+Use `pebble-agent` directly when the application supplies its own tools and
+does not need coding profiles or environment policy. Pebble also exposes the
+exact crate as `pebble::agent`:
+
+```rust,no_run
+use pebble::agent::{Agent, Tool};
+use serde_json::json;
+
+# async fn example(client: lithos_llm::Client) -> Result<(), Box<dyn std::error::Error>> {
+let inspect = Tool::function(
+    "inspect",
+    "Inspect a named value",
+    json!({"type": "object"}),
+    |_context, arguments| async move {
+        Ok(format!("inspected {}", arguments["name"]).into())
+    },
+);
+
+let mut agent = Agent::builder(client, "provider/model")
+    .system_prompt("Use tools when they help.")
+    .tools([inspect])
+    .build()?;
+
+agent.follow_up("Now explain the result");
+let outcome = agent.prompt("Inspect the parser").await?;
+println!("{}", outcome.text());
+# Ok(())
+# }
+```
+
+The public verbs are `prompt`, `steer`, `follow_up`, `abort`, and
+`wait_for_idle`. `Agent::snapshot` returns an owned immutable view instead of
+exposing mutable agent state. A `ContextTransform` can summarize or rewrite
+history before a model turn without adding coding policy to the agent crate.
+
+The coding layer has the same concise path for application tools:
+
+```rust
+use pebble::RegisteredTool;
+use serde_json::json;
+
+let inspect = RegisteredTool::function(
+    "inspect",
+    "Inspect an application value",
+    json!({"type": "object"}),
+    |_context, arguments| async move {
+        Ok(format!("inspected {}", arguments["name"]))
+    },
+);
+
+# let _ = inspect;
+```
+
+Pass it to `CodingSessionBuilder::tools`. Pebble records its source as
+`ToolSource::Application` and keeps coding-layer policy and event behavior
+around its execution.
 
 ## Which harness a session runs
 
@@ -137,10 +213,10 @@ is a build error, not a session that runs with the wrong prompt.
 
 ## Stability
 
-The serialized form of `SessionEvent` and `AgentEvent` is public API, and so is
-`SessionRecord`, which carries a format version. Evolution is additive: new
-variants and new optional fields. Consumers should ignore members they do not
-know and tolerate variants they do not know.
+The serialized form of `CodingSessionEvent` (`SessionEvent`) and `CodingEvent`
+(`AgentEvent`) is public API, and so is `SessionRecord`, which carries a format
+version. Evolution is additive: new variants and new optional fields. Consumers
+should ignore members they do not know and tolerate variants they do not know.
 
 Ignoring an unknown member is free; tolerating an unknown *variant* is the
 reader's own work, because a variant a build has never heard of fails the whole

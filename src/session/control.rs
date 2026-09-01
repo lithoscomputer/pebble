@@ -1,15 +1,16 @@
 //! Steering a session that is already running.
 //!
-//! A running session is busy inside [`Session::run`](crate::Session::run), so
-//! everything an application wants to say to it mid-run arrives through a
-//! [`SessionControlHandle`]: a cheap clone of the three shared pieces the
-//! session and its callers both hold. The handle queues messages and cancels
-//! the current round; the session drains the queue at round boundaries.
+//! A running session is busy inside
+//! [`Session::prompt`](crate::Session::prompt), so everything an application
+//! wants to say to it mid-prompt arrives through a [`SessionControlHandle`]: a
+//! cheap clone of the three shared pieces the session and its callers both
+//! hold. The handle queues messages and cancels the current round; the session
+//! drains the queue at round boundaries.
 //!
 //! Two gestures are distinct and often confused. [`SessionControlHandle`]
 //! *interrupts a round*: the current turn is abandoned and the session picks up
 //! whatever is queued. [`Session::interrupt`](crate::Session::interrupt) ends
-//! the whole run. Only the second closes the session.
+//! the whole prompt. Only the second closes the session.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
@@ -132,7 +133,7 @@ pub(crate) struct ControlState {
     pub(crate) settled_interrupt_generation: u64,
 }
 
-/// Decides whether a finished turn really ends the run.
+/// Decides whether a finished turn really ends the prompt.
 ///
 /// A session that answers with no tool calls is done, unless something outside
 /// it knows a steer is about to arrive. An application that feeds steering from
@@ -141,7 +142,7 @@ pub(crate) struct ControlState {
 ///
 /// The contract is the caller's to keep: once
 /// [`on_natural_completion`](Self::on_natural_completion) answers `false`, no
-/// further steer may reach the queue for this run, because the session is on
+/// further steer may reach the queue for this prompt, because the session is on
 /// its way out and would never drain it.
 pub trait CompletionCoordinator: Send + Sync {
     /// Whether the session should run one more round.
@@ -208,12 +209,12 @@ impl SessionControlHandle {
     /// Abandons the current round.
     ///
     /// With nothing queued the session parks at the next round boundary and
-    /// waits for a steer, so an operator can stop a run mid-thought and decide
-    /// what to say afterwards. The gesture is counted, so the session publishes
-    /// exactly one [`RoundInterrupted`](crate::AgentEvent::RoundInterrupted)
-    /// for it.
+    /// waits for a steer, so an operator can stop a prompt mid-thought and
+    /// decide what to say afterwards. The gesture is counted, so the
+    /// session publishes exactly one
+    /// [`RoundInterrupted`](crate::AgentEvent::RoundInterrupted) for it.
     ///
-    /// This does not end the run.
+    /// This does not end the prompt.
     /// [`Session::interrupt`](crate::Session::interrupt) does that.
     ///
     /// No author is taken, because nothing records one: an interrupt is

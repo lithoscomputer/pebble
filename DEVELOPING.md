@@ -1,8 +1,10 @@
 # Developing
 
-Pebble is a library crate with one example binary. Most work is a change to
-`src/`, its unit tests beside it, and the contract tests in `tests/`. The
-example is how a change is seen working against a real model.
+Pebble is a two-crate library workspace with one example binary.
+`crates/pebble-agent` is the provider-neutral agent loop. The root `pebble`
+crate is the coding-agent facade and owns the example. Most coding-agent work
+is a change to `src/`, its unit tests beside it, and the contract tests in
+`tests/`. Generic turn-loop work belongs in `crates/pebble-agent/src/`.
 
 ## Setup
 
@@ -43,7 +45,7 @@ Run `mise run check` before opening a pull request.
 ## Running the example
 
 `examples/coding_agent.rs` runs a real session: it builds a client, works in a
-new directory under the system temporary directory, steers one run, interrupts
+new directory under the system temporary directory, steers one prompt, interrupts
 another, and prints what the session used. It is the only thing in the
 repository that calls a provider.
 
@@ -52,7 +54,7 @@ repository that calls a provider.
 mise run dev
 
 # Any selector the built-in catalog knows.
-cargo run --locked --example coding_agent -- gpt-5.6
+cargo run --locked -p pebble --example coding_agent -- gpt-5.6
 ```
 
 It needs a key for whichever provider the model resolves to, in the variable
@@ -74,7 +76,7 @@ mise run test
 mise run test:doc
 
 # Just the end-to-end suite.
-cargo nextest run --locked --all-features --test e2e
+cargo nextest run --locked -p pebble --all-features --test e2e
 ```
 
 Unit tests live beside the code they cover. `tests/` holds the contract tests:
@@ -105,7 +107,7 @@ each night. Both workflows test these native platforms:
 - Linux arm64.
 
 The workflows check out only this repository. They cannot build until the
-`lithos-llm` path dependency is available on the runner, because `lithos-llm`
+`lithos-llm` path dependency is available on the promptner, because `lithos-llm`
 is a separate private repository. Both workflows fail at manifest load until a
 second checkout step is added, or the dependency changes form. Verify changes
 locally with `mise run check` in the meantime.
@@ -126,5 +128,5 @@ whatever version the lockfile named. A dependency that drags in entries no
 
 ## Releases
 
-Pebble is a library. It has no release pipeline. Consumers depend on the
-repository directly.
+Both crates are libraries. Neither has a release pipeline. Consumers depend on
+the repository directly.

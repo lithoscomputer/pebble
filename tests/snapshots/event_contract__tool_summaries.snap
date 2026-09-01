@@ -13,6 +13,15 @@ expression: render(&summaries)
     "invoked": false
   },
   {
+    "name": "inspect",
+    "description": "Inspect an application value",
+    "source": {
+      "kind": "application"
+    },
+    "category": "other",
+    "invoked": true
+  },
+  {
     "name": "mcp__filesystem__read_text_file",
     "description": "Read a text file",
     "source": {

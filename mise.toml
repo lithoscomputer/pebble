@@ -20,7 +20,7 @@ run = "bin/style-guides prepare"
 
 [tasks.dev]
 description = "Run the coding-agent example against a live provider"
-run = "cargo run --locked --example coding_agent"
+run = "cargo run --locked -p pebble --example coding_agent"
 
 [tasks.fmt]
 description = "Format Rust with the pinned nightly formatter"
@@ -33,29 +33,29 @@ run = "cargo +nightly-2026-04-14 fmt --check --all"
 [tasks.lint]
 description = "Lint all Rust targets with warnings denied"
 env = { CARGO_TARGET_DIR = "{{config_root}}/target/clippy" }
-run = "cargo clippy --locked --all-targets --all-features -- -D warnings"
+run = "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings"
 
 [tasks.test]
 description = "Run all Rust tests with Nextest"
-run = "cargo nextest run --locked --all-targets --all-features --no-tests=pass"
+run = "cargo nextest run --locked --workspace --all-targets --all-features --no-tests=pass"
 
 [tasks."test:doc"]
 description = "Run the documentation tests, which Nextest does not cover"
-run = "cargo test --doc --locked --all-features"
+run = "cargo test --doc --locked --workspace --all-features"
 
 [tasks.doc]
 description = "Build the API documentation with warnings denied"
 env = { CARGO_TARGET_DIR = "{{config_root}}/target/doc-check", RUSTDOCFLAGS = "-D warnings" }
-run = "cargo doc --no-deps --locked --all-features"
+run = "cargo doc --no-deps --locked --workspace --all-features"
 
 [tasks."test:release"]
 description = "Run all Rust tests in release mode"
-run = "cargo nextest run --locked --release --all-targets --all-features --no-tests=pass"
+run = "cargo nextest run --locked --release --workspace --all-targets --all-features --no-tests=pass"
 
 [tasks."check:msrv"]
 description = "Check all targets with the declared minimum Rust version"
 env = { CARGO_TARGET_DIR = "{{config_root}}/target/msrv" }
-run = "cargo +1.88.0 check --locked --all-targets --all-features"
+run = "cargo +1.88.0 check --locked --workspace --all-targets --all-features"
 
 [tasks."check:actions"]
 description = "Audit GitHub Actions workflows"

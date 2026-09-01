@@ -62,7 +62,7 @@ async fn a_streamed_turn_publishes_its_text() {
         TestSession::answering(vec![ScriptedCall::response(text_response("Hello there!"))]);
     let mut events = session.subscribe();
 
-    session.run("Hi").await.expect("the run succeeds");
+    session.prompt("Hi").await.expect("the prompt succeeds");
 
     let published = settled(&mut session, &mut events).await;
     let deltas: Vec<&str> = published
@@ -83,7 +83,7 @@ async fn a_broken_stream_is_replayed_and_only_the_recovered_turn_is_committed() 
     ]);
     let mut events = session.subscribe();
 
-    session.run("Hello").await.expect("the run succeeds");
+    session.prompt("Hello").await.expect("the prompt succeeds");
 
     assert_eq!(provider.call_count(), 2);
     assert_eq!(session.history().turns().len(), 2);
@@ -119,7 +119,7 @@ async fn a_replay_re_arms_the_first_output_latch() {
     ]);
     let mut events = session.subscribe();
 
-    session.run("Hello").await.expect("the run succeeds");
+    session.prompt("Hello").await.expect("the prompt succeeds");
 
     assert_eq!(provider.call_count(), 2);
     assert!(matches!(
@@ -162,7 +162,7 @@ async fn a_stream_that_ends_without_finishing_is_replayed_with_nothing_to_withdr
     ]);
     let mut events = session.subscribe();
 
-    session.run("Hello").await.expect("the run succeeds");
+    session.prompt("Hello").await.expect("the prompt succeeds");
 
     assert_eq!(provider.call_count(), 2);
     assert!(matches!(
@@ -209,7 +209,7 @@ async fn a_stream_that_never_finishes_fails_once_its_replays_are_spent() {
     let mut events = session.subscribe();
 
     let error = session
-        .run("Hello")
+        .prompt("Hello")
         .await
         .expect_err("no attempt produced a response");
 
@@ -269,7 +269,7 @@ async fn the_last_unfinished_attempt_withdraws_what_it_showed() {
     let mut events = session.subscribe();
 
     let error = session
-        .run("Hello")
+        .prompt("Hello")
         .await
         .expect_err("no attempt produced a response");
 
@@ -304,7 +304,7 @@ async fn a_truncated_response_is_replayed_rather_than_committed() {
     ]);
     let mut events = session.subscribe();
 
-    let answer = session.run("Hello").await.expect("the run succeeds");
+    let answer = session.prompt("Hello").await.expect("the prompt succeeds");
 
     assert_eq!(answer.as_deref(), Some("the whole answer"));
     assert_eq!(provider.call_count(), 2);
@@ -333,7 +333,7 @@ async fn a_truncated_response_is_replayed_rather_than_committed() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_failure_worth_no_repeat_ends_the_run_on_the_first_attempt() {
+async fn a_failure_worth_no_repeat_ends_the_prompt_on_the_first_attempt() {
     for kind in [
         LlmErrorKind::Authentication,
         LlmErrorKind::ContextLength,
@@ -348,11 +348,11 @@ async fn a_failure_worth_no_repeat_ends_the_run_on_the_first_attempt() {
         ]);
         let mut events = session.subscribe();
 
-        let error = session.run("Hello").await.expect_err("the call failed");
+        let error = session.prompt("Hello").await.expect_err("the call failed");
 
         assert!(
             matches!(&error, Error::Llm(inner) if inner.kind() == kind),
-            "the run reports the provider's own failure: {error:?}"
+            "the prompt reports the provider's own failure: {error:?}"
         );
         assert_eq!(provider.call_count(), 1);
         assert_eq!(session.history().turns().len(), 1);
@@ -392,7 +392,7 @@ async fn spent_quota_is_never_replayed() {
         .with_provider_code("insufficient_quota"),
     )]);
 
-    let error = session.run("Hello").await.expect_err("the call failed");
+    let error = session.prompt("Hello").await.expect_err("the call failed");
 
     assert!(
         matches!(&error, Error::Llm(inner) if inner.kind() == LlmErrorKind::QuotaExceeded),
@@ -416,7 +416,7 @@ async fn a_turn_that_never_arrives_fails_once_and_commits_nothing() {
     let mut subscriber = session.subscribe();
 
     let error = session
-        .run("Hello")
+        .prompt("Hello")
         .await
         .expect_err("every attempt failed");
 
@@ -488,17 +488,17 @@ async fn a_replay_never_waits_on_the_stream_it_replaced() {
     ])
     .limited(1)
     .options(SessionOptions {
-        retry_policy: RetryPolicy::exponential()
+        turn_replay: RetryPolicy::exponential()
             .max_attempts(4)
             .initial_delay(Duration::from_millis(1)),
         ..SessionOptions::default()
     })
     .build();
 
-    let answer = timeout(Duration::from_secs(5), session.run("Hello"))
+    let answer = timeout(Duration::from_secs(5), session.prompt("Hello"))
         .await
         .expect("the replay reopens rather than waiting on a permit it holds")
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
 
     assert_eq!(answer.as_deref(), Some("Recovered"));
     assert_eq!(provider.call_count(), 2);
@@ -515,7 +515,7 @@ async fn a_reopen_that_fails_on_the_credential_closes_the_session() {
     let mut events = session.subscribe();
 
     let error = session
-        .run("Hello")
+        .prompt("Hello")
         .await
         .expect_err("the credential failed");
 
@@ -556,7 +556,10 @@ async fn the_clients_own_reconnect_is_published_as_an_open_phase_retry() {
     .build();
     let mut events = session.subscribe();
 
-    let answer = session.run("Hello").await.expect("the client reconnects");
+    let answer = session
+        .prompt("Hello")
+        .await
+        .expect("the client reconnects");
 
     assert_eq!(answer.as_deref(), Some("Recovered"));
     assert_eq!(provider.call_count(), 2, "the client opened the call again");
@@ -604,7 +607,10 @@ async fn a_drop_before_any_output_is_the_clients_to_repeat() {
     .build();
     let mut events = session.subscribe();
 
-    let answer = session.run("Hello").await.expect("the client reconnects");
+    let answer = session
+        .prompt("Hello")
+        .await
+        .expect("the client reconnects");
 
     assert_eq!(answer.as_deref(), Some("Recovered"));
     assert_eq!(provider.call_count(), 2);
@@ -657,7 +663,10 @@ async fn one_failure_is_replayed_by_one_layer() {
     .build();
     let mut events = session.subscribe();
 
-    let answer = session.run("Hello").await.expect("the fourth call answers");
+    let answer = session
+        .prompt("Hello")
+        .await
+        .expect("the fourth call answers");
 
     assert_eq!(answer.as_deref(), Some("Recovered"));
     assert_eq!(provider.call_count(), 4);
@@ -714,7 +723,10 @@ async fn a_completed_response_reports_its_reasoning_once() {
     )]);
     let mut events = session.subscribe();
 
-    session.run("What is 2+2?").await.expect("the run succeeds");
+    session
+        .prompt("What is 2+2?")
+        .await
+        .expect("the prompt succeeds");
 
     let published = settled(&mut session, &mut events).await;
     assert_eq!(reasoning_of(&published), [Some(ReasoningOutput::new(
@@ -739,7 +751,10 @@ async fn a_turn_with_no_visible_text_still_reports_its_reasoning() {
     ]);
     let mut events = session.subscribe();
 
-    session.run("Do something").await.expect("the run succeeds");
+    session
+        .prompt("Do something")
+        .await
+        .expect("the prompt succeeds");
 
     let published = settled(&mut session, &mut events).await;
     assert_eq!(reasoning_of(&published), [
@@ -762,7 +777,7 @@ async fn only_the_replayed_turn_contributes_reasoning() {
     ]);
     let mut events = session.subscribe();
 
-    session.run("Hello").await.expect("the run succeeds");
+    session.prompt("Hello").await.expect("the prompt succeeds");
 
     assert_eq!(provider.call_count(), 2);
     let published = settled(&mut session, &mut events).await;
@@ -797,7 +812,7 @@ async fn one_bracket_wraps_a_text_first_turn() {
         TestSession::answering(vec![ScriptedCall::response(text_response("Hello"))]);
     let mut events = session.subscribe();
 
-    session.run("Hi").await.expect("the run succeeds");
+    session.prompt("Hi").await.expect("the prompt succeeds");
 
     let published = settled(&mut session, &mut events).await;
     assert_eq!(bracket(&published), [
@@ -817,7 +832,7 @@ async fn reasoning_that_arrives_first_is_what_the_bracket_reports() {
     let (mut session, _provider) = TestSession::answering(vec![ScriptedCall::Events(events)]);
     let mut subscriber = session.subscribe();
 
-    session.run("Hi").await.expect("the run succeeds");
+    session.prompt("Hi").await.expect("the prompt succeeds");
 
     let published = settled(&mut session, &mut subscriber).await;
     assert_eq!(bracket(&published), [
@@ -841,7 +856,10 @@ async fn a_turn_that_only_calls_a_tool_reports_a_tool_call_first() {
     ]);
     let mut events = session.subscribe();
 
-    session.run("Use the tool").await.expect("the run succeeds");
+    session
+        .prompt("Use the tool")
+        .await
+        .expect("the prompt succeeds");
 
     let published = settled(&mut session, &mut events).await;
     let observed = bracket(&published);

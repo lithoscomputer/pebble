@@ -1,31 +1,37 @@
-//! Pebble is a coding-agent loop library built on lithos-llm. It runs the
-//! turn loop that a coding agent needs — model calls, tool execution, session
-//! state, and the events an application observes — and leaves transport,
-//! storage, and process isolation to the embedding application.
+//! Pebble is a coding agent as a library, built on [`pebble_agent`] and
+//! lithos-llm. It adds coding profiles, environment-backed tools, memory,
+//! skills, compaction policy, subagents, and durable events to the
+//! provider-neutral agent loop. Transport, storage, credentials, and process
+//! isolation remain with the embedding application.
 //!
 //! # Running one
 //!
-//! [`Session`] is the whole loop. [`Session::builder`] resolves a model through
-//! the client's catalog, picks the harness that model expects, and freezes the
-//! tools the session may call; [`Session::initialize`] loads what the session
-//! was told and captures where it is working; [`Session::run`] answers one
-//! input, however many rounds of model calls and tool calls that takes. A
-//! [`SessionControlHandle`] steers or interrupts a run already in progress, and
-//! [`Session::shutdown`] closes the session and joins everything it owns.
+//! [`CodingSession`] is the short path. [`CodingSession::builder`] resolves a
+//! model through the client's catalog, selects its coding profile, freezes its
+//! tools, loads its resources, and captures its environment before
+//! [`CodingSessionBuilder::build`] returns. [`CodingSession::prompt`] answers
+//! one input, however many model and tool turns it takes. A
+//! [`CodingSessionControlHandle`] steers, follows up, or aborts a prompt
+//! already in progress, and [`CodingSession::shutdown`] closes the session and
+//! joins everything it owns.
 //!
-//! [`Session::subscribe`] is how an application watches all of that happen. The
-//! stream it hands out is bounded and lossy for a reader that falls behind, and
-//! it ends when the session is shut down rather than when the session value is
-//! dropped: a reader looping until `RecvError::Closed` finishes once
-//! [`Session::shutdown`] has returned, so it can be joined before the session
-//! goes. An application that must see every event installs an [`EventSink`]
-//! instead.
+//! [`Session`] remains the lower-level coding session for applications that
+//! need separate construction and initialization. Use [`agent`] when coding
+//! profiles and environment-backed tools are not needed.
+//!
+//! [`CodingSession::subscribe`] is how an application watches all of that
+//! happen. The stream it hands out is bounded and lossy for a reader that falls
+//! behind, and it ends when the session is shut down rather than when the
+//! session value is dropped: a reader looping until `RecvError::Closed`
+//! finishes once [`CodingSession::shutdown`] has returned, so it can be joined
+//! before the session goes. An application that must see every event installs
+//! an [`EventSink`] instead.
 //!
 //! # Embedding pebble
 //!
 //! An application needs one dependency for all of this: `pebble`. What a
 //! session is built from that pebble does not define is re-exported here — the
-//! model layer as [`lithos_llm`], whose [`Client`](lithos_llm::Client),
+//! model layer as [`llm`], whose [`Client`](llm::Client),
 //! catalog and credentials build the client a session talks through; the
 //! [`async_trait`](macro@async_trait) attribute every seam trait is written
 //! with; and [`CancellationToken`], which those seams take and
@@ -59,9 +65,10 @@
 //!
 //! [`RetryEventObserver`] is what puts the client's own retries on the
 //! session's event stream; without it a session still runs correctly and simply
-//! never reports one. Give
-//! [`SessionOptions::retry_policy`](SessionOptions::retry_policy) the same
-//! policy, so one failure is spaced the same way whichever layer handles it.
+//! never reports one.
+//! [`SessionOptions::turn_replay`](SessionOptions::turn_replay) controls the
+//! separate replay after a response stream opens. The two policies do not have
+//! to match.
 //!
 //! # Where the work lands
 //!
@@ -132,7 +139,7 @@
 //!
 //! A session asks the person a question only where the application gave it a
 //! [`HumanInputProvider`]. Without one no question tool is registered, so a
-//! model cannot block a run waiting for an answer that will never come.
+//! model cannot block a prompt waiting for an answer that will never come.
 //!
 //! # What the session is told
 //!
@@ -145,14 +152,14 @@
 //!
 //! # Staying inside the window
 //!
-//! A long run outgrows the model's context window.
+//! A long prompt can outgrow the model's context window.
 //! [`build_local_snapshot`] measures where a request stands, attributing tokens
 //! to the prompt, the tools, memory, skills, and the conversation, and
 //! [`check_context_usage`] says when the session is close enough to the edge to
 //! act. [`compact_context`] then spends one call summarizing the older turns
 //! and replaces them with the summary, keeping the file work a
-//! [`FileTracker`] recorded. [`detect_loop`] catches the other way a run stops
-//! progressing: the same tool calls, round after round.
+//! [`FileTracker`] recorded. [`detect_loop`] catches the other way a prompt
+//! stops progressing: the same tool calls, round after round.
 //!
 //! # Stability
 //!
@@ -209,6 +216,7 @@
 //! methods.
 
 mod char_boundary;
+mod coding_session;
 mod compaction;
 mod config;
 mod context_window;
@@ -253,54 +261,30 @@ mod readme {}
 /// [`SearchProvider`] or [`ToolExecutor`] can be written without naming the
 /// desugared lifetimes.
 pub use async_trait::async_trait;
-/// The model layer pebble is built on, re-exported whole because a session
-/// cannot be built without a [`Client`](lithos_llm::Client) and an application
-/// resolving its own copy could resolve a different version.
-pub use lithos_llm;
-/// How a failed model call is spaced before it is tried again, carried by
-/// [`SessionOptions::retry_policy`].
+/// The model layer used by Pebble's public contracts.
 ///
-/// The same type the client's
-/// [`RetryMiddleware`](lithos_llm::middleware::RetryMiddleware) is built with,
-/// so one policy can be given to both.
-#[doc(inline)]
-pub use lithos_llm::middleware::RetryPolicy;
-/// One part of a message or of a tool's result.
-#[doc(inline)]
-pub use lithos_llm::types::ContentPart;
-/// The model-layer error category carried by [`ErrorData::llm_kind`].
-#[doc(inline)]
-pub use lithos_llm::types::ErrorKind as LlmErrorKind;
-/// How hard the model should think, carried by
-/// [`SessionOptions::reasoning_effort`].
-#[doc(inline)]
-pub use lithos_llm::types::ReasoningEffort;
-/// Whether repeating a failed model call is safe, carried by
-/// [`ErrorData::retry`].
-#[doc(inline)]
-pub use lithos_llm::types::RetryClassification;
-/// The latency or cost tier to ask for, carried by
-/// [`SessionOptions::speed`].
-#[doc(inline)]
-pub use lithos_llm::types::Speed;
-/// One answered tool call, as history and the model read it.
-#[doc(inline)]
-pub use lithos_llm::types::ToolResult;
-/// A tool invocation the model asked for, answered by [`ToolDispatch`].
-#[doc(inline)]
-pub use lithos_llm::types::{ToolCall, ToolCallKind};
-/// What the model is told about one tool, carried by [`RegisteredTool`].
-#[doc(inline)]
-pub use lithos_llm::types::{ToolDefinition, ToolDefinitionKind};
+/// Model requests, responses, tools, catalogs, credentials, and client
+/// middleware live under this one namespace rather than being mixed into the
+/// coding-agent root.
+pub use lithos_llm as llm;
+/// The provider-neutral agent layer used below Pebble's coding facade.
+pub use pebble_agent as agent;
 /// The signal a session passes into the work it starts, so an application's
 /// [`HumanInputProvider`] or [`ToolExecutor`] can stop when the round it is
 /// running in does. [`Session::cancel_token`] hands out the session's own.
 pub use tokio_util::sync::CancellationToken;
 
+pub use self::coding_session::{
+    CodingSession, CodingSessionBuildError, CodingSessionBuilder, CodingSessionControlHandle,
+    PromptOutcome,
+};
 pub use self::compaction::{
     CompactionRequest, ContextEstimate, ContextEstimateMethod, check_context_usage,
     compact_context, estimate_active_context_usage, render_turns_for_summary,
 };
+/// Coding-agent policy. Kept as an alias so the lower-level [`Session`] and
+/// the [`CodingSession`] facade share one configuration record.
+pub use self::config::SessionOptions as CodingSessionOptions;
 pub use self::config::{
     NativeToolOptions, SessionOptions, ToolAccess, ToolAccessPolicy, ToolApprovalAdapter,
     ToolApprovalFn, ToolExposureMode, ToolHookCallback, ToolHookDecision,
@@ -336,7 +320,7 @@ pub use self::record::{SESSION_RECORD_FORMAT_VERSION, SessionRecord, StoredMessa
 pub use self::redact::{NoRedaction, Redactor};
 pub use self::search::{SearchError, SearchErrorKind, SearchProvider, SearchRequest, SearchResult};
 pub use self::session::{
-    CompletionCoordinator, InterruptReasonHandle, RetryEventObserver, RunTiming, Session,
+    CompletionCoordinator, InterruptReasonHandle, PromptTiming, RetryEventObserver, Session,
     SessionBuildError, SessionBuilder, SessionControlHandle, ShutdownReason, SteeringItem,
     SteeringMessage,
 };
@@ -366,6 +350,10 @@ pub use self::truncation::{
     DEFAULT_TOOL_OUTPUT_RETENTION_BYTES, DEFAULT_TOOL_OUTPUT_SERIALIZED_BYTES, OutputBudgets,
     ToolOutputLimits, TruncationMode, truncate_lines, truncate_output, truncate_tool_output,
 };
+/// A coding-layer event, distinct from [`agent::AgentEvent`].
+pub use self::types::AgentEvent as CodingEvent;
+/// The coding event envelope, distinct from the generic agent event stream.
+pub use self::types::SessionEvent as CodingSessionEvent;
 pub use self::types::{
     Actor, AgentEvent, AgentProfileKind, CommandTermination, ContextWindowBreakdownItem,
     ContextWindowCategory, ContextWindowCountMethod, ContextWindowSnapshot, ContextWindowStaleness,

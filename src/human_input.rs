@@ -1,4 +1,4 @@
-//! Asking the person a question mid-run.
+//! Asking the person a question mid-prompt.
 //!
 //! A session can only ask if the application gave it a way to: pebble defines
 //! the seam, [`HumanInputProvider`], and the application implements it over
@@ -8,7 +8,7 @@
 //! Three rules hold wherever the provider comes from:
 //!
 //! - **One question tool per round.** The question tools are the point where a
-//!   run waits for a person, so the execution layer runs at most one of them
+//!   prompt waits for a person, so the execution layer runs at most one of them
 //!   per tool round and refuses its peers. A model that wants to ask several
 //!   things asks them in one batch.
 //! - **Root sessions only.** Child sessions never register a question tool;
@@ -109,9 +109,9 @@ pub struct Question {
 pub enum AnswerStatus {
     /// The person answered.
     Answered,
-    /// The run was cancelled while the question was open.
+    /// The prompt was cancelled while the question was open.
     Cancelled,
-    /// The person interrupted the run instead of answering.
+    /// The person interrupted the prompt instead of answering.
     Interrupted,
     /// The person chose not to answer this question.
     Skipped,
@@ -218,7 +218,7 @@ impl From<HumanInputError> for ToolError {
 
 /// Where a session's questions go.
 ///
-/// An application installs one on the session, or on a single run when a
+/// An application installs one on the session, or on a single prompt when a
 /// reused session should bind its questions to the current stage. A session
 /// without a provider registers no question tool, so a model cannot ask.
 ///

@@ -1,7 +1,7 @@
 //! A coding agent, end to end.
 //!
 //! The example builds a lithos-llm client, runs a pebble session over a fresh
-//! directory, renders the session's events as they arrive, steers one run,
+//! directory, renders the session's events as they arrive, steers one prompt,
 //! interrupts another, and reports what the whole thing did and cost.
 //!
 //! ```sh
@@ -37,8 +37,9 @@ use lithos_llm::client::ClientBuild;
 use lithos_llm::credentials::EnvironmentCredentials;
 use lithos_llm::middleware::{RetryMiddleware, RetryPolicy};
 use pebble::{
-    AgentEvent, LocalEnvironment, RetryEventObserver, Session, SessionControlHandle, SessionEvent,
-    SessionOptions, ShutdownReason, TokenUsage,
+    CodingEvent, CodingSession, CodingSessionControlHandle, CodingSessionEvent,
+    CodingSessionOptions, LocalEnvironment, PromptOutcome, RetryEventObserver, ShutdownReason,
+    TokenUsage,
 };
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
@@ -48,7 +49,7 @@ use tokio::time::timeout;
 /// The model the example asks for when the command line names none.
 const DEFAULT_MODEL: &str = "claude-sonnet-5";
 
-/// The work the first run is given: a file, an edit, and a command.
+/// The work the first prompt is given: a file, an edit, and a command.
 const FIRST_PROMPT: &str = "\
 Work only inside your working directory, and use your tools rather than telling me what to do.
 
@@ -58,10 +59,10 @@ Work only inside your working directory, and use your tools rather than telling 
 
 Then tell me, in one sentence, what the command printed.";
 
-/// What the steer adds to the first run, once the model is already working.
+/// What the steer adds to the first prompt, once the model is already working.
 const STEER: &str = "One more thing: also write `notes.md` listing what you have done so far.";
 
-/// The work the second run is given, which is long enough to interrupt.
+/// The work the second prompt is given, which is long enough to interrupt.
 const SECOND_PROMPT: &str = "\
 Write a long, detailed description of every file in your working directory: what it contains, \
 line by line, and how you would extend it. Take your time and be thorough.";
@@ -71,12 +72,12 @@ const REDIRECT: &str = "Never mind the description. Reply with the single word D
 
 /// How long a control task waits for the moment it acts on.
 ///
-/// The end of the run is the usual answer, and this is only the backstop for a
-/// stream that stops without ending.
+/// The end of the prompt is the usual answer, and this is only the backstop for
+/// a stream that stops without ending.
 const CONTROL_PATIENCE: Duration = Duration::from_secs(300);
 
-/// How long one run may take before the session ends it.
-const RUN_BUDGET: Duration = Duration::from_secs(600);
+/// How long one prompt may take before the session ends it.
+const PROMPT_BUDGET: Duration = Duration::from_secs(600);
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -116,47 +117,44 @@ async fn run() -> Result<(), Box<dyn StdError>> {
     let environment = LocalEnvironment::new(&workspace);
     environment.prepare().await?;
 
-    let mut session = Session::builder(client)
+    let mut session = CodingSession::builder(client, Arc::new(environment))
         .model(&model)
-        .environment(Arc::new(environment))
-        .options(SessionOptions {
-            wall_clock_timeout: Some(RUN_BUDGET),
-            // The same policy the client's middleware was built with, so one
-            // failure is spaced the same way whichever layer handles it.
-            retry_policy: policy,
-            ..SessionOptions::default()
+        .options(CodingSessionOptions {
+            wall_clock_timeout: Some(PROMPT_BUDGET),
+            // This example chooses the same spacing for request retry and
+            // turn replay. Applications can configure them independently.
+            turn_replay: policy,
+            ..CodingSessionOptions::default()
         })
-        .build()?;
+        .build()
+        .await?;
 
-    // Subscribed before anything runs, so the renderer sees the session open.
+    // Subscribed before the first prompt, so the renderer sees every prompt event.
+    // An event sink configured on the builder also sees initialization events.
     let renderer = tokio::spawn(render_events(session.subscribe()));
-
-    // Loads what the session was told — nothing here, because no memory files
-    // and no skill directories were named — and captures where it is working.
-    session.initialize().await?;
 
     let mut totals = Totals::default();
 
-    // --- One run, steered while it works ---
+    // --- One prompt, steered while it works ---
     //
-    // `run` borrows the session until it returns, so everything said to a live
-    // run goes through a control handle.
+    // `prompt` borrows the session until it returns, so everything said to a
+    // live prompt goes through a control handle.
     let steering = steer_once(session.subscribe(), session.control_handle());
 
-    eprintln!("\n--- run 1: write, edit, run a command ---");
-    let answer = session.run(FIRST_PROMPT).await?;
+    eprintln!("\n--- prompt 1: write, edit, run a command ---");
+    let answer = session.prompt(FIRST_PROMPT).await?;
     steering.await?;
-    totals.add(&session);
-    eprintln!("\nanswer: {}", answer.as_deref().unwrap_or("(no text)"));
+    totals.add(&answer);
+    eprintln!("\nanswer: {}", answer.text().unwrap_or("(no text)"));
 
-    // --- One run, interrupted while it works ---
+    // --- One prompt, interrupted while it works ---
     let interrupting = interrupt_once(session.subscribe(), session.control_handle());
 
-    eprintln!("\n--- run 2: interrupted mid-answer ---");
-    let answer = session.run(SECOND_PROMPT).await?;
+    eprintln!("\n--- prompt 2: interrupted mid-answer ---");
+    let answer = session.prompt(SECOND_PROMPT).await?;
     interrupting.await?;
-    totals.add(&session);
-    eprintln!("\nanswer: {}", answer.as_deref().unwrap_or("(no text)"));
+    totals.add(&answer);
+    eprintln!("\nanswer: {}", answer.text().unwrap_or("(no text)"));
 
     // Closing publishes what is queued and joins everything the session owns.
     // Joining the event pump is what ends the renderer: the stream closes when
@@ -186,7 +184,7 @@ fn build_client(policy: RetryPolicy) -> Result<Client, Box<dyn StdError>> {
         .middleware(RetryMiddleware::new(policy).observer(RetryEventObserver))
         .build()?;
     // A provider whose adapter could not be built degrades the client rather
-    // than failing it, so name the ones that are missing before a run needs
+    // than failing it, so name the ones that are missing before a prompt needs
     // them.
     for issue in &issues {
         eprintln!("provider unavailable: {} ({})", issue.provider, issue.cause);
@@ -194,7 +192,7 @@ fn build_client(policy: RetryPolicy) -> Result<Client, Box<dyn StdError>> {
     Ok(client)
 }
 
-/// A new directory for this run, named so two runs never share one.
+/// A new directory for this process, named so two processes never share one.
 fn workspace_path() -> PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -202,102 +200,91 @@ fn workspace_path() -> PathBuf {
     env::temp_dir().join(format!("pebble-coding-agent-{}-{unique}", process::id()))
 }
 
-/// Adds to the job of a run that is already working.
+/// Adds to the job of a prompt that is already being processed.
 ///
-/// The waiting happens in its own task, because `Session::run` borrows the
-/// session for as long as the run takes. The first finished tool call is the
-/// sign that the model is working and that a round boundary is coming, and a
-/// steer sent then lands as its own turn at the next boundary of a run still
-/// in progress.
+/// The waiting happens in its own task, because `CodingSession::prompt` borrows
+/// the session for as long as the prompt takes. The first finished tool call is
+/// the sign that the model is working and that a round boundary is coming, and
+/// a steer sent then lands as its own turn at the next boundary of a prompt
+/// still in progress.
 ///
-/// Nothing here can make the run wait for it. A steer that loses the race to a
-/// natural completion is not lost and is not injected either: it stays queued
-/// and opens the next run. `SteeringInjected` is what says it landed, so this
-/// task waits for that event and says so when it never comes. An application
-/// that needs the race closed rather than reported gives the session a
-/// `CompletionCoordinator`.
+/// Nothing here can make the prompt wait for it. A steer that loses the race to
+/// a natural completion is not lost and is not injected either: it stays queued
+/// and opens the next prompt. `SteeringInjected` is what says it landed, so
+/// this task waits for that event and says so when it never comes. An
+/// application that needs the race closed rather than reported gives the
+/// session a `CompletionCoordinator`.
 fn steer_once(
-    mut events: broadcast::Receiver<SessionEvent>,
-    handle: SessionControlHandle,
+    mut events: broadcast::Receiver<CodingSessionEvent>,
+    handle: CodingSessionControlHandle,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         wait_for_start(&mut events).await;
         if !wait_for(&mut events, |event| {
-            matches!(event, AgentEvent::ToolCallCompleted { .. })
+            matches!(event, CodingEvent::ToolCallCompleted { .. })
         })
         .await
         {
-            eprintln!("[control] the run passed the point this was waiting for");
+            eprintln!("[control] the prompt passed the point this was waiting for");
             return;
         }
-        handle.steer(STEER, None);
+        handle.steer(STEER);
         if !wait_for(&mut events, |event| {
-            matches!(event, AgentEvent::SteeringInjected { .. })
+            matches!(event, CodingEvent::SteeringInjected { .. })
         })
         .await
         {
-            eprintln!("[control] the run finished first: the steer waits for the next run");
+            eprintln!("[control] the prompt finished first: the steer waits for the next prompt");
         }
     })
 }
 
 /// Abandons the round the model is answering in, then says what to do instead.
 ///
-/// `SessionControlHandle::interrupt` ends the round and nothing else: with
-/// nothing queued the session parks at the round boundary and waits, so an
-/// operator can stop a run mid-thought and decide afterwards what to say. That
-/// is why the steer follows. `Session::interrupt` is the other gesture — that
-/// one ends the run for good.
+/// Steering interrupts the current round and supplies its replacement in one
+/// action. `CodingSessionControlHandle::abort` is the other gesture — that one
+/// ends the prompt for good.
 fn interrupt_once(
-    mut events: broadcast::Receiver<SessionEvent>,
-    handle: SessionControlHandle,
+    mut events: broadcast::Receiver<CodingSessionEvent>,
+    handle: CodingSessionControlHandle,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         wait_for_start(&mut events).await;
         if !wait_for(&mut events, |event| {
-            matches!(event, AgentEvent::TextDelta { .. })
+            matches!(event, CodingEvent::TextDelta { .. })
         })
         .await
         {
-            eprintln!("[control] the run answered before it could be interrupted");
+            eprintln!("[control] the prompt answered before it could be interrupted");
             return;
         }
-        handle.interrupt();
-        // Exactly one `RoundInterrupted` is published per gesture, so waiting
-        // for it is waiting for this interrupt to have settled.
-        if wait_for(&mut events, |event| {
-            matches!(event, AgentEvent::RoundInterrupted { .. })
-        })
-        .await
-        {
-            handle.steer(REDIRECT, None);
-        }
+        handle.steer(REDIRECT);
     })
 }
 
-/// Waits until the run this task was made for has begun.
+/// Waits until the prompt this task was made for has begun.
 ///
-/// A subscriber joins the stream where it is, and the run before this one may
-/// still have events in flight. Waiting for the input that starts this run is
-/// what keeps the last run's ending from being read as this one's.
-async fn wait_for_start(events: &mut broadcast::Receiver<SessionEvent>) {
+/// A subscriber joins the stream where it is, and the prompt before this one
+/// may still have events in flight. Waiting for the input that starts this
+/// prompt is what keeps the last prompt's ending from being read as this one's.
+async fn wait_for_start(events: &mut broadcast::Receiver<CodingSessionEvent>) {
     wait_until(events, |event| {
-        matches!(event, AgentEvent::UserInput { .. })
+        matches!(event, CodingEvent::UserInput { .. })
     })
     .await;
 }
 
 /// Waits for the first event `wanted` matches, and reports whether one came.
 ///
-/// The end of the run's processing cycle is the answer "no": a task waiting
-/// for a moment the run went past must not go on waiting after the run that
-/// would have produced it is over.
+/// The end of the prompt's processing cycle is the answer "no": a task waiting
+/// for a moment the prompt went past must not go on waiting after the prompt
+/// that would have produced it is over.
 async fn wait_for(
-    events: &mut broadcast::Receiver<SessionEvent>,
-    wanted: impl Fn(&AgentEvent) -> bool + Sync,
+    events: &mut broadcast::Receiver<CodingSessionEvent>,
+    wanted: impl Fn(&CodingEvent) -> bool + Sync,
 ) -> bool {
     wait_until(events, |event| {
-        wanted(event) || matches!(event, AgentEvent::ProcessingEnd)
+        wanted(event) || matches!(event, CodingEvent::ProcessingEnd)
     })
     .await
     .is_some_and(|event| wanted(&event))
@@ -305,9 +292,9 @@ async fn wait_for(
 
 /// Reads the stream until `wanted` matches, and answers with what matched.
 async fn wait_until(
-    events: &mut broadcast::Receiver<SessionEvent>,
-    wanted: impl Fn(&AgentEvent) -> bool + Sync,
-) -> Option<AgentEvent> {
+    events: &mut broadcast::Receiver<CodingSessionEvent>,
+    wanted: impl Fn(&CodingEvent) -> bool + Sync,
+) -> Option<CodingEvent> {
     let found = timeout(CONTROL_PATIENCE, async {
         loop {
             match events.recv().await {
@@ -321,28 +308,27 @@ async fn wait_until(
     found.unwrap_or_default()
 }
 
-/// What one session accumulated across its runs.
+/// What one session accumulated across its prompts.
 ///
-/// `last_run_usage` and `last_run_cost_usd_micros` describe the run that just
-/// finished, so an application that wants a session total keeps its own.
+/// A [`PromptOutcome`] describes one completed prompt, so an application that
+/// wants a session total keeps its own.
 #[derive(Debug, Default)]
 struct Totals {
     usage:           TokenUsage,
     cost_usd_micros: u64,
     priced:          bool,
-    runs:            usize,
+    prompts:         usize,
 }
 
 impl Totals {
-    /// Adds what the run that just finished reported.
-    fn add(&mut self, session: &Session) {
-        let usage = session.last_run_usage();
-        self.usage = self.usage.saturating_add(usage);
-        if let Some(cost) = session.last_run_cost_usd_micros() {
+    /// Adds what the prompt that just finished reported.
+    fn add(&mut self, outcome: &PromptOutcome) {
+        self.usage = self.usage.saturating_add(outcome.usage());
+        if let Some(cost) = outcome.cost_usd_micros() {
             self.cost_usd_micros += cost;
             self.priced = true;
         }
-        self.runs += 1;
+        self.prompts += 1;
     }
 }
 
@@ -365,15 +351,15 @@ struct Observed {
 ///
 /// Two things end this loop, and either one would do. `SessionEnded` is the
 /// session saying so on its own stream, and a closed stream is the same news
-/// from the pipeline: `Session::shutdown` joins the pump, and that is what
-/// closes every receiver `subscribe` handed out.
-async fn render_events(mut events: broadcast::Receiver<SessionEvent>) -> Observed {
+/// from the pipeline: `CodingSession::shutdown` joins the pump, and that is
+/// what closes every receiver `subscribe` handed out.
+async fn render_events(mut events: broadcast::Receiver<CodingSessionEvent>) -> Observed {
     let mut observed = Observed::default();
     let mut streaming = false;
     loop {
         match events.recv().await {
             Ok(event) => {
-                let ended = matches!(event.event, AgentEvent::SessionEnded);
+                let ended = matches!(event.event, CodingEvent::SessionEnded);
                 render(&event.event, &mut observed, &mut streaming);
                 if ended {
                     break;
@@ -393,10 +379,10 @@ async fn render_events(mut events: broadcast::Receiver<SessionEvent>) -> Observe
 }
 
 /// Prints one event, and remembers the ones the summary counts.
-fn render(event: &AgentEvent, observed: &mut Observed, streaming: &mut bool) {
+fn render(event: &CodingEvent, observed: &mut Observed, streaming: &mut bool) {
     // The model's text is the one thing that gets no line of its own: it
     // arrives in pieces and is printed as it arrives.
-    if let AgentEvent::TextDelta { delta } = event {
+    if let CodingEvent::TextDelta { delta } = event {
         eprint!("{delta}");
         *streaming = true;
         return;
@@ -407,18 +393,18 @@ fn render(event: &AgentEvent, observed: &mut Observed, streaming: &mut bool) {
     }
 
     match event {
-        AgentEvent::SessionStarted { provider, model } => eprintln!(
+        CodingEvent::SessionStarted { provider, model } => eprintln!(
             "[open] {}/{}",
             provider.as_deref().unwrap_or("?"),
             model.as_deref().unwrap_or("?")
         ),
-        AgentEvent::SessionEnded => eprintln!("[close]"),
-        AgentEvent::MemoryLoaded { files, .. } => eprintln!("[memory] {} file(s)", files.len()),
-        AgentEvent::SkillsDiscovered { skills, .. } => {
+        CodingEvent::SessionEnded => eprintln!("[close]"),
+        CodingEvent::MemoryLoaded { files, .. } => eprintln!("[memory] {} file(s)", files.len()),
+        CodingEvent::SkillsDiscovered { skills, .. } => {
             eprintln!("[skills] {} discovered", skills.len());
         }
-        AgentEvent::LlmRequestStarted { requested_model } => eprintln!("[ask] {requested_model}"),
-        AgentEvent::AssistantMessage {
+        CodingEvent::LlmRequestStarted { requested_model } => eprintln!("[ask] {requested_model}"),
+        CodingEvent::AssistantMessage {
             usage,
             cost_usd_micros,
             tool_call_count,
@@ -428,15 +414,15 @@ fn render(event: &AgentEvent, observed: &mut Observed, streaming: &mut bool) {
             usage.total(),
             cost_usd_micros.map_or_else(String::new, |cost| format!(", {}", dollars(cost)))
         ),
-        AgentEvent::AssistantOutputReplace { .. } => {
+        CodingEvent::AssistantOutputReplace { .. } => {
             eprintln!("[replay] the last output was withdrawn and the turn is being asked again");
         }
-        AgentEvent::ToolCallStarted {
+        CodingEvent::ToolCallStarted {
             tool_name,
             arguments,
             ..
         } => eprintln!("[tool] {tool_name} {}", abbreviate(&arguments.to_string())),
-        AgentEvent::ToolCallCompleted {
+        CodingEvent::ToolCallCompleted {
             tool_name,
             is_error,
             ..
@@ -447,7 +433,7 @@ fn render(event: &AgentEvent, observed: &mut Observed, streaming: &mut bool) {
                 eprintln!("[tool] {tool_name} failed");
             }
         }
-        AgentEvent::ToolProcessCompleted {
+        CodingEvent::ToolProcessCompleted {
             exit_code,
             duration_ms,
             ..
@@ -455,15 +441,15 @@ fn render(event: &AgentEvent, observed: &mut Observed, streaming: &mut bool) {
             "[exec] exit {} in {duration_ms} ms",
             exit_code.map_or_else(|| "?".to_owned(), |code| code.to_string())
         ),
-        AgentEvent::SteeringInjected { text, .. } => {
+        CodingEvent::SteeringInjected { text, .. } => {
             observed.steers += 1;
             eprintln!("[steer] {}", first_line(text));
         }
-        AgentEvent::RoundInterrupted { generation } => {
+        CodingEvent::RoundInterrupted { generation } => {
             observed.interrupts += 1;
             eprintln!("[interrupt] round abandoned (gesture {generation})");
         }
-        AgentEvent::LlmRetry {
+        CodingEvent::LlmRetry {
             attempt,
             delay_secs,
             error,
@@ -475,16 +461,16 @@ fn render(event: &AgentEvent, observed: &mut Observed, streaming: &mut bool) {
                 error.message
             );
         }
-        AgentEvent::LoopDetected => eprintln!("[loop] the session is repeating itself"),
-        AgentEvent::CompactionCompleted {
+        CodingEvent::LoopDetected => eprintln!("[loop] the session is repeating itself"),
+        CodingEvent::CompactionCompleted {
             original_turn_count,
             preserved_turn_count,
             ..
         } => eprintln!("[compact] {original_turn_count} turns down to {preserved_turn_count}"),
-        AgentEvent::Error { error } => eprintln!("[error] {}", error.message),
-        AgentEvent::Warning { kind, message, .. } => eprintln!("[warning] {kind}: {message}"),
-        AgentEvent::TodoCreated(props) => eprintln!("[plan] {}", props.subject),
-        AgentEvent::TodoUpdated(props) => eprintln!(
+        CodingEvent::Error { error } => eprintln!("[error] {}", error.message),
+        CodingEvent::Warning { kind, message, .. } => eprintln!("[warning] {kind}: {message}"),
+        CodingEvent::TodoCreated(props) => eprintln!("[plan] {}", props.subject),
+        CodingEvent::TodoUpdated(props) => eprintln!(
             "[plan] {} is now {}",
             props.todo_id,
             props
@@ -493,7 +479,7 @@ fn render(event: &AgentEvent, observed: &mut Observed, streaming: &mut bool) {
         ),
         // Everything else — the pieces of a command's output, the model's
         // reasoning, the end of a processing cycle — is left off a terminal
-        // that is busy enough. `AgentEvent` is `#[non_exhaustive]`, so a
+        // that is busy enough. `CodingEvent` is `#[non_exhaustive]`, so a
         // reader needs this arm however much it renders.
         _ => {}
     }
@@ -511,7 +497,7 @@ fn report(model: &str, workspace: &Path, turns: usize, totals: &Totals, observed
 
     eprintln!("\n--- summary ---");
     eprintln!("model:      {model}");
-    eprintln!("runs:       {}", totals.runs);
+    eprintln!("prompts:    {}", totals.prompts);
     eprintln!("turns:      {turns}");
     eprintln!("tools:      {calls} call(s), {} failed", observed.failures);
     if !named.is_empty() {

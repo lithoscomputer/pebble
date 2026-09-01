@@ -9,11 +9,12 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
+use pebble::llm::types::{ContentPart, ToolCall, ToolDefinition, ToolResult};
 use pebble::test_support::MockEnvironment;
 use pebble::{
-    AgentEvent, ContentPart, Emitter, Environment, EventOptions, EventPump, RegisteredTool,
-    SessionEvent, SessionOptions, ToolCall, ToolContext, ToolDefinition, ToolDispatch, ToolError,
-    ToolErrorKind, ToolHookCallback, ToolHookDecision, ToolRegistry, ToolResult, ToolSource,
+    AgentEvent, Emitter, Environment, EventOptions, EventPump, RegisteredTool, SessionEvent,
+    SessionOptions, ToolContext, ToolDispatch, ToolError, ToolErrorKind, ToolHookCallback,
+    ToolHookDecision, ToolRegistry, ToolSource,
 };
 use serde_json::{Value, json};
 use tokio::sync::broadcast::Receiver;

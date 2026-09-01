@@ -21,9 +21,9 @@ expression: render(&projections)
   },
   {
     "kind": "event_sink",
-    "message": "event sink failed: the run log is not writable",
+    "message": "event sink failed: the event log is not writable",
     "source_chain": [
-      "the run log is not writable"
+      "the event log is not writable"
     ]
   },
   {

@@ -34,7 +34,7 @@ pub trait AgentEventEmitter: Send + Sync {
     /// Publishes one event on the owning session's stream.
     fn emit(&self, event: AgentEvent);
 
-    /// Reports how many bytes of model-facing output the running tool
+    /// Reports how many bytes of model-facing output the promptning tool
     /// produced.
     ///
     /// A side channel, not an event: the execution layer drains it once the
@@ -57,9 +57,9 @@ impl AgentEventEmitter for SessionBoundEmitter {
 /// Extra environment variables one tool call runs with.
 ///
 /// An application implements this when a command's environment is decided per
-/// call rather than per session — run-scoped credentials, a token that has to
-/// be fetched, a value that changes between rounds. The shell tool resolves it
-/// immediately before each call.
+/// call rather than per session — prompt-scoped credentials, a token that has
+/// to be fetched, a value that changes between rounds. The shell tool resolves
+/// it immediately before each call.
 #[async_trait]
 pub trait ToolEnvProvider: Send + Sync {
     /// Produces the variables to add to this call's environment.
@@ -101,8 +101,8 @@ pub struct ToolContext {
     /// Watching it is the tool's own responsibility, and the session waits for
     /// the answer either way: a cancelled call is never dropped, because a call
     /// with no result is a conversation the provider will refuse. A tool that
-    /// ignores this token therefore holds its round — and the run ending it —
-    /// open until it returns, so long work must watch it and answer.
+    /// ignores this token therefore holds its round — and the prompt ending it
+    /// — open until it returns, so long work must watch it and answer.
     pub cancel:              CancellationToken,
     /// Extra environment variables for a command this call runs.
     pub tool_env_provider:   Option<Arc<dyn ToolEnvProvider>>,
@@ -265,6 +265,30 @@ pub struct RegisteredTool {
     pub source:     ToolSource,
 }
 
+impl RegisteredTool {
+    /// Defines an application tool with an asynchronous closure.
+    ///
+    /// Arguments have already been validated against `input_schema` when the
+    /// closure runs. Returning an error sends its safe message back to the
+    /// model and records its structured kind on the completion event.
+    pub fn function<F, Fut>(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: Value,
+        execute: F,
+    ) -> Self
+    where
+        F: Fn(ToolContext, Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<String, ToolError>> + Send + 'static,
+    {
+        Self {
+            definition: ToolDefinition::function(name, description, input_schema),
+            executor:   Arc::new(move |arguments, context| Box::pin(execute(context, arguments))),
+            source:     ToolSource::Application,
+        }
+    }
+}
+
 /// One registered tool's advertised half.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolDefinitionWithSource {
@@ -298,7 +322,7 @@ impl ToolDefinitionWithSource {
 /// one last tool while it initializes — the skill tool, whose skills are
 /// discovered rather than configured — and only reads it afterwards.
 /// Registration is therefore a setup activity: nothing is added or removed
-/// while a run is in flight.
+/// while a prompt is in flight.
 pub struct ToolRegistry {
     tools:      HashMap<String, RegisteredTool>,
     /// The naming scheme applied to built-in tools as they are registered.
@@ -349,7 +373,7 @@ impl ToolRegistry {
             }
             // Matched exhaustively so a new kind of tool has to state whether
             // the vocabulary applies to it.
-            ToolSource::Skill | ToolSource::Mcp { .. } => None,
+            ToolSource::Application | ToolSource::Skill | ToolSource::Mcp { .. } => None,
         };
         if let Some(native) = native {
             native
@@ -540,6 +564,24 @@ mod tests {
 
     fn context() -> ToolContext {
         ToolContext::new(Arc::new(MockEnvironment::default()))
+    }
+
+    #[tokio::test]
+    async fn application_tool_function_pairs_definition_and_executor() {
+        let tool = RegisteredTool::function(
+            "inspect",
+            "Inspect a value",
+            json!({"type": "object"}),
+            |_context, arguments| async move { Ok(format!("{}", arguments["name"])) },
+        );
+
+        let output = (tool.executor)(json!({"name": "parser"}), context())
+            .await
+            .expect("the tool succeeds");
+
+        assert_eq!(tool.definition.name, "inspect");
+        assert_eq!(tool.source, ToolSource::Application);
+        assert_eq!(output, "\"parser\"");
     }
 
     #[test]
@@ -865,7 +907,9 @@ mod tests {
         #[async_trait]
         impl ToolEnvProvider for Failing {
             async fn resolve(&self) -> Result<HashMap<String, String>, ToolError> {
-                Err(ToolError::execution("Could not read the run's credentials"))
+                Err(ToolError::execution(
+                    "Could not read the prompt's credentials",
+                ))
             }
         }
 
@@ -877,7 +921,7 @@ mod tests {
             .expect_err("the provider fails");
 
         assert_eq!(error.kind(), ToolErrorKind::Execution);
-        assert_eq!(error.message(), "Could not read the run's credentials");
+        assert_eq!(error.message(), "Could not read the prompt's credentials");
     }
 
     #[test]

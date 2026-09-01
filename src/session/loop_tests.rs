@@ -66,10 +66,10 @@ async fn a_new_session_starts_idle() {
 }
 
 #[tokio::test]
-async fn a_text_only_response_completes_the_run() {
+async fn a_text_only_response_completes_the_prompt() {
     let (mut session, _provider) = TestSession::answering(answers("Hello there!"));
 
-    let output = session.run("Hi").await.expect("the run succeeds");
+    let output = session.prompt("Hi").await.expect("the prompt succeeds");
 
     assert_eq!(output.as_deref(), Some("Hello there!"));
     assert_eq!(session.state(), SessionState::Idle);
@@ -83,21 +83,27 @@ async fn a_text_only_response_completes_the_run() {
 async fn a_blank_answer_reports_no_output() {
     let (mut session, _provider) = TestSession::answering(answers("  "));
 
-    let output = session.run("Hi").await.expect("the run succeeds");
+    let output = session.prompt("Hi").await.expect("the prompt succeeds");
 
     assert_eq!(output, None);
 }
 
 #[tokio::test]
-async fn inputs_run_one_after_another() {
+async fn inputs_are_processed_one_after_another() {
     let (mut session, _provider) = TestSession::answering(vec![
         ScriptedCall::response(text_response("First")),
         ScriptedCall::response(text_response("Second")),
     ]);
 
-    session.run("one").await.expect("the first run succeeds");
+    session
+        .prompt("one")
+        .await
+        .expect("the first prompt succeeds");
     assert_eq!(session.state(), SessionState::Idle);
-    session.run("two").await.expect("the second run succeeds");
+    session
+        .prompt("two")
+        .await
+        .expect("the second prompt succeeds");
     assert_eq!(session.state(), SessionState::Idle);
 
     let turns = session.history().turns();
@@ -117,9 +123,9 @@ async fn a_follow_up_starts_another_cycle() {
     session.follow_up("followup message");
 
     session
-        .run("initial message")
+        .prompt("initial message")
         .await
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
 
     let turns = session.history().turns();
     assert_eq!(turns.len(), 4);
@@ -147,9 +153,9 @@ async fn a_tool_round_pairs_the_call_with_its_result() {
     .build();
 
     session
-        .run("Use echo tool")
+        .prompt("Use echo tool")
         .await
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
 
     assert_eq!(session.state(), SessionState::Idle);
     let turns = session.history().turns();
@@ -179,9 +185,9 @@ async fn every_call_of_a_parallel_round_comes_back() {
     let mut events = session.subscribe();
 
     session
-        .run("Use echo three times")
+        .prompt("Use echo three times")
         .await
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
 
     let turns = session.history().turns();
     assert_eq!(turns.len(), 4);
@@ -220,7 +226,10 @@ async fn an_unknown_tool_still_answers_its_call() {
         ScriptedCall::response(text_response("OK")),
     ]);
 
-    session.run("Do something").await.expect("the run succeeds");
+    session
+        .prompt("Do something")
+        .await
+        .expect("the prompt succeeds");
 
     assert_eq!(session.history().turns().len(), 4);
     let results = tool_results(&session, 2);
@@ -238,9 +247,9 @@ async fn a_tool_that_fails_still_answers_its_call() {
     .build();
 
     session
-        .run("Use fail tool")
+        .prompt("Use fail tool")
         .await
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
 
     let results = tool_results(&session, 2);
     assert!(results[0].is_error);
@@ -272,9 +281,9 @@ async fn arguments_that_miss_the_schema_answer_with_a_validation_error() {
     .build();
 
     session
-        .run("Use strict tool")
+        .prompt("Use strict tool")
         .await
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
 
     let results = tool_results(&session, 2);
     assert!(results[0].is_error);
@@ -314,9 +323,9 @@ async fn arguments_that_match_the_schema_reach_the_tool() {
     .build();
 
     session
-        .run("Use strict tool")
+        .prompt("Use strict tool")
         .await
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
 
     assert!(!tool_results(&session, 2)[0].is_error);
 }
@@ -335,7 +344,10 @@ async fn a_completed_call_reports_the_output_the_model_read() {
     .build();
     let mut events = session.subscribe();
 
-    session.run("Use echo").await.expect("the run succeeds");
+    session
+        .prompt("Use echo")
+        .await
+        .expect("the prompt succeeds");
 
     let published = settled(&mut session, &mut events).await;
     let completions: Vec<&AgentEvent> = published
@@ -350,15 +362,15 @@ async fn a_completed_call_reports_the_output_the_model_read() {
 }
 
 #[tokio::test]
-async fn a_tool_that_ends_the_run_still_has_its_result_committed() {
-    // The tool ends the whole run — the terminal gesture, not the round
+async fn a_tool_that_ends_the_prompt_still_has_its_result_committed() {
+    // The tool ends the whole prompt — the terminal gesture, not the round
     // interrupt — and learns the session's token once the session exists.
     let token: Arc<OnceLock<CancellationToken>> = Arc::new(OnceLock::new());
     let held = Arc::clone(&token);
     let stopping = RegisteredTool {
         definition: ToolDefinition::function(
             "set_abort",
-            "Ends the run",
+            "Ends the prompt",
             json!({"type": "object"}),
         ),
         executor:   Arc::new(move |_arguments, _context| {
@@ -385,9 +397,9 @@ async fn a_tool_that_ends_the_run_still_has_its_result_committed() {
         .expect("the token is set once");
 
     let error = session
-        .run("Do something")
+        .prompt("Do something")
         .await
-        .expect_err("the run ended");
+        .expect_err("the prompt ended");
 
     assert!(matches!(error, Error::Interrupted(_)));
     assert_eq!(session.state(), SessionState::Closed);
@@ -428,7 +440,10 @@ async fn repeating_the_same_call_warns_the_model() {
     .build();
     let mut events = session.subscribe();
 
-    session.run("Keep echoing").await.expect("the run succeeds");
+    session
+        .prompt("Keep echoing")
+        .await
+        .expect("the prompt succeeds");
 
     let published = settled(&mut session, &mut events).await;
     assert!(
@@ -447,7 +462,7 @@ async fn repeating_the_same_call_warns_the_model() {
 // --- Accounting ---
 
 #[tokio::test]
-async fn a_run_sums_the_cost_of_every_response() {
+async fn a_prompt_sums_the_cost_of_every_response() {
     let (mut session, _provider) = TestSession::new(vec![
         ScriptedCall::response(with_cost(
             tool_call_response("echo", "call_1", json!({"text": "hello"})),
@@ -459,15 +474,15 @@ async fn a_run_sums_the_cost_of_every_response() {
     .build();
 
     session
-        .run("Use echo tool")
+        .prompt("Use echo tool")
         .await
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
 
-    assert_eq!(session.last_run_cost_usd_micros(), Some(100_000));
+    assert_eq!(session.last_prompt_cost_usd_micros(), Some(100_000));
 }
 
 #[tokio::test]
-async fn a_run_reports_where_it_spent_its_time() {
+async fn a_prompt_reports_where_it_spent_its_time() {
     let slow_tool = RegisteredTool {
         definition: ToolDefinition::function(
             "slow_tool",
@@ -492,14 +507,14 @@ async fn a_run_reports_where_it_spent_its_time() {
     .build();
 
     session
-        .run("use the slow tool")
+        .prompt("use the slow tool")
         .await
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
 
-    let first = session.last_run_timing();
+    let first = session.last_prompt_timing();
     assert!(
         first.inference >= Duration::from_millis(35),
-        "both of the run's two model calls are counted: {first:?}"
+        "both of the prompt's two model calls are counted: {first:?}"
     );
     assert!(
         first.tool >= Duration::from_millis(30),
@@ -507,19 +522,19 @@ async fn a_run_reports_where_it_spent_its_time() {
     );
 
     session
-        .run("no tools this time")
+        .prompt("no tools this time")
         .await
-        .expect("the run succeeds");
+        .expect("the prompt succeeds");
 
-    let second = session.last_run_timing();
+    let second = session.last_prompt_timing();
     assert!(
         second.inference >= Duration::from_millis(15),
-        "each run is timed on its own: {second:?}"
+        "each prompt is timed on its own: {second:?}"
     );
     assert_eq!(
         second.tool,
         Duration::ZERO,
-        "a run with no tools spends no tool time"
+        "a prompt with no tools spends no tool time"
     );
 }
 
@@ -575,7 +590,10 @@ async fn every_tool_round_resolves_the_environment_again() {
         ])),
     }));
 
-    session.run("Use tools").await.expect("the run succeeds");
+    session
+        .prompt("Use tools")
+        .await
+        .expect("the prompt succeeds");
 
     assert_eq!(
         seen.lock()
@@ -603,9 +621,9 @@ async fn a_cancelled_session_never_calls_the_model() {
     session.interrupt();
 
     let error = session
-        .run("Do something")
+        .prompt("Do something")
         .await
-        .expect_err("the run ended");
+        .expect_err("the prompt ended");
 
     assert!(matches!(error, Error::Interrupted(_)));
     assert_eq!(session.state(), SessionState::Closed);
@@ -621,7 +639,7 @@ async fn a_credential_failure_closes_the_session() {
         ScriptedFailure::terminal(LlmErrorKind::Authentication, "invalid api key"),
     )]);
 
-    let error = session.run("Hello").await.expect_err("the call failed");
+    let error = session.prompt("Hello").await.expect_err("the call failed");
 
     assert!(matches!(error, Error::Llm(_)));
     assert_eq!(session.state(), SessionState::Closed);
@@ -636,7 +654,10 @@ async fn a_closed_session_announces_no_new_start() {
         .expect("the shutdown succeeds");
     let mut events = session.subscribe();
 
-    let error = session.run("Hello").await.expect_err("the session ended");
+    let error = session
+        .prompt("Hello")
+        .await
+        .expect_err("the session ended");
 
     assert!(matches!(error, Error::SessionClosed));
     assert!(
@@ -651,7 +672,7 @@ async fn returning_to_idle_ends_the_processing_cycle() {
     session.initialize().await.expect("initialization succeeds");
     let mut events = session.subscribe();
 
-    session.run("Hi").await.expect("the run succeeds");
+    session.prompt("Hi").await.expect("the prompt succeeds");
 
     assert_eq!(session.state(), SessionState::Idle);
     let published = drained(&mut events).await;
@@ -671,8 +692,14 @@ async fn a_session_starts_and_ends_once_however_many_inputs_it_answers() {
     let mut events = session.subscribe();
 
     session.initialize().await.expect("initialization succeeds");
-    session.run("one").await.expect("the first run succeeds");
-    session.run("two").await.expect("the second run succeeds");
+    session
+        .prompt("one")
+        .await
+        .expect("the first prompt succeeds");
+    session
+        .prompt("two")
+        .await
+        .expect("the second prompt succeeds");
 
     let published = settled(&mut session, &mut events).await;
     assert_eq!(
@@ -691,15 +718,15 @@ async fn a_session_starts_and_ends_once_however_many_inputs_it_answers() {
     );
 }
 
-// --- What a run publishes ---
+// --- What a prompt publishes ---
 
 #[tokio::test]
-async fn a_run_publishes_its_input_its_answer_and_the_window_it_used() {
+async fn a_prompt_publishes_its_input_its_answer_and_the_window_it_used() {
     let (mut session, _provider) = TestSession::answering(answers("Hello"));
     let mut events = session.subscribe();
 
     session.initialize().await.expect("initialization succeeds");
-    session.run("Hi").await.expect("the run succeeds");
+    session.prompt("Hi").await.expect("the prompt succeeds");
 
     let published = settled(&mut session, &mut events).await;
     assert!(
@@ -739,7 +766,7 @@ async fn a_response_that_reports_no_usage_is_measured_locally() {
     )]);
     let mut events = session.subscribe();
 
-    session.run("Hi").await.expect("the run succeeds");
+    session.prompt("Hi").await.expect("the prompt succeeds");
 
     let published = settled(&mut session, &mut events).await;
     let snapshot = published
@@ -808,9 +835,9 @@ async fn a_blocking_tool_is_cancelled_rather_than_dropped() {
     });
 
     let error = session
-        .run("watch something")
+        .prompt("watch something")
         .await
-        .expect_err("the run was ended");
+        .expect_err("the prompt was ended");
     stopper.await.expect("the stopper finishes");
 
     assert!(matches!(error, Error::Interrupted(_)));
@@ -845,9 +872,9 @@ async fn a_blocking_tool_answers_the_round_that_was_interrupted() {
     });
 
     session
-        .run("use the tool")
+        .prompt("use the tool")
         .await
-        .expect("the run resumes after the steer");
+        .expect("the prompt resumes after the steer");
     controller.await.expect("the controller finishes");
 
     let published = settled(&mut session, &mut recorded).await;

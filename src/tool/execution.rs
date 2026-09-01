@@ -17,8 +17,8 @@
 //! character and line limits second. See [`crate::truncate_tool_output`].
 //!
 //! Human-question tools are the one exception to running calls together: they
-//! park a run until a person answers, so at most one of them runs per round and
-//! its peers are refused with an explanation the model can act on.
+//! park a prompt until a person answers, so at most one of them runs per round
+//! and its peers are refused with an explanation the model can act on.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -26,6 +26,7 @@ use std::time::Instant;
 
 use futures_util::future::join_all;
 use lithos_llm::types::{ContentPart, ToolCall, ToolCallKind, ToolDefinitionKind, ToolResult};
+use pebble_agent::advanced::validate_tool_arguments;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -248,7 +249,7 @@ impl<'a> ToolDispatch<'a> {
 
     /// Runs the first human-question call and refuses the rest of the round.
     ///
-    /// A question parks the run until a person answers, so running its peers
+    /// A question parks the prompt until a person answers, so running its peers
     /// would either race the answer or waste work the answer invalidates. Both
     /// refusals name what to do instead, and the results stay in call order.
     async fn execute_question_round(
@@ -485,121 +486,8 @@ struct Retained {
 /// [`InvalidArguments`](ToolErrorKind::InvalidArguments) naming every problem
 /// found, so a model can fix them all in one retry.
 pub fn validate_tool_args(kind: &ToolDefinitionKind, arguments: &Value) -> Result<(), ToolError> {
-    let ToolDefinitionKind::Function { input_schema } = kind else {
-        return Ok(());
-    };
-
-    let mut problems = Vec::new();
-    check_against_schema(input_schema, arguments, "arguments", &mut problems);
-    if problems.is_empty() {
-        return Ok(());
-    }
-
-    Err(ToolError::invalid_arguments(format!(
-        "Tool argument validation failed: {}",
-        problems.join("; ")
-    )))
-}
-
-/// Collects everything wrong with `value` under `schema`.
-fn check_against_schema(schema: &Value, value: &Value, path: &str, problems: &mut Vec<String>) {
-    let Some(schema) = schema.as_object() else {
-        return;
-    };
-    if schema.is_empty() {
-        return;
-    }
-
-    if let Some(expected) = schema.get("type")
-        && !matches_type(expected, value)
-    {
-        problems.push(format!(
-            "{path}: expected {}, got {}",
-            render_type(expected),
-            type_name(value)
-        ));
-        // Nothing below this point can be judged once the shape is wrong.
-        return;
-    }
-
-    if let Some(members) = value.as_object() {
-        if let Some(required) = schema.get("required").and_then(Value::as_array) {
-            for name in required.iter().filter_map(Value::as_str) {
-                if !members.contains_key(name) {
-                    problems.push(format!("{path}: missing required property \"{name}\""));
-                }
-            }
-        }
-
-        if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
-            for (name, property_schema) in properties {
-                if let Some(member) = members.get(name) {
-                    check_against_schema(
-                        property_schema,
-                        member,
-                        &format!("{path}.{name}"),
-                        problems,
-                    );
-                }
-            }
-        }
-    }
-
-    if let (Some(items), Some(item_schema)) = (value.as_array(), schema.get("items")) {
-        for (index, item) in items.iter().enumerate() {
-            check_against_schema(item_schema, item, &format!("{path}[{index}]"), problems);
-        }
-    }
-}
-
-/// Whether `value` is one of the types `expected` names.
-fn matches_type(expected: &Value, value: &Value) -> bool {
-    match expected {
-        Value::String(name) => is_type(name, value),
-        Value::Array(names) => names
-            .iter()
-            .filter_map(Value::as_str)
-            .any(|name| is_type(name, value)),
-        // A schema that names no type constrains nothing.
-        _ => true,
-    }
-}
-
-fn is_type(name: &str, value: &Value) -> bool {
-    match name {
-        "object" => value.is_object(),
-        "array" => value.is_array(),
-        "string" => value.is_string(),
-        "number" => value.is_number(),
-        "integer" => value.is_i64() || value.is_u64(),
-        "boolean" => value.is_boolean(),
-        "null" => value.is_null(),
-        // An unknown type keyword is not pebble's to reject.
-        _ => true,
-    }
-}
-
-fn render_type(expected: &Value) -> String {
-    match expected {
-        Value::String(name) => name.clone(),
-        Value::Array(names) => names
-            .iter()
-            .filter_map(Value::as_str)
-            .collect::<Vec<_>>()
-            .join(" or "),
-        other => other.to_string(),
-    }
-}
-
-const fn type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
+    validate_tool_arguments(kind, arguments)
+        .map_err(|error| ToolError::invalid_arguments(error.to_string()))
 }
 
 /// A result carrying one block of text, which is what every pebble tool

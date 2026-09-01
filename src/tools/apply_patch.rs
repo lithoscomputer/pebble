@@ -310,7 +310,7 @@ fn check_patch_boundaries_strict(lines: &[&str]) -> Result<(), ToolError> {
 /// Applies parsed operations to the files `env` holds.
 ///
 /// Operations run in the order the patch listed them, and the first failure
-/// stops the run — so a patch whose third operation cannot match leaves the
+/// stops the prompt — so a patch whose third operation cannot match leaves the
 /// first two applied. That is Codex's behavior, and the summary names only what
 /// a successful run changed.
 ///

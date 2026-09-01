@@ -33,10 +33,10 @@
 //! # }
 //! ```
 //!
-//! Give [`SessionOptions::retry_policy`](crate::SessionOptions::retry_policy)
-//! the same policy, so a failure is spaced the same way whichever layer handles
-//! it. A session whose client has no retry middleware still runs correctly: it
-//! simply never publishes an `open`-phase retry, because nothing retried.
+//! [`SessionOptions::turn_replay`](crate::SessionOptions::turn_replay) controls
+//! the separate replay after a response stream opens. A session whose client
+//! has no retry middleware still runs correctly: it simply never publishes an
+//! `open`-phase retry, because nothing retried.
 
 use std::time::Duration;
 
