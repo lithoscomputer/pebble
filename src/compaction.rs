@@ -29,7 +29,7 @@ use crate::history::{APPROX_CHARS_PER_TOKEN, History};
 use crate::profile::ModelFacts;
 use crate::tool::result_text;
 use crate::truncation::serialized_json_bytes;
-use crate::types::{AgentEvent, Message};
+use crate::types::{CodingEvent, Message};
 
 /// The output budget for the summary text itself.
 const SUMMARY_MAX_TOKENS: u32 = 4_096;
@@ -107,7 +107,7 @@ pub struct CompactionRequest<'a> {
 
 /// Whether the session has crossed the compaction threshold, and by how much.
 ///
-/// Emits a `context_window` [`AgentEvent::Warning`] when it has, so an
+/// Emits a `context_window` [`CodingEvent::Warning`] when it has, so an
 /// application sees the pressure whether or not compaction is enabled. Answers
 /// `None` for a model whose window is unknown, because a threshold on an
 /// unknown window means nothing.
@@ -131,7 +131,7 @@ pub fn check_context_usage(
     }
 
     let usage_percent = estimate.tokens.saturating_mul(100) / context_window_tokens;
-    emitter.emit(session_id.to_owned(), AgentEvent::Warning {
+    emitter.emit(session_id.to_owned(), CodingEvent::Warning {
         kind:    "context_window".to_owned(),
         message: format!("Context window usage: {usage_percent}%"),
         details: serde_json::json!({
@@ -173,7 +173,7 @@ pub async fn compact_context(
     }
     let preserved_turn_count = original_turn_count - preserve_start;
 
-    emitter.emit(session_id.to_owned(), AgentEvent::CompactionStarted {
+    emitter.emit(session_id.to_owned(), CodingEvent::CompactionStarted {
         estimated_tokens:    request.estimate.tokens,
         context_window_size: request.facts.context_window_tokens,
     });
@@ -227,7 +227,7 @@ pub async fn compact_context(
 
     history.compact_from(preserve_start, content);
 
-    emitter.emit(session_id.to_owned(), AgentEvent::CompactionCompleted {
+    emitter.emit(session_id.to_owned(), CodingEvent::CompactionCompleted {
         original_turn_count,
         preserved_turn_count,
         summary_token_estimate,
@@ -504,7 +504,7 @@ mod tests {
         ScriptedCompletion, ScriptedFailure, ScriptedProvider, client_from, message_text,
         test_catalog, text_response,
     };
-    use crate::types::{SessionEvent, TokenUsage};
+    use crate::types::{CodingSessionEvent, TokenUsage};
 
     /// A summarization call that answers with `text`.
     fn summary(text: &str) -> ScriptedCompletion {
@@ -579,7 +579,7 @@ mod tests {
 
         /// Drops the emitter, runs the pump to exhaustion, and answers what was
         /// published.
-        async fn drain(mut self) -> Vec<AgentEvent> {
+        async fn drain(mut self) -> Vec<CodingEvent> {
             let mut receiver = self.emitter.subscribe();
             drop(self.emitter);
             self.pump
@@ -589,7 +589,7 @@ mod tests {
                 .await
                 .expect("no sink can refuse");
             let mut events = Vec::new();
-            while let Ok(SessionEvent { event, .. }) = receiver.try_recv() {
+            while let Ok(CodingSessionEvent { event, .. }) = receiver.try_recv() {
                 events.push(event);
             }
             events
@@ -890,7 +890,7 @@ mod tests {
         assert!(
             published.iter().any(|event| matches!(
                 event,
-                AgentEvent::Warning { kind, details, .. }
+                CodingEvent::Warning { kind, details, .. }
                     if kind == "context_window" && details["estimate_method"] == "local_estimate"
             )),
             "{published:?}"
@@ -914,7 +914,7 @@ mod tests {
         result:  Result<()>,
         history: History,
         before:  Vec<StoredMessage>,
-        events:  Vec<AgentEvent>,
+        events:  Vec<CodingEvent>,
     }
 
     /// Compacts a four-turn history against a provider that answers
@@ -970,7 +970,7 @@ mod tests {
             compacted
                 .events
                 .iter()
-                .any(|event| matches!(event, AgentEvent::CompactionCompleted { .. }))
+                .any(|event| matches!(event, CodingEvent::CompactionCompleted { .. }))
         );
     }
 
@@ -996,14 +996,14 @@ mod tests {
                 compacted
                     .events
                     .iter()
-                    .any(|event| matches!(event, AgentEvent::CompactionStarted { .. })),
+                    .any(|event| matches!(event, CodingEvent::CompactionStarted { .. })),
                 "the attempt is still recorded"
             );
             assert!(
                 !compacted
                     .events
                     .iter()
-                    .any(|event| matches!(event, AgentEvent::CompactionCompleted { .. })),
+                    .any(|event| matches!(event, CodingEvent::CompactionCompleted { .. })),
                 "a refused summary must not complete"
             );
         }

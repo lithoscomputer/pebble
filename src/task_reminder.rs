@@ -1,7 +1,7 @@
 //! Reminding a model that it has task tools it has stopped using.
 //!
 //! A session that tracks its work in tasks stays legible to the person watching
-//! it, but a model drifts away from the task tools over a long run. The
+//! it, but a model drifts away from the task tools over a long prompt. The
 //! reminder is one system turn, injected only when the session actually has
 //! both task tools, only after ten assistant turns without either, and never
 //! more often than once every ten assistant turns.
@@ -35,7 +35,7 @@ TaskCreate and TaskUpdate are available but have not been used in the last 10 as
 /// that is not registered would send the model after something it cannot call.
 ///
 /// ```
-/// # use pebble::{History, maybe_task_reminder};
+/// # use pebble::resources::{History, maybe_task_reminder};
 /// let history = History::default();
 /// assert!(maybe_task_reminder(&history, &["TaskCreate", "TaskUpdate"]).is_none());
 /// ```

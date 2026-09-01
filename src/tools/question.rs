@@ -15,8 +15,8 @@
 //! executor refuses a call whose session is not the root of its tree even if
 //! one somehow was.
 //!
-//! [`Question`]: crate::Question
-//! [`HumanInputProvider`]: crate::HumanInputProvider
+//! [`Question`]: crate::advanced::Question
+//! [`HumanInputProvider`]: crate::advanced::HumanInputProvider
 
 use std::collections::BTreeMap;
 use std::ops::RangeInclusive;
@@ -45,8 +45,9 @@ const ROOT_SESSION_REQUIRED_ERROR: &str =
 ///
 /// This is the whole registration rule: a session builder asks once, and only
 /// when the application gave the session a
-/// [`HumanInputProvider`](crate::HumanInputProvider) to ask through. Gemini's
-/// harness has no question tool, so a Gemini session never advertises one.
+/// [`HumanInputProvider`](crate::advanced::HumanInputProvider) to ask through.
+/// Gemini's harness has no question tool, so a Gemini session never advertises
+/// one.
 #[must_use]
 pub fn make_question_tool(profile: AgentProfileKind) -> Option<RegisteredTool> {
     match profile {

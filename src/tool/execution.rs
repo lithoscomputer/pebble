@@ -12,9 +12,10 @@
 //! what the model re-reads next turn can differ in size but never in substance.
 //!
 //! Output is bounded twice, by
-//! [`SessionOptions::tool_output_retention_bytes`] and
-//! [`SessionOptions::tool_output_serialized_bytes`] first and by the tool's own
-//! character and line limits second. See [`crate::truncate_tool_output`].
+//! [`CodingSessionOptions::tool_output_retention_bytes`] and
+//! [`CodingSessionOptions::tool_output_serialized_bytes`] first and by the
+//! tool's own character and line limits second. See
+//! [`crate::truncate_tool_output`].
 //!
 //! Human-question tools are the one exception to running calls together: they
 //! park a prompt until a person answers, so at most one of them runs per round
@@ -34,9 +35,9 @@ use tracing::debug;
 use super::error::ToolError;
 use super::permissions::canonical_tool_name;
 use super::registry::{
-    AgentEventEmitter, RegisteredTool, ToolContext, ToolEnvProvider, ToolRegistry,
+    CodingEventEmitter, RegisteredTool, ToolContext, ToolEnvProvider, ToolRegistry,
 };
-use crate::config::{SessionOptions, ToolHookDecision};
+use crate::config::{CodingSessionOptions, ToolHookDecision};
 use crate::environment::Environment;
 use crate::event::{Emitter, OutputCaptureStats, SessionBoundEmitter};
 use crate::human_input::{HumanInputProvider, is_question_tool};
@@ -45,7 +46,7 @@ use crate::truncation::{
     OutputBudgets, ToolOutputLimits, preview_tool_output, serialized_json_bytes,
     truncate_tool_output,
 };
-use crate::types::{AgentEvent, ToolErrorKind};
+use crate::types::{CodingEvent, ToolErrorKind};
 
 /// What a second human-question call in one round is told.
 const ONE_QUESTION_PER_ROUND: &str = "Only one human-question tool call may be used in a tool \
@@ -70,7 +71,7 @@ const CANCELLED: &str = "Cancelled";
 pub struct ToolDispatch<'a> {
     registry:          &'a ToolRegistry,
     env:               &'a Arc<dyn Environment>,
-    config:            &'a SessionOptions,
+    config:            &'a CodingSessionOptions,
     emitter:           &'a Emitter,
     session_id:        &'a str,
     root_session_id:   &'a str,
@@ -89,7 +90,7 @@ impl<'a> ToolDispatch<'a> {
     pub fn new(
         registry: &'a ToolRegistry,
         env: &'a Arc<dyn Environment>,
-        config: &'a SessionOptions,
+        config: &'a CodingSessionOptions,
         emitter: &'a Emitter,
         session_id: &'a str,
         root_session_id: &'a str,
@@ -310,7 +311,7 @@ impl<'a> ToolDispatch<'a> {
             .with_cancel(cancel)
             .with_session(self.session_id, self.root_session_id)
             .with_tool_call_id(call.id.clone())
-            .with_event_emitter(Arc::clone(&bound) as Arc<dyn AgentEventEmitter>);
+            .with_coding_event_emitter(Arc::clone(&bound) as Arc<dyn CodingEventEmitter>);
         if let Some(provider) = self.tool_env_provider {
             context = context.with_tool_env_provider(Arc::clone(provider));
         }
@@ -397,7 +398,7 @@ impl<'a> ToolDispatch<'a> {
     }
 
     fn emit_started(&self, call: &ToolCall) {
-        self.emit(call, AgentEvent::ToolCallStarted {
+        self.emit(call, CodingEvent::ToolCallStarted {
             tool_name:    call.name.clone(),
             tool_call_id: call.id.clone(),
             arguments:    call.arguments.clone(),
@@ -416,10 +417,10 @@ impl<'a> ToolDispatch<'a> {
         // so a store keeps the completed event and drops deltas as ephemeral.
         // No tool streams incremental deltas yet, which makes the two payloads
         // equal today.
-        self.emit(call, AgentEvent::ToolCallOutputDelta {
+        self.emit(call, CodingEvent::ToolCallOutputDelta {
             delta: result_text(result).into_owned(),
         });
-        self.emit(call, AgentEvent::ToolCallCompleted {
+        self.emit(call, CodingEvent::ToolCallCompleted {
             tool_name: call.name.clone(),
             tool_call_id: call.id.clone(),
             output: output_value(result),
@@ -433,7 +434,7 @@ impl<'a> ToolDispatch<'a> {
 
     /// Publishes an event about one call, stamping the call on the envelope so
     /// a fragment with no identity of its own is still attributable.
-    fn emit(&self, call: &ToolCall, event: AgentEvent) {
+    fn emit(&self, call: &ToolCall, event: CodingEvent) {
         self.emitter
             .emit_with_tool_call_id(self.session_id, event, Some(call.id.clone()));
     }
@@ -561,13 +562,13 @@ mod tests {
     use crate::event::{EventOptions, EventPump};
     use crate::human_input::{Answer, AnswerStatus, HumanInputError, Question, QuestionKind};
     use crate::test_support::MockEnvironment;
-    use crate::types::{CommandTermination, SessionEvent, ToolSource};
+    use crate::types::{CodingSessionEvent, CommandTermination, ToolSource};
 
     /// An event pipeline whose events can be read once the round is over.
     struct Events {
         emitter:  Emitter,
         pump:     JoinHandle<PebbleResult<()>>,
-        received: broadcast::Receiver<SessionEvent>,
+        received: broadcast::Receiver<CodingSessionEvent>,
     }
 
     impl Events {
@@ -582,7 +583,7 @@ mod tests {
         }
 
         /// Stops the pipeline and returns everything it published.
-        async fn drain(self) -> Vec<SessionEvent> {
+        async fn drain(self) -> Vec<CodingSessionEvent> {
             let Self {
                 emitter,
                 pump,
@@ -601,14 +602,14 @@ mod tests {
         }
 
         /// The names of the tool-call events, in published order.
-        fn order(events: &[SessionEvent]) -> Vec<&'static str> {
+        fn order(events: &[CodingSessionEvent]) -> Vec<&'static str> {
             events
                 .iter()
                 .filter_map(|event| match &event.event {
-                    AgentEvent::ToolCallStarted { .. } => Some("started"),
-                    AgentEvent::ToolProcessCompleted { .. } => Some("process"),
-                    AgentEvent::ToolCallOutputDelta { .. } => Some("delta"),
-                    AgentEvent::ToolCallCompleted { .. } => Some("completed"),
+                    CodingEvent::ToolCallStarted { .. } => Some("started"),
+                    CodingEvent::ToolProcessCompleted { .. } => Some("process"),
+                    CodingEvent::ToolCallOutputDelta { .. } => Some("delta"),
+                    CodingEvent::ToolCallCompleted { .. } => Some("completed"),
                     _ => None,
                 })
                 .collect()
@@ -752,7 +753,7 @@ mod tests {
             executor:   Arc::new(move |_arguments, context: ToolContext| {
                 Box::pin(async move {
                     context.record_tool_output_stats(OutputCaptureStats::complete(3));
-                    context.emit_agent_event(AgentEvent::ToolProcessCompleted {
+                    context.emit_coding_event(CodingEvent::ToolProcessCompleted {
                         exit_code:             Some(exit_code),
                         termination:           CommandTermination::Exited,
                         duration_ms:           12,
@@ -849,11 +850,11 @@ mod tests {
         result_text(result).into_owned()
     }
 
-    fn completion(events: &[SessionEvent]) -> &AgentEvent {
+    fn completion(events: &[CodingSessionEvent]) -> &CodingEvent {
         events
             .iter()
             .map(|event| &event.event)
-            .find(|event| matches!(event, AgentEvent::ToolCallCompleted { .. }))
+            .find(|event| matches!(event, CodingEvent::ToolCallCompleted { .. }))
             .expect("a completion event")
     }
 
@@ -861,7 +862,7 @@ mod tests {
     async fn a_tool_runs_and_reports_its_output() {
         let registry = registry_with([echo_tool()]);
         let environment = environment();
-        let config = SessionOptions::default();
+        let config = CodingSessionOptions::default();
         let events = Events::new();
 
         let result = ToolDispatch::new(
@@ -891,7 +892,7 @@ mod tests {
         }
         assert!(matches!(
             completion(&published),
-            AgentEvent::ToolCallCompleted {
+            CodingEvent::ToolCallCompleted {
                 output,
                 is_error: false,
                 error_kind: None,
@@ -904,7 +905,7 @@ mod tests {
     async fn a_failing_tool_reports_only_its_safe_message() {
         let registry = registry_with([failing_tool()]);
         let environment = environment();
-        let config = SessionOptions::default();
+        let config = CodingSessionOptions::default();
         let events = Events::new();
 
         let result = ToolDispatch::new(
@@ -925,7 +926,7 @@ mod tests {
         assert_eq!(text_of(&result), "tool failed");
         assert!(matches!(
             completion(&events.drain().await),
-            AgentEvent::ToolCallCompleted {
+            CodingEvent::ToolCallCompleted {
                 is_error: true,
                 error_kind: Some(ToolErrorKind::Execution),
                 ..
@@ -937,7 +938,7 @@ mod tests {
     async fn an_unknown_tool_is_reported_as_unavailable() {
         let registry = ToolRegistry::new();
         let environment = environment();
-        let config = SessionOptions::default();
+        let config = CodingSessionOptions::default();
         let events = Events::new();
 
         let result = ToolDispatch::new(
@@ -955,7 +956,7 @@ mod tests {
         assert_eq!(text_of(&result), "Unknown tool: nope");
         assert!(matches!(
             completion(&events.drain().await),
-            AgentEvent::ToolCallCompleted {
+            CodingEvent::ToolCallCompleted {
                 error_kind: Some(ToolErrorKind::Unavailable),
                 ..
             }
@@ -976,7 +977,7 @@ mod tests {
         });
         let registry = registry_with([tool]);
         let environment = environment();
-        let config = SessionOptions::default();
+        let config = CodingSessionOptions::default();
         let events = Events::new();
 
         let result = ToolDispatch::new(
@@ -999,7 +1000,7 @@ mod tests {
         assert_eq!(*runs.lock().unwrap_or_else(PoisonError::into_inner), 0);
         assert!(matches!(
             completion(&events.drain().await),
-            AgentEvent::ToolCallCompleted {
+            CodingEvent::ToolCallCompleted {
                 error_kind: Some(ToolErrorKind::InvalidArguments),
                 ..
             }
@@ -1010,11 +1011,11 @@ mod tests {
     async fn a_pre_hook_blocks_execution() {
         let registry = registry_with([echo_tool()]);
         let environment = environment();
-        let config = SessionOptions {
+        let config = CodingSessionOptions {
             tool_hooks: Some(Arc::new(RecordingHooks::new(ToolHookDecision::Block {
                 reason: "blocked by hook".to_owned(),
             }))),
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         };
         let events = Events::new();
 
@@ -1036,7 +1037,7 @@ mod tests {
         assert!(text_of(&result).contains("blocked by hook"));
         assert!(matches!(
             completion(&events.drain().await),
-            AgentEvent::ToolCallCompleted {
+            CodingEvent::ToolCallCompleted {
                 error_kind: Some(ToolErrorKind::Denied),
                 ..
             }
@@ -1047,9 +1048,9 @@ mod tests {
     async fn a_pre_hook_that_proceeds_lets_the_tool_run() {
         let registry = registry_with([echo_tool()]);
         let environment = environment();
-        let config = SessionOptions {
+        let config = CodingSessionOptions {
             tool_hooks: Some(Arc::new(RecordingHooks::new(ToolHookDecision::Proceed))),
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         };
         let events = Events::new();
 
@@ -1076,9 +1077,9 @@ mod tests {
         let hooks = Arc::new(RecordingHooks::new(ToolHookDecision::Proceed));
         let registry = registry_with([echo_tool()]);
         let environment = environment();
-        let config = SessionOptions {
+        let config = CodingSessionOptions {
             tool_hooks: Some(Arc::clone(&hooks) as Arc<dyn ToolHookCallback>),
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         };
         let events = Events::new();
 
@@ -1109,9 +1110,9 @@ mod tests {
         let hooks = Arc::new(RecordingHooks::new(ToolHookDecision::Proceed));
         let registry = registry_with([failing_tool()]);
         let environment = environment();
-        let config = SessionOptions {
+        let config = CodingSessionOptions {
             tool_hooks: Some(Arc::clone(&hooks) as Arc<dyn ToolHookCallback>),
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         };
         let events = Events::new();
 
@@ -1142,7 +1143,7 @@ mod tests {
     async fn a_session_without_hooks_calls_none() {
         let registry = registry_with([echo_tool()]);
         let environment = environment();
-        let config = SessionOptions::default();
+        let config = CodingSessionOptions::default();
         let events = Events::new();
 
         let result = ToolDispatch::new(
@@ -1182,13 +1183,13 @@ mod tests {
             source:     ToolSource::Native,
         }]);
         let environment = environment();
-        let config = SessionOptions {
+        let config = CodingSessionOptions {
             tool_access_policy: Some(Arc::new(NamedPolicy::new([(
                 "write_file",
                 ToolAccess::Denied,
             )]))),
             tool_exposure_mode: ToolExposureMode::IncludeRequiresApproval,
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         };
         let events = Events::new();
 
@@ -1211,7 +1212,7 @@ mod tests {
         assert_eq!(*runs.lock().unwrap_or_else(PoisonError::into_inner), 0);
         assert!(matches!(
             completion(&events.drain().await),
-            AgentEvent::ToolCallCompleted {
+            CodingEvent::ToolCallCompleted {
                 error_kind: Some(ToolErrorKind::Denied),
                 ..
             }
@@ -1238,13 +1239,13 @@ mod tests {
             source:     ToolSource::Native,
         }]);
         let environment = environment();
-        let config = SessionOptions {
+        let config = CodingSessionOptions {
             tool_access_policy: Some(Arc::new(NamedPolicy::new([(
                 "shell",
                 ToolAccess::RequiresApproval,
             )]))),
             tool_exposure_mode: ToolExposureMode::AutoApprovedOnly,
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         };
         let events = Events::new();
 
@@ -1272,7 +1273,7 @@ mod tests {
     async fn tool_output_is_bounded_before_events_and_history() {
         let registry = registry_with([echo_tool()]);
         let environment = environment();
-        let config = SessionOptions::default();
+        let config = CodingSessionOptions::default();
         let budget = config.tool_output_retention_bytes;
         let text = "x".repeat(budget + 100);
         let events = Events::new();
@@ -1298,7 +1299,7 @@ mod tests {
         assert!(output.contains("tokens truncated"));
 
         let published = events.drain().await;
-        let AgentEvent::ToolCallCompleted {
+        let CodingEvent::ToolCallCompleted {
             output: event_output,
             is_error,
             output_bytes_observed,
@@ -1324,7 +1325,7 @@ mod tests {
     async fn serialized_tool_output_stays_within_the_serialized_budget() {
         let registry = registry_with([echo_tool()]);
         let environment = environment();
-        let config = SessionOptions::default();
+        let config = CodingSessionOptions::default();
         // Output made almost entirely of characters JSON escapes: it fits the
         // retained budget as text and blows past it once serialized.
         let text = format!(
@@ -1349,7 +1350,7 @@ mod tests {
 
         assert!(!result.is_error);
         let published = events.drain().await;
-        let AgentEvent::ToolCallCompleted {
+        let CodingEvent::ToolCallCompleted {
             output: event_output,
             ..
         } = completion(&published)
@@ -1370,9 +1371,9 @@ mod tests {
         let registry = registry_with([process_tool(7)]);
         let environment = environment();
         let hooks = Arc::new(RecordingHooks::new(ToolHookDecision::Proceed));
-        let config = SessionOptions {
+        let config = CodingSessionOptions {
             tool_hooks: Some(Arc::clone(&hooks) as Arc<dyn ToolHookCallback>),
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         };
         let events = Events::new();
 
@@ -1402,7 +1403,7 @@ mod tests {
         ]);
         let process = published
             .iter()
-            .find(|event| matches!(event.event, AgentEvent::ToolProcessCompleted { .. }))
+            .find(|event| matches!(event.event, CodingEvent::ToolProcessCompleted { .. }))
             .expect("a process event");
         assert_eq!(process.tool_call_id.as_deref(), Some("call_1"));
 
@@ -1415,9 +1416,9 @@ mod tests {
         let registry = registry_with([process_tool(0)]);
         let environment = environment();
         let hooks = Arc::new(RecordingHooks::new(ToolHookDecision::Proceed));
-        let config = SessionOptions {
+        let config = CodingSessionOptions {
             tool_hooks: Some(Arc::clone(&hooks) as Arc<dyn ToolHookCallback>),
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         };
         let events = Events::new();
 
@@ -1445,7 +1446,7 @@ mod tests {
     async fn what_a_tool_reported_about_its_own_output_reaches_the_counters() {
         let registry = registry_with([process_tool(0)]);
         let environment = environment();
-        let config = SessionOptions::default();
+        let config = CodingSessionOptions::default();
         let events = Events::new();
 
         ToolDispatch::new(
@@ -1465,7 +1466,7 @@ mod tests {
         let published = events.drain().await;
         assert!(matches!(
             completion(&published),
-            AgentEvent::ToolCallCompleted {
+            CodingEvent::ToolCallCompleted {
                 output_bytes_observed: 3,
                 output_bytes_retained: 3,
                 output_bytes_omitted: 0,
@@ -1478,7 +1479,7 @@ mod tests {
     async fn a_question_round_runs_one_question_and_refuses_its_peers() {
         let registry = registry_with([question_tool(), echo_tool()]);
         let environment = environment();
-        let config = SessionOptions::default();
+        let config = CodingSessionOptions::default();
         let provider: Arc<dyn HumanInputProvider> = Arc::new(StubHumanInput);
         let events = Events::new();
         let calls = [
@@ -1512,7 +1513,7 @@ mod tests {
     async fn only_the_first_of_several_question_calls_runs() {
         let registry = registry_with([question_tool()]);
         let environment = environment();
-        let config = SessionOptions::default();
+        let config = CodingSessionOptions::default();
         let provider: Arc<dyn HumanInputProvider> = Arc::new(StubHumanInput);
         let events = Events::new();
         let calls = [
@@ -1544,7 +1545,7 @@ mod tests {
     async fn a_cancelled_round_answers_every_call_without_starting_one() {
         let registry = registry_with([echo_tool()]);
         let environment = environment();
-        let config = SessionOptions::default();
+        let config = CodingSessionOptions::default();
         let cancel = CancellationToken::new();
         cancel.cancel();
         let events = Events::new();
@@ -1579,7 +1580,7 @@ mod tests {
     async fn parallel_calls_come_back_in_call_order() {
         let registry = registry_with([echo_tool()]);
         let environment = environment();
-        let config = SessionOptions::default();
+        let config = CodingSessionOptions::default();
         let events = Events::new();
         let calls = [
             call("echo", "call_1", json!({"text": "one"})),
@@ -1621,7 +1622,7 @@ mod tests {
             source:     ToolSource::Native,
         }]);
         let environment = environment();
-        let config = SessionOptions::default();
+        let config = CodingSessionOptions::default();
         let events = Events::new();
 
         let result = ToolDispatch::new(
@@ -1644,7 +1645,7 @@ mod tests {
         assert_eq!(result.tool_call_id, "call_1");
 
         let published = events.drain().await;
-        let AgentEvent::ToolCallCompleted { output, .. } = completion(&published) else {
+        let CodingEvent::ToolCallCompleted { output, .. } = completion(&published) else {
             panic!("a completion event");
         };
         assert_eq!(output.as_str().map(str::len), Some(60_000));
@@ -1660,7 +1661,7 @@ mod tests {
             source:     ToolSource::Native,
         }]);
         let environment = environment();
-        let config = SessionOptions::default();
+        let config = CodingSessionOptions::default();
         let events = Events::new();
 
         let result = ToolDispatch::new(

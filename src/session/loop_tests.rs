@@ -206,14 +206,14 @@ async fn every_call_of_a_parallel_round_comes_back() {
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::ToolCallStarted { .. }
+            CodingEvent::ToolCallStarted { .. }
         )),
         3
     );
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::ToolCallCompleted { .. }
+            CodingEvent::ToolCallCompleted { .. }
         )),
         3
     );
@@ -350,14 +350,14 @@ async fn a_completed_call_reports_the_output_the_model_read() {
         .expect("the prompt succeeds");
 
     let published = settled(&mut session, &mut events).await;
-    let completions: Vec<&AgentEvent> = published
+    let completions: Vec<&CodingEvent> = published
         .iter()
-        .filter(|event| matches!(event, AgentEvent::ToolCallCompleted { .. }))
+        .filter(|event| matches!(event, CodingEvent::ToolCallCompleted { .. }))
         .collect();
     assert_eq!(completions.len(), 1);
     assert!(matches!(
         completions[0],
-        AgentEvent::ToolCallCompleted { output, .. } if *output == json!("echo: hello world")
+        CodingEvent::ToolCallCompleted { output, .. } if *output == json!("echo: hello world")
     ));
 }
 
@@ -386,9 +386,9 @@ async fn a_tool_that_ends_the_prompt_still_has_its_result_committed() {
         ScriptedCall::response(tool_call_response("set_abort", "call_1", json!({}))),
         ScriptedCall::response(text_response("Should not reach this")),
     ])
-    .options(SessionOptions {
+    .options(CodingSessionOptions {
         enable_loop_detection: false,
-        ..SessionOptions::default()
+        ..CodingSessionOptions::default()
     })
     .tools([stopping])
     .build();
@@ -432,10 +432,10 @@ async fn repeating_the_same_call_warns_the_model() {
         ScriptedCall::response(text_response("Done")),
     ])
     .tools([echo_tool()])
-    .options(SessionOptions {
+    .options(CodingSessionOptions {
         enable_loop_detection: true,
         loop_detection_window: 3,
-        ..SessionOptions::default()
+        ..CodingSessionOptions::default()
     })
     .build();
     let mut events = session.subscribe();
@@ -449,7 +449,7 @@ async fn repeating_the_same_call_warns_the_model() {
     assert!(
         published
             .iter()
-            .any(|event| matches!(event, AgentEvent::LoopDetected))
+            .any(|event| matches!(event, CodingEvent::LoopDetected))
     );
     assert!(
         session.history().turns().iter().any(|turn| {
@@ -613,9 +613,9 @@ async fn a_cancelled_session_never_calls_the_model() {
         ScriptedCall::response(tool_call_response("echo", "call_2", json!({"text": "b"}))),
     ])
     .tools([echo_tool()])
-    .options(SessionOptions {
+    .options(CodingSessionOptions {
         enable_loop_detection: false,
-        ..SessionOptions::default()
+        ..CodingSessionOptions::default()
     })
     .build();
     session.interrupt();
@@ -679,7 +679,7 @@ async fn returning_to_idle_ends_the_processing_cycle() {
     assert!(
         published
             .iter()
-            .any(|event| matches!(event, AgentEvent::ProcessingEnd))
+            .any(|event| matches!(event, CodingEvent::ProcessingEnd))
     );
 }
 
@@ -705,14 +705,14 @@ async fn a_session_starts_and_ends_once_however_many_inputs_it_answers() {
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::SessionStarted { .. }
+            CodingEvent::SessionStarted { .. }
         )),
         1
     );
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::SessionEnded
+            CodingEvent::SessionEnded
         )),
         1
     );
@@ -732,23 +732,23 @@ async fn a_prompt_publishes_its_input_its_answer_and_the_window_it_used() {
     assert!(
         published
             .iter()
-            .any(|event| matches!(event, AgentEvent::SessionStarted { .. }))
+            .any(|event| matches!(event, CodingEvent::SessionStarted { .. }))
     );
     assert!(
         published
             .iter()
-            .any(|event| matches!(event, AgentEvent::UserInput { .. }))
+            .any(|event| matches!(event, CodingEvent::UserInput { .. }))
     );
     assert!(
         published
             .iter()
-            .any(|event| matches!(event, AgentEvent::SessionEnded))
+            .any(|event| matches!(event, CodingEvent::SessionEnded))
     );
 
     let snapshot = published
         .iter()
         .find_map(|event| match event {
-            AgentEvent::AssistantMessage { context_window, .. } => context_window.as_ref(),
+            CodingEvent::AssistantMessage { context_window, .. } => context_window.as_ref(),
             _ => None,
         })
         .expect("the assistant turn carries a context window");
@@ -772,7 +772,7 @@ async fn a_response_that_reports_no_usage_is_measured_locally() {
     let snapshot = published
         .iter()
         .find_map(|event| match event {
-            AgentEvent::AssistantMessage { context_window, .. } => context_window.as_ref(),
+            CodingEvent::AssistantMessage { context_window, .. } => context_window.as_ref(),
             _ => None,
         })
         .expect("the assistant turn carries a context window");
@@ -828,7 +828,7 @@ async fn a_blocking_tool_is_cancelled_rather_than_dropped() {
         // Ended once the call is running, so the tool is cancelled rather than
         // never started.
         wait_for_event(&mut events, |event| {
-            matches!(event, AgentEvent::ToolCallStarted { .. })
+            matches!(event, CodingEvent::ToolCallStarted { .. })
         })
         .await;
         cancel.cancel();
@@ -860,12 +860,12 @@ async fn a_blocking_tool_answers_the_round_that_was_interrupted() {
     let mut recorded = session.subscribe();
     let controller = tokio::spawn(async move {
         wait_for_event(&mut events, |event| {
-            matches!(event, AgentEvent::ToolCallStarted { tool_name, .. } if tool_name == "block")
+            matches!(event, CodingEvent::ToolCallStarted { tool_name, .. } if tool_name == "block")
         })
         .await;
         control.interrupt();
         wait_for_event(&mut events, |event| {
-            matches!(event, AgentEvent::RoundInterrupted { generation: 1 })
+            matches!(event, CodingEvent::RoundInterrupted { generation: 1 })
         })
         .await;
         control.steer("resume after tool", None);
@@ -881,17 +881,17 @@ async fn a_blocking_tool_answers_the_round_that_was_interrupted() {
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::RoundInterrupted { .. }
+            CodingEvent::RoundInterrupted { .. }
         )),
         1,
         "one gesture, one announcement"
     );
     let completed = position(&published, |event| {
-        matches!(event, AgentEvent::ToolCallCompleted { .. })
+        matches!(event, CodingEvent::ToolCallCompleted { .. })
     })
     .expect("the tool call completed");
     let settled_at = position(&published, |event| {
-        matches!(event, AgentEvent::RoundInterrupted { .. })
+        matches!(event, CodingEvent::RoundInterrupted { .. })
     })
     .expect("the interrupt settled");
     assert!(

@@ -2,9 +2,9 @@
 //!
 //! Where a Kimi Code tool behaves the way pebble's already does, the Kimi
 //! harness reuses pebble's and only the exposed name changes, which the
-//! [vocabulary](crate::ToolVocabulary) does on its own. The five here differ in
-//! what their parameters *mean*, so renaming pebble's parameters would
-//! advertise behavior pebble does not have:
+//! [vocabulary](crate::tools::ToolVocabulary) does on its own. The five here
+//! differ in what their parameters *mean*, so renaming pebble's parameters
+//! would advertise behavior pebble does not have:
 //!
 //! - `Bash` takes `timeout` in **seconds** where pebble takes milliseconds, and
 //!   accepts a `cwd`. A rename alone would make every timeout 1000× wrong.

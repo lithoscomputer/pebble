@@ -92,10 +92,10 @@ impl EnvContext {
 /// instead — so a profile builds them rather than a builder choosing for it.
 ///
 /// It carries the session's place in the tree, and — when the application
-/// configured a [`SessionFactory`](crate::SessionFactory) — the supervisor the
-/// tools drive. The supervisor is a shared handle, so this type deliberately
-/// derives neither `Copy` nor `Eq`: growing it must not have to remove a derive
-/// that callers depend on.
+/// configured a [`SessionFactory`](crate::advanced::SessionFactory) — the
+/// supervisor the tools drive. The supervisor is a shared handle, so this type
+/// deliberately derives neither `Copy` nor `Eq`: growing it must not have to
+/// remove a derive that callers depend on.
 ///
 /// A profile outside pebble reads [`depth`](Self::depth) and contributes
 /// whatever tools it likes; pebble's own four are reached through
@@ -171,7 +171,7 @@ impl ModelFacts {
     /// the rest.
     ///
     /// ```
-    /// # use pebble::ModelFacts;
+    /// # use pebble::resources::ModelFacts;
     /// let facts = ModelFacts::new()
     ///     .with_context_window_tokens(128_000)
     ///     .with_max_output_tokens(Some(8_192));
@@ -193,7 +193,8 @@ impl ModelFacts {
     /// is told not to, and one that only takes a thinking budget does not. A
     /// catalog row that knows better says so with
     /// `metadata.pebble.reasoning_by_default`, which
-    /// [`SessionBuilder`](crate::SessionBuilder) applies on top of this.
+    /// [`SessionBuilder`](crate::advanced::SessionBuilder) applies on top of
+    /// this.
     #[must_use]
     pub fn from_catalog_model(model: &CatalogModel) -> Self {
         let capabilities = model.capabilities();

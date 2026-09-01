@@ -31,8 +31,9 @@ const TRUNCATION_MARKER: &str = "[Project instructions truncated at 32KB]";
 /// One loaded memory file.
 ///
 /// [`content`](Self::content) is what goes into the system prompt. The rest
-/// describes the file for the [`MemoryLoaded`](crate::AgentEvent::MemoryLoaded)
-/// event, which deliberately carries the description and never the text.
+/// describes the file for the
+/// [`MemoryLoaded`](crate::events::CodingEvent::MemoryLoaded) event, which
+/// deliberately carries the description and never the text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryDocument {
     /// The path the file was read from.

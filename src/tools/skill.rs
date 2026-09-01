@@ -4,8 +4,9 @@
 //! [`expand_skill`](crate::expand_skill) turns into the skill's prompt. A model
 //! activates one by calling this tool, and gets the same prompt back as the
 //! call's output. Both publish
-//! [`SkillActivated`](crate::AgentEvent::SkillActivated), so an application
-//! reading the stream sees every activation and which of the two it was.
+//! [`SkillActivated`](crate::events::CodingEvent::SkillActivated), so an
+//! application reading the stream sees every activation and which of the two it
+//! was.
 //!
 //! The tool's arguments are the one thing that differs by harness. Kimi Code
 //! and Claude 5 call the fields `skill` and `args`; pebble's own name for the
@@ -18,7 +19,7 @@ use lithos_llm::types::ToolDefinition;
 
 use crate::skills::{Skill, USER_INPUT_PLACEHOLDER};
 use crate::tool::{NativeTool, RegisteredTool, ToolError, ToolVocabulary, required_str};
-use crate::types::{AgentEvent, SkillActivationSource, ToolSource};
+use crate::types::{CodingEvent, SkillActivationSource, ToolSource};
 
 /// What the model is told the skill tool is for.
 const USE_SKILL_DESCRIPTION: &str = "Load a skill's instructions by name. Call this when the \
@@ -63,7 +64,7 @@ pub fn make_use_skill_tool_for_vocabulary(
                     })?;
                 // Published only once the skill was found: a lookup that
                 // failed activated nothing.
-                ctx.emit_agent_event(AgentEvent::SkillActivated {
+                ctx.emit_coding_event(CodingEvent::SkillActivated {
                     skill_name: name.to_owned(),
                     source:     SkillActivationSource::Tool,
                 });
@@ -157,7 +158,7 @@ mod tests {
 
     use super::*;
     use crate::test_support::MockEnvironment;
-    use crate::tool::AgentEventEmitter;
+    use crate::tool::CodingEventEmitter;
     use crate::tools::testing::{context, schema_of};
     use crate::types::ToolErrorKind;
 
@@ -180,11 +181,11 @@ mod tests {
     /// An emitter that keeps what it was given.
     #[derive(Default)]
     struct Recorder {
-        events: Mutex<Vec<AgentEvent>>,
+        events: Mutex<Vec<CodingEvent>>,
     }
 
     impl Recorder {
-        fn events(&self) -> Vec<AgentEvent> {
+        fn events(&self) -> Vec<CodingEvent> {
             self.events
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -192,8 +193,8 @@ mod tests {
         }
     }
 
-    impl AgentEventEmitter for Recorder {
-        fn emit(&self, event: AgentEvent) {
+    impl CodingEventEmitter for Recorder {
+        fn emit(&self, event: CodingEvent) {
             self.events
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -205,11 +206,11 @@ mod tests {
     async fn call_with_events(
         vocabulary: ToolVocabulary,
         args: serde_json::Value,
-    ) -> (Result<String, ToolError>, Vec<AgentEvent>) {
+    ) -> (Result<String, ToolError>, Vec<CodingEvent>) {
         let recorder = Arc::new(Recorder::default());
         let tool = make_use_skill_tool_for_vocabulary(test_skills(), vocabulary);
         let context = context(MockEnvironment::default())
-            .with_event_emitter(Arc::clone(&recorder) as Arc<dyn AgentEventEmitter>);
+            .with_coding_event_emitter(Arc::clone(&recorder) as Arc<dyn CodingEventEmitter>);
         let result = (tool.executor)(args, context).await;
         (result, recorder.events())
     }
@@ -341,7 +342,7 @@ mod tests {
             call_with_events(ToolVocabulary::Canonical, json!({"skill_name": "review"})).await;
 
         assert!(result.is_ok());
-        assert_eq!(events, vec![AgentEvent::SkillActivated {
+        assert_eq!(events, vec![CodingEvent::SkillActivated {
             skill_name: "review".to_owned(),
             source:     SkillActivationSource::Tool,
         }]);

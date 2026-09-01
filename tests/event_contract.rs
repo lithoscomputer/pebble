@@ -1,7 +1,7 @@
 //! Contract tests for the serialized event stream.
 //!
-//! The JSON form of [`SessionEvent`] and [`AgentEvent`] is public API, so
-//! these snapshots are reviewed like a specification. Evolution is additive:
+//! The JSON form of [`CodingSessionEvent`] and [`CodingEvent`] is public API,
+//! so these snapshots are reviewed like a specification. Evolution is additive:
 //! a new variant or a new optional field may appear, but an existing line may
 //! not change or disappear without a major version and a migration.
 //!
@@ -13,15 +13,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lithos_llm::catalog::ProviderId;
 use lithos_llm::types::{Error as LlmError, ErrorKind as LlmErrorKind, RetryClassification};
-use pebble::{
-    Actor, AgentEvent, AgentProfileKind, CommandTermination, ContextWindowBreakdownItem,
-    ContextWindowCategory, ContextWindowCountMethod, ContextWindowSnapshot, ContextWindowStaleness,
-    ContextWindowWarning, CostSource, Error, ErrorData, ErrorKind, EventSinkError, ExecOutputTail,
-    InterruptReason, LlmOutputKind, LlmRetryPhase, MemoryFileSummary, PermissionLevel,
-    ReasoningOutput, SessionEvent, SkillActivationSource, SkillSummary, TodoCreatedProps,
+use pebble::events::{
+    Actor, AgentProfileKind, CodingEvent, CodingSessionEvent, CommandTermination,
+    ContextWindowBreakdownItem, ContextWindowCategory, ContextWindowCountMethod,
+    ContextWindowSnapshot, ContextWindowStaleness, ContextWindowWarning, CostSource, ErrorData,
+    ErrorKind, EventSinkError, ExecOutputTail, LlmOutputKind, LlmRetryPhase, MemoryFileSummary,
+    PermissionLevel, ReasoningOutput, SkillActivationSource, SkillSummary, TodoCreatedProps,
     TodoDeletedProps, TodoListKind, TodoStatus, TodoUpdatedProps, TokenUsage, ToolCategory,
     ToolErrorKind, ToolSource, ToolSummary,
 };
+use pebble::{Error, InterruptReason};
 use serde::Serialize;
 use serde_json::json;
 
@@ -83,28 +84,28 @@ fn context_window() -> ContextWindowSnapshot {
     }
 }
 
-fn every_variant() -> Vec<AgentEvent> {
+fn every_variant() -> Vec<CodingEvent> {
     vec![
-        AgentEvent::SessionStarted {
+        CodingEvent::SessionStarted {
             provider: Some("anthropic".into()),
             model:    Some("claude-sonnet-5".into()),
         },
-        AgentEvent::SessionEnded,
-        AgentEvent::ProcessingEnd,
-        AgentEvent::UserInput {
+        CodingEvent::SessionEnded,
+        CodingEvent::ProcessingEnd,
+        CodingEvent::UserInput {
             text: "fix the failing test".into(),
         },
-        AgentEvent::LlmRequestStarted {
+        CodingEvent::LlmRequestStarted {
             requested_model: "claude-sonnet-5".into(),
         },
-        AgentEvent::LlmFirstOutput {
+        CodingEvent::LlmFirstOutput {
             kind: LlmOutputKind::Reasoning,
         },
-        AgentEvent::AssistantOutputReplace {
+        CodingEvent::AssistantOutputReplace {
             text:      String::new(),
             reasoning: None,
         },
-        AgentEvent::AssistantMessage {
+        CodingEvent::AssistantMessage {
             text:            "I updated the parser.".into(),
             model:           "claude-sonnet-5".into(),
             usage:           usage(),
@@ -114,21 +115,21 @@ fn every_variant() -> Vec<AgentEvent> {
             context_window:  Some(context_window()),
             reasoning:       Some(ReasoningOutput::new("checked the parser", "step one")),
         },
-        AgentEvent::TextDelta {
+        CodingEvent::TextDelta {
             delta: "I up".into(),
         },
-        AgentEvent::ReasoningDelta {
+        CodingEvent::ReasoningDelta {
             delta: "weighing".into(),
         },
-        AgentEvent::ToolCallStarted {
+        CodingEvent::ToolCallStarted {
             tool_name:    "shell".into(),
             tool_call_id: "call_1".into(),
             arguments:    serde_json::json!({"command": "cargo test"}),
         },
-        AgentEvent::ToolCallOutputDelta {
+        CodingEvent::ToolCallOutputDelta {
             delta: "running 1 test".into(),
         },
-        AgentEvent::ToolCallCompleted {
+        CodingEvent::ToolCallCompleted {
             tool_name:             "shell".into(),
             tool_call_id:          "call_1".into(),
             output:                serde_json::json!("test result: ok"),
@@ -138,7 +139,7 @@ fn every_variant() -> Vec<AgentEvent> {
             output_bytes_retained: 1_024,
             output_bytes_omitted:  3_072,
         },
-        AgentEvent::ToolCallCompleted {
+        CodingEvent::ToolCallCompleted {
             tool_name:             "write_file".into(),
             tool_call_id:          "call_2".into(),
             output:                serde_json::json!("permission denied"),
@@ -148,7 +149,7 @@ fn every_variant() -> Vec<AgentEvent> {
             output_bytes_retained: 17,
             output_bytes_omitted:  0,
         },
-        AgentEvent::ToolProcessCompleted {
+        CodingEvent::ToolProcessCompleted {
             exit_code:             Some(101),
             termination:           CommandTermination::Exited,
             duration_ms:           1_432,
@@ -163,34 +164,34 @@ fn every_variant() -> Vec<AgentEvent> {
             output_bytes_retained: 1_024,
             output_bytes_omitted:  3_072,
         },
-        AgentEvent::Error {
+        CodingEvent::Error {
             error: ErrorData::from(&Error::Interrupted(InterruptReason::WallClockTimeout)),
         },
-        AgentEvent::Warning {
+        CodingEvent::Warning {
             kind:    "context_budget".into(),
             message: "the prompt is close to the context window".into(),
             details: serde_json::json!({"usage_percent": 92.5}),
         },
-        AgentEvent::LoopDetected,
-        AgentEvent::SteeringInjected {
+        CodingEvent::LoopDetected,
+        CodingEvent::SteeringInjected {
             text:  "also update the changelog".into(),
             actor: Some(Actor::User {
                 id:           Some("u_1".into()),
                 display_name: Some("Ada".into()),
             }),
         },
-        AgentEvent::RoundInterrupted { generation: 3 },
-        AgentEvent::CompactionStarted {
+        CodingEvent::RoundInterrupted { generation: 3 },
+        CodingEvent::CompactionStarted {
             estimated_tokens:    180_000,
             context_window_size: 200_000,
         },
-        AgentEvent::CompactionCompleted {
+        CodingEvent::CompactionCompleted {
             original_turn_count:    64,
             preserved_turn_count:   12,
             summary_token_estimate: 900,
             tracked_file_count:     7,
         },
-        AgentEvent::LlmRetry {
+        CodingEvent::LlmRetry {
             provider:   "openai".into(),
             model:      "gpt-5".into(),
             attempt:    0,
@@ -200,37 +201,37 @@ fn every_variant() -> Vec<AgentEvent> {
                 .with_model("gpt-5"),
             phase:      LlmRetryPhase::Open,
         },
-        AgentEvent::SubAgentSpawned {
+        CodingEvent::SubAgentSpawned {
             agent_id:   "sa_1".into(),
             depth:      1,
             task:       "survey the test suite".into(),
             generation: 1,
         },
-        AgentEvent::SubAgentTurnStarted {
+        CodingEvent::SubAgentTurnStarted {
             agent_id:   "sa_1".into(),
             depth:      1,
             task:       "survey the test suite".into(),
             generation: 2,
         },
-        AgentEvent::SubAgentCompleted {
+        CodingEvent::SubAgentCompleted {
             agent_id:   "sa_1".into(),
             depth:      1,
             generation: 2,
             success:    true,
             turns_used: 4,
         },
-        AgentEvent::SubAgentFailed {
+        CodingEvent::SubAgentFailed {
             agent_id:   "sa_2".into(),
             depth:      1,
             generation: 1,
             error:      ErrorData::from(&Error::SessionClosed),
         },
-        AgentEvent::SubAgentClosed {
+        CodingEvent::SubAgentClosed {
             agent_id:   "sa_1".into(),
             depth:      1,
             generation: 2,
         },
-        AgentEvent::MemoryLoaded {
+        CodingEvent::MemoryLoaded {
             profile:            AgentProfileKind::Claude5.as_str().to_owned(),
             files:              vec![MemoryFileSummary {
                 path:         "/work/AGENTS.md".into(),
@@ -241,7 +242,7 @@ fn every_variant() -> Vec<AgentEvent> {
             total_loaded_bytes: 2_048,
             budget_bytes:       8_192,
         },
-        AgentEvent::SkillsDiscovered {
+        CodingEvent::SkillsDiscovered {
             profile:     AgentProfileKind::Claude5.as_str().to_owned(),
             source_dirs: vec!["/work/.skills".into()],
             skills:      vec![SkillSummary {
@@ -249,11 +250,11 @@ fn every_variant() -> Vec<AgentEvent> {
                 description: "Review a diff".into(),
             }],
         },
-        AgentEvent::SkillActivated {
+        CodingEvent::SkillActivated {
             skill_name: "review".into(),
             source:     SkillActivationSource::Slash,
         },
-        AgentEvent::TodoCreated(TodoCreatedProps {
+        CodingEvent::TodoCreated(TodoCreatedProps {
             list_id:     "openai_plan:ses_1".into(),
             list_kind:   TodoListKind::OpenAiPlan,
             todo_id:     "todo_1".into(),
@@ -267,14 +268,14 @@ fn every_variant() -> Vec<AgentEvent> {
             blocked_by:  Vec::new(),
             metadata:    BTreeMap::from([("origin".to_owned(), serde_json::json!("plan"))]),
         }),
-        AgentEvent::TodoUpdated(TodoUpdatedProps {
+        CodingEvent::TodoUpdated(TodoUpdatedProps {
             status: Some(TodoStatus::InProgress),
             active_form: Some(None),
             owner: Some(Some("agent".into())),
             metadata_patch: BTreeMap::from([("origin".to_owned(), serde_json::Value::Null)]),
             ..TodoUpdatedProps::new("openai_plan:ses_1", TodoListKind::OpenAiPlan, "todo_1")
         }),
-        AgentEvent::TodoDeleted(TodoDeletedProps {
+        CodingEvent::TodoDeleted(TodoDeletedProps {
             list_id:   "openai_plan:ses_1".into(),
             list_kind: TodoListKind::OpenAiPlan,
             todo_id:   "todo_1".into(),
@@ -283,17 +284,17 @@ fn every_variant() -> Vec<AgentEvent> {
 }
 
 #[test]
-fn every_agent_event_variant_keeps_its_serialized_shape() {
-    insta::assert_snapshot!("agent_event_variants", render(&every_variant()));
+fn every_coding_event_variant_keeps_its_serialized_shape() {
+    insta::assert_snapshot!("coding_event_variants", render(&every_variant()));
 }
 
 #[test]
-fn the_session_event_envelope_keeps_its_serialized_shape() {
+fn the_coding_session_event_envelope_keeps_its_serialized_shape() {
     let events = vec![
-        SessionEvent::new("ses_root", AgentEvent::SessionEnded, moment()).with_seq(1),
-        SessionEvent::new(
+        CodingSessionEvent::new("ses_root", CodingEvent::SessionEnded, moment()).with_seq(1),
+        CodingSessionEvent::new(
             "ses_child",
-            AgentEvent::ToolCallOutputDelta {
+            CodingEvent::ToolCallOutputDelta {
                 delta: "running".into(),
             },
             moment(),
@@ -302,7 +303,7 @@ fn the_session_event_envelope_keeps_its_serialized_shape() {
         .with_parent_session_id("ses_root")
         .with_tool_call_id("call_1"),
     ];
-    insta::assert_snapshot!("session_event_envelope", render(&events));
+    insta::assert_snapshot!("coding_session_event_envelope", render(&events));
 }
 
 #[test]
@@ -377,13 +378,13 @@ fn error_projections_keep_their_serialized_shape() {
 fn every_variant_survives_a_round_trip_through_its_snapshot_shape() {
     let events = every_variant();
     let json = serde_json::to_string(&events).expect("events serialize");
-    let restored: Vec<AgentEvent> = serde_json::from_str(&json).expect("events parse");
+    let restored: Vec<CodingEvent> = serde_json::from_str(&json).expect("events parse");
     assert_eq!(restored, events);
 }
 
 #[test]
 fn an_event_with_unknown_members_still_parses() {
-    let envelope: SessionEvent = serde_json::from_value(json!({
+    let envelope: CodingSessionEvent = serde_json::from_value(json!({
         "seq": 7,
         "event": {
             "UserInput": {
@@ -402,7 +403,7 @@ fn an_event_with_unknown_members_still_parses() {
     assert_eq!(envelope.parent_session_id, None);
     assert!(matches!(
         envelope.event,
-        AgentEvent::UserInput { text } if text == "fix the failing test"
+        CodingEvent::UserInput { text } if text == "fix the failing test"
     ));
 }
 
@@ -426,20 +427,20 @@ fn an_event_variant_this_build_does_not_know_is_read_through_the_envelope() {
         "session_id": "ses_root",
     });
 
-    serde_json::from_value::<SessionEvent>(line.clone())
+    serde_json::from_value::<CodingSessionEvent>(line.clone())
         .expect_err("the typed envelope refuses a variant this build does not know");
 
     let envelope: RawEnvelope =
         serde_json::from_value(line).expect("the envelope parses without the payload");
     assert_eq!(envelope.seq, 9);
     assert_eq!(envelope.session_id, "ses_root");
-    serde_json::from_value::<AgentEvent>(envelope.event)
+    serde_json::from_value::<CodingEvent>(envelope.event)
         .expect_err("the payload is what this build cannot read");
 }
 
 #[test]
 fn an_event_without_its_optional_members_still_parses() {
-    let envelope: SessionEvent = serde_json::from_value(json!({
+    let envelope: CodingSessionEvent = serde_json::from_value(json!({
         "event": "SessionEnded",
         "timestamp": "2026-01-01T00:00:00.500Z",
         "session_id": "ses_root",
@@ -448,5 +449,5 @@ fn an_event_without_its_optional_members_still_parses() {
 
     assert_eq!(envelope.seq, 0, "an unsequenced event reads as sequence 0");
     assert_eq!(envelope.tool_call_id, None);
-    assert!(matches!(envelope.event, AgentEvent::SessionEnded));
+    assert!(matches!(envelope.event, CodingEvent::SessionEnded));
 }

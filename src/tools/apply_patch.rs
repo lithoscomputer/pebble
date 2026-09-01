@@ -125,10 +125,10 @@ fn extract_context_line(line: &str) -> String {
 /// # Errors
 ///
 /// Returns a [`ToolError`] of kind
-/// [`InvalidArguments`](crate::ToolErrorKind::InvalidArguments) when the text
-/// is not a patch: the envelope is missing, a hunk holds a line with no `+`,
-/// `-`, or space prefix, or an `Add`/`Update` block is empty. The model repairs
-/// every one of those by sending a different patch.
+/// [`InvalidArguments`](crate::tools::ToolErrorKind::InvalidArguments) when the
+/// text is not a patch: the envelope is missing, a hunk holds a line with no
+/// `+`, `-`, or space prefix, or an `Add`/`Update` block is empty. The model
+/// repairs every one of those by sending a different patch.
 pub fn parse_apply_patch(text: &str) -> Result<Vec<PatchOperation>, ToolError> {
     let lines: Vec<&str> = text.trim().lines().collect();
     let lines = patch_lines_with_valid_boundaries(&lines)?;
@@ -317,11 +317,12 @@ fn check_patch_boundaries_strict(lines: &[&str]) -> Result<(), ToolError> {
 /// # Errors
 ///
 /// Returns a [`ToolError`] of kind
-/// [`InvalidArguments`](crate::ToolErrorKind::InvalidArguments) when the patch
-/// cannot be matched against the files it names — an anchor that is not there,
-/// lines that are not there, a file to delete that does not exist — because the
-/// model repairs those by reading the file and sending a different patch. A
-/// failure of the environment itself keeps the kind the environment reported.
+/// [`InvalidArguments`](crate::tools::ToolErrorKind::InvalidArguments) when the
+/// patch cannot be matched against the files it names — an anchor that is not
+/// there, lines that are not there, a file to delete that does not exist —
+/// because the model repairs those by reading the file and sending a different
+/// patch. A failure of the environment itself keeps the kind the environment
+/// reported.
 pub async fn apply_patch_operations(
     ops: &[PatchOperation],
     env: &dyn Environment,

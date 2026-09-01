@@ -23,7 +23,7 @@ use tokio::sync::broadcast;
 use tokio::task::yield_now;
 
 use super::{RetryEventObserver, Session, SessionBuilder, ShutdownReason};
-use crate::config::SessionOptions;
+use crate::config::CodingSessionOptions;
 use crate::environment::Environment;
 use crate::history::History;
 use crate::human_input::HumanInputProvider;
@@ -37,7 +37,7 @@ use crate::test_support::{
     scripted_client_builder,
 };
 use crate::tool::{RegisteredTool, ToolError, ToolRegistry, ToolVocabulary};
-use crate::types::{AgentEvent, AgentProfileKind, Message, SessionEvent, ToolSource};
+use crate::types::{AgentProfileKind, CodingEvent, CodingSessionEvent, Message, ToolSource};
 
 /// A profile that names a harness and contributes only what it is given.
 pub(crate) struct TestProfile {
@@ -104,7 +104,7 @@ pub(crate) struct TestSession {
     delay:           Duration,
     completions:     Vec<ScriptedCompletion>,
     tools:           Vec<RegisteredTool>,
-    options:         SessionOptions,
+    options:         CodingSessionOptions,
     model:           String,
     environment:     Option<Arc<dyn Environment>>,
     retries:         Option<RetryPolicy>,
@@ -124,7 +124,7 @@ impl TestSession {
             delay: Duration::ZERO,
             completions: Vec::new(),
             tools: Vec::new(),
-            options: SessionOptions::default(),
+            options: CodingSessionOptions::default(),
             model: "test/model".to_owned(),
             environment: None,
             retries: None,
@@ -191,7 +191,7 @@ impl TestSession {
     }
 
     /// Sets how the session behaves.
-    pub(crate) fn options(mut self, options: SessionOptions) -> Self {
+    pub(crate) fn options(mut self, options: CodingSessionOptions) -> Self {
         self.options = options;
         self
     }
@@ -303,8 +303,8 @@ pub(crate) fn history_from(turns: Vec<Message>) -> History {
 /// until the pump runs, and the pump stops only when the session tells it to.
 pub(crate) async fn settled(
     session: &mut Session,
-    receiver: &mut broadcast::Receiver<SessionEvent>,
-) -> Vec<AgentEvent> {
+    receiver: &mut broadcast::Receiver<CodingSessionEvent>,
+) -> Vec<CodingEvent> {
     session
         .shutdown(ShutdownReason::Completed)
         .await
@@ -316,14 +316,16 @@ pub(crate) async fn settled(
 ///
 /// The session queues events for a task to publish, so a test that reads the
 /// stream while the session is still open has to let that task run first.
-pub(crate) async fn drained(receiver: &mut broadcast::Receiver<SessionEvent>) -> Vec<AgentEvent> {
+pub(crate) async fn drained(
+    receiver: &mut broadcast::Receiver<CodingSessionEvent>,
+) -> Vec<CodingEvent> {
     yield_now().await;
     yield_now().await;
     drain(receiver)
 }
 
 /// Everything the receiver already holds.
-pub(crate) fn drain(receiver: &mut broadcast::Receiver<SessionEvent>) -> Vec<AgentEvent> {
+pub(crate) fn drain(receiver: &mut broadcast::Receiver<CodingSessionEvent>) -> Vec<CodingEvent> {
     let mut events = Vec::new();
     while let Ok(event) = receiver.try_recv() {
         events.push(event.event);
@@ -333,14 +335,14 @@ pub(crate) fn drain(receiver: &mut broadcast::Receiver<SessionEvent>) -> Vec<Age
 
 /// Waits for the first event that satisfies `predicate`.
 pub(crate) async fn wait_for_event(
-    receiver: &mut broadcast::Receiver<SessionEvent>,
-    predicate: impl Fn(&AgentEvent) -> bool,
+    receiver: &mut broadcast::Receiver<CodingSessionEvent>,
+    predicate: impl Fn(&CodingEvent) -> bool,
 ) {
     loop {
         let event = receiver
             .recv()
             .await
-            .expect("the session event stream stays open");
+            .expect("the coding event stream stays open");
         if predicate(&event.event) {
             return;
         }
@@ -349,36 +351,36 @@ pub(crate) async fn wait_for_event(
 
 /// Where `matcher` first matched, which a test uses to assert on ordering.
 pub(crate) fn position(
-    events: &[AgentEvent],
-    matcher: impl Fn(&AgentEvent) -> bool,
+    events: &[CodingEvent],
+    matcher: impl Fn(&CodingEvent) -> bool,
 ) -> Option<usize> {
     events.iter().position(matcher)
 }
 
 /// A short name for each event, for asserting on a whole stream at once.
-pub(crate) fn event_names(events: &[AgentEvent]) -> Vec<&'static str> {
+pub(crate) fn event_names(events: &[CodingEvent]) -> Vec<&'static str> {
     events.iter().map(event_name).collect()
 }
 
 /// A short name for one event.
-pub(crate) fn event_name(event: &AgentEvent) -> &'static str {
+pub(crate) fn event_name(event: &CodingEvent) -> &'static str {
     match event {
-        AgentEvent::SessionStarted { .. } => "started",
-        AgentEvent::SessionEnded => "ended",
-        AgentEvent::ProcessingEnd => "processing_end",
-        AgentEvent::MemoryLoaded { .. } => "memory",
-        AgentEvent::SkillsDiscovered { .. } => "skills",
-        AgentEvent::UserInput { .. } => "input",
-        AgentEvent::LlmRequestStarted { .. } => "request",
-        AgentEvent::LlmFirstOutput { .. } => "first_output",
-        AgentEvent::TextDelta { .. } => "delta",
-        AgentEvent::AssistantMessage { .. } => "message",
+        CodingEvent::SessionStarted { .. } => "started",
+        CodingEvent::SessionEnded => "ended",
+        CodingEvent::ProcessingEnd => "processing_end",
+        CodingEvent::MemoryLoaded { .. } => "memory",
+        CodingEvent::SkillsDiscovered { .. } => "skills",
+        CodingEvent::UserInput { .. } => "input",
+        CodingEvent::LlmRequestStarted { .. } => "request",
+        CodingEvent::LlmFirstOutput { .. } => "first_output",
+        CodingEvent::TextDelta { .. } => "delta",
+        CodingEvent::AssistantMessage { .. } => "message",
         _ => "other",
     }
 }
 
 /// How many events `matcher` matched.
-pub(crate) fn count(events: &[AgentEvent], matcher: impl Fn(&AgentEvent) -> bool) -> usize {
+pub(crate) fn count(events: &[CodingEvent], matcher: impl Fn(&CodingEvent) -> bool) -> usize {
     events.iter().filter(|event| matcher(event)).count()
 }
 

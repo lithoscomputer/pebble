@@ -9,13 +9,14 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
+use pebble::events::{CodingEvent, CodingSessionEvent, Emitter, EventOptions, EventPump};
 use pebble::llm::types::{ContentPart, ToolCall, ToolDefinition, ToolResult};
 use pebble::test_support::MockEnvironment;
-use pebble::{
-    AgentEvent, Emitter, Environment, EventOptions, EventPump, RegisteredTool, SessionEvent,
-    SessionOptions, ToolContext, ToolDispatch, ToolError, ToolErrorKind, ToolHookCallback,
+use pebble::tools::{
+    RegisteredTool, ToolContext, ToolDispatch, ToolError, ToolErrorKind, ToolHookCallback,
     ToolHookDecision, ToolRegistry, ToolSource,
 };
+use pebble::{CodingSessionOptions, Environment};
 use serde_json::{Value, json};
 use tokio::sync::broadcast::Receiver;
 use tokio::task::JoinHandle;
@@ -25,7 +26,7 @@ use tokio_util::sync::CancellationToken;
 struct Events {
     emitter:  Emitter,
     pump:     JoinHandle<pebble::Result<()>>,
-    received: Receiver<SessionEvent>,
+    received: Receiver<CodingSessionEvent>,
 }
 
 impl Events {
@@ -40,7 +41,7 @@ impl Events {
     }
 
     /// Stops the pipeline and returns everything it published.
-    async fn drain(self) -> Vec<SessionEvent> {
+    async fn drain(self) -> Vec<CodingSessionEvent> {
         let Self {
             emitter,
             pump,
@@ -155,7 +156,7 @@ fn text_of(result: &ToolResult) -> &str {
 }
 
 /// The tool-call events for one call, in published order.
-fn round_for<'a>(events: &'a [SessionEvent], tool_call_id: &str) -> Vec<&'a AgentEvent> {
+fn round_for<'a>(events: &'a [CodingSessionEvent], tool_call_id: &str) -> Vec<&'a CodingEvent> {
     events
         .iter()
         .filter(|event| event.tool_call_id.as_deref() == Some(tool_call_id))
@@ -170,9 +171,9 @@ async fn a_round_runs_its_tools_publishes_their_events_and_calls_the_hooks_in_or
     registry.register(failing_tool());
     let environment = environment();
     let hooks = Arc::new(HookLog::default());
-    let config = SessionOptions {
+    let config = CodingSessionOptions {
         tool_hooks: Some(Arc::clone(&hooks) as Arc<dyn ToolHookCallback>),
-        ..SessionOptions::default()
+        ..CodingSessionOptions::default()
     };
     let events = Events::new();
     let calls = [
@@ -209,13 +210,13 @@ async fn a_round_runs_its_tools_publishes_their_events_and_calls_the_hooks_in_or
 
     let read_round = round_for(&published, "call_read");
     assert!(matches!(read_round.as_slice(), [
-        AgentEvent::ToolCallStarted {
+        CodingEvent::ToolCallStarted {
             tool_name,
             tool_call_id,
             ..
         },
-        AgentEvent::ToolCallOutputDelta { delta },
-        AgentEvent::ToolCallCompleted {
+        CodingEvent::ToolCallOutputDelta { delta },
+        CodingEvent::ToolCallCompleted {
             output,
             is_error: false,
             error_kind: None,
@@ -233,9 +234,9 @@ async fn a_round_runs_its_tools_publishes_their_events_and_calls_the_hooks_in_or
 
     let failed_round = round_for(&published, "call_boom");
     assert!(matches!(failed_round.as_slice(), [
-        AgentEvent::ToolCallStarted { .. },
-        AgentEvent::ToolCallOutputDelta { .. },
-        AgentEvent::ToolCallCompleted {
+        CodingEvent::ToolCallStarted { .. },
+        CodingEvent::ToolCallOutputDelta { .. },
+        CodingEvent::ToolCallCompleted {
             is_error: true,
             error_kind: Some(ToolErrorKind::Execution),
             ..
@@ -268,9 +269,9 @@ async fn output_past_the_session_budget_is_bounded_before_anything_else_sees_it(
         source:     ToolSource::Native,
     });
     let environment = environment();
-    let config = SessionOptions {
+    let config = CodingSessionOptions {
         tool_output_retention_bytes: 4_096,
-        ..SessionOptions::default()
+        ..CodingSessionOptions::default()
     };
     let events = Events::new();
 
@@ -289,7 +290,7 @@ async fn output_past_the_session_budget_is_bounded_before_anything_else_sees_it(
     .await;
 
     let published = events.drain().await;
-    let AgentEvent::ToolCallCompleted {
+    let CodingEvent::ToolCallCompleted {
         output,
         is_error,
         output_bytes_observed,
@@ -299,7 +300,7 @@ async fn output_past_the_session_budget_is_bounded_before_anything_else_sees_it(
     } = published
         .iter()
         .map(|event| &event.event)
-        .find(|event| matches!(event, AgentEvent::ToolCallCompleted { .. }))
+        .find(|event| matches!(event, CodingEvent::ToolCallCompleted { .. }))
         .expect("a completion event")
     else {
         unreachable!("the event was matched above")

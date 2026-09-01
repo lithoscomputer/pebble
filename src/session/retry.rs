@@ -7,11 +7,12 @@
 //! anything went wrong. After visible output, only the session can replay,
 //! because a replay has to withdraw what was shown first.
 //!
-//! Both halves publish the same [`LlmRetry`](crate::AgentEvent::LlmRetry)
-//! event, so an application sees one account of a struggling call. This module
-//! is the half that reaches into the client: pebble puts a bridge into each
-//! call's context, and [`RetryEventObserver`] — which the application installs
-//! on the middleware — reads it back out.
+//! Both halves publish the same
+//! [`LlmRetry`](crate::events::CodingEvent::LlmRetry) event, so an application
+//! sees one account of a struggling call. This module is the half that reaches
+//! into the client: pebble puts a bridge into each call's context, and
+//! [`RetryEventObserver`] — which the application installs on the middleware —
+//! reads it back out.
 //!
 //! # Installing it
 //!
@@ -20,7 +21,7 @@
 //! ```no_run
 //! use lithos_llm::Client;
 //! use lithos_llm::middleware::{RetryMiddleware, RetryPolicy};
-//! use pebble::RetryEventObserver;
+//! use pebble::events::RetryEventObserver;
 //!
 //! # fn build(catalog: lithos_llm::catalog::Catalog) -> Result<(), Box<dyn std::error::Error>> {
 //! let policy = RetryPolicy::exponential().max_attempts(4);
@@ -33,7 +34,7 @@
 //! # }
 //! ```
 //!
-//! [`SessionOptions::turn_replay`](crate::SessionOptions::turn_replay) controls
+//! [`CodingSessionOptions::turn_replay`](crate::CodingSessionOptions::turn_replay) controls
 //! the separate replay after a response stream opens. A session whose client
 //! has no retry middleware still runs correctly: it simply never publishes an
 //! `open`-phase retry, because nothing retried.
@@ -45,7 +46,7 @@ use lithos_llm::types::Error as LlmError;
 
 use crate::error::ErrorData;
 use crate::event::Emitter;
-use crate::types::{AgentEvent, LlmRetryPhase};
+use crate::types::{CodingEvent, LlmRetryPhase};
 
 /// Publishes the retries a client's retry middleware decides.
 ///
@@ -108,7 +109,7 @@ impl RetryEventBridge {
     /// delivery.
     fn report(&self, error: &LlmError, attempt: u32, delay: Duration, stage: RetryStage) {
         self.emitter
-            .emit(self.session_id.clone(), AgentEvent::LlmRetry {
+            .emit(self.session_id.clone(), CodingEvent::LlmRetry {
                 provider:   self.provider.clone(),
                 model:      self.model.clone(),
                 attempt:    attempt_index(attempt),
@@ -186,7 +187,7 @@ mod tests {
         let event = events.recv().await.expect("the retry reaches the stream");
         assert_eq!(event.session_id, "ses_1");
         match event.event {
-            AgentEvent::LlmRetry {
+            CodingEvent::LlmRetry {
                 provider,
                 model,
                 attempt,
@@ -219,11 +220,11 @@ mod tests {
         // The observer reads its bridge from the call, so a call that carries
         // none — anything the application makes on the same client — is
         // ignored rather than reported onto a session's stream.
-        emitter.emit("ses_1", AgentEvent::LoopDetected);
+        emitter.emit("ses_1", CodingEvent::LoopDetected);
 
         assert!(matches!(
             events.recv().await.map(|event| event.event),
-            Ok(AgentEvent::LoopDetected)
+            Ok(CodingEvent::LoopDetected)
         ));
         assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
 

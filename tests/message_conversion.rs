@@ -13,7 +13,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use lithos_llm::types::{
     ContentPart, Message as LlmMessage, ReasoningContent, Role, ToolCall, ToolCallKind, ToolResult,
 };
-use pebble::{History, Message, TokenUsage};
+use pebble::events::TokenUsage;
+use pebble::resources::{History, Message};
 use serde_json::json;
 
 fn moment() -> SystemTime {

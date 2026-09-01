@@ -3,7 +3,7 @@
 //! A stream that breaks after the model has already produced visible output
 //! cannot be reconnected underneath a reader, so the session withdraws the
 //! turn — one empty
-//! [`AssistantOutputReplace`](crate::AgentEvent::AssistantOutputReplace) — and
+//! [`AssistantOutputReplace`](crate::events::CodingEvent::AssistantOutputReplace) — and
 //! plays it again. These tests pin what a reader sees while that happens, how
 //! many times it may happen, and which failures are not worth repeating at all.
 
@@ -30,27 +30,27 @@ fn dropped_stream() -> ScriptedFailure {
 }
 
 /// The reasoning every `AssistantMessage` carried, in order.
-fn reasoning_of(events: &[AgentEvent]) -> Vec<Option<ReasoningOutput>> {
+fn reasoning_of(events: &[CodingEvent]) -> Vec<Option<ReasoningOutput>> {
     events
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::AssistantMessage { reasoning, .. } => Some(reasoning.clone()),
+            CodingEvent::AssistantMessage { reasoning, .. } => Some(reasoning.clone()),
             _ => None,
         })
         .collect()
 }
 
 /// The replay-relevant events, rendered the way fabro's tests read them.
-fn output_trace(events: &[AgentEvent]) -> Vec<String> {
+fn output_trace(events: &[CodingEvent]) -> Vec<String> {
     events
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::TextDelta { delta } => Some(format!("delta:{delta}")),
-            AgentEvent::AssistantOutputReplace { text, reasoning } => {
+            CodingEvent::TextDelta { delta } => Some(format!("delta:{delta}")),
+            CodingEvent::AssistantOutputReplace { text, reasoning } => {
                 Some(format!("replace:{text}:{reasoning:?}"))
             }
-            AgentEvent::AssistantMessage { text, .. } => Some(format!("message:{text}")),
-            AgentEvent::Error { .. } => Some("error".to_owned()),
+            CodingEvent::AssistantMessage { text, .. } => Some(format!("message:{text}")),
+            CodingEvent::Error { .. } => Some("error".to_owned()),
             _ => None,
         })
         .collect()
@@ -68,7 +68,7 @@ async fn a_streamed_turn_publishes_its_text() {
     let deltas: Vec<&str> = published
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::TextDelta { delta } => Some(delta.as_str()),
+            CodingEvent::TextDelta { delta } => Some(delta.as_str()),
             _ => None,
         })
         .collect();
@@ -93,14 +93,14 @@ async fn a_broken_stream_is_replayed_and_only_the_recovered_turn_is_committed() 
     ));
 
     let published = settled(&mut session, &mut events).await;
-    let retries: Vec<&AgentEvent> = published
+    let retries: Vec<&CodingEvent> = published
         .iter()
-        .filter(|event| matches!(event, AgentEvent::LlmRetry { .. }))
+        .filter(|event| matches!(event, CodingEvent::LlmRetry { .. }))
         .collect();
     assert_eq!(retries.len(), 1);
     assert!(matches!(
         retries[0],
-        AgentEvent::LlmRetry { error, .. }
+        CodingEvent::LlmRetry { error, .. }
             if error.retry == Some(RetryClassification::Safe)
     ));
     assert_eq!(output_trace(&published), [
@@ -131,14 +131,14 @@ async fn a_replay_re_arms_the_first_output_latch() {
     let observed: Vec<String> = published
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::LlmRequestStarted { .. } => Some("start".to_owned()),
-            AgentEvent::LlmFirstOutput { kind } => Some(format!("first:{}", kind.as_str())),
-            AgentEvent::TextDelta { delta } => Some(format!("delta:{delta}")),
-            AgentEvent::AssistantOutputReplace { text, reasoning } => {
+            CodingEvent::LlmRequestStarted { .. } => Some("start".to_owned()),
+            CodingEvent::LlmFirstOutput { kind } => Some(format!("first:{}", kind.as_str())),
+            CodingEvent::TextDelta { delta } => Some(format!("delta:{delta}")),
+            CodingEvent::AssistantOutputReplace { text, reasoning } => {
                 Some(format!("replace:{text}:{reasoning:?}"))
             }
-            AgentEvent::LlmRetry { phase, .. } => Some(format!("retry:{}", phase.as_str())),
-            AgentEvent::AssistantMessage { text, .. } => Some(format!("message:{text}")),
+            CodingEvent::LlmRetry { phase, .. } => Some(format!("retry:{}", phase.as_str())),
+            CodingEvent::AssistantMessage { text, .. } => Some(format!("message:{text}")),
             _ => None,
         })
         .collect();
@@ -174,7 +174,7 @@ async fn a_stream_that_ends_without_finishing_is_replayed_with_nothing_to_withdr
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::LlmRequestStarted { .. }
+            CodingEvent::LlmRequestStarted { .. }
         )),
         1,
         "the replay happens inside the round, not as a new one"
@@ -182,7 +182,7 @@ async fn a_stream_that_ends_without_finishing_is_replayed_with_nothing_to_withdr
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::AssistantOutputReplace { .. }
+            CodingEvent::AssistantOutputReplace { .. }
         )),
         0,
         "nothing was shown, so nothing is withdrawn"
@@ -190,7 +190,7 @@ async fn a_stream_that_ends_without_finishing_is_replayed_with_nothing_to_withdr
     let retries: Vec<(usize, LlmRetryPhase)> = published
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::LlmRetry { attempt, phase, .. } => Some((*attempt, *phase)),
+            CodingEvent::LlmRetry { attempt, phase, .. } => Some((*attempt, *phase)),
             _ => None,
         })
         .collect();
@@ -229,7 +229,7 @@ async fn a_stream_that_never_finishes_fails_once_its_replays_are_spent() {
     let retries: Vec<(usize, LlmRetryPhase)> = published
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::LlmRetry { attempt, phase, .. } => Some((*attempt, *phase)),
+            CodingEvent::LlmRetry { attempt, phase, .. } => Some((*attempt, *phase)),
             _ => None,
         })
         .collect();
@@ -241,7 +241,7 @@ async fn a_stream_that_never_finishes_fails_once_its_replays_are_spent() {
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::AssistantOutputReplace { .. }
+            CodingEvent::AssistantOutputReplace { .. }
         )),
         0,
         "nothing was shown, so nothing is withdrawn"
@@ -249,14 +249,14 @@ async fn a_stream_that_never_finishes_fails_once_its_replays_are_spent() {
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::Error { .. }
+            CodingEvent::Error { .. }
         )),
         1
     );
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::AssistantMessage { .. }
+            CodingEvent::AssistantMessage { .. }
         )),
         0
     );
@@ -318,7 +318,7 @@ async fn a_truncated_response_is_replayed_rather_than_committed() {
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::AssistantOutputReplace { .. }
+            CodingEvent::AssistantOutputReplace { .. }
         )),
         1,
         "what the truncated turn showed is withdrawn"
@@ -326,7 +326,7 @@ async fn a_truncated_response_is_replayed_rather_than_committed() {
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::AssistantMessage { .. }
+            CodingEvent::AssistantMessage { .. }
         )),
         1
     );
@@ -361,7 +361,7 @@ async fn a_failure_worth_no_repeat_ends_the_prompt_on_the_first_attempt() {
         assert_eq!(
             count(&published, |event| matches!(
                 event,
-                AgentEvent::LlmRetry { .. }
+                CodingEvent::LlmRetry { .. }
             )),
             0
         );
@@ -373,7 +373,7 @@ async fn a_failure_worth_no_repeat_ends_the_prompt_on_the_first_attempt() {
         let reported = published
             .iter()
             .find_map(|event| match event {
-                AgentEvent::Error { error } => Some(error.clone()),
+                CodingEvent::Error { error } => Some(error.clone()),
                 _ => None,
             })
             .expect("the failure is published");
@@ -435,7 +435,7 @@ async fn a_turn_that_never_arrives_fails_once_and_commits_nothing() {
     let retries: Vec<(usize, LlmRetryPhase)> = published
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::LlmRetry { attempt, phase, .. } => Some((*attempt, *phase)),
+            CodingEvent::LlmRetry { attempt, phase, .. } => Some((*attempt, *phase)),
             _ => None,
         })
         .collect();
@@ -451,7 +451,7 @@ async fn a_turn_that_never_arrives_fails_once_and_commits_nothing() {
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::AssistantOutputReplace { text, reasoning }
+            CodingEvent::AssistantOutputReplace { text, reasoning }
                 if text.is_empty() && reasoning.is_none()
         )),
         4,
@@ -460,16 +460,16 @@ async fn a_turn_that_never_arrives_fails_once_and_commits_nothing() {
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::Error { .. }
+            CodingEvent::Error { .. }
         )),
         1
     );
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::AssistantMessage { .. }
-                | AgentEvent::ToolCallStarted { .. }
-                | AgentEvent::ToolCallCompleted { .. }
+            CodingEvent::AssistantMessage { .. }
+                | CodingEvent::ToolCallStarted { .. }
+                | CodingEvent::ToolCallCompleted { .. }
         )),
         0,
         "a turn that never committed runs no tools"
@@ -487,11 +487,11 @@ async fn a_replay_never_waits_on_the_stream_it_replaced() {
         ScriptedCall::response(text_response("Recovered")),
     ])
     .limited(1)
-    .options(SessionOptions {
+    .options(CodingSessionOptions {
         turn_replay: RetryPolicy::exponential()
             .max_attempts(4)
             .initial_delay(Duration::from_millis(1)),
-        ..SessionOptions::default()
+        ..CodingSessionOptions::default()
     })
     .build();
 
@@ -535,7 +535,7 @@ async fn a_reopen_that_fails_on_the_credential_closes_the_session() {
     let reported = published
         .iter()
         .find_map(|event| match event {
-            AgentEvent::Error { error } => Some(error.clone()),
+            CodingEvent::Error { error } => Some(error.clone()),
             _ => None,
         })
         .expect("the failure is published");
@@ -567,7 +567,7 @@ async fn the_clients_own_reconnect_is_published_as_an_open_phase_retry() {
     let retries: Vec<(usize, LlmRetryPhase)> = published
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::LlmRetry { attempt, phase, .. } => Some((*attempt, *phase)),
+            CodingEvent::LlmRetry { attempt, phase, .. } => Some((*attempt, *phase)),
             _ => None,
         })
         .collect();
@@ -579,7 +579,7 @@ async fn the_clients_own_reconnect_is_published_as_an_open_phase_retry() {
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::AssistantOutputReplace { .. }
+            CodingEvent::AssistantOutputReplace { .. }
         )),
         0,
         "nothing was shown, so nothing had to be withdrawn"
@@ -587,7 +587,7 @@ async fn the_clients_own_reconnect_is_published_as_an_open_phase_retry() {
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::LlmRequestStarted { .. }
+            CodingEvent::LlmRequestStarted { .. }
         )),
         1,
         "the reconnect happens inside the round the session opened"
@@ -619,7 +619,7 @@ async fn a_drop_before_any_output_is_the_clients_to_repeat() {
     let retries: Vec<(usize, LlmRetryPhase)> = published
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::LlmRetry { attempt, phase, .. } => Some((*attempt, *phase)),
+            CodingEvent::LlmRetry { attempt, phase, .. } => Some((*attempt, *phase)),
             _ => None,
         })
         .collect();
@@ -631,7 +631,7 @@ async fn a_drop_before_any_output_is_the_clients_to_repeat() {
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::AssistantOutputReplace { .. }
+            CodingEvent::AssistantOutputReplace { .. }
         )),
         0,
         "nothing was shown, so nothing had to be withdrawn"
@@ -639,7 +639,7 @@ async fn a_drop_before_any_output_is_the_clients_to_repeat() {
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::LlmRequestStarted { .. }
+            CodingEvent::LlmRequestStarted { .. }
         )),
         1
     );
@@ -676,7 +676,7 @@ async fn one_failure_is_replayed_by_one_layer() {
     let phases: Vec<LlmRetryPhase> = published
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::LlmRetry { phase, .. } => Some(*phase),
+            CodingEvent::LlmRetry { phase, .. } => Some(*phase),
             _ => None,
         })
         .collect();
@@ -692,7 +692,7 @@ async fn one_failure_is_replayed_by_one_layer() {
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::AssistantOutputReplace { .. }
+            CodingEvent::AssistantOutputReplace { .. }
         )),
         1,
         "only the failure a reader saw is withdrawn"
@@ -700,7 +700,7 @@ async fn one_failure_is_replayed_by_one_layer() {
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::LlmRequestStarted { .. }
+            CodingEvent::LlmRequestStarted { .. }
         )),
         1,
         "every replay happens inside the one round"
@@ -708,7 +708,7 @@ async fn one_failure_is_replayed_by_one_layer() {
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::AssistantMessage { .. }
+            CodingEvent::AssistantMessage { .. }
         )),
         1
     );
@@ -790,17 +790,19 @@ async fn only_the_replayed_turn_contributes_reasoning() {
 // --- The inference bracket ---
 
 /// The bracket events, as `(label, detail)` pairs.
-fn bracket(events: &[AgentEvent]) -> Vec<(String, String)> {
+fn bracket(events: &[CodingEvent]) -> Vec<(String, String)> {
     events
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::LlmRequestStarted { requested_model } => {
+            CodingEvent::LlmRequestStarted { requested_model } => {
                 Some(("started".to_owned(), requested_model.clone()))
             }
-            AgentEvent::LlmFirstOutput { kind } => {
+            CodingEvent::LlmFirstOutput { kind } => {
                 Some(("first_output".to_owned(), kind.as_str().to_owned()))
             }
-            AgentEvent::AssistantMessage { text, .. } => Some(("message".to_owned(), text.clone())),
+            CodingEvent::AssistantMessage { text, .. } => {
+                Some(("message".to_owned(), text.clone()))
+            }
             _ => None,
         })
         .collect()

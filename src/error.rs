@@ -110,7 +110,7 @@ pub enum Error {
     #[error("interrupted: {0}")]
     Interrupted(InterruptReason),
 
-    /// The configured [`crate::EventSink`] refused an event.
+    /// The configured [`crate::events::EventSink`] refused an event.
     ///
     /// The event stream is the durable record of a prompt, so a session that
     /// cannot record what it did stops instead of continuing untracked.

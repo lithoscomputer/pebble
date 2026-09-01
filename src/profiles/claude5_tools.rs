@@ -462,7 +462,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-    use crate::Session;
+    use crate::advanced::Session;
     use crate::profiles::tests::UnusedSearch;
     use crate::session::testing::TestSession;
     use crate::test_support::{MockEnvironment, ScriptedCall, text_response};

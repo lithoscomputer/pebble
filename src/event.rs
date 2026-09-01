@@ -25,7 +25,7 @@
 //! stopped and been joined, every live receiver reads out whatever it still
 //! holds and then observes `RecvError::Closed`, however many emitter clones
 //! are still alive. That is what lets a reader loop until `Closed` and end,
-//! and it is the guarantee [`crate::Session::shutdown`] rests on.
+//! and it is the guarantee [`crate::advanced::Session::shutdown`] rests on.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -38,7 +38,7 @@ use async_trait::async_trait;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::error::Result;
-use crate::types::{AgentEvent, SessionEvent};
+use crate::types::{CodingEvent, CodingSessionEvent};
 
 /// The broadcast capacity a pipeline uses when the caller names none.
 pub const DEFAULT_EVENT_CAPACITY: usize = 1024;
@@ -60,14 +60,14 @@ pub trait EventSink: Send + Sync {
     ///
     /// Returning an error stops the prompt, so report only failures that make
     /// the recorded stream untrustworthy.
-    async fn record(&self, event: &SessionEvent) -> StdResult<(), EventSinkError>;
+    async fn record(&self, event: &CodingSessionEvent) -> StdResult<(), EventSinkError>;
 }
 
 /// A failure reported by an [`EventSink`].
 ///
-/// The message is rendered into [`crate::ErrorData`] on the way to consumers,
-/// so keep it free of credentials and provider payloads. An optional source is
-/// retained for logging and is not projected.
+/// The message is rendered into [`crate::events::ErrorData`] on the way to
+/// consumers, so keep it free of credentials and provider payloads. An optional
+/// source is retained for logging and is not projected.
 #[derive(Debug)]
 pub struct EventSinkError {
     message: String,
@@ -119,8 +119,8 @@ impl StdError for EventSinkError {
 ///
 /// Crate-private: no public signature takes or returns one. The numbers
 /// themselves reach an application through
-/// [`SessionEvent::seq`](crate::SessionEvent::seq), [`Emitter::last_seq`], and
-/// [`EventOptions::resume_after_seq`].
+/// [`CodingSessionEvent::seq`](crate::events::CodingSessionEvent::seq),
+/// [`Emitter::last_seq`], and [`EventOptions::resume_after_seq`].
 #[derive(Debug)]
 pub(crate) struct EventSequence {
     stamped:  AtomicU64,
@@ -183,7 +183,7 @@ impl Default for EventSequence {
 /// from [`Default`].
 ///
 /// ```
-/// # use pebble::{EventCapacity, EventOptions};
+/// # use pebble::events::{EventCapacity, EventOptions};
 /// let options = EventOptions {
 ///     capacity: EventCapacity::new(64),
 ///     ..EventOptions::default()
@@ -202,7 +202,8 @@ pub struct EventOptions {
 
     /// The last sequence number a previous prompt of this session published.
     ///
-    /// Zero for a new session; [`crate::SessionRecord::last_event_seq`] for a
+    /// Zero for a new session;
+    /// [`crate::resources::SessionRecord::last_event_seq`] for a
     /// resumed one.
     pub resume_after_seq: u64,
 }
@@ -269,7 +270,7 @@ pub struct Emitter {
     ///
     /// Weak on purpose: the pump holds the one sender, so the live stream ends
     /// when the pump is joined rather than when the last emitter is dropped.
-    published: broadcast::WeakSender<SessionEvent>,
+    published: broadcast::WeakSender<CodingSessionEvent>,
     sequence:  Arc<EventSequence>,
 }
 
@@ -278,11 +279,11 @@ pub struct Emitter {
 /// `None` is the stop signal a session sends at shutdown, so the pump can be
 /// joined without waiting for every [`Emitter`] clone to be dropped. Anything
 /// queued before it is still published.
-type Queued = Option<SessionEvent>;
+type Queued = Option<CodingSessionEvent>;
 
 impl Emitter {
     /// Publishes an event this session produced.
-    pub fn emit(&self, session_id: impl Into<String>, event: AgentEvent) {
+    pub fn emit(&self, session_id: impl Into<String>, event: CodingEvent) {
         self.emit_with_tool_call_id(session_id, event, None);
     }
 
@@ -293,12 +294,12 @@ impl Emitter {
     pub fn emit_with_tool_call_id(
         &self,
         session_id: impl Into<String>,
-        event: AgentEvent,
+        event: CodingEvent,
         tool_call_id: Option<String>,
     ) {
         let session_id = session_id.into();
         event.trace(&session_id);
-        self.queue(SessionEvent {
+        self.queue(CodingSessionEvent {
             seq: 0,
             event,
             timestamp: SystemTime::now(),
@@ -313,7 +314,7 @@ impl Emitter {
     /// The child's `session_id`, `parent_session_id`, and timestamp pass
     /// through untouched; only the sequence number is reassigned, because a
     /// forwarded event takes its place in the parent's stream.
-    pub fn forward(&self, event: SessionEvent) {
+    pub fn forward(&self, event: CodingSessionEvent) {
         self.queue(event);
     }
 
@@ -328,7 +329,7 @@ impl Emitter {
     /// receiver that is closed from its first read, which is what a stream
     /// nothing will ever publish to looks like.
     #[must_use]
-    pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<CodingSessionEvent> {
         match self.published.upgrade() {
             Some(published) => published.subscribe(),
             None => ended_stream(),
@@ -375,7 +376,7 @@ impl Emitter {
     /// The number is claimed before the event is queued, so a record taken
     /// from another task never names a number the pump is still about to
     /// stamp.
-    fn queue(&self, event: SessionEvent) {
+    fn queue(&self, event: CodingSessionEvent) {
         self.sequence.reserve();
         let _ = self.outbox.send(Some(event));
     }
@@ -386,7 +387,7 @@ impl Emitter {
 /// What [`Emitter::subscribe`] answers with once the pump is gone, so a late
 /// subscriber gets the ordinary end of a stream on its first read rather than
 /// a receiver that never speaks.
-fn ended_stream() -> broadcast::Receiver<SessionEvent> {
+fn ended_stream() -> broadcast::Receiver<CodingSessionEvent> {
     let (sender, receiver) = broadcast::channel(1);
     drop(sender);
     receiver
@@ -405,7 +406,7 @@ fn ended_stream() -> broadcast::Receiver<SessionEvent> {
 #[must_use = "a pipeline publishes nothing until its pump runs"]
 pub struct EventPump {
     inbox:     mpsc::UnboundedReceiver<Queued>,
-    published: broadcast::Sender<SessionEvent>,
+    published: broadcast::Sender<CodingSessionEvent>,
     sequence:  Arc<EventSequence>,
     sink:      Option<Arc<dyn EventSink>>,
 }
@@ -467,7 +468,7 @@ impl EventPump {
         Ok(())
     }
 
-    async fn publish(&mut self, mut event: SessionEvent) -> Result<()> {
+    async fn publish(&mut self, mut event: CodingSessionEvent) -> Result<()> {
         event.seq = self.sequence.assign();
         if let Some(sink) = self.sink.as_ref() {
             sink.record(&event).await?;
@@ -482,7 +483,7 @@ impl EventPump {
 ///
 /// A tool observes every byte, retains what the output budget allows, and
 /// omits the rest; the three counters land on
-/// [`AgentEvent::ToolCallCompleted`].
+/// [`CodingEvent::ToolCallCompleted`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OutputCaptureStats {
     /// Bytes the tool produced.
@@ -545,7 +546,7 @@ impl SessionBoundEmitter {
     }
 
     /// Publishes an event stamped with the bound identities.
-    pub fn emit(&self, event: AgentEvent) {
+    pub fn emit(&self, event: CodingEvent) {
         self.emitter.emit_with_tool_call_id(
             self.session_id.clone(),
             event,
@@ -599,7 +600,7 @@ mod tests {
     /// seen a given number of them.
     #[derive(Debug, Default)]
     struct RecordingSink {
-        recorded: Mutex<Vec<SessionEvent>>,
+        recorded: Mutex<Vec<CodingSessionEvent>>,
         fail_at:  Option<usize>,
     }
 
@@ -611,7 +612,7 @@ mod tests {
             }
         }
 
-        fn recorded(&self) -> Vec<SessionEvent> {
+        fn recorded(&self) -> Vec<CodingSessionEvent> {
             self.recorded
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -621,7 +622,7 @@ mod tests {
 
     #[async_trait]
     impl EventSink for RecordingSink {
-        async fn record(&self, event: &SessionEvent) -> StdResult<(), EventSinkError> {
+        async fn record(&self, event: &CodingSessionEvent) -> StdResult<(), EventSinkError> {
             let mut recorded = self.recorded.lock().unwrap_or_else(PoisonError::into_inner);
             if self.fail_at == Some(recorded.len()) {
                 return Err(EventSinkError::new("disk is full"));
@@ -640,8 +641,8 @@ mod tests {
         (emitter, tokio::spawn(pump.run()))
     }
 
-    fn session_started() -> AgentEvent {
-        AgentEvent::SessionStarted {
+    fn session_started() -> CodingEvent {
+        CodingEvent::SessionStarted {
             provider: Some("anthropic".into()),
             model:    Some("claude-sonnet-5".into()),
         }
@@ -655,7 +656,7 @@ mod tests {
         emitter.emit("ses_1", session_started());
 
         let event = receiver.recv().await.unwrap();
-        assert!(matches!(event.event, AgentEvent::SessionStarted {
+        assert!(matches!(event.event, CodingEvent::SessionStarted {
             provider: Some(_),
             model:    Some(_),
         }));
@@ -669,13 +670,13 @@ mod tests {
         let (emitter, _pump) = pipeline();
         let mut receiver = emitter.subscribe();
 
-        emitter.emit("ses_2", AgentEvent::UserInput {
+        emitter.emit("ses_2", CodingEvent::UserInput {
             text: "fix the failing test".into(),
         });
 
         let event = receiver.recv().await.unwrap();
         assert!(
-            matches!(&event.event, AgentEvent::UserInput { text } if text == "fix the failing test")
+            matches!(&event.event, CodingEvent::UserInput { text } if text == "fix the failing test")
         );
     }
 
@@ -685,12 +686,12 @@ mod tests {
         let mut first = emitter.subscribe();
         let mut second = emitter.subscribe();
 
-        emitter.emit("ses_3", AgentEvent::SessionEnded);
+        emitter.emit("ses_3", CodingEvent::SessionEnded);
 
         let from_first = first.recv().await.unwrap();
         let from_second = second.recv().await.unwrap();
-        assert!(matches!(from_first.event, AgentEvent::SessionEnded));
-        assert!(matches!(from_second.event, AgentEvent::SessionEnded));
+        assert!(matches!(from_first.event, CodingEvent::SessionEnded));
+        assert!(matches!(from_second.event, CodingEvent::SessionEnded));
         assert_eq!(from_first.session_id, "ses_3");
         assert_eq!(from_second.session_id, "ses_3");
     }
@@ -699,7 +700,7 @@ mod tests {
     async fn emitting_without_subscribers_is_not_a_failure() {
         let (emitter, pump) = pipeline();
 
-        emitter.emit("ses_4", AgentEvent::LoopDetected);
+        emitter.emit("ses_4", CodingEvent::LoopDetected);
         drop(emitter);
 
         pump.await.unwrap().unwrap();
@@ -710,7 +711,7 @@ mod tests {
         let (emitter, pump) = EventPump::new(EventOptions::default());
         drop(pump);
 
-        emitter.emit("ses_5", AgentEvent::LoopDetected);
+        emitter.emit("ses_5", CodingEvent::LoopDetected);
 
         assert!(emitter.is_closed());
     }
@@ -721,7 +722,7 @@ mod tests {
         let mut receiver = emitter.subscribe();
         let stamped = SystemTime::UNIX_EPOCH;
 
-        emitter.forward(SessionEvent {
+        emitter.forward(CodingSessionEvent {
             seq:               17,
             event:             session_started(),
             timestamp:         stamped,
@@ -746,7 +747,7 @@ mod tests {
         let mut receiver = emitter.subscribe();
 
         for _ in 0..3 {
-            emitter.emit("ses_1", AgentEvent::LoopDetected);
+            emitter.emit("ses_1", CodingEvent::LoopDetected);
         }
 
         let mut seen = Vec::new();
@@ -765,7 +766,7 @@ mod tests {
         });
         let mut receiver = emitter.subscribe();
 
-        emitter.emit("ses_1", AgentEvent::LoopDetected);
+        emitter.emit("ses_1", CodingEvent::LoopDetected);
 
         assert_eq!(receiver.recv().await.unwrap().seq, 42);
     }
@@ -778,8 +779,8 @@ mod tests {
             ..EventOptions::default()
         });
 
-        emitter.emit("ses_1", AgentEvent::UserInput { text: "one".into() });
-        emitter.emit("ses_1", AgentEvent::UserInput { text: "two".into() });
+        emitter.emit("ses_1", CodingEvent::UserInput { text: "one".into() });
+        emitter.emit("ses_1", CodingEvent::UserInput { text: "two".into() });
         drop(emitter);
         pump.await.unwrap().unwrap();
 
@@ -798,8 +799,8 @@ mod tests {
         });
         let mut receiver = emitter.subscribe();
 
-        emitter.emit("ses_1", AgentEvent::UserInput { text: "one".into() });
-        emitter.emit("ses_1", AgentEvent::UserInput { text: "two".into() });
+        emitter.emit("ses_1", CodingEvent::UserInput { text: "one".into() });
+        emitter.emit("ses_1", CodingEvent::UserInput { text: "two".into() });
 
         let error = pump.await.unwrap().expect_err("the sink refused an event");
         assert_eq!(error.kind(), ErrorKind::EventSink);
@@ -822,7 +823,7 @@ mod tests {
         let mut receiver = emitter.subscribe();
 
         for _ in 0..4 {
-            emitter.emit("ses_1", AgentEvent::LoopDetected);
+            emitter.emit("ses_1", CodingEvent::LoopDetected);
         }
         // Let the pump drain the queue before the subscriber reads.
         yield_now().await;
@@ -852,9 +853,9 @@ mod tests {
             ..EventOptions::default()
         });
 
-        emitter.emit("ses_1", AgentEvent::UserInput { text: "one".into() });
+        emitter.emit("ses_1", CodingEvent::UserInput { text: "one".into() });
         emitter.close();
-        emitter.emit("ses_1", AgentEvent::UserInput { text: "two".into() });
+        emitter.emit("ses_1", CodingEvent::UserInput { text: "two".into() });
 
         pump.await.unwrap().unwrap();
 
@@ -872,7 +873,7 @@ mod tests {
         let mut receiver = emitter.subscribe();
         let held = emitter.clone();
 
-        emitter.emit("ses_1", AgentEvent::LoopDetected);
+        emitter.emit("ses_1", CodingEvent::LoopDetected);
         emitter.close();
         pump.await.unwrap().unwrap();
 
@@ -908,7 +909,7 @@ mod tests {
         let mut receiver = emitter.subscribe();
         let bound = SessionBoundEmitter::new(emitter, "ses_1", Some("call_1".into()));
 
-        bound.emit(AgentEvent::ToolCallOutputDelta {
+        bound.emit(CodingEvent::ToolCallOutputDelta {
             delta: "running".into(),
         });
 
@@ -1004,7 +1005,7 @@ mod tests {
         let mut receiver = emitter.subscribe();
 
         for _ in 0..3 {
-            emitter.emit("ses_1", AgentEvent::LoopDetected);
+            emitter.emit("ses_1", CodingEvent::LoopDetected);
         }
 
         assert_eq!(

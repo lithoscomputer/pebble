@@ -157,7 +157,7 @@ fn parent_waiting_on_a_blocked_child() -> (
     let watcher = tokio::spawn(async move {
         let mut events = events;
         wait_for_event(&mut events, |event| {
-            matches!(event, AgentEvent::ToolCallStarted { tool_name, .. } if tool_name == "wait")
+            matches!(event, CodingEvent::ToolCallStarted { tool_name, .. } if tool_name == "wait")
         })
         .await;
     });
@@ -251,9 +251,9 @@ async fn background_agent_output_is_not_parsed_for_skill_references() {
         ScriptedCall::response(text_response("Acknowledged")),
     ])
     .environment(environment)
-    .options(SessionOptions {
+    .options(CodingSessionOptions {
         skill_dirs: vec!["/skills".to_owned()],
-        ..SessionOptions::default()
+        ..CodingSessionOptions::default()
     })
     .with_subagents()
     .build();
@@ -311,11 +311,11 @@ async fn control_interrupt_during_subagent_wait_closes_child_and_resumes_after_s
         waiting.await.expect("the wait tool started");
         controller.interrupt();
         wait_for_event(&mut watched, |event| {
-            matches!(event, AgentEvent::SubAgentClosed { .. })
+            matches!(event, CodingEvent::SubAgentClosed { .. })
         })
         .await;
         wait_for_event(&mut watched, |event| {
-            matches!(event, AgentEvent::RoundInterrupted { generation: 1 })
+            matches!(event, CodingEvent::RoundInterrupted { generation: 1 })
         })
         .await;
         assert!(controller.is_waiting_for_steer());
@@ -341,17 +341,17 @@ async fn control_interrupt_during_subagent_wait_closes_child_and_resumes_after_s
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::RoundInterrupted { .. }
+            CodingEvent::RoundInterrupted { .. }
         )),
         1,
         "one gesture is announced once"
     );
     let closed = position(&published, |event| {
-        matches!(event, AgentEvent::SubAgentClosed { .. })
+        matches!(event, CodingEvent::SubAgentClosed { .. })
     })
     .expect("the child was closed");
     let settled = position(&published, |event| {
-        matches!(event, AgentEvent::RoundInterrupted { .. })
+        matches!(event, CodingEvent::RoundInterrupted { .. })
     })
     .expect("the interrupt was announced");
     assert!(closed < settled, "the child closes as the round unwinds");
@@ -416,11 +416,11 @@ async fn shutdown_cleans_up_subagents_before_emitting_session_ended() {
     ));
     let published = drain(&mut events);
     let closed = position(&published, |event| {
-        matches!(event, AgentEvent::SubAgentClosed { .. })
+        matches!(event, CodingEvent::SubAgentClosed { .. })
     })
     .expect("the child was closed");
     let ended = position(&published, |event| {
-        matches!(event, AgentEvent::SessionEnded)
+        matches!(event, CodingEvent::SessionEnded)
     })
     .expect("the session published its end");
     assert!(closed < ended, "a tree unwinds from the leaves");
@@ -530,7 +530,7 @@ async fn a_spawn_the_tree_has_no_room_for_is_answered_and_the_parent_carries_on(
     assert!(
         published.iter().any(|event| matches!(
             event,
-            AgentEvent::ToolCallCompleted {
+            CodingEvent::ToolCallCompleted {
                 tool_name,
                 is_error: true,
                 error_kind: Some(ToolErrorKind::Denied),
@@ -542,7 +542,7 @@ async fn a_spawn_the_tree_has_no_room_for_is_answered_and_the_parent_carries_on(
     assert!(
         !published
             .iter()
-            .any(|event| matches!(event, AgentEvent::SubAgentSpawned { .. })),
+            .any(|event| matches!(event, CodingEvent::SubAgentSpawned { .. })),
         "nothing was spawned"
     );
 }
@@ -589,8 +589,8 @@ async fn a_grandchilds_news_reaches_the_root_stream() {
         while two.is_none() || three.is_none() {
             let event = events.recv().await.expect("the parent's stream stays open");
             match event.event {
-                AgentEvent::SubAgentSpawned { depth: 2, .. } => two = Some(event),
-                AgentEvent::SubAgentSpawned { depth: 3, .. } => three = Some(event),
+                CodingEvent::SubAgentSpawned { depth: 2, .. } => two = Some(event),
+                CodingEvent::SubAgentSpawned { depth: 3, .. } => three = Some(event),
                 _ => {}
             }
         }
@@ -612,7 +612,7 @@ async fn a_grandchilds_news_reaches_the_root_stream() {
         from_depth_two.seq > 0,
         "a forwarded event takes a parent-stream sequence number"
     );
-    let AgentEvent::SubAgentSpawned { agent_id, .. } = &from_depth_two.event else {
+    let CodingEvent::SubAgentSpawned { agent_id, .. } = &from_depth_two.event else {
         panic!("the event is a spawn: {from_depth_two:?}");
     };
     assert_eq!(agent_id, &grandchild);
@@ -627,7 +627,7 @@ async fn a_grandchilds_news_reaches_the_root_stream() {
         "the parent it names is the session it was forwarded from, not the root"
     );
     assert!(from_depth_three.seq > 0);
-    let AgentEvent::SubAgentSpawned { agent_id, .. } = &from_depth_three.event else {
+    let CodingEvent::SubAgentSpawned { agent_id, .. } = &from_depth_three.event else {
         panic!("the event is a spawn: {from_depth_three:?}");
     };
     assert_eq!(agent_id, &great_grandchild);
@@ -718,7 +718,7 @@ async fn a_session_with_no_factory_answers_a_spawn_as_a_tool_it_does_not_have() 
     assert!(
         published.iter().any(|event| matches!(
             event,
-            AgentEvent::ToolCallCompleted {
+            CodingEvent::ToolCallCompleted {
                 tool_name,
                 is_error: true,
                 error_kind: Some(ToolErrorKind::Unavailable),
@@ -746,7 +746,7 @@ impl TreeSink {
 
 #[async_trait::async_trait]
 impl EventSink for TreeSink {
-    async fn record(&self, event: &SessionEvent) -> StdResult<(), EventSinkError> {
+    async fn record(&self, event: &CodingSessionEvent) -> StdResult<(), EventSinkError> {
         self.recorded
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

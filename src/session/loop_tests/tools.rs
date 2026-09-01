@@ -60,11 +60,11 @@ fn leaking_environment() -> Arc<MockEnvironment> {
 }
 
 /// The output tail of the one process event in `events`.
-fn process_tail(events: &[AgentEvent]) -> ExecOutputTail {
+fn process_tail(events: &[CodingEvent]) -> ExecOutputTail {
     events
         .iter()
         .find_map(|event| match event {
-            AgentEvent::ToolProcessCompleted {
+            CodingEvent::ToolProcessCompleted {
                 exec_output_tail, ..
             } => exec_output_tail.clone(),
             _ => None,
@@ -280,19 +280,19 @@ fn session_with_a_skill(calls: Vec<ScriptedCall>) -> (Session, Arc<ScriptedProvi
             )],
             vec!["/skills/commit/SKILL.md"],
         ))
-        .options(SessionOptions {
+        .options(CodingSessionOptions {
             skill_dirs: vec!["/skills".to_owned()],
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         })
         .build()
 }
 
 /// Every `SkillActivated` in `events`, as `(name, source)` pairs.
-fn activations(events: &[AgentEvent]) -> Vec<(String, SkillActivationSource)> {
+fn activations(events: &[CodingEvent]) -> Vec<(String, SkillActivationSource)> {
     events
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::SkillActivated { skill_name, source } => {
+            CodingEvent::SkillActivated { skill_name, source } => {
                 Some((skill_name.clone(), *source))
             }
             _ => None,

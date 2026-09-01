@@ -79,7 +79,7 @@ pub(crate) async fn execute_grep(
 /// colon ends the path.
 ///
 /// ```
-/// use pebble::grep_result_path;
+/// use pebble::tools::grep_result_path;
 ///
 /// assert_eq!(
 ///     grep_result_path("src/main.rs:42:fn main() {", "src"),

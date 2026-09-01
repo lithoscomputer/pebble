@@ -9,13 +9,14 @@
 //! ```no_run
 //! use std::sync::Arc;
 //!
-//! use pebble::{LocalEnvironment, Session, SessionOptions, ShutdownReason};
+//! use pebble::advanced::Session;
+//! use pebble::{CodingSessionOptions, LocalEnvironment, ShutdownReason};
 //!
 //! # async fn example(client: lithos_llm::Client) -> Result<(), Box<dyn std::error::Error>> {
 //! let mut session = Session::builder(client)
 //!     .model("claude-sonnet-5")
 //!     .environment(Arc::new(LocalEnvironment::new(".")))
-//!     .options(SessionOptions::default())
+//!     .options(CodingSessionOptions::default())
 //!     .build()?;
 //!
 //! let mut events = session.subscribe();
@@ -66,7 +67,7 @@ mod turn;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::result::Result as StdResult;
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, SystemTime};
 
 use lithos_llm::Client;
@@ -89,7 +90,7 @@ pub use self::control::{
     CompletionCoordinator, SessionControlHandle, SteeringItem, SteeringMessage,
 };
 pub use self::retry::RetryEventObserver;
-use crate::config::SessionOptions;
+use crate::config::CodingSessionOptions;
 use crate::context_window::{memory_prompt_tokens, skills_prompt_tokens};
 use crate::environment::{Environment, ExecRequest};
 use crate::error::{Error, ErrorData, InterruptReason, Result};
@@ -117,8 +118,8 @@ use crate::tools::{
     make_web_search_tool,
 };
 use crate::types::{
-    Actor, AgentEvent, AgentProfileKind, PermissionLevel, SessionEvent, SessionState, TokenUsage,
-    ToolSummary, rfc3339_millis,
+    Actor, AgentProfileKind, CodingEvent, CodingSessionEvent, PermissionLevel, SessionState,
+    TokenUsage, ToolSummary, rfc3339_millis,
 };
 
 /// The catalog metadata namespace pebble reads.
@@ -271,7 +272,7 @@ pub struct SessionBuilder {
     redactor:             Arc<dyn Redactor>,
     web_fetch_summarizer: Option<String>,
     search_provider:      Option<Arc<dyn SearchProvider>>,
-    options:              SessionOptions,
+    options:              CodingSessionOptions,
     events:               EventOptions,
     profile:              Option<Arc<dyn AgentProfile>>,
     subagents:            Option<SessionFactory>,
@@ -292,7 +293,7 @@ impl SessionBuilder {
             redactor: Arc::new(NoRedaction),
             web_fetch_summarizer: None,
             search_provider: None,
-            options: SessionOptions::default(),
+            options: CodingSessionOptions::default(),
             events: EventOptions::default(),
             profile: None,
             subagents: None,
@@ -371,8 +372,9 @@ impl SessionBuilder {
     ///
     /// The built-in profiles' fetch tool captures the summarizer when the
     /// profile is constructed; an application registering
-    /// [`make_web_fetch_tool`](crate::make_web_fetch_tool) itself passes a
-    /// [`WebFetchSummarizer`](crate::WebFetchSummarizer) directly instead.
+    /// [`make_web_fetch_tool`](crate::tools::make_web_fetch_tool) itself passes
+    /// a [`WebFetchSummarizer`](crate::tools::WebFetchSummarizer) directly
+    /// instead.
     pub fn web_fetch_summarizer(mut self, model: impl Into<String>) -> Self {
         self.web_fetch_summarizer = Some(model.into());
         self
@@ -395,7 +397,7 @@ impl SessionBuilder {
     }
 
     /// Sets how the session behaves.
-    pub fn options(mut self, options: SessionOptions) -> Self {
+    pub fn options(mut self, options: CodingSessionOptions) -> Self {
         self.options = options;
         self
     }
@@ -425,7 +427,8 @@ impl SessionBuilder {
     /// this session's event pipeline, so a child's events cannot be lost by an
     /// application that forgot to connect them.
     ///
-    /// Pebble builds the [`ChildSessionSpec`](crate::ChildSessionSpec) each
+    /// Pebble builds the
+    /// [`ChildSessionSpec`](crate::advanced::ChildSessionSpec) each
     /// call receives from this
     /// session, so a child inherits the environment, the tools, the access
     /// policy, and the hooks its parent had, and never a
@@ -626,7 +629,6 @@ impl SessionBuilder {
             active_agent_control: Arc::new(Mutex::new(None)),
             followup_queue: Arc::new(Mutex::new(VecDeque::new())),
             cancel_token: CancellationToken::new(),
-            round_token: Arc::new(RwLock::new(CancellationToken::new())),
             interrupt_reason: Arc::new(Mutex::new(None)),
             skills: Vec::new(),
             memory_tokens: 0,
@@ -658,8 +660,8 @@ impl SessionBuilder {
 /// memory files and the skill directories. A child is given a task, not a
 /// project briefing, and paying for the briefing again in every child is how a
 /// tree of agents spends a context window on nothing.
-fn child_options(parent: &SessionOptions) -> SessionOptions {
-    SessionOptions {
+fn child_options(parent: &CodingSessionOptions) -> CodingSessionOptions {
+    CodingSessionOptions {
         memory_files: Vec::new(),
         skill_dirs: Vec::new(),
         ..parent.clone()
@@ -795,7 +797,7 @@ pub struct Session {
     /// specification in the session a factory answered with. A root has none.
     built_from: Option<Arc<ChildDeps>>,
     created_at: SystemTime,
-    config: SessionOptions,
+    config: CodingSessionOptions,
     history: History,
     emitter: Emitter,
     /// The event pump, until [`Session::shutdown`] joins it.
@@ -825,9 +827,6 @@ pub struct Session {
     /// Ends the whole prompt. Distinct from the round token, which ends one
     /// turn.
     cancel_token: CancellationToken,
-    /// Ends the current round. The cell is shared with every control handle;
-    /// the loop swaps a fresh token in as each round starts.
-    round_token: Arc<RwLock<CancellationToken>>,
     interrupt_reason: Arc<Mutex<Option<InterruptReason>>>,
     skills: Vec<Skill>,
     /// What the memory files and the skills section contribute to the system
@@ -929,7 +928,7 @@ impl Session {
     /// Loads what the session was told, and captures where it is working.
     ///
     /// Call this once, before the first prompt. It publishes
-    /// [`SessionStarted`](AgentEvent::SessionStarted), loads the memory files
+    /// [`SessionStarted`](CodingEvent::SessionStarted), loads the memory files
     /// and skill directories the options name, probes the environment for the
     /// prompt's sake, and asks the profile for the system prompt the whole
     /// session will use. Naming no memory files and no skill directories is
@@ -948,7 +947,7 @@ impl Session {
     pub async fn initialize(&mut self) -> Result<()> {
         let cancel = self.cancel_token.clone();
 
-        self.emit(AgentEvent::SessionStarted {
+        self.emit(CodingEvent::SessionStarted {
             provider: Some(self.provider.clone()),
             model:    Some(self.model.clone()),
         });
@@ -968,7 +967,7 @@ impl Session {
         let memory = memory?;
         // The files are described, never quoted: the durable stream must not
         // carry the bytes of a project's own instructions.
-        self.emit(AgentEvent::MemoryLoaded {
+        self.emit(CodingEvent::MemoryLoaded {
             profile:            profile.clone(),
             files:              memory.iter().map(MemoryDocument::to_summary).collect(),
             total_loaded_bytes: memory.iter().map(|document| document.loaded_bytes).sum(),
@@ -977,7 +976,7 @@ impl Session {
 
         self.skills = skills?;
         debug!(skill_count = self.skills.len(), "Skills discovered");
-        self.emit(AgentEvent::SkillsDiscovered {
+        self.emit(CodingEvent::SkillsDiscovered {
             profile,
             source_dirs: self.config.skill_dirs.clone(),
             skills: self.skills.iter().map(Skill::to_summary).collect(),
@@ -1217,7 +1216,7 @@ impl Session {
     /// still alive. So a reader that loops until the stream closes can be
     /// joined before the session is dropped, which is the order an application
     /// wants — the renderer's summary is the last thing printed.
-    pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<CodingSessionEvent> {
         self.emitter.subscribe()
     }
 
@@ -1225,7 +1224,6 @@ impl Session {
     pub fn control_handle(&self) -> SessionControlHandle {
         SessionControlHandle::attached(
             Arc::clone(&self.control_state),
-            Arc::clone(&self.round_token),
             Arc::clone(&self.control_notify),
             Arc::clone(&self.active_agent_control),
         )
@@ -1470,7 +1468,7 @@ impl Session {
             supervisor.shutdown_all().await;
         }
         self.ended = true;
-        self.emit(AgentEvent::SessionEnded);
+        self.emit(CodingEvent::SessionEnded);
         self.join_pump().await?;
         Ok(true)
     }
@@ -1543,7 +1541,7 @@ impl Session {
     }
 
     /// Publishes one event on this session's stream.
-    fn emit(&self, event: AgentEvent) {
+    fn emit(&self, event: CodingEvent) {
         self.emitter.emit(self.id.clone(), event);
     }
 
@@ -1558,7 +1556,7 @@ impl Session {
         // Projected from the error the caller receives, so what a reader sees
         // and what the prompt returns say the same thing.
         let error = Error::Llm(error);
-        self.emit(AgentEvent::Error {
+        self.emit(CodingEvent::Error {
             error: ErrorData::from(&error),
         });
         if credential_failure {
@@ -1596,7 +1594,7 @@ impl Session {
         if matches!(from, SessionState::Thinking | SessionState::Executing)
             && to == SessionState::Idle
         {
-            self.emit(AgentEvent::ProcessingEnd);
+            self.emit(CodingEvent::ProcessingEnd);
         }
 
         self.state = to;
@@ -1825,7 +1823,7 @@ mod tests {
         ]);
         assert!(matches!(
             &published[1],
-            AgentEvent::MemoryLoaded {
+            CodingEvent::MemoryLoaded {
                 files,
                 total_loaded_bytes: 0,
                 budget_bytes: MEMORY_BUDGET_BYTES,
@@ -1913,20 +1911,20 @@ mod tests {
         let interrupts: Vec<u64> = published
             .iter()
             .filter_map(|event| match event {
-                AgentEvent::RoundInterrupted { generation } => Some(*generation),
+                CodingEvent::RoundInterrupted { generation } => Some(*generation),
                 _ => None,
             })
             .collect();
         assert_eq!(interrupts, [1, 2], "one announcement per gesture");
-        let position = |matcher: fn(&AgentEvent) -> bool| {
+        let position = |matcher: fn(&CodingEvent) -> bool| {
             published
                 .iter()
                 .position(&matcher)
                 .expect("the event was published")
         };
         assert!(
-            position(|event| matches!(event, AgentEvent::RoundInterrupted { generation: 2 }))
-                < position(|event| matches!(event, AgentEvent::SteeringInjected { .. })),
+            position(|event| matches!(event, CodingEvent::RoundInterrupted { generation: 2 }))
+                < position(|event| matches!(event, CodingEvent::SteeringInjected { .. })),
             "the interrupt settles before its steer is delivered"
         );
         assert!(matches!(
@@ -1978,7 +1976,7 @@ mod tests {
         assert_eq!(
             published
                 .iter()
-                .filter(|event| matches!(event, AgentEvent::SessionEnded))
+                .filter(|event| matches!(event, CodingEvent::SessionEnded))
                 .count(),
             1
         );
@@ -2032,7 +2030,7 @@ mod tests {
 
     #[async_trait]
     impl EventSink for RefusingSink {
-        async fn record(&self, _event: &SessionEvent) -> StdResult<(), EventSinkError> {
+        async fn record(&self, _event: &CodingSessionEvent) -> StdResult<(), EventSinkError> {
             Err(EventSinkError::new("the disk is full"))
         }
     }
@@ -2157,7 +2155,7 @@ mod tests {
         let resumed =
             Session::from_record(&record, builder(client())).expect("the record restores");
         let mut events = resumed.subscribe();
-        resumed.emit(AgentEvent::LoopDetected);
+        resumed.emit(CodingEvent::LoopDetected);
 
         assert_eq!(
             events.recv().await.expect("the event is published").seq,

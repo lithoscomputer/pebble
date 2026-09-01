@@ -28,7 +28,7 @@ struct FileOps {
 /// The files one session has touched, and how.
 ///
 /// Paths are kept in sorted order, so the rendered section is stable between
-/// runs that did the same work.
+/// prompts that did the same work.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileTracker {
     files: BTreeMap<String, FileOps>,
@@ -65,7 +65,7 @@ impl FileTracker {
     /// The tracked files as one Markdown list, one line per path.
     ///
     /// ```
-    /// # use pebble::FileTracker;
+    /// # use pebble::resources::FileTracker;
     /// let mut tracker = FileTracker::default();
     /// tracker.record_read("src/lib.rs");
     /// tracker.record_edit("src/lib.rs");
@@ -93,8 +93,8 @@ impl FileTracker {
     /// Records the file work in one round of answered tool calls.
     ///
     /// Calls and results are paired in order, which is the order
-    /// [`ToolDispatch`](crate::ToolDispatch) answers them in. A call whose
-    /// result reports an error is skipped: the file was not touched.
+    /// [`ToolDispatch`](crate::tools::ToolDispatch) answers them in. A call
+    /// whose result reports an error is skipped: the file was not touched.
     pub fn record_from_tool_calls(&mut self, tool_calls: &[ToolCall], results: &[ToolResult]) {
         for (call, result) in tool_calls.iter().zip(results) {
             if result.is_error {

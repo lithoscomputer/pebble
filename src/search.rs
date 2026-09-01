@@ -181,7 +181,7 @@ impl From<SearchError> for ToolError {
 /// Where a session's web searches go.
 ///
 /// An application installs one with
-/// [`SessionBuilder::search_provider`](crate::SessionBuilder::search_provider);
+/// [`SessionBuilder::search_provider`](crate::advanced::SessionBuilder::search_provider);
 /// a session without one advertises no search tool.
 ///
 /// Implementations run inside a tool call, so they hold the round open until

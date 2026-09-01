@@ -19,7 +19,7 @@ pub use self::execution::{ToolDispatch, validate_tool_args};
 pub use self::native::{NativeTool, ToolVocabulary};
 pub use self::permissions::{canonical_tool_name, known_tool_category, tool_category};
 pub use self::registry::{
-    AgentEventEmitter, RegisteredTool, StaticEnvProvider, ToolContext, ToolDefinitionWithSource,
+    CodingEventEmitter, RegisteredTool, StaticEnvProvider, ToolContext, ToolDefinitionWithSource,
     ToolEnvProvider, ToolExecutor, ToolRegistry,
 };
 pub(crate) use self::registry::{optional_usize_arg, required_str};

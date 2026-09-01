@@ -197,14 +197,14 @@ fn one_skill() -> Arc<MockEnvironment> {
 /// the tools `initialize` adds for itself are registered.
 async fn initialized(selector: &str, configured: Configured) -> Session {
     let (environment, options) = if configured.skills {
-        (one_skill(), SessionOptions {
+        (one_skill(), CodingSessionOptions {
             skill_dirs: vec!["/skills".to_owned()],
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         })
     } else {
         (
             Arc::new(MockEnvironment::linux()),
-            SessionOptions::default(),
+            CodingSessionOptions::default(),
         )
     };
     let mut builder = Session::builder(shipped_client())

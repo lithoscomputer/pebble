@@ -5,7 +5,7 @@ use std::sync::{Mutex, PoisonError};
 
 use crate::tool::ToolContext;
 use crate::types::{
-    AgentEvent, TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoListProjection,
+    CodingEvent, TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoListProjection,
     TodoProjection, TodoStatus, TodoUpdatedProps,
 };
 
@@ -26,9 +26,9 @@ struct TodoRuntimeState {
 /// one list per session, while the task tools write one list per session tree.
 ///
 /// Every change is announced. The runtime is the live state, and the
-/// [`TodoCreated`](crate::AgentEvent::TodoCreated),
-/// [`TodoUpdated`](crate::AgentEvent::TodoUpdated) and
-/// [`TodoDeleted`](crate::AgentEvent::TodoDeleted) events are how an
+/// [`TodoCreated`](crate::events::CodingEvent::TodoCreated),
+/// [`TodoUpdated`](crate::events::CodingEvent::TodoUpdated) and
+/// [`TodoDeleted`](crate::events::CodingEvent::TodoDeleted) events are how an
 /// application projects the same state for itself.
 #[derive(Debug, Default)]
 pub struct TodoRuntime {
@@ -93,7 +93,7 @@ impl TodoRuntime {
                 .or_insert_with(|| TodoListProjection::new(kind, props.list_id.clone()))
                 .upsert(todo);
         }
-        ctx.emit_agent_event(AgentEvent::TodoCreated(props));
+        ctx.emit_coding_event(CodingEvent::TodoCreated(props));
     }
 
     /// Applies a patch and announces it, answering whether the todo was there.
@@ -114,7 +114,7 @@ impl TodoRuntime {
             list.apply_patch(&props.todo_id, &props)
         };
         if applied {
-            ctx.emit_agent_event(AgentEvent::TodoUpdated(props));
+            ctx.emit_coding_event(CodingEvent::TodoUpdated(props));
         }
         applied
     }
@@ -135,7 +135,7 @@ impl TodoRuntime {
             list.remove(&todo_id)
         };
         if removed {
-            ctx.emit_agent_event(AgentEvent::TodoDeleted(TodoDeletedProps {
+            ctx.emit_coding_event(CodingEvent::TodoDeleted(TodoDeletedProps {
                 list_id,
                 list_kind: kind,
                 todo_id,
@@ -173,9 +173,9 @@ mod tests {
 
         let events = collector.events();
         assert_eq!(events.len(), 3);
-        assert!(matches!(events[0], AgentEvent::TodoCreated(_)));
-        assert!(matches!(events[1], AgentEvent::TodoUpdated(_)));
-        assert!(matches!(events[2], AgentEvent::TodoDeleted(_)));
+        assert!(matches!(events[0], CodingEvent::TodoCreated(_)));
+        assert!(matches!(events[1], CodingEvent::TodoUpdated(_)));
+        assert!(matches!(events[2], CodingEvent::TodoDeleted(_)));
     }
 
     #[test]
@@ -198,7 +198,7 @@ mod tests {
 
         let events = collector.events();
         assert_eq!(events.len(), 2);
-        assert!(matches!(events[1], AgentEvent::TodoDeleted(_)));
+        assert!(matches!(events[1], CodingEvent::TodoDeleted(_)));
         assert!(
             runtime
                 .snapshot(&list_id)

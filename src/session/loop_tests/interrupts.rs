@@ -2,10 +2,10 @@
 //!
 //! Every interrupt gesture raises a generation, and the loop settles the count
 //! as it unwinds — one
-//! [`RoundInterrupted`](crate::AgentEvent::RoundInterrupted) per gesture,
-//! before the steer that replaces the abandoned round is delivered. These
-//! tests interrupt the loop everywhere it can be interrupted: before it starts,
-//! while it waits on the model, and while a tool is running.
+//! [`RoundInterrupted`](crate::events::CodingEvent::RoundInterrupted) per
+//! gesture, before the steer that replaces the abandoned round is delivered.
+//! These tests interrupt the loop everywhere it can be interrupted: before it
+//! starts, while it waits on the model, and while a tool is running.
 //!
 //! What the session owns is here too, because a prompt that ends — however it
 //! ends — has to leave nothing behind: the wall-clock timer stops, the event
@@ -69,7 +69,7 @@ async fn a_steer_is_announced_with_its_text() {
 
     let published = settled(&mut session, &mut events).await;
     let steered = published.iter().find_map(|event| match event {
-        AgentEvent::SteeringInjected { text, .. } => Some(text.clone()),
+        CodingEvent::SteeringInjected { text, .. } => Some(text.clone()),
         _ => None,
     });
     assert_eq!(steered.as_deref(), Some("hi there"));
@@ -102,7 +102,7 @@ async fn a_bare_interrupt_parks_the_session_until_a_steer_arrives() {
     let generations: Vec<u64> = published
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::RoundInterrupted { generation } => Some(*generation),
+            CodingEvent::RoundInterrupted { generation } => Some(*generation),
             _ => None,
         })
         .collect();
@@ -121,7 +121,7 @@ async fn an_interrupt_that_lands_while_the_session_is_parked_is_announced_too() 
 
     let controller = tokio::spawn(async move {
         wait_for_event(&mut controller_events, |event| {
-            matches!(event, AgentEvent::RoundInterrupted { generation: 1 })
+            matches!(event, CodingEvent::RoundInterrupted { generation: 1 })
         })
         .await;
         control.interrupt();
@@ -138,7 +138,7 @@ async fn an_interrupt_that_lands_while_the_session_is_parked_is_announced_too() 
     let generations: Vec<u64> = published
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::RoundInterrupted { generation } => Some(*generation),
+            CodingEvent::RoundInterrupted { generation } => Some(*generation),
             _ => None,
         })
         .collect();
@@ -181,7 +181,7 @@ async fn a_gesture_whose_round_cancel_was_lost_is_still_announced() {
     let generations: Vec<u64> = published
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::RoundInterrupted { generation } => Some(*generation),
+            CodingEvent::RoundInterrupted { generation } => Some(*generation),
             _ => None,
         })
         .collect();
@@ -200,12 +200,12 @@ async fn an_interrupt_settles_before_the_steer_that_replaces_it() {
     assert!(!handle.is_waiting_for_steer());
     let published = settled(&mut session, &mut events).await;
     let settled_at = position(&published, |event| {
-        matches!(event, AgentEvent::RoundInterrupted { generation: 1 })
+        matches!(event, CodingEvent::RoundInterrupted { generation: 1 })
     })
     .expect("the interrupt settled");
     let steered_at = position(
         &published,
-        |event| matches!(event, AgentEvent::SteeringInjected { text, .. } if text == "stop now"),
+        |event| matches!(event, CodingEvent::SteeringInjected { text, .. } if text == "stop now"),
     )
     .expect("the steer was delivered");
     assert!(settled_at < steered_at);
@@ -225,7 +225,7 @@ async fn an_interrupt_while_the_model_is_thinking_settles_once() {
         waiting.wait_for_call().await;
         control.interrupt();
         wait_for_event(&mut controller_events, |event| {
-            matches!(event, AgentEvent::RoundInterrupted { generation: 1 })
+            matches!(event, CodingEvent::RoundInterrupted { generation: 1 })
         })
         .await;
         assert!(control.is_waiting_for_steer());
@@ -245,16 +245,16 @@ async fn an_interrupt_while_the_model_is_thinking_settles_once() {
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::RoundInterrupted { .. }
+            CodingEvent::RoundInterrupted { .. }
         )),
         1
     );
     let settled_at = position(&published, |event| {
-        matches!(event, AgentEvent::RoundInterrupted { .. })
+        matches!(event, CodingEvent::RoundInterrupted { .. })
     })
     .expect("the interrupt settled");
     let steered_at = position(&published, |event| {
-        matches!(event, AgentEvent::SteeringInjected { .. })
+        matches!(event, CodingEvent::SteeringInjected { .. })
     })
     .expect("the steer was delivered");
     assert!(settled_at < steered_at);
@@ -289,14 +289,14 @@ async fn an_interrupted_round_leaves_no_task_reminder_behind() {
     let mut events = session.subscribe();
     let controller = tokio::spawn(async move {
         wait_for_event(&mut events, |event| {
-            matches!(event, AgentEvent::LlmFirstOutput {
+            matches!(event, CodingEvent::LlmFirstOutput {
                 kind: LlmOutputKind::ToolCall,
             })
         })
         .await;
         control.interrupt();
         wait_for_event(&mut events, |event| {
-            matches!(event, AgentEvent::RoundInterrupted { generation: 1 })
+            matches!(event, CodingEvent::RoundInterrupted { generation: 1 })
         })
         .await;
         control.steer("wrap up now", None);
@@ -354,7 +354,7 @@ async fn an_interrupt_mid_stream_withdraws_what_the_turn_showed_and_commits_noth
     let controller = tokio::spawn(async move {
         wait_for_event(
             &mut controller_events,
-            |event| matches!(event, AgentEvent::TextDelta { delta } if delta == "half an answer"),
+            |event| matches!(event, CodingEvent::TextDelta { delta } if delta == "half an answer"),
         )
         .await;
         control.interrupt_then_steer("say it differently", None);
@@ -380,7 +380,7 @@ async fn an_interrupt_mid_stream_withdraws_what_the_turn_showed_and_commits_noth
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::AssistantOutputReplace { .. }
+            CodingEvent::AssistantOutputReplace { .. }
         )),
         1,
         "the abandoned turn's output is withdrawn once"
@@ -388,18 +388,18 @@ async fn an_interrupt_mid_stream_withdraws_what_the_turn_showed_and_commits_noth
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::RoundInterrupted { .. }
+            CodingEvent::RoundInterrupted { .. }
         )),
         1
     );
     let withdrawn = position(&published, |event| {
-        matches!(event, AgentEvent::AssistantOutputReplace { .. })
+        matches!(event, CodingEvent::AssistantOutputReplace { .. })
     })
     .expect("the withdrawal was published");
     let second_delta = published
         .iter()
         .enumerate()
-        .filter(|(_, event)| matches!(event, AgentEvent::TextDelta { .. }))
+        .filter(|(_, event)| matches!(event, CodingEvent::TextDelta { .. }))
         .nth(1)
         .map(|(index, _)| index)
         .expect("the replayed turn published its own text");
@@ -417,18 +417,18 @@ async fn ending_the_prompt_while_a_replay_waits_ends_it_as_a_cancellation() {
         "partial",
         ScriptedFailure::retryable(LlmErrorKind::Network, "connection reset"),
     )])
-    .options(SessionOptions {
+    .options(CodingSessionOptions {
         turn_replay: RetryPolicy::exponential()
             .max_attempts(4)
             .initial_delay(Duration::from_secs(30)),
-        ..SessionOptions::default()
+        ..CodingSessionOptions::default()
     })
     .build();
     let cancel = session.cancel_token();
     let mut events = session.subscribe();
     let controller = tokio::spawn(async move {
         wait_for_event(&mut events, |event| {
-            matches!(event, AgentEvent::LlmRetry { .. })
+            matches!(event, CodingEvent::LlmRetry { .. })
         })
         .await;
         cancel.cancel();
@@ -463,7 +463,7 @@ async fn an_interrupted_parallel_round_answers_every_call_it_made() {
     let mut events = session.subscribe();
     let controller = tokio::spawn(async move {
         wait_for_event(&mut events, |event| {
-            matches!(event, AgentEvent::ToolCallStarted { .. })
+            matches!(event, CodingEvent::ToolCallStarted { .. })
         })
         .await;
         control.interrupt_then_steer("stop all of that", None);
@@ -524,7 +524,7 @@ async fn a_tool_that_ignores_its_cancellation_holds_the_round_open() {
         timeout(
             PATIENCE,
             wait_for_event(&mut events, |event| {
-                matches!(event, AgentEvent::ToolCallStarted { .. })
+                matches!(event, CodingEvent::ToolCallStarted { .. })
             }),
         )
         .await
@@ -593,10 +593,10 @@ async fn a_prompt_that_outlasts_its_budget_ends_with_the_budget_as_its_reason() 
         ScriptedCall::response(text_response("Should not reach this")),
     ])
     .tools([blocking_tool("slow_tool")])
-    .options(SessionOptions {
+    .options(CodingSessionOptions {
         wall_clock_timeout: Some(Duration::from_millis(10)),
         enable_loop_detection: false,
-        ..SessionOptions::default()
+        ..CodingSessionOptions::default()
     })
     .build();
 
@@ -641,9 +641,9 @@ async fn the_reason_an_outside_task_recorded_first_is_the_one_reported() {
 #[tokio::test]
 async fn a_prompt_inside_its_budget_is_untouched() {
     let (mut session, _provider) = TestSession::new(answers("Fast response"))
-        .options(SessionOptions {
+        .options(CodingSessionOptions {
             wall_clock_timeout: Some(Duration::from_secs(10)),
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         })
         .build();
 
@@ -661,9 +661,9 @@ async fn a_finished_prompt_leaves_no_timer_behind() {
         ScriptedCall::response(text_response("first")),
         ScriptedCall::response(text_response("second")),
     ])
-    .options(SessionOptions {
+    .options(CodingSessionOptions {
         wall_clock_timeout: Some(Duration::from_millis(20)),
-        ..SessionOptions::default()
+        ..CodingSessionOptions::default()
     })
     .build();
 
@@ -687,9 +687,9 @@ async fn a_finished_prompt_leaves_no_timer_behind() {
 #[tokio::test]
 async fn a_shutdown_joins_everything_the_session_owns() {
     let (mut session, _provider) = TestSession::new(answers("done"))
-        .options(SessionOptions {
+        .options(CodingSessionOptions {
             wall_clock_timeout: Some(Duration::from_secs(10)),
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         })
         .build();
 
@@ -736,7 +736,7 @@ impl RecordingSink {
 
 #[async_trait::async_trait]
 impl EventSink for RecordingSink {
-    async fn record(&self, event: &SessionEvent) -> StdResult<(), EventSinkError> {
+    async fn record(&self, event: &CodingSessionEvent) -> StdResult<(), EventSinkError> {
         self.recorded
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -831,7 +831,7 @@ async fn a_resumed_session_carries_on_the_conversation_and_the_numbering() {
 }
 
 /// The sequence number of every event the receiver holds.
-fn sequence_numbers(receiver: &mut broadcast::Receiver<SessionEvent>) -> Vec<u64> {
+fn sequence_numbers(receiver: &mut broadcast::Receiver<CodingSessionEvent>) -> Vec<u64> {
     let mut seqs = Vec::new();
     while let Ok(event) = receiver.try_recv() {
         seqs.push(event.seq);
@@ -867,7 +867,7 @@ async fn a_tool_that_ends_the_round_is_still_answered_before_the_next_one() {
     let mut events = session.subscribe();
     let controller = tokio::spawn(async move {
         wait_for_event(&mut events, |event| {
-            matches!(event, AgentEvent::ToolCallStarted { .. })
+            matches!(event, CodingEvent::ToolCallStarted { .. })
         })
         .await;
         control.interrupt_then_steer("stop that", None);

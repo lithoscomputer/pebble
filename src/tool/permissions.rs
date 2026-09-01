@@ -2,9 +2,9 @@
 //! auto-approval table.
 //!
 //! The session loop consults neither. It asks the
-//! [`ToolAccessPolicy`](crate::ToolAccessPolicy) an application installed, and
-//! this module is what an application can build that policy out of when it
-//! wants pebble's own answer instead of its own.
+//! [`ToolAccessPolicy`](crate::tools::ToolAccessPolicy) an application
+//! installed, and this module is what an application can build that policy out
+//! of when it wants pebble's own answer instead of its own.
 
 use super::native::NativeTool;
 use crate::types::{PermissionLevel, ToolCategory};

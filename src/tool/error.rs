@@ -17,7 +17,7 @@ use crate::types::ToolErrorKind;
 ///
 /// The execution layer owns rendering: it puts the message in the tool result,
 /// marks the result as an error, and reports [`kind`](Self::kind) on
-/// [`AgentEvent::ToolCallCompleted`](crate::AgentEvent::ToolCallCompleted) so
+/// [`CodingEvent::ToolCallCompleted`](crate::events::CodingEvent::ToolCallCompleted) so
 /// hooks and event consumers can branch without parsing text.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]

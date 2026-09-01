@@ -36,8 +36,8 @@ pub use self::runtime::TodoRuntime;
 /// # Errors
 ///
 /// Returns a [`ToolError`] of kind
-/// [`Unavailable`](crate::ToolErrorKind::Unavailable) outside a session, which
-/// is the only place these tools have no list to write.
+/// [`Unavailable`](crate::tools::ToolErrorKind::Unavailable) outside a session,
+/// which is the only place these tools have no list to write.
 fn session_todo_scope(
     ctx: &ToolContext,
     kind: TodoListKind,

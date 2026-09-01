@@ -18,14 +18,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, process};
 
 use lithos_llm::types::ToolDefinition;
+use pebble::advanced::Session;
+use pebble::events::{CodingEvent, CodingSessionEvent, ToolSource};
+use pebble::resources::Message;
 use pebble::test_support::{
     ScriptedCall, ScriptedProvider, client_from, message_text, text_delta_events, text_response,
     tool_call_response, with_cost,
 };
-use pebble::{
-    AgentEvent, LocalEnvironment, Message, RegisteredTool, Session, SessionEvent, ShutdownReason,
-    ToolSource,
-};
+use pebble::tools::RegisteredTool;
+use pebble::{LocalEnvironment, ShutdownReason};
 use serde_json::json;
 use tokio::sync::{Notify, broadcast};
 use tokio::time::timeout;
@@ -106,13 +107,13 @@ async fn a_prompt_writes_edits_reads_and_runs_a_command_in_its_workspace() {
     assert!(
         !published
             .iter()
-            .any(|event| matches!(event, AgentEvent::ToolCallCompleted { is_error: true, .. })),
+            .any(|event| matches!(event, CodingEvent::ToolCallCompleted { is_error: true, .. })),
         "no tool failed: {published:?}"
     );
     assert!(
         published
             .iter()
-            .any(|event| matches!(event, AgentEvent::ToolProcessCompleted {
+            .any(|event| matches!(event, CodingEvent::ToolProcessCompleted {
                 exit_code: Some(0),
                 ..
             })),
@@ -219,7 +220,7 @@ async fn a_steer_sent_while_a_tool_runs_arrives_as_the_next_turn() {
     assert!(
         published.iter().any(|event| matches!(
             event,
-            AgentEvent::SteeringInjected { text, .. } if text == "also write notes.md"
+            CodingEvent::SteeringInjected { text, .. } if text == "also write notes.md"
         )),
         "an application watching the stream sees the steer too"
     );
@@ -242,14 +243,14 @@ async fn an_interrupt_abandons_the_round_and_a_steer_resumes_it() {
 
     let controller = tokio::spawn(async move {
         wait_for(&mut watched, |event| {
-            matches!(event, AgentEvent::TextDelta { .. })
+            matches!(event, CodingEvent::TextDelta { .. })
         })
         .await;
         control.interrupt();
         // Exactly one of these is published per gesture, so waiting for it is
         // waiting for the interrupt to have settled.
         wait_for(&mut watched, |event| {
-            matches!(event, AgentEvent::RoundInterrupted { .. })
+            matches!(event, CodingEvent::RoundInterrupted { .. })
         })
         .await;
         assert!(control.is_waiting_for_steer(), "a bare interrupt parks");
@@ -279,17 +280,17 @@ async fn an_interrupt_abandons_the_round_and_a_steer_resumes_it() {
     assert_eq!(
         published
             .iter()
-            .filter(|event| matches!(event, AgentEvent::RoundInterrupted { .. }))
+            .filter(|event| matches!(event, CodingEvent::RoundInterrupted { .. }))
             .count(),
         1,
         "one gesture, one announcement"
     );
     let withdrawn = position(&published, |event| {
-        matches!(event, AgentEvent::AssistantOutputReplace { .. })
+        matches!(event, CodingEvent::AssistantOutputReplace { .. })
     })
     .expect("the abandoned output was withdrawn");
     let answered = position(&published, |event| {
-        matches!(event, AgentEvent::AssistantMessage { .. })
+        matches!(event, CodingEvent::AssistantMessage { .. })
     })
     .expect("the replacement round answered");
     assert!(
@@ -383,8 +384,8 @@ fn checkpoint_tool(reached: Arc<Notify>, release: Arc<Notify>) -> RegisteredTool
 /// to.
 async fn settled(
     session: &mut Session,
-    events: &mut broadcast::Receiver<SessionEvent>,
-) -> Vec<AgentEvent> {
+    events: &mut broadcast::Receiver<CodingSessionEvent>,
+) -> Vec<CodingEvent> {
     session
         .shutdown(ShutdownReason::Completed)
         .await
@@ -398,8 +399,8 @@ async fn settled(
 
 /// Waits for the first event `wanted` matches.
 async fn wait_for(
-    events: &mut broadcast::Receiver<SessionEvent>,
-    wanted: impl Fn(&AgentEvent) -> bool,
+    events: &mut broadcast::Receiver<CodingSessionEvent>,
+    wanted: impl Fn(&CodingEvent) -> bool,
 ) {
     loop {
         let event = events.recv().await.expect("the event stream stays open");
@@ -410,18 +411,18 @@ async fn wait_for(
 }
 
 /// The tools the session finished calling, in order.
-fn tools_called(published: &[AgentEvent]) -> Vec<String> {
+fn tools_called(published: &[CodingEvent]) -> Vec<String> {
     published
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::ToolCallCompleted { tool_name, .. } => Some(tool_name.clone()),
+            CodingEvent::ToolCallCompleted { tool_name, .. } => Some(tool_name.clone()),
             _ => None,
         })
         .collect()
 }
 
 /// Where `wanted` first matched, for an assertion about ordering.
-fn position(published: &[AgentEvent], wanted: impl Fn(&AgentEvent) -> bool) -> Option<usize> {
+fn position(published: &[CodingEvent], wanted: impl Fn(&CodingEvent) -> bool) -> Option<usize> {
     published.iter().position(wanted)
 }
 

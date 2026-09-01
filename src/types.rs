@@ -1,9 +1,9 @@
 //! The vocabulary a pebble session speaks: conversation turns, session state,
 //! and the event stream an application observes.
 //!
-//! The serialized form of [`SessionEvent`] and [`AgentEvent`] is public API.
-//! Evolution is additive: new variants and new optional fields only. Consumers
-//! should ignore unknown fields and tolerate unknown variants.
+//! The serialized form of [`CodingSessionEvent`] and [`CodingEvent`] is public
+//! API. Evolution is additive: new variants and new optional fields only.
+//! Consumers should ignore unknown fields and tolerate unknown variants.
 //!
 //! Pebble builds these values and an application reads them, so the additive
 //! promise covers reading. Building an event payload from outside the crate is
@@ -599,7 +599,7 @@ impl fmt::Display for AgentProfileKind {
 /// Variant names are permanent API.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
-pub enum AgentEvent {
+pub enum CodingEvent {
     /// The session opened.
     SessionStarted {
         /// The provider the session resolved to.
@@ -622,7 +622,7 @@ pub enum AgentEvent {
     ///
     /// Emitted after the request is built and compaction has run, immediately
     /// before the stream opens. Failover can re-target the call, so
-    /// [`AgentEvent::AssistantMessage`] stays authoritative for what answered.
+    /// [`CodingEvent::AssistantMessage`] stays authoritative for what answered.
     LlmRequestStarted {
         /// The catalog identifier of the requested model.
         requested_model: String,
@@ -721,7 +721,7 @@ pub enum AgentEvent {
     },
     /// The outcome of a subordinate process a tool ran.
     ///
-    /// Emitted before its owning [`AgentEvent::ToolCallCompleted`], which
+    /// Emitted before its owning [`CodingEvent::ToolCallCompleted`], which
     /// stays the single tool-protocol completion and the authoritative owner
     /// of `is_error`. Session and tool-call identity come from the envelope.
     ToolProcessCompleted {
@@ -920,7 +920,7 @@ pub enum AgentEvent {
     TodoDeleted(TodoDeletedProps),
 }
 
-impl AgentEvent {
+impl CodingEvent {
     /// Whether this is a streaming-delta or buffer-replacement event.
     ///
     /// These are typically filtered out before an event stream is forwarded or
@@ -1240,23 +1240,23 @@ impl AgentEvent {
     }
 }
 
-/// One [`AgentEvent`] with the identity a consumer needs to place it.
+/// One [`CodingEvent`] with the identity a consumer needs to place it.
 ///
 /// Pebble builds the envelope and an application reads it. The struct is
 /// `#[non_exhaustive]` because the envelope is where later identity lands —
-/// `seq` arrived this way — so build one with [`SessionEvent::new`] and the
-/// `with_*` methods instead of a struct literal. Reading a field, and
+/// `seq` arrived this way — so build one with [`CodingSessionEvent::new`] and
+/// the `with_*` methods instead of a struct literal. Reading a field, and
 /// assigning to one on an envelope you already hold, stay open.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
-pub struct SessionEvent {
+pub struct CodingSessionEvent {
     /// A monotonic per-session sequence number, assigned as the event is
     /// published. Events forwarded from a child session are renumbered into
     /// the parent's stream.
     #[serde(default)]
     pub seq:               u64,
     /// What happened.
-    pub event:             AgentEvent,
+    pub event:             CodingEvent,
     /// When it happened.
     #[serde(with = "rfc3339_millis")]
     pub timestamp:         SystemTime,
@@ -1270,13 +1270,13 @@ pub struct SessionEvent {
     pub tool_call_id:      Option<String>,
 }
 
-impl SessionEvent {
+impl CodingSessionEvent {
     /// Builds an envelope for an event `session_id` produced at `timestamp`.
     ///
     /// The sequence number starts at zero, which is what an unpublished event
     /// carries; the session's event pump assigns the real one as it publishes.
     #[must_use]
-    pub fn new(session_id: impl Into<String>, event: AgentEvent, timestamp: SystemTime) -> Self {
+    pub fn new(session_id: impl Into<String>, event: CodingEvent, timestamp: SystemTime) -> Self {
         Self {
             seq: 0,
             event,
@@ -1324,8 +1324,8 @@ mod tests {
         UNIX_EPOCH + Duration::from_millis(1_767_225_600_500)
     }
 
-    fn session_event(event: AgentEvent) -> SessionEvent {
-        SessionEvent::new("ses_1", event, moment()).with_seq(1)
+    fn coding_session_event(event: CodingEvent) -> CodingSessionEvent {
+        CodingSessionEvent::new("ses_1", event, moment()).with_seq(1)
     }
 
     // --- Timestamps ---
@@ -1578,8 +1578,8 @@ mod tests {
     // --- Event envelope ---
 
     #[test]
-    fn session_event_omits_absent_identity_and_keeps_its_timestamp_format() {
-        let event = session_event(AgentEvent::SessionStarted {
+    fn coding_session_event_omits_absent_identity_and_keeps_its_timestamp_format() {
+        let event = coding_session_event(CodingEvent::SessionStarted {
             provider: Some("anthropic".into()),
             model:    Some("claude-sonnet-5".into()),
         });
@@ -1591,18 +1591,18 @@ mod tests {
         assert!(!json.contains("tool_call_id"), "{json}");
         assert!(json.contains("2026-01-01T00:00:00.500Z"), "{json}");
 
-        let restored: SessionEvent = serde_json::from_str(&json).expect("parses");
+        let restored: CodingSessionEvent = serde_json::from_str(&json).expect("parses");
         assert_eq!(restored, event);
     }
 
     #[test]
-    fn session_event_keeps_subagent_identity_when_present() {
-        let mut event = session_event(AgentEvent::ProcessingEnd);
+    fn coding_session_event_keeps_subagent_identity_when_present() {
+        let mut event = coding_session_event(CodingEvent::ProcessingEnd);
         event.parent_session_id = Some("ses_parent".into());
         event.tool_call_id = Some("call_1".into());
 
         let json = serde_json::to_string(&event).expect("serializes");
-        let restored: SessionEvent = serde_json::from_str(&json).expect("parses");
+        let restored: CodingSessionEvent = serde_json::from_str(&json).expect("parses");
 
         assert_eq!(restored.parent_session_id.as_deref(), Some("ses_parent"));
         assert_eq!(restored.tool_call_id.as_deref(), Some("call_1"));
@@ -1610,7 +1610,7 @@ mod tests {
 
     #[test]
     fn a_new_envelope_starts_unpublished_and_takes_its_identity_afterwards() {
-        let envelope = SessionEvent::new("ses_1", AgentEvent::SessionEnded, moment());
+        let envelope = CodingSessionEvent::new("ses_1", CodingEvent::SessionEnded, moment());
 
         assert_eq!(envelope.seq, 0, "an unpublished envelope carries no place");
         assert_eq!(envelope.parent_session_id, None);
@@ -1629,8 +1629,8 @@ mod tests {
     }
 
     #[test]
-    fn a_session_event_without_a_sequence_reads_back_as_zero() {
-        let event: SessionEvent = serde_json::from_value(json!({
+    fn a_coding_session_event_without_a_sequence_reads_back_as_zero() {
+        let event: CodingSessionEvent = serde_json::from_value(json!({
             "event": "SessionEnded",
             "timestamp": "2026-01-01T00:00:00.500Z",
             "session_id": "ses_1",
@@ -1644,18 +1644,18 @@ mod tests {
     #[test]
     fn unit_variants_serialize_as_bare_names() {
         assert_eq!(
-            serde_json::to_value(AgentEvent::SessionEnded).expect("serializes"),
+            serde_json::to_value(CodingEvent::SessionEnded).expect("serializes"),
             json!("SessionEnded")
         );
         assert_eq!(
-            serde_json::to_value(AgentEvent::LoopDetected).expect("serializes"),
+            serde_json::to_value(CodingEvent::LoopDetected).expect("serializes"),
             json!("LoopDetected")
         );
     }
 
     #[test]
     fn payload_variants_are_externally_tagged() {
-        let event = AgentEvent::ToolCallStarted {
+        let event = CodingEvent::ToolCallStarted {
             tool_name:    "shell".into(),
             tool_call_id: "call_1".into(),
             arguments:    json!({"command": "ls"}),
@@ -1673,22 +1673,22 @@ mod tests {
     #[test]
     fn streaming_noise_is_exactly_the_four_buffer_events() {
         let noisy = [
-            AgentEvent::AssistantOutputReplace {
+            CodingEvent::AssistantOutputReplace {
                 text:      String::new(),
                 reasoning: None,
             },
-            AgentEvent::TextDelta { delta: "a".into() },
-            AgentEvent::ReasoningDelta { delta: "a".into() },
-            AgentEvent::ToolCallOutputDelta { delta: "a".into() },
+            CodingEvent::TextDelta { delta: "a".into() },
+            CodingEvent::ReasoningDelta { delta: "a".into() },
+            CodingEvent::ToolCallOutputDelta { delta: "a".into() },
         ];
         for event in &noisy {
             assert!(event.is_streaming_noise(), "{event:?}");
         }
 
         let quiet = [
-            AgentEvent::SessionEnded,
-            AgentEvent::UserInput { text: "hi".into() },
-            AgentEvent::LoopDetected,
+            CodingEvent::SessionEnded,
+            CodingEvent::UserInput { text: "hi".into() },
+            CodingEvent::LoopDetected,
         ];
         for event in &quiet {
             assert!(!event.is_streaming_noise(), "{event:?}");
@@ -1697,20 +1697,20 @@ mod tests {
 
     #[test]
     fn assistant_output_replace_round_trips() {
-        let event = AgentEvent::AssistantOutputReplace {
+        let event = CodingEvent::AssistantOutputReplace {
             text:      "hello again".into(),
             reasoning: Some("retrying from scratch".into()),
         };
         let json = serde_json::to_string(&event).expect("serializes");
         assert_eq!(
-            serde_json::from_str::<AgentEvent>(&json).expect("parses"),
+            serde_json::from_str::<CodingEvent>(&json).expect("parses"),
             event
         );
     }
 
     #[test]
     fn assistant_message_carries_usage_and_cost() {
-        let event = AgentEvent::AssistantMessage {
+        let event = CodingEvent::AssistantMessage {
             text:            "hello".into(),
             model:           "claude-sonnet-5".into(),
             usage:           TokenUsage {
@@ -1736,46 +1736,46 @@ mod tests {
         assert!(payload.get("context_window").is_none());
         assert!(payload.get("reasoning").is_none());
         assert_eq!(
-            serde_json::from_value::<AgentEvent>(value).expect("parses"),
+            serde_json::from_value::<CodingEvent>(value).expect("parses"),
             event
         );
     }
 
     #[test]
     fn legacy_subagent_events_default_to_the_initial_generation() {
-        let event: AgentEvent = serde_json::from_str(
+        let event: CodingEvent = serde_json::from_str(
             r#"{"SubAgentSpawned":{"agent_id":"sa-1","depth":0,"task":"test"}}"#,
         )
         .expect("parses");
-        assert!(matches!(event, AgentEvent::SubAgentSpawned {
+        assert!(matches!(event, CodingEvent::SubAgentSpawned {
             generation: 1,
             ..
         }));
 
-        let event: AgentEvent = serde_json::from_str(
+        let event: CodingEvent = serde_json::from_str(
             r#"{"SubAgentCompleted":{"agent_id":"sa-1","depth":0,"success":true,"turns_used":2}}"#,
         )
         .expect("parses");
-        assert!(matches!(event, AgentEvent::SubAgentCompleted {
+        assert!(matches!(event, CodingEvent::SubAgentCompleted {
             generation: 1,
             ..
         }));
 
         let error = serde_json::to_value(ErrorData::from(&Error::ToolExecution("boom".into())))
             .expect("serializes");
-        let event: AgentEvent = serde_json::from_value(
+        let event: CodingEvent = serde_json::from_value(
             json!({ "SubAgentFailed": { "agent_id": "sa-1", "depth": 0, "error": error } }),
         )
         .expect("parses");
-        assert!(matches!(event, AgentEvent::SubAgentFailed {
+        assert!(matches!(event, CodingEvent::SubAgentFailed {
             generation: 1,
             ..
         }));
 
-        let event: AgentEvent =
+        let event: CodingEvent =
             serde_json::from_str(r#"{"SubAgentClosed":{"agent_id":"sa-1","depth":0}}"#)
                 .expect("parses");
-        assert!(matches!(event, AgentEvent::SubAgentClosed {
+        assert!(matches!(event, CodingEvent::SubAgentClosed {
             generation: 1,
             ..
         }));
@@ -1790,7 +1790,7 @@ mod tests {
         // while a turn has never been published without one. Harmonizing the
         // serde attributes across all five would invent a first generation for
         // an event that is simply malformed.
-        let error = serde_json::from_str::<AgentEvent>(
+        let error = serde_json::from_str::<CodingEvent>(
             r#"{"SubAgentTurnStarted":{"agent_id":"sa-1","depth":0,"task":"test"}}"#,
         )
         .expect_err("a turn with no generation does not parse");
@@ -1800,12 +1800,12 @@ mod tests {
 
     #[test]
     fn legacy_tool_completions_default_their_byte_counts_and_error_kind() {
-        let event: AgentEvent = serde_json::from_str(
+        let event: CodingEvent = serde_json::from_str(
             r#"{"ToolCallCompleted":{"tool_name":"shell","tool_call_id":"call_1","output":"ok","is_error":false}}"#,
         )
         .expect("parses");
 
-        assert!(matches!(event, AgentEvent::ToolCallCompleted {
+        assert!(matches!(event, CodingEvent::ToolCallCompleted {
             error_kind: None,
             output_bytes_observed: 0,
             output_bytes_retained: 0,
@@ -1816,7 +1816,7 @@ mod tests {
 
     #[test]
     fn a_failed_tool_call_reports_why() {
-        let event = AgentEvent::ToolCallCompleted {
+        let event = CodingEvent::ToolCallCompleted {
             tool_name:             "shell".into(),
             tool_call_id:          "call_1".into(),
             output:                json!("permission denied"),
@@ -1829,14 +1829,14 @@ mod tests {
         let value = serde_json::to_value(&event).expect("serializes");
         assert_eq!(value["ToolCallCompleted"]["error_kind"], json!("denied"));
         assert_eq!(
-            serde_json::from_value::<AgentEvent>(value).expect("parses"),
+            serde_json::from_value::<CodingEvent>(value).expect("parses"),
             event
         );
     }
 
     #[test]
     fn error_events_carry_the_projection() {
-        let event = AgentEvent::Error {
+        let event = CodingEvent::Error {
             error: ErrorData::from(&Error::ToolExecution("command failed".into())),
         };
         let value = serde_json::to_value(&event).expect("serializes");
@@ -1847,16 +1847,16 @@ mod tests {
             json!("tool execution error: command failed")
         );
 
-        let restored: AgentEvent = serde_json::from_value(value).expect("parses");
+        let restored: CodingEvent = serde_json::from_value(value).expect("parses");
         assert!(matches!(
             restored,
-            AgentEvent::Error { error } if error.kind == ErrorKind::ToolExecution
+            CodingEvent::Error { error } if error.kind == ErrorKind::ToolExecution
         ));
     }
 
     #[test]
     fn retry_events_pin_the_zero_based_attempt_and_phase() {
-        let event = AgentEvent::LlmRetry {
+        let event = CodingEvent::LlmRetry {
             provider:   "openai".into(),
             model:      "gpt-5".into(),
             attempt:    0,
@@ -1869,27 +1869,27 @@ mod tests {
         assert_eq!(value["LlmRetry"]["attempt"], json!(0));
         assert_eq!(value["LlmRetry"]["phase"], json!("open"));
         assert_eq!(
-            serde_json::from_value::<AgentEvent>(value).expect("parses"),
+            serde_json::from_value::<CodingEvent>(value).expect("parses"),
             event
         );
     }
 
     #[test]
     fn subagent_failures_carry_the_projection() {
-        let event = AgentEvent::SubAgentFailed {
+        let event = CodingEvent::SubAgentFailed {
             agent_id:   "sa-1".into(),
             depth:      1,
             generation: 2,
             error:      ErrorData::from(&Error::SessionClosed),
         };
         let json = serde_json::to_string(&event).expect("serializes");
-        let restored: AgentEvent = serde_json::from_str(&json).expect("parses");
+        let restored: CodingEvent = serde_json::from_str(&json).expect("parses");
         assert_eq!(restored, event);
     }
 
     #[test]
     fn steering_records_who_authored_it() {
-        let event = AgentEvent::SteeringInjected {
+        let event = CodingEvent::SteeringInjected {
             text:  "also update the changelog".into(),
             actor: Some(Actor::User {
                 id:           Some("u_1".into()),
@@ -1905,7 +1905,7 @@ mod tests {
 
     #[test]
     fn steering_without_an_author_omits_the_field() {
-        let event = AgentEvent::SteeringInjected {
+        let event = CodingEvent::SteeringInjected {
             text:  "keep going".into(),
             actor: None,
         };
@@ -1917,7 +1917,7 @@ mod tests {
 
     #[test]
     fn todo_events_serialize_their_props_inline() {
-        let event = AgentEvent::TodoDeleted(TodoDeletedProps {
+        let event = CodingEvent::TodoDeleted(TodoDeletedProps {
             list_id:   "openai_plan:ses_1".into(),
             list_kind: TodoListKind::OpenAiPlan,
             todo_id:   "a".into(),
@@ -1934,7 +1934,7 @@ mod tests {
 
     #[test]
     fn memory_and_skill_events_name_the_profile() {
-        let event = AgentEvent::SkillsDiscovered {
+        let event = CodingEvent::SkillsDiscovered {
             profile:     AgentProfileKind::Claude5.as_str().to_owned(),
             source_dirs: vec!["/skills".into()],
             skills:      vec![SkillSummary {
@@ -1945,14 +1945,14 @@ mod tests {
         let value = serde_json::to_value(&event).expect("serializes");
         assert_eq!(value["SkillsDiscovered"]["profile"], json!("claude-5"));
         assert_eq!(
-            serde_json::from_value::<AgentEvent>(value).expect("parses"),
+            serde_json::from_value::<CodingEvent>(value).expect("parses"),
             event
         );
     }
 
     #[test]
     fn a_profile_identifier_this_build_does_not_know_still_parses() {
-        let event: AgentEvent = serde_json::from_value(json!({
+        let event: CodingEvent = serde_json::from_value(json!({
             "SkillsDiscovered": {
                 "profile": "a-later-profile",
                 "source_dirs": [],
@@ -1962,7 +1962,7 @@ mod tests {
         .expect("parses");
 
         assert!(
-            matches!(event, AgentEvent::SkillsDiscovered { profile, .. } if profile == "a-later-profile")
+            matches!(event, CodingEvent::SkillsDiscovered { profile, .. } if profile == "a-later-profile")
         );
     }
 
@@ -1992,7 +1992,7 @@ mod tests {
 
     #[test]
     fn process_completions_report_a_bounded_tail() {
-        let event = AgentEvent::ToolProcessCompleted {
+        let event = CodingEvent::ToolProcessCompleted {
             exit_code:             Some(1),
             termination:           CommandTermination::Exited,
             duration_ms:           42,
@@ -2013,85 +2013,85 @@ mod tests {
             json!("exited")
         );
         assert_eq!(
-            serde_json::from_value::<AgentEvent>(value).expect("parses"),
+            serde_json::from_value::<CodingEvent>(value).expect("parses"),
             event
         );
     }
 
     #[test]
     fn unknown_members_are_ignored_when_parsing() {
-        let event: AgentEvent = serde_json::from_value(json!({
+        let event: CodingEvent = serde_json::from_value(json!({
             "UserInput": {"text": "hi", "future_field": 7},
         }))
         .expect("parses");
-        assert_eq!(event, AgentEvent::UserInput { text: "hi".into() });
+        assert_eq!(event, CodingEvent::UserInput { text: "hi".into() });
     }
 
     #[test]
     fn every_event_survives_a_json_round_trip() {
         let events = vec![
-            AgentEvent::SessionStarted {
+            CodingEvent::SessionStarted {
                 provider: None,
                 model:    None,
             },
-            AgentEvent::SessionEnded,
-            AgentEvent::ProcessingEnd,
-            AgentEvent::UserInput { text: "hi".into() },
-            AgentEvent::LlmRequestStarted {
+            CodingEvent::SessionEnded,
+            CodingEvent::ProcessingEnd,
+            CodingEvent::UserInput { text: "hi".into() },
+            CodingEvent::LlmRequestStarted {
                 requested_model: "claude-sonnet-5".into(),
             },
-            AgentEvent::LlmFirstOutput {
+            CodingEvent::LlmFirstOutput {
                 kind: LlmOutputKind::Reasoning,
             },
-            AgentEvent::AssistantOutputReplace {
+            CodingEvent::AssistantOutputReplace {
                 text:      String::new(),
                 reasoning: None,
             },
-            AgentEvent::TextDelta { delta: "a".into() },
-            AgentEvent::ReasoningDelta { delta: "a".into() },
-            AgentEvent::ToolCallOutputDelta { delta: "a".into() },
-            AgentEvent::Warning {
+            CodingEvent::TextDelta { delta: "a".into() },
+            CodingEvent::ReasoningDelta { delta: "a".into() },
+            CodingEvent::ToolCallOutputDelta { delta: "a".into() },
+            CodingEvent::Warning {
                 kind:    "budget".into(),
                 message: "close to the limit".into(),
                 details: json!({}),
             },
-            AgentEvent::LoopDetected,
-            AgentEvent::RoundInterrupted { generation: 3 },
-            AgentEvent::CompactionStarted {
+            CodingEvent::LoopDetected,
+            CodingEvent::RoundInterrupted { generation: 3 },
+            CodingEvent::CompactionStarted {
                 estimated_tokens:    5_000,
                 context_window_size: 8_000,
             },
-            AgentEvent::CompactionCompleted {
+            CodingEvent::CompactionCompleted {
                 original_turn_count:    20,
                 preserved_turn_count:   6,
                 summary_token_estimate: 500,
                 tracked_file_count:     3,
             },
-            AgentEvent::SubAgentSpawned {
+            CodingEvent::SubAgentSpawned {
                 agent_id:   "sa-1".into(),
                 depth:      1,
                 task:       "list files".into(),
                 generation: 1,
             },
-            AgentEvent::SubAgentTurnStarted {
+            CodingEvent::SubAgentTurnStarted {
                 agent_id:   "sa-1".into(),
                 depth:      1,
                 task:       "list files".into(),
                 generation: 2,
             },
-            AgentEvent::SubAgentCompleted {
+            CodingEvent::SubAgentCompleted {
                 agent_id:   "sa-1".into(),
                 depth:      1,
                 generation: 2,
                 success:    true,
                 turns_used: 5,
             },
-            AgentEvent::SubAgentClosed {
+            CodingEvent::SubAgentClosed {
                 agent_id:   "sa-1".into(),
                 depth:      1,
                 generation: 2,
             },
-            AgentEvent::MemoryLoaded {
+            CodingEvent::MemoryLoaded {
                 profile:            AgentProfileKind::Gpt56.as_str().to_owned(),
                 files:              vec![MemoryFileSummary {
                     path:         "/memory/AGENTS.md".into(),
@@ -2102,11 +2102,11 @@ mod tests {
                 total_loaded_bytes: 100,
                 budget_bytes:       1_000,
             },
-            AgentEvent::SkillActivated {
+            CodingEvent::SkillActivated {
                 skill_name: "review".into(),
                 source:     SkillActivationSource::Slash,
             },
-            AgentEvent::TodoCreated(TodoCreatedProps {
+            CodingEvent::TodoCreated(TodoCreatedProps {
                 list_id:     "openai_plan:ses_1".into(),
                 list_kind:   TodoListKind::OpenAiPlan,
                 todo_id:     "a".into(),
@@ -2120,7 +2120,7 @@ mod tests {
                 blocked_by:  Vec::new(),
                 metadata:    BTreeMap::new(),
             }),
-            AgentEvent::TodoUpdated(TodoUpdatedProps::new(
+            CodingEvent::TodoUpdated(TodoUpdatedProps::new(
                 "openai_plan:ses_1",
                 TodoListKind::OpenAiPlan,
                 "a",
@@ -2128,7 +2128,7 @@ mod tests {
         ];
 
         let json = serde_json::to_string(&events).expect("serializes");
-        let restored: Vec<AgentEvent> = serde_json::from_str(&json).expect("parses");
+        let restored: Vec<CodingEvent> = serde_json::from_str(&json).expect("parses");
         assert_eq!(restored, events);
     }
 }

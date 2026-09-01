@@ -19,7 +19,7 @@ use crate::environment::Environment;
 use crate::event::{OutputCaptureStats, SessionBoundEmitter};
 use crate::human_input::HumanInputProvider;
 use crate::redact::{NoRedaction, Redactor};
-use crate::types::{AgentEvent, ToolCategory, ToolSource, ToolSummary};
+use crate::types::{CodingEvent, ToolCategory, ToolSource, ToolSummary};
 
 /// The narrow handle a running tool publishes events through.
 ///
@@ -30,9 +30,9 @@ use crate::types::{AgentEvent, ToolCategory, ToolSource, ToolSummary};
 ///
 /// Implementations must stamp emitted events with the session identity the
 /// owning session is using, so a child session's events stay attributable.
-pub trait AgentEventEmitter: Send + Sync {
+pub trait CodingEventEmitter: Send + Sync {
     /// Publishes one event on the owning session's stream.
-    fn emit(&self, event: AgentEvent);
+    fn emit(&self, event: CodingEvent);
 
     /// Reports how many bytes of model-facing output the running tool
     /// produced.
@@ -44,8 +44,8 @@ pub trait AgentEventEmitter: Send + Sync {
     fn record_tool_output_stats(&self, _stats: OutputCaptureStats) {}
 }
 
-impl AgentEventEmitter for SessionBoundEmitter {
-    fn emit(&self, event: AgentEvent) {
+impl CodingEventEmitter for SessionBoundEmitter {
+    fn emit(&self, event: CodingEvent) {
         Self::emit(self, event);
     }
 
@@ -93,40 +93,40 @@ impl ToolEnvProvider for StaticEnvProvider {
 #[non_exhaustive]
 pub struct ToolContext {
     /// Where the tool's work lands.
-    pub env:                 Arc<dyn Environment>,
+    pub env:                  Arc<dyn Environment>,
     /// Fires when this call should stop. Composed from the session's terminal
-    /// cancellation and the current round's interrupt, so a tool that watches
-    /// it observes both.
+    /// cancellation and the current model turn's interrupt, so a tool that
+    /// watches it observes both.
     ///
     /// Watching it is the tool's own responsibility, and the session waits for
     /// the answer either way: a cancelled call is never dropped, because a call
     /// with no result is a conversation the provider will refuse. A tool that
-    /// ignores this token therefore holds its round — and the prompt ending it
+    /// ignores this token therefore holds its turn — and the prompt ending it
     /// — open until it returns, so long work must watch it and answer.
-    pub cancel:              CancellationToken,
+    pub cancel:               CancellationToken,
     /// Extra environment variables for a command this call runs.
-    pub tool_env_provider:   Option<Arc<dyn ToolEnvProvider>>,
+    pub tool_env_provider:    Option<Arc<dyn ToolEnvProvider>>,
     /// The session that called the tool.
-    pub session_id:          Option<String>,
+    pub session_id:           Option<String>,
     /// The root of the session tree this call belongs to. Equal to
     /// [`session_id`](Self::session_id) in a root session; a child inherits
     /// its parent's root.
-    pub root_session_id:     Option<String>,
+    pub root_session_id:      Option<String>,
     /// The model-native identifier of this call.
-    pub tool_call_id:        Option<String>,
+    pub tool_call_id:         Option<String>,
     /// Where the tool publishes events.
-    pub agent_event_emitter: Option<Arc<dyn AgentEventEmitter>>,
+    pub coding_event_emitter: Option<Arc<dyn CodingEventEmitter>>,
     /// Where the tool asks the person a question. Absent in child sessions and
     /// wherever the application installed no provider.
-    pub human_input:         Option<Arc<dyn HumanInputProvider>>,
+    pub human_input:          Option<Arc<dyn HumanInputProvider>>,
     /// What strips secrets out of text the tool publishes.
     ///
     /// Only output leaving the session through an event goes through it — the
     /// process tail a shell tool publishes — never what the model is shown,
     /// which is the same text the model would have read from the terminal.
-    /// [`NoRedaction`](crate::NoRedaction) unless the application installed
-    /// one.
-    pub redactor:            Arc<dyn Redactor>,
+    /// [`NoRedaction`](crate::advanced::NoRedaction) unless the application
+    /// installed one.
+    pub redactor:             Arc<dyn Redactor>,
 }
 
 impl ToolContext {
@@ -140,7 +140,7 @@ impl ToolContext {
             session_id: None,
             root_session_id: None,
             tool_call_id: None,
-            agent_event_emitter: None,
+            coding_event_emitter: None,
             human_input: None,
             redactor: Arc::new(NoRedaction),
         }
@@ -181,8 +181,8 @@ impl ToolContext {
 
     /// Sets where the tool's events go.
     #[must_use]
-    pub fn with_event_emitter(mut self, emitter: Arc<dyn AgentEventEmitter>) -> Self {
-        self.agent_event_emitter = Some(emitter);
+    pub fn with_coding_event_emitter(mut self, emitter: Arc<dyn CodingEventEmitter>) -> Self {
+        self.coding_event_emitter = Some(emitter);
         self
     }
 
@@ -214,8 +214,8 @@ impl ToolContext {
     }
 
     /// Publishes an event, or does nothing when the context has no emitter.
-    pub fn emit_agent_event(&self, event: AgentEvent) {
-        if let Some(emitter) = self.agent_event_emitter.as_ref() {
+    pub fn emit_coding_event(&self, event: CodingEvent) {
+        if let Some(emitter) = self.coding_event_emitter.as_ref() {
             emitter.emit(event);
         }
     }
@@ -223,7 +223,7 @@ impl ToolContext {
     /// Reports this call's model-facing output byte counts, or does nothing
     /// when the context has no emitter.
     pub fn record_tool_output_stats(&self, stats: OutputCaptureStats) {
-        if let Some(emitter) = self.agent_event_emitter.as_ref() {
+        if let Some(emitter) = self.coding_event_emitter.as_ref() {
             emitter.record_tool_output_stats(stats);
         }
     }
@@ -478,8 +478,8 @@ impl Default for ToolRegistry {
 /// # Errors
 ///
 /// Returns a [`ToolError`] of kind
-/// [`InvalidArguments`](crate::ToolErrorKind::InvalidArguments) when `key` is
-/// absent or is not a string.
+/// [`InvalidArguments`](crate::tools::ToolErrorKind::InvalidArguments) when
+/// `key` is absent or is not a string.
 pub(crate) fn required_str<'a>(arguments: &'a Value, key: &str) -> StdResult<&'a str, ToolError> {
     arguments
         .get(key)
@@ -497,8 +497,8 @@ pub(crate) fn required_str<'a>(arguments: &'a Value, key: &str) -> StdResult<&'a
 /// # Errors
 ///
 /// Returns a [`ToolError`] of kind
-/// [`InvalidArguments`](crate::ToolErrorKind::InvalidArguments) when `key`
-/// holds a number this platform cannot hold.
+/// [`InvalidArguments`](crate::tools::ToolErrorKind::InvalidArguments) when
+/// `key` holds a number this platform cannot hold.
 pub(crate) fn optional_usize_arg(
     arguments: &Value,
     key: &str,
@@ -937,7 +937,7 @@ mod tests {
         let context = context();
         // No emitter is installed: neither call reaches anything, and neither
         // panics.
-        context.emit_agent_event(AgentEvent::SessionEnded);
+        context.emit_coding_event(CodingEvent::SessionEnded);
         context.record_tool_output_stats(OutputCaptureStats::complete(8));
     }
 
@@ -947,15 +947,15 @@ mod tests {
         let mut events = emitter.subscribe();
         let pump = tokio::spawn(pump.run());
         let bound = SessionBoundEmitter::new(emitter, "ses_1", Some("call_1".to_owned()));
-        let context = context().with_event_emitter(Arc::new(bound.clone()));
+        let context = context().with_coding_event_emitter(Arc::new(bound.clone()));
 
-        context.emit_agent_event(AgentEvent::SessionEnded);
+        context.emit_coding_event(CodingEvent::SessionEnded);
         context.record_tool_output_stats(OutputCaptureStats::complete(8));
 
         let event = events.recv().await.expect("an event is published");
         assert_eq!(event.session_id, "ses_1");
         assert_eq!(event.tool_call_id.as_deref(), Some("call_1"));
-        assert_eq!(event.event, AgentEvent::SessionEnded);
+        assert_eq!(event.event, CodingEvent::SessionEnded);
         assert_eq!(
             bound.take_tool_output_stats(),
             Some(OutputCaptureStats::complete(8))

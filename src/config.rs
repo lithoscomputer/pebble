@@ -1,6 +1,6 @@
 //! How an application configures one session.
 //!
-//! [`SessionOptions`] is a plain record with a [`Default`]: build one with
+//! [`CodingSessionOptions`] is a plain record with a [`Default`]: build one with
 //! `..Default::default()` and set only what differs. Everything that needs a
 //! decision from the application rather than a value — which tools may run,
 //! what happens around each call — arrives as a trait object on the same
@@ -71,16 +71,17 @@ pub enum ToolExposureMode {
 /// Argument-sensitive, asynchronous, or logged decisions belong in
 /// [`ToolHookCallback`].
 ///
-/// Pebble ships the [`permission table`](crate::PermissionLevel::auto_approves)
-/// an application can build a policy out of, but installs no policy of its
-/// own; without one, every registered tool is exposed.
+/// Pebble ships the [`permission
+/// table`](crate::tools::PermissionLevel::auto_approves) an application can
+/// build a policy out of, but installs no policy of its own; without one, every
+/// registered tool is exposed.
 pub trait ToolAccessPolicy: Send + Sync {
     /// What the session may do with the tool the model would call
     /// `tool_name`.
     ///
     /// The name is the exposed one, after any vocabulary rename. Resolve it
-    /// with [`canonical_tool_name`](crate::canonical_tool_name) to decide by
-    /// identity.
+    /// with [`canonical_tool_name`](crate::tools::canonical_tool_name) to
+    /// decide by identity.
     fn access_for_tool(&self, tool_name: &str) -> ToolAccess;
 }
 
@@ -116,9 +117,9 @@ pub trait ToolHookCallback: Send + Sync {
     /// why the call failed.
     ///
     /// The kind is the same one the call's
-    /// [`ToolCallCompleted`](crate::AgentEvent::ToolCallCompleted) event
-    /// carries, so a hook can branch on a refusal, a bad argument, or an
-    /// interrupt without parsing the message.
+    /// [`ToolCallCompleted`](crate::events::CodingEvent::ToolCallCompleted)
+    /// event carries, so a hook can branch on a refusal, a bad argument, or
+    /// an interrupt without parsing the message.
     async fn post_tool_use_failure(
         &self,
         tool_name: &str,
@@ -204,16 +205,16 @@ impl Default for NativeToolOptions {
 /// matter:
 ///
 /// ```
-/// use pebble::SessionOptions;
+/// use pebble::CodingSessionOptions;
 ///
-/// let options = SessionOptions {
+/// let options = CodingSessionOptions {
 ///     enable_context_compaction: false,
-///     ..SessionOptions::default()
+///     ..CodingSessionOptions::default()
 /// };
 /// assert_eq!(options.compaction_preserve_turns, 6);
 /// ```
 #[derive(Clone)]
-pub struct SessionOptions {
+pub struct CodingSessionOptions {
     /// How hard the model should think, where the provider offers a choice.
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Which latency or cost tier to ask for, where the provider offers one.
@@ -294,12 +295,12 @@ pub struct SessionOptions {
     pub turn_replay: RetryPolicy,
 }
 
-impl fmt::Debug for SessionOptions {
+impl fmt::Debug for CodingSessionOptions {
     /// Reports the callbacks as placeholders: they are application code, and
     /// what they close over is not pebble's to print.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("SessionOptions")
+            .debug_struct("CodingSessionOptions")
             .field("reasoning_effort", &self.reasoning_effort)
             .field("speed", &self.speed)
             .field("max_tokens", &self.max_tokens)
@@ -341,7 +342,7 @@ impl fmt::Debug for SessionOptions {
     }
 }
 
-impl Default for SessionOptions {
+impl Default for CodingSessionOptions {
     fn default() -> Self {
         Self {
             reasoning_effort: None,
@@ -370,13 +371,13 @@ impl Default for SessionOptions {
     }
 }
 
-/// How many attempts the default [`SessionOptions::turn_replay`] allows.
+/// How many attempts the default [`CodingSessionOptions::turn_replay`] allows.
 ///
 /// One opening attempt plus the three replays a session will spend on a turn
 /// whose stream broke after it had already shown output.
 const DEFAULT_RETRY_ATTEMPTS: u32 = 4;
 
-impl SessionOptions {
+impl CodingSessionOptions {
     /// What the installed policy says about one tool, or
     /// [`ToolAccess::Allowed`] when there is no policy.
     #[must_use]
@@ -443,7 +444,7 @@ mod tests {
 
     #[test]
     fn default_config_values() {
-        let config = SessionOptions::default();
+        let config = CodingSessionOptions::default();
 
         assert!(config.reasoning_effort.is_none());
         assert!(config.speed.is_none());
@@ -463,14 +464,14 @@ mod tests {
 
     #[test]
     fn memory_and_skill_paths_start_empty() {
-        let config = SessionOptions::default();
+        let config = CodingSessionOptions::default();
         assert!(config.memory_files.is_empty());
         assert!(config.skill_dirs.is_empty());
     }
 
     #[test]
     fn default_output_budgets_are_the_documented_ones() {
-        let config = SessionOptions::default();
+        let config = CodingSessionOptions::default();
         assert_eq!(config.tool_output_retention_bytes, 1024 * 1024);
         assert_eq!(config.tool_output_serialized_bytes, 1_572_864);
     }
@@ -497,7 +498,7 @@ mod tests {
 
     #[test]
     fn the_default_turn_replay_allows_the_replays_a_turn_is_worth() {
-        let config = SessionOptions::default();
+        let config = CodingSessionOptions::default();
         let error = LlmError::new(LlmErrorKind::Network, "connection reset")
             .with_retry(RetryClassification::Safe);
 
@@ -518,7 +519,7 @@ mod tests {
 
     #[test]
     fn default_config_has_compaction_enabled() {
-        let config = SessionOptions::default();
+        let config = CodingSessionOptions::default();
         assert!(config.enable_context_compaction);
         assert_eq!(config.compaction_threshold_percent, 80);
         assert_eq!(config.compaction_preserve_turns, 6);
@@ -526,7 +527,7 @@ mod tests {
 
     #[test]
     fn config_with_custom_values() {
-        let config = SessionOptions {
+        let config = CodingSessionOptions {
             reasoning_effort: Some(ReasoningEffort::High),
             ..Default::default()
         };
@@ -536,10 +537,10 @@ mod tests {
     #[test]
     fn debug_reports_callbacks_as_placeholders() {
         let approval: ToolApprovalFn = Arc::new(|_name, _args| Ok(()));
-        let config = SessionOptions {
+        let config = CodingSessionOptions {
             tool_hooks: Some(Arc::new(ToolApprovalAdapter(approval))),
             tool_access_policy: Some(Arc::new(StaticToolPolicy(ToolAccess::Allowed))),
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         };
 
         let debug = format!("{config:?}");
@@ -561,7 +562,7 @@ mod tests {
 
     #[test]
     fn no_tool_access_policy_exposes_tools_by_default() {
-        let config = SessionOptions::default();
+        let config = CodingSessionOptions::default();
 
         assert_eq!(config.tool_access_for("shell"), ToolAccess::Allowed);
         assert!(config.exposes_tool("shell"));
@@ -570,9 +571,9 @@ mod tests {
 
     #[test]
     fn denied_tool_access_has_denial_reason() {
-        let config = SessionOptions {
+        let config = CodingSessionOptions {
             tool_access_policy: Some(Arc::new(StaticToolPolicy(ToolAccess::Denied))),
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         };
 
         let reason = config
@@ -585,10 +586,10 @@ mod tests {
 
     #[test]
     fn approval_required_tools_follow_exposure_mode() {
-        let config = SessionOptions {
+        let config = CodingSessionOptions {
             tool_access_policy: Some(Arc::new(StaticToolPolicy(ToolAccess::RequiresApproval))),
             tool_exposure_mode: ToolExposureMode::AutoApprovedOnly,
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         };
 
         assert!(!config.exposes_tool("shell"));
@@ -599,7 +600,7 @@ mod tests {
             "shell tool requires approval, but this session does not expose approval-required tools"
         );
 
-        let config = SessionOptions {
+        let config = CodingSessionOptions {
             tool_exposure_mode: ToolExposureMode::IncludeRequiresApproval,
             ..config
         };

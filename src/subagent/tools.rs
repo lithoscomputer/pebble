@@ -132,7 +132,7 @@ fn wait_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
             Box::pin(async move {
                 let agent_id = required_str(&arguments, "agent_id")?;
                 // The context's token is the composite one: an interrupted
-                // round and an ended run both reach the wait, and both close
+                // turn and an ended prompt both reach the wait, and both close
                 // the child on their way out.
                 let result = supervisor
                     .wait_with_cancel(agent_id, &context.cancel)

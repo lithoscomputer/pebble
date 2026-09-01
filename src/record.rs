@@ -116,11 +116,12 @@ impl SessionRecord {
 
 /// One stored conversation turn.
 ///
-/// The mirror of [`crate::Message`]. The two forms hold the same facts:
-/// [`crate::Message::to_stored_message`] writes one and
-/// [`crate::Message::from_stored_message`] reads it back, keeping every field.
-/// Timestamps are the one place the serialized form is coarser than the turn
-/// it came from, because they are written with millisecond precision.
+/// The mirror of [`crate::resources::Message`]. The two forms hold the same
+/// facts: [`crate::resources::Message::to_stored_message`] writes one and
+/// [`crate::resources::Message::from_stored_message`] reads it back, keeping
+/// every field. Timestamps are the one place the serialized form is coarser
+/// than the turn it came from, because they are written with millisecond
+/// precision.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]

@@ -47,7 +47,8 @@ use lithos_llm::Client;
 use lithos_llm::catalog::Catalog;
 use lithos_llm::credentials::EnvironmentCredentials;
 use lithos_llm::middleware::{RetryMiddleware, RetryPolicy};
-use pebble::{CodingSession, LocalEnvironment, RetryEventObserver, ShutdownReason};
+use pebble::events::RetryEventObserver;
+use pebble::{CodingSession, LocalEnvironment, ShutdownReason};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -80,6 +81,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
 and system-prompt construction happen inside the build. There is no separate
 initialization step to remember. `prompt` returns a `PromptOutcome` with the final
 message, text, token usage, cost, and timing.
+
+The crate root contains the normal coding-session path and the environment
+contract. Durable event types are in `pebble::events`. Tool contracts and
+built-in tools are in `pebble::tools`. History and loaded resources are in
+`pebble::resources`. Lower-level session construction is in
+`pebble::advanced`.
 
 Take a `CodingSessionControlHandle` before calling `prompt` when another task
 must `steer`, `follow_up`, `abort`, or `wait_for_idle` while the prompt holds
@@ -126,21 +133,22 @@ lossy for a reader that falls behind: right for a terminal, wrong for a ledger.
 The stream ends with the session rather than with the session value: once
 `CodingSession::shutdown` has returned, a reader looping until
 `RecvError::Closed` finishes, so a renderer task can be joined before the
-session is dropped. An application that must see every event installs an
-`EventSink` instead — each event is recorded there, in sequence, before any
-subscriber sees it, and a sink that refuses one stops the prompt, because a
-session that cannot record what it did is worse than one that stops.
+session is dropped. An application that must see every event installs a
+`pebble::events::EventSink` instead. Each event is recorded there, in sequence,
+before any subscriber sees it. A sink that refuses one stops the prompt,
+because a session that cannot record what it did is worse than one that stops.
 
 **A policy, if the agent should not do everything.** Pebble installs none: with
-no `ToolAccessPolicy` and no `ToolHookCallback`, every registered tool is
-exposed and every call runs. `PermissionLevel` and its table are there to build
-a policy out of, not a policy pebble applies.
+no `pebble::tools::ToolAccessPolicy` and no
+`pebble::tools::ToolHookCallback`, every registered tool is exposed and every
+call runs. `pebble::tools::PermissionLevel` and its table are there to build a
+policy out of, not a policy pebble applies.
 
-Optional seams follow the same rule — pebble ships no implementation and
-advertises no tool without one: a `HumanInputProvider` (no provider, no
-question tool), a `SearchProvider` (no provider, no `web_search`), a `Redactor`
-for the process output the event stream carries, and a `SessionFactory` for
-subagents.
+Optional seams follow the same rule. Pebble ships no implementation and
+advertises no tool without one: an `advanced::HumanInputProvider` (no provider,
+no question tool), an `advanced::SearchProvider` (no provider, no
+`web_search`), an `advanced::Redactor` for process output, and an
+`advanced::SessionFactory` for subagents.
 
 ## The generic agent API
 
@@ -182,7 +190,7 @@ history before a model turn without adding coding policy to the agent crate.
 The coding layer has the same concise path for application tools:
 
 ```rust
-use pebble::RegisteredTool;
+use pebble::tools::RegisteredTool;
 use serde_json::json;
 
 let inspect = RegisteredTool::function(
@@ -213,10 +221,11 @@ is a build error, not a session that runs with the wrong prompt.
 
 ## Stability
 
-The serialized form of `CodingSessionEvent` (`SessionEvent`) and `CodingEvent`
-(`AgentEvent`) is public API, and so is `SessionRecord`, which carries a format
-version. Evolution is additive: new variants and new optional fields. Consumers
-should ignore members they do not know and tolerate variants they do not know.
+The serialized form of `pebble::events::CodingSessionEvent` and
+`pebble::events::CodingEvent` is public API. So is
+`pebble::resources::SessionRecord`, which carries a format version. Evolution
+is additive: new variants and new optional fields. Consumers should ignore
+members they do not know and tolerate variants they do not know.
 
 Ignoring an unknown member is free; tolerating an unknown *variant* is the
 reader's own work, because a variant a build has never heard of fails the whole

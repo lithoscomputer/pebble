@@ -26,7 +26,7 @@ use super::control::SteeringItem;
 use super::retry::RetryEventBridge;
 use super::{PromptTotals, Session};
 use crate::compaction::{CompactionRequest, check_context_usage, compact_context};
-use crate::config::SessionOptions;
+use crate::config::CodingSessionOptions;
 use crate::context_window::{
     ContextWindowInput, build_local_snapshot, context_window_from_response_usage,
 };
@@ -48,7 +48,7 @@ use crate::tool::{
     canonical_tool_name,
 };
 use crate::types::{
-    AgentEvent, ContextWindowSnapshot, CostSource, LlmOutputKind, LlmRetryPhase, Message,
+    CodingEvent, ContextWindowSnapshot, CostSource, LlmOutputKind, LlmRetryPhase, Message,
     SessionState, SkillActivationSource, TokenUsage,
 };
 
@@ -68,7 +68,7 @@ struct CodingAgentBridge {
     provider:               String,
     system_prompt:          String,
     facts:                  ModelFacts,
-    config:                 SessionOptions,
+    config:                 CodingSessionOptions,
     registry:               ToolRegistry,
     env:                    Arc<dyn Environment>,
     human_input:            Option<Arc<dyn HumanInputProvider>>,
@@ -158,7 +158,7 @@ impl CodingAgentBridge {
             .take()
     }
 
-    fn emit(&self, event: AgentEvent) {
+    fn emit(&self, event: CodingEvent) {
         self.emitter.emit(self.session_id.clone(), event);
     }
 
@@ -196,7 +196,7 @@ impl CodingAgentBridge {
             }
         };
         for generation in generations {
-            self.emit(AgentEvent::RoundInterrupted { generation });
+            self.emit(CodingEvent::RoundInterrupted { generation });
         }
     }
 
@@ -258,7 +258,7 @@ impl CodingAgentBridge {
         )
         .await
         {
-            self.emit(AgentEvent::Error {
+            self.emit(CodingEvent::Error {
                 error: ErrorData::from(&error),
             });
             return true;
@@ -301,7 +301,7 @@ impl CodingAgentBridge {
             timestamp: SystemTime::now(),
         });
         drop(state);
-        self.emit(AgentEvent::UserInput { text });
+        self.emit(CodingEvent::UserInput { text });
     }
 
     fn commit_steering(&self, message: &LlmMessage) {
@@ -322,7 +322,7 @@ impl CodingAgentBridge {
                     timestamp,
                 });
                 drop(state);
-                self.emit(AgentEvent::SteeringInjected { text, actor });
+                self.emit(CodingEvent::SteeringInjected { text, actor });
             }
             SteeringItem::User { text } => state.history.push(Message::User {
                 content: text,
@@ -372,7 +372,7 @@ impl CodingAgentBridge {
         drop(state);
 
         let answering_model = response.model.model().as_str();
-        self.emit(AgentEvent::AssistantMessage {
+        self.emit(CodingEvent::AssistantMessage {
             text,
             model: if answering_model.is_empty() {
                 self.model.clone()
@@ -420,7 +420,7 @@ impl EventProjection for CodingAgentBridge {
                 state.local_context_window = Some(local);
                 state.inference_start = Some(Instant::now());
                 drop(state);
-                self.emit(AgentEvent::LlmRequestStarted {
+                self.emit(CodingEvent::LlmRequestStarted {
                     requested_model: self.model.clone(),
                 });
             }
@@ -431,20 +431,20 @@ impl EventProjection for CodingAgentBridge {
                     FirstOutputKind::ToolCall => LlmOutputKind::ToolCall,
                     _ => return,
                 };
-                self.emit(AgentEvent::LlmFirstOutput { kind });
+                self.emit(CodingEvent::LlmFirstOutput { kind });
             }
             GenericEvent::TextDelta { delta } => {
-                self.emit(AgentEvent::TextDelta {
+                self.emit(CodingEvent::TextDelta {
                     delta: delta.clone(),
                 });
             }
             GenericEvent::ReasoningDelta { delta } => {
-                self.emit(AgentEvent::ReasoningDelta {
+                self.emit(CodingEvent::ReasoningDelta {
                     delta: delta.clone(),
                 });
             }
             GenericEvent::OutputReplaced => {
-                self.emit(AgentEvent::AssistantOutputReplace {
+                self.emit(CodingEvent::AssistantOutputReplace {
                     text:      String::new(),
                     reasoning: None,
                 });
@@ -454,7 +454,7 @@ impl EventProjection for CodingAgentBridge {
                 delay_seconds,
                 error,
             } => {
-                self.emit(AgentEvent::LlmRetry {
+                self.emit(CodingEvent::LlmRetry {
                     provider:   self.provider.clone(),
                     model:      self.model.clone(),
                     attempt:    usize::try_from(failed_attempt.saturating_sub(1))
@@ -549,7 +549,7 @@ impl ToolRoundExecutor for CodingAgentBridge {
         }
         drop(state);
         if loop_detected {
-            self.emit(AgentEvent::LoopDetected);
+            self.emit(CodingEvent::LoopDetected);
         }
         results
     }
@@ -640,7 +640,7 @@ impl TurnBoundaryHooks for CodingAgentBridge {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .activated_skill_context_observed = true;
-                self.emit(AgentEvent::SkillActivated {
+                self.emit(CodingEvent::SkillActivated {
                     skill_name: name,
                     source:     SkillActivationSource::Slash,
                 });
@@ -709,7 +709,7 @@ impl Session {
         let expanded = self.expand_input(input, skill_expansion)?;
         if let Some(name) = &expanded.skill_name {
             self.activated_skill_context_observed = true;
-            self.emit(AgentEvent::SkillActivated {
+            self.emit(CodingEvent::SkillActivated {
                 skill_name: name.clone(),
                 source:     SkillActivationSource::Slash,
             });

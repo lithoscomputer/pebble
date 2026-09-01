@@ -1,23 +1,24 @@
 //! Steering a session that is already running.
 //!
 //! A running session is busy inside
-//! [`Session::prompt`](crate::Session::prompt), so everything an application
-//! wants to say to it mid-prompt arrives through a [`SessionControlHandle`]: a
-//! cheap clone of the three shared pieces the session and its callers both
-//! hold. The handle queues messages and cancels the current round; the session
-//! drains the queue at round boundaries.
+//! [`Session::prompt`](crate::advanced::Session::prompt), so everything an
+//! application wants to say to it mid-prompt arrives through a
+//! [`SessionControlHandle`]. The handle queues messages and asks the active
+//! provider-neutral agent to interrupt its current model turn. The coding
+//! bridge commits the queued message and its durable event at the next turn
+//! boundary.
 //!
 //! Two gestures are distinct and often confused. [`SessionControlHandle`]
 //! *interrupts a round*: the current turn is abandoned and the session picks up
-//! whatever is queued. [`Session::interrupt`](crate::Session::interrupt) ends
+//! whatever is queued.
+//! [`Session::interrupt`](crate::advanced::Session::interrupt) ends
 //! the whole prompt. Only the second closes the session.
 
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use pebble_agent::AgentControlHandle;
 use tokio::sync::Notify;
-use tokio_util::sync::CancellationToken;
 
 use crate::types::Actor;
 
@@ -56,9 +57,9 @@ impl SteeringMessage {
 /// The three kinds differ in what the model is told they are: guidance that
 /// stays visibly separate from the conversation, another user turn, or a system
 /// note. Only [`Steering`](Self::Steering) publishes
-/// [`SteeringInjected`](crate::AgentEvent::SteeringInjected); the other two are
-/// how a surrounding system writes into the conversation without claiming a
-/// person said it.
+/// [`SteeringInjected`](crate::events::CodingEvent::SteeringInjected); the
+/// other two are how a surrounding system writes into the conversation without
+/// claiming a person said it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum SteeringItem {
@@ -118,14 +119,15 @@ impl From<SteeringMessage> for SteeringItem {
     }
 }
 
-/// Everything the control plane and the loop share, under one lock.
+/// Coding metadata shared by the control plane and the agent bridge.
 ///
 /// The two generation counters are the exactly-once interrupt ledger: every
 /// gesture raises `interrupt_generation`, and the loop raises
 /// `settled_interrupt_generation` to match as it publishes one
-/// [`RoundInterrupted`](crate::AgentEvent::RoundInterrupted) per generation it
-/// has not settled yet. Several interrupts before the loop unwinds therefore
-/// produce one event each, never two for one gesture and never none.
+/// [`RoundInterrupted`](crate::events::CodingEvent::RoundInterrupted) per
+/// generation it has not settled yet. Several interrupts before the loop
+/// unwinds therefore produce one event each, never two for one gesture and
+/// never none.
 #[derive(Debug, Default)]
 pub(crate) struct ControlState {
     pub(crate) queue: VecDeque<SteeringItem>,
@@ -155,8 +157,8 @@ pub trait CompletionCoordinator: Send + Sync {
 /// The handle that steers and interrupts a running session.
 ///
 /// Cloning is cheap, and every clone drives the same session:
-/// [`Session::control_handle`](crate::Session::control_handle) builds one from
-/// the state the session itself holds. An unattached handle from
+/// [`Session::control_handle`](crate::advanced::Session::control_handle) builds
+/// one from the state the session itself holds. An unattached handle from
 /// [`SessionControlHandle::new`] drives nothing, which is what a test or a
 /// half-built application wants.
 ///
@@ -165,7 +167,6 @@ pub trait CompletionCoordinator: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct SessionControlHandle {
     control:      Arc<Mutex<ControlState>>,
-    round_token:  Arc<RwLock<CancellationToken>>,
     notify:       Arc<Notify>,
     active_agent: Arc<Mutex<Option<AgentControlHandle>>>,
 }
@@ -182,7 +183,6 @@ impl SessionControlHandle {
     pub fn new() -> Self {
         Self {
             control:      Arc::new(Mutex::new(ControlState::default())),
-            round_token:  Arc::new(RwLock::new(CancellationToken::new())),
             notify:       Arc::new(Notify::new()),
             active_agent: Arc::new(Mutex::new(None)),
         }
@@ -191,13 +191,11 @@ impl SessionControlHandle {
     /// Builds the handle that shares one session's control state.
     pub(crate) fn attached(
         control: Arc<Mutex<ControlState>>,
-        round_token: Arc<RwLock<CancellationToken>>,
         notify: Arc<Notify>,
         active_agent: Arc<Mutex<Option<AgentControlHandle>>>,
     ) -> Self {
         Self {
             control,
-            round_token,
             notify,
             active_agent,
         }
@@ -217,10 +215,11 @@ impl SessionControlHandle {
     /// waits for a steer, so an operator can stop a prompt mid-thought and
     /// decide what to say afterwards. The gesture is counted, so the
     /// session publishes exactly one
-    /// [`RoundInterrupted`](crate::AgentEvent::RoundInterrupted) for it.
+    /// [`RoundInterrupted`](crate::events::CodingEvent::RoundInterrupted) for
+    /// it.
     ///
     /// This does not end the prompt.
-    /// [`Session::interrupt`](crate::Session::interrupt) does that.
+    /// [`Session::interrupt`](crate::advanced::Session::interrupt) does that.
     ///
     /// No author is taken, because nothing records one: an interrupt is
     /// announced as a generation, not as something somebody said. Where the
@@ -234,9 +233,7 @@ impl SessionControlHandle {
                 control.waiting_for_steer = true;
             }
         }
-        if !self.with_active_agent(AgentControlHandle::interrupt) {
-            self.cancel_round();
-        }
+        let _ = self.with_active_agent(AgentControlHandle::interrupt);
         self.notify.notify_waiters();
     }
 
@@ -344,9 +341,7 @@ impl SessionControlHandle {
             control.waiting_for_steer = false;
             evicted
         };
-        if !self.with_active_agent(|agent| agent.steer(text)) {
-            self.cancel_round();
-        }
+        let _ = self.with_active_agent(|agent| agent.steer(text));
         self.notify.notify_waiters();
         evicted
     }
@@ -389,21 +384,8 @@ impl SessionControlHandle {
             control.queue.push_back(item);
             control.waiting_for_steer = false;
         }
-        if !self.with_active_agent(|agent| agent.steer(text)) {
-            self.cancel_round();
-        }
+        let _ = self.with_active_agent(|agent| agent.steer(text));
         self.notify.notify_waiters();
-    }
-
-    /// Cancels the round the session is in right now.
-    ///
-    /// The cell is shared; the session swaps a fresh token into it as each
-    /// round starts, so this always reaches the live round.
-    fn cancel_round(&self) {
-        self.round_token
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .cancel();
     }
 
     fn deliver_to_active_agent(&self, text: String, interrupt: bool) {
@@ -474,16 +456,6 @@ mod tests {
     }
 
     #[test]
-    fn an_interrupt_cancels_the_round_the_session_is_in() {
-        let handle = SessionControlHandle::new();
-        let round = handle.round_token.read().expect("not poisoned").clone();
-
-        handle.interrupt();
-
-        assert!(round.is_cancelled());
-    }
-
-    #[test]
     fn a_steer_clears_a_park() {
         let handle = SessionControlHandle::new();
         handle.interrupt();
@@ -495,14 +467,12 @@ mod tests {
     }
 
     #[test]
-    fn parking_claims_a_session_without_cancelling_its_round() {
+    fn parking_claims_a_session() {
         let handle = SessionControlHandle::new();
-        let round = handle.round_token.read().expect("not poisoned").clone();
 
         handle.park_for_steer();
 
         assert!(handle.is_waiting_for_steer());
-        assert!(!round.is_cancelled());
     }
 
     #[test]
@@ -541,13 +511,11 @@ mod tests {
     #[test]
     fn an_interrupting_bounded_enqueue_does_both_at_once() {
         let handle = SessionControlHandle::new();
-        let round = handle.round_token.read().expect("not poisoned").clone();
         handle.enqueue(SteeringItem::steering("first"));
 
         let evicted = handle.interrupt_then_enqueue_bounded(SteeringItem::steering("second"), 1);
 
         assert_eq!(evicted.as_ref().map(SteeringItem::text), Some("first"));
-        assert!(round.is_cancelled());
         assert_eq!(handle.lock().interrupt_generation, 1);
         assert!(!handle.is_waiting_for_steer());
     }

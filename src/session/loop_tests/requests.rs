@@ -20,7 +20,7 @@ struct NamedToolAccessPolicy {
 }
 
 impl NamedToolAccessPolicy {
-    /// The policy, ready to install on [`SessionOptions`].
+    /// The policy, ready to install on [`CodingSessionOptions`].
     fn installed(decisions: Vec<(&'static str, ToolAccess)>) -> Arc<dyn ToolAccessPolicy> {
         Arc::new(Self { decisions })
     }
@@ -47,9 +47,9 @@ fn tool_names(request: &Request) -> Vec<&str> {
 #[tokio::test]
 async fn the_system_prompt_carries_the_application_instructions() {
     let (mut session, provider) = TestSession::new(answers("captured"))
-        .options(SessionOptions {
+        .options(CodingSessionOptions {
             user_instructions: Some("Always use TDD".to_owned()),
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         })
         .build();
     session.initialize().await.expect("initialization succeeds");
@@ -112,13 +112,13 @@ async fn every_registered_tool_is_exposed_when_no_policy_says_otherwise() {
 async fn a_denied_tool_is_never_advertised() {
     let (mut session, provider) = TestSession::new(answers("captured"))
         .tools([noop_tool("read_file"), noop_tool("write_file")])
-        .options(SessionOptions {
+        .options(CodingSessionOptions {
             tool_access_policy: Some(NamedToolAccessPolicy::installed(vec![
                 ("read_file", ToolAccess::Allowed),
                 ("write_file", ToolAccess::Denied),
             ])),
             tool_exposure_mode: ToolExposureMode::IncludeRequiresApproval,
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         })
         .build();
 
@@ -133,13 +133,13 @@ async fn a_denied_tool_is_never_advertised() {
 async fn an_approval_required_tool_is_advertised_where_the_mode_allows_it() {
     let (mut session, provider) = TestSession::new(answers("captured"))
         .tools([noop_tool("read_file"), noop_tool("shell")])
-        .options(SessionOptions {
+        .options(CodingSessionOptions {
             tool_access_policy: Some(NamedToolAccessPolicy::installed(vec![
                 ("read_file", ToolAccess::Allowed),
                 ("shell", ToolAccess::RequiresApproval),
             ])),
             tool_exposure_mode: ToolExposureMode::IncludeRequiresApproval,
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         })
         .build();
 
@@ -160,14 +160,14 @@ async fn the_tools_a_session_reports_are_the_tools_it_sends() {
             noop_tool("apply_patch"),
             noop_tool("shell"),
         ])
-        .options(SessionOptions {
+        .options(CodingSessionOptions {
             tool_access_policy: Some(NamedToolAccessPolicy::installed(vec![
                 ("read_file", ToolAccess::Allowed),
                 ("apply_patch", ToolAccess::RequiresApproval),
                 ("shell", ToolAccess::Denied),
             ])),
             tool_exposure_mode: ToolExposureMode::IncludeRequiresApproval,
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         })
         .build();
 
@@ -238,11 +238,11 @@ fn approval_calls() -> Vec<ScriptedCall> {
 async fn a_refused_call_answers_the_model_with_the_reason() {
     let (mut session, _provider) = TestSession::new(approval_calls())
         .tools([echo_tool()])
-        .options(SessionOptions {
+        .options(CodingSessionOptions {
             tool_hooks: Some(Arc::new(ToolApprovalAdapter(Arc::new(
                 |_name, _arguments| Err("denied by policy".to_owned()),
             )))),
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         })
         .build();
     let mut events = session.subscribe();
@@ -262,12 +262,12 @@ async fn a_refused_call_answers_the_model_with_the_reason() {
     );
 
     let published = settled(&mut session, &mut events).await;
-    let completions: Vec<&AgentEvent> = published
+    let completions: Vec<&CodingEvent> = published
         .iter()
-        .filter(|event| matches!(event, AgentEvent::ToolCallCompleted { .. }))
+        .filter(|event| matches!(event, CodingEvent::ToolCallCompleted { .. }))
         .collect();
     assert_eq!(completions.len(), 1);
-    assert!(matches!(completions[0], AgentEvent::ToolCallCompleted {
+    assert!(matches!(completions[0], CodingEvent::ToolCallCompleted {
         is_error: true,
         ..
     }));
@@ -277,11 +277,11 @@ async fn a_refused_call_answers_the_model_with_the_reason() {
 async fn an_approved_call_runs() {
     let (mut session, _provider) = TestSession::new(approval_calls())
         .tools([echo_tool()])
-        .options(SessionOptions {
+        .options(CodingSessionOptions {
             tool_hooks: Some(Arc::new(ToolApprovalAdapter(Arc::new(
                 |_name, _arguments| Ok(()),
             )))),
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         })
         .build();
 
@@ -308,7 +308,7 @@ async fn the_approval_hook_sees_the_call_the_model_asked_for() {
         ScriptedCall::response(text_response("Done")),
     ])
     .tools([echo_tool()])
-    .options(SessionOptions {
+    .options(CodingSessionOptions {
         tool_hooks: Some(Arc::new(ToolApprovalAdapter(Arc::new(
             move |name, arguments| {
                 *recorder.lock().unwrap_or_else(PoisonError::into_inner) =
@@ -316,7 +316,7 @@ async fn the_approval_hook_sees_the_call_the_model_asked_for() {
                 Ok(())
             },
         )))),
-        ..SessionOptions::default()
+        ..CodingSessionOptions::default()
     })
     .build();
 
@@ -335,9 +335,9 @@ async fn the_approval_hook_sees_the_call_the_model_asked_for() {
 async fn a_session_with_no_hook_runs_the_call_unchecked() {
     let (mut session, _provider) = TestSession::new(approval_calls())
         .tools([echo_tool()])
-        .options(SessionOptions {
+        .options(CodingSessionOptions {
             tool_hooks: None,
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         })
         .build();
 
@@ -364,11 +364,11 @@ async fn a_subscriber_sees_the_round_while_it_runs() {
     let mut events = session.subscribe();
     let watcher = tokio::spawn(async move {
         wait_for_event(&mut events, |event| {
-            matches!(event, AgentEvent::ToolCallStarted { tool_name, .. } if tool_name == "echo")
+            matches!(event, CodingEvent::ToolCallStarted { tool_name, .. } if tool_name == "echo")
         })
         .await;
         wait_for_event(&mut events, |event| {
-            matches!(event, AgentEvent::ToolCallCompleted { .. })
+            matches!(event, CodingEvent::ToolCallCompleted { .. })
         })
         .await;
     });

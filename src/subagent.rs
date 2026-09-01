@@ -11,8 +11,8 @@
 //! own dependencies — the same client, model, harness, environment, tools, and
 //! policy — so a child inherits what its parent had and cannot be given more:
 //! there is no method on the spec that widens anything, and no
-//! [`HumanInputProvider`](crate::HumanInputProvider) travels on it, which is
-//! what makes questions root-only.
+//! [`HumanInputProvider`](crate::advanced::HumanInputProvider) travels on it,
+//! which is what makes questions root-only.
 //!
 //! # How many sessions a tree may hold open
 //!
@@ -50,7 +50,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 pub(crate) use self::tools::{subagent_tools, tree_position};
-use crate::config::SessionOptions;
+use crate::config::CodingSessionOptions;
 use crate::environment::Environment;
 use crate::error::{Error, ErrorData, ErrorKind, InterruptReason, Result};
 use crate::event::EventCapacity;
@@ -60,7 +60,7 @@ use crate::search::SearchProvider;
 use crate::session::{Session, SessionBuildError, ShutdownReason};
 use crate::tool::{RegisteredTool, ToolEnvProvider, ToolError};
 use crate::types::{
-    AgentEvent, INITIAL_SUBAGENT_GENERATION, SessionEvent, SessionState, ToolErrorKind,
+    CodingEvent, CodingSessionEvent, INITIAL_SUBAGENT_GENERATION, SessionState, ToolErrorKind,
 };
 
 /// How long a closing child has to stop on its own before it is aborted.
@@ -202,9 +202,9 @@ impl Drop for SessionSlot {
 /// Builds one child session from the dependencies pebble hands it.
 ///
 /// Registering a factory is what turns subagents on:
-/// [`SessionBuilder::subagents`](crate::SessionBuilder::subagents) registers
-/// the profile's subagent tools only when there is one, and a session without
-/// one answers every spawn with a tool error.
+/// [`SessionBuilder::subagents`](crate::advanced::SessionBuilder::subagents)
+/// registers the profile's subagent tools only when there is one, and a session
+/// without one answers every spawn with a tool error.
 ///
 /// The factory decides whether a child may be built at all and what to do with
 /// the session it returns — record it, keep a control handle, install a
@@ -216,7 +216,7 @@ impl Drop for SessionSlot {
 /// ```no_run
 /// use std::sync::Arc;
 ///
-/// use pebble::{ChildSessionSpec, SessionFactory};
+/// use pebble::advanced::{ChildSessionSpec, SessionFactory};
 ///
 /// let factory: SessionFactory = Arc::new(|spec: ChildSessionSpec| spec.build());
 /// # let _ = factory;
@@ -286,7 +286,7 @@ impl ChildSessionSpec {
     /// How the child will behave, which is how the parent does apart from the
     /// memory files and skill directories the root loaded once.
     #[must_use]
-    pub fn options(&self) -> &SessionOptions {
+    pub fn options(&self) -> &CodingSessionOptions {
         &self.deps.options
     }
 
@@ -308,9 +308,9 @@ impl ChildSessionSpec {
     /// # Errors
     ///
     /// Returns [`SessionBuildError`] for the same reasons
-    /// [`SessionBuilder::build`](crate::SessionBuilder::build) does. A parent
-    /// that built successfully normally means its child does too, because the
-    /// selector and the harness are the parent's own.
+    /// [`SessionBuilder::build`](crate::advanced::SessionBuilder::build) does.
+    /// A parent that built successfully normally means its child does too,
+    /// because the selector and the harness are the parent's own.
     pub fn build(self) -> StdResult<Session, SessionBuildError> {
         let deps = Arc::clone(&self.deps);
         let mut builder = Session::builder(deps.client.clone())
@@ -351,7 +351,7 @@ pub(crate) struct ChildDeps {
     pub(crate) profile:           Arc<dyn AgentProfile>,
     pub(crate) environment:       Arc<dyn Environment>,
     pub(crate) tools:             Vec<RegisteredTool>,
-    pub(crate) options:           SessionOptions,
+    pub(crate) options:           CodingSessionOptions,
     pub(crate) tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
     /// What strips secrets out of what a child publishes. Inherited, because
     /// a child's process output reaches the same stream its parent's does.
@@ -383,9 +383,9 @@ pub(crate) struct ChildIdentity {
 #[derive(Debug, Clone)]
 pub(crate) enum SubagentCallbackEvent {
     /// A fact about a child, for the parent's own stream.
-    Lifecycle(AgentEvent),
+    Lifecycle(CodingEvent),
     /// A child's own event, to be republished as it stands.
-    Forwarded(SessionEvent),
+    Forwarded(CodingSessionEvent),
 }
 
 /// Where a supervisor sends what its children produce.
@@ -546,7 +546,7 @@ impl Drop for SubAgent {
 struct SupervisorState {
     agents:             HashMap<String, SubAgent>,
     next_spawn_seq:     u64,
-    lifecycle_events:   VecDeque<AgentEvent>,
+    lifecycle_events:   VecDeque<CodingEvent>,
     lifecycle_draining: bool,
 }
 
@@ -563,7 +563,7 @@ impl SupervisorState {
             .ok_or_else(|| unknown_agent(agent_id))
     }
 
-    fn queue_lifecycle_event(&mut self, event: AgentEvent) {
+    fn queue_lifecycle_event(&mut self, event: CodingEvent) {
         self.lifecycle_events.push_back(event);
     }
 }
@@ -605,7 +605,7 @@ fn already_closed(agent_id: &str) -> ToolError {
 ///
 /// [`ToolErrorKind`] is a narrower vocabulary than [`ErrorKind`], so a caller
 /// that needs the exact category reads it from the
-/// [`SubAgentFailed`](AgentEvent::SubAgentFailed) event, which carries the
+/// [`SubAgentFailed`](CodingEvent::SubAgentFailed) event, which carries the
 /// projection whole.
 fn child_failure(error: ErrorData) -> ToolError {
     let kind = match error.kind {
@@ -772,16 +772,16 @@ fn completion_event(
     depth: usize,
     generation: u64,
     result: &StdResult<SubagentResult, ErrorData>,
-) -> AgentEvent {
+) -> CodingEvent {
     match result {
-        Ok(result) => AgentEvent::SubAgentCompleted {
+        Ok(result) => CodingEvent::SubAgentCompleted {
             agent_id: agent_id.to_owned(),
             depth,
             generation,
             success: result.success,
             turns_used: result.turns_used,
         },
-        Err(error) => AgentEvent::SubAgentFailed {
+        Err(error) => CodingEvent::SubAgentFailed {
             agent_id: agent_id.to_owned(),
             depth,
             generation,
@@ -878,7 +878,7 @@ impl SubagentHandle {
             .map(|agent| agent.generation)
     }
 
-    fn queue_and_publish(&self, event: AgentEvent) {
+    fn queue_and_publish(&self, event: CodingEvent) {
         let Some(state) = self.state.upgrade() else {
             return;
         };
@@ -1233,7 +1233,7 @@ impl SubagentSupervisor {
                 spawn_seq,
                 slot: Some(slot),
             });
-            state.queue_lifecycle_event(AgentEvent::SubAgentSpawned {
+            state.queue_lifecycle_event(CodingEvent::SubAgentSpawned {
                 agent_id:   agent_id.clone(),
                 depth:      child_depth,
                 task:       task_prompt,
@@ -1296,9 +1296,9 @@ impl SubagentSupervisor {
                 if event.event.is_streaming_noise()
                     || matches!(
                         &event.event,
-                        AgentEvent::SessionStarted { .. }
-                            | AgentEvent::SessionEnded
-                            | AgentEvent::ProcessingEnd
+                        CodingEvent::SessionStarted { .. }
+                            | CodingEvent::SessionEnded
+                            | CodingEvent::ProcessingEnd
                     )
                 {
                     continue;
@@ -1364,7 +1364,7 @@ impl SubagentSupervisor {
                         notification.pending_generations.push_back(generation);
                     }
                     let depth = agent.depth;
-                    state.queue_lifecycle_event(AgentEvent::SubAgentTurnStarted {
+                    state.queue_lifecycle_event(CodingEvent::SubAgentTurnStarted {
                         agent_id: agent_id.to_owned(),
                         depth,
                         task: message.to_owned(),
@@ -1410,14 +1410,15 @@ impl SubagentSupervisor {
     /// # Errors
     ///
     /// Returns a [`ToolError`] of kind
-    /// [`Cancelled`](crate::ToolErrorKind::Cancelled) when `cancel` fires,
-    /// and an execution error for an agent that is unknown or closed. A child
-    /// that failed reports its own failure through this error as well, with
-    /// its category carried across by [`child_failure`]: an interrupted child
-    /// is [`Cancelled`](crate::ToolErrorKind::Cancelled), every other failure
-    /// is [`Execution`](crate::ToolErrorKind::Execution). A caller that must
-    /// tell its own cancellation apart from the child's reads the message, or
-    /// takes the whole projection from
+    /// [`Cancelled`](crate::tools::ToolErrorKind::Cancelled) when `cancel`
+    /// fires, and an execution error for an agent that is unknown or
+    /// closed. A child that failed reports its own failure through this
+    /// error as well, with its category carried across by
+    /// [`child_failure`]: an interrupted child
+    /// is [`Cancelled`](crate::tools::ToolErrorKind::Cancelled), every other
+    /// failure is [`Execution`](crate::tools::ToolErrorKind::Execution). A
+    /// caller that must tell its own cancellation apart from the child's
+    /// reads the message, or takes the whole projection from
     /// [`status`](Self::status).
     pub(crate) async fn wait_with_cancel(
         &self,
@@ -1703,7 +1704,7 @@ impl SubagentSupervisor {
             if let Some(slot) = work.slot.take() {
                 slot.release();
             }
-            work.handle.queue_and_publish(AgentEvent::SubAgentClosed {
+            work.handle.queue_and_publish(CodingEvent::SubAgentClosed {
                 agent_id:   work.handle.agent_id.clone(),
                 depth:      work.handle.depth,
                 generation: work.generation,
@@ -2108,7 +2109,7 @@ mod tests {
         (callback, captured)
     }
 
-    fn lifecycle(captured: &Captured) -> Vec<AgentEvent> {
+    fn lifecycle(captured: &Captured) -> Vec<CodingEvent> {
         captured
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -2138,7 +2139,7 @@ mod tests {
     /// Where a drain sends what it delivers.
     type CallbackSlot = Arc<RwLock<Option<SubagentEventCallback>>>;
     /// What a drain delivered.
-    type SeenEvents = Arc<Mutex<Vec<AgentEvent>>>;
+    type SeenEvents = Arc<Mutex<Vec<CodingEvent>>>;
 
     /// A callback slot that records the lifecycle events a drain delivers.
     fn recording_lifecycle_callback() -> (CallbackSlot, SeenEvents) {
@@ -2155,8 +2156,8 @@ mod tests {
         (Arc::new(RwLock::new(Some(callback))), seen)
     }
 
-    fn closed_event(agent_id: &str) -> AgentEvent {
-        AgentEvent::SubAgentClosed {
+    fn closed_event(agent_id: &str) -> CodingEvent {
+        CodingEvent::SubAgentClosed {
             agent_id:   agent_id.to_owned(),
             depth:      1,
             generation: INITIAL_SUBAGENT_GENERATION,
@@ -2607,13 +2608,13 @@ mod tests {
         assert!(
             !events
                 .iter()
-                .any(|event| matches!(event, AgentEvent::SubAgentTurnStarted { .. })),
+                .any(|event| matches!(event, CodingEvent::SubAgentTurnStarted { .. })),
             "a follow-up does not start a generation: {events:?}"
         );
         assert!(
             events
                 .iter()
-                .any(|event| matches!(event, AgentEvent::SubAgentCompleted { generation: 1, .. }))
+                .any(|event| matches!(event, CodingEvent::SubAgentCompleted { generation: 1, .. }))
         );
         supervisor.shutdown_all().await;
     }
@@ -2674,7 +2675,7 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(event, AgentEvent::SubAgentSpawned { .. }))
+                .filter(|event| matches!(event, CodingEvent::SubAgentSpawned { .. }))
                 .count(),
             1,
             "one session, two turns: {events:?}"
@@ -2682,7 +2683,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|event| matches!(event, AgentEvent::SubAgentTurnStarted {
+                .any(|event| matches!(event, CodingEvent::SubAgentTurnStarted {
                     generation: 2,
                     ..
                 }))
@@ -2690,7 +2691,7 @@ mod tests {
         let completions: Vec<u64> = events
             .iter()
             .filter_map(|event| match event {
-                AgentEvent::SubAgentCompleted { generation, .. } => Some(*generation),
+                CodingEvent::SubAgentCompleted { generation, .. } => Some(*generation),
                 _ => None,
             })
             .collect();
@@ -2777,7 +2778,7 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(event, AgentEvent::SubAgentCompleted { .. }))
+                .filter(|event| matches!(event, CodingEvent::SubAgentCompleted { .. }))
                 .count(),
             1,
             "{events:?}"
@@ -2808,7 +2809,7 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(event, AgentEvent::SubAgentCompleted { .. }))
+                .filter(|event| matches!(event, CodingEvent::SubAgentCompleted { .. }))
                 .count(),
             1,
             "{events:?}"
@@ -2977,7 +2978,7 @@ mod tests {
         let events = lifecycle(&captured);
         assert_eq!(events.len(), 1, "{events:?}");
         assert!(
-            matches!(&events[0], AgentEvent::SubAgentSpawned { depth: 1, task, generation: 1, .. }
+            matches!(&events[0], CodingEvent::SubAgentSpawned { depth: 1, task, generation: 1, .. }
                 if task == "test task"),
             "{events:?}"
         );
@@ -2997,7 +2998,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|event| matches!(event, AgentEvent::SubAgentCompleted {
+                .any(|event| matches!(event, CodingEvent::SubAgentCompleted {
                     depth: 1,
                     success: true,
                     ..
@@ -3023,7 +3024,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|event| matches!(event, AgentEvent::SubAgentClosed { depth: 1, .. })),
+                .any(|event| matches!(event, CodingEvent::SubAgentClosed { depth: 1, .. })),
             "{events:?}"
         );
     }
@@ -3051,7 +3052,7 @@ mod tests {
         assert!(
             events
                 .iter()
-                .any(|event| matches!(event, AgentEvent::SubAgentSpawned { depth: 2, .. })),
+                .any(|event| matches!(event, CodingEvent::SubAgentSpawned { depth: 2, .. })),
             "a grandchild sits one deeper than its parent: {events:?}"
         );
         assert!(child.supervisor.contains(&grandchild));
@@ -3079,7 +3080,7 @@ mod tests {
             .await
             .expect("the parent shuts down");
 
-        let published: Vec<SessionEvent> = iter::from_fn(|| events.try_recv().ok()).collect();
+        let published: Vec<CodingSessionEvent> = iter::from_fn(|| events.try_recv().ok()).collect();
         let forwarded = published
             .iter()
             .find(|event| event.session_id != parent.id())
@@ -3089,7 +3090,7 @@ mod tests {
         assert!(
             published.iter().any(|event| {
                 event.session_id != parent.id()
-                    && matches!(&event.event, AgentEvent::AssistantMessage { text, .. }
+                    && matches!(&event.event, CodingEvent::AssistantMessage { text, .. }
                         if text == "child result")
             }),
             "what the child answered is news the parent's readers get: {published:?}"
@@ -3097,7 +3098,7 @@ mod tests {
         assert!(
             published
                 .iter()
-                .any(|event| matches!(event.event, AgentEvent::SubAgentSpawned { .. })),
+                .any(|event| matches!(event.event, CodingEvent::SubAgentSpawned { .. })),
             "the parent's own news about the child is on the same stream"
         );
         // One numbering for the whole stream: the parent's own events and the
@@ -3112,7 +3113,7 @@ mod tests {
         assert!(
             !published
                 .iter()
-                .any(|event| matches!(event.event, AgentEvent::TextDelta { .. })),
+                .any(|event| matches!(event.event, CodingEvent::TextDelta { .. })),
             "the parent's stream carries the child's news, not its keystrokes"
         );
     }
@@ -3123,16 +3124,16 @@ mod tests {
         let mut events = parent.subscribe();
         let callback = parent.sub_agent_event_callback();
 
-        let grandchild = SessionEvent::new(
+        let grandchild = CodingSessionEvent::new(
             "ses_grandchild".to_owned(),
-            AgentEvent::ProcessingEnd,
+            CodingEvent::ProcessingEnd,
             SystemTime::now(),
         )
         .with_parent_session_id("ses_child".to_owned());
         callback(SubagentCallbackEvent::Forwarded(grandchild));
-        let child = SessionEvent::new(
+        let child = CodingSessionEvent::new(
             "ses_child".to_owned(),
-            AgentEvent::ProcessingEnd,
+            CodingEvent::ProcessingEnd,
             SystemTime::now(),
         );
         callback(SubagentCallbackEvent::Forwarded(child));
@@ -3141,7 +3142,7 @@ mod tests {
             .await
             .expect("the parent shuts down");
 
-        let published: Vec<SessionEvent> = iter::from_fn(|| events.try_recv().ok()).collect();
+        let published: Vec<CodingSessionEvent> = iter::from_fn(|| events.try_recv().ok()).collect();
         let stamped: Vec<(String, Option<String>)> = published
             .iter()
             .filter(|event| event.session_id != parent.id())
@@ -3309,17 +3310,17 @@ mod tests {
         // the runtime check that stops the second.
         let (session, _provider) =
             TestSession::new(vec![ScriptedCall::response(text_response("child result"))])
-                .options(SessionOptions {
+                .options(CodingSessionOptions {
                     permission_level: Some(PermissionLevel::ReadOnly),
-                    ..SessionOptions::default()
+                    ..CodingSessionOptions::default()
                 })
                 .subagents(Arc::new(|_spec: ChildSessionSpec| {
                     let (wider, _provider) =
                         TestSession::new(vec![ScriptedCall::response(text_response("mine"))])
                             .tools(vec![noop_tool("privileged")])
-                            .options(SessionOptions {
+                            .options(CodingSessionOptions {
                                 permission_level: Some(PermissionLevel::Full),
-                                ..SessionOptions::default()
+                                ..CodingSessionOptions::default()
                             })
                             .human_input(Arc::new(AlwaysSilent))
                             .build();
@@ -3422,10 +3423,10 @@ mod tests {
             scripted_client(vec![ScriptedCall::response(text_response("child result"))]);
         let session = testing::builder(client)
             .tools(vec![noop_tool("allowed"), noop_tool("forbidden")])
-            .options(SessionOptions {
+            .options(CodingSessionOptions {
                 permission_level: Some(PermissionLevel::ReadOnly),
                 tool_access_policy: Some(Arc::new(DenyByName("forbidden"))),
-                ..SessionOptions::default()
+                ..CodingSessionOptions::default()
             })
             .subagents(factory)
             .build()
@@ -3519,7 +3520,7 @@ mod tests {
         assert!(
             events.iter().any(|event| matches!(
                 event,
-                AgentEvent::SubAgentFailed {
+                CodingEvent::SubAgentFailed {
                     depth: 1,
                     generation: 1,
                     error,
@@ -3532,7 +3533,7 @@ mod tests {
         assert!(
             !events
                 .iter()
-                .any(|event| matches!(event, AgentEvent::SubAgentCompleted { .. })),
+                .any(|event| matches!(event, CodingEvent::SubAgentCompleted { .. })),
             "a failure is not a completion: {events:?}"
         );
         assert!(matches!(
@@ -3938,7 +3939,7 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(event, AgentEvent::SubAgentClosed { .. }))
+                .filter(|event| matches!(event, CodingEvent::SubAgentClosed { .. }))
                 .count(),
             1,
             "one close, announced once: {events:?}"
@@ -3977,8 +3978,8 @@ mod tests {
         let recorder = Arc::clone(&seen);
         supervisor.set_event_callback(Arc::new(move |event| {
             let SubagentCallbackEvent::Lifecycle(
-                AgentEvent::SubAgentSpawned { agent_id, .. }
-                | AgentEvent::SubAgentCompleted { agent_id, .. },
+                CodingEvent::SubAgentSpawned { agent_id, .. }
+                | CodingEvent::SubAgentCompleted { agent_id, .. },
             ) = &event
             else {
                 return;

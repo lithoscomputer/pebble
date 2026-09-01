@@ -33,7 +33,7 @@ const MAX_PATTERN_LEN: usize = 3;
 /// Fewer than two tool-calling turns is never a loop.
 ///
 /// ```
-/// # use pebble::{History, detect_loop};
+/// # use pebble::resources::{History, detect_loop};
 /// let history = History::default();
 /// assert!(!detect_loop(&history, 10));
 /// ```

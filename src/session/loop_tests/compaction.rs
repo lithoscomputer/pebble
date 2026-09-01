@@ -36,11 +36,11 @@ fn summary() -> Vec<ScriptedCompletion> {
 }
 
 /// The `context_window` warnings a prompt published.
-fn warnings(events: &[AgentEvent]) -> Vec<serde_json::Value> {
+fn warnings(events: &[CodingEvent]) -> Vec<serde_json::Value> {
     events
         .iter()
         .filter_map(|event| match event {
-            AgentEvent::Warning { kind, details, .. } if kind == "context_window" => {
+            CodingEvent::Warning { kind, details, .. } if kind == "context_window" => {
                 Some(details.clone())
             }
             _ => None,
@@ -89,10 +89,10 @@ async fn crossing_the_threshold_summarizes_the_older_turns() {
     ))])
     .model("test/small")
     .completing(summary())
-    .options(SessionOptions {
+    .options(CodingSessionOptions {
         enable_context_compaction: true,
         compaction_preserve_turns: 1,
-        ..SessionOptions::default()
+        ..CodingSessionOptions::default()
     })
     .build();
     let mut events = session.subscribe();
@@ -106,13 +106,13 @@ async fn crossing_the_threshold_summarizes_the_older_turns() {
     assert!(
         published
             .iter()
-            .any(|event| matches!(event, AgentEvent::CompactionStarted { .. })),
+            .any(|event| matches!(event, CodingEvent::CompactionStarted { .. })),
         "compaction announces itself"
     );
     assert!(
         published
             .iter()
-            .any(|event| matches!(event, AgentEvent::CompactionCompleted { .. })),
+            .any(|event| matches!(event, CodingEvent::CompactionCompleted { .. })),
     );
     assert!(
         session.history().turns().iter().any(|turn| {
@@ -130,10 +130,10 @@ async fn the_reported_usage_of_the_last_turn_is_the_baseline() {
     )])
     .model("test/small")
     .completing(summary())
-    .options(SessionOptions {
+    .options(CodingSessionOptions {
         enable_context_compaction: true,
         compaction_preserve_turns: 1,
-        ..SessionOptions::default()
+        ..CodingSessionOptions::default()
     })
     .build();
     let mut events = session.subscribe();
@@ -142,7 +142,7 @@ async fn the_reported_usage_of_the_last_turn_is_the_baseline() {
 
     let published = settled(&mut session, &mut events).await;
     let started = published.iter().find_map(|event| match event {
-        AgentEvent::CompactionStarted {
+        CodingEvent::CompactionStarted {
             estimated_tokens,
             context_window_size,
         } => Some((*estimated_tokens, *context_window_size)),
@@ -156,7 +156,7 @@ async fn the_reported_usage_of_the_last_turn_is_the_baseline() {
     assert!(
         published
             .iter()
-            .any(|event| matches!(event, AgentEvent::CompactionCompleted { .. }))
+            .any(|event| matches!(event, CodingEvent::CompactionCompleted { .. }))
     );
 }
 
@@ -173,10 +173,10 @@ async fn a_summary_that_never_arrives_outlasts_an_interrupt() {
     ))])
     .model("test/small")
     .completing(vec![ScriptedCompletion::Pending])
-    .options(SessionOptions {
+    .options(CodingSessionOptions {
         enable_context_compaction: true,
         compaction_preserve_turns: 1,
-        ..SessionOptions::default()
+        ..CodingSessionOptions::default()
     })
     .build();
     let cancel = session.cancel_token();
@@ -185,7 +185,7 @@ async fn a_summary_that_never_arrives_outlasts_an_interrupt() {
         timeout(
             Duration::from_secs(5),
             wait_for_event(&mut events, |event| {
-                matches!(event, AgentEvent::CompactionStarted { .. })
+                matches!(event, CodingEvent::CompactionStarted { .. })
             }),
         )
         .await
@@ -207,10 +207,10 @@ async fn a_compaction_with_nothing_to_summarize_announces_nothing() {
     let (mut session, provider) = TestSession::new(answers("OK"))
         .model("test/small")
         .completing(summary())
-        .options(SessionOptions {
+        .options(CodingSessionOptions {
             enable_context_compaction: true,
             compaction_preserve_turns: 10,
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         })
         .build();
     let mut events = session.subscribe();
@@ -229,7 +229,7 @@ async fn a_compaction_with_nothing_to_summarize_announces_nothing() {
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::CompactionStarted { .. } | AgentEvent::CompactionCompleted { .. }
+            CodingEvent::CompactionStarted { .. } | CodingEvent::CompactionCompleted { .. }
         )),
         0,
         "a compaction that would preserve everything is not a compaction"
@@ -241,9 +241,9 @@ async fn a_compaction_with_nothing_to_summarize_announces_nothing() {
 async fn compaction_that_is_turned_off_never_runs() {
     let (mut session, provider) = TestSession::new(answers("OK"))
         .model("test/small")
-        .options(SessionOptions {
+        .options(CodingSessionOptions {
             enable_context_compaction: false,
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         })
         .build();
     let mut events = session.subscribe();
@@ -257,7 +257,7 @@ async fn compaction_that_is_turned_off_never_runs() {
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::CompactionStarted { .. } | AgentEvent::CompactionCompleted { .. }
+            CodingEvent::CompactionStarted { .. } | CodingEvent::CompactionCompleted { .. }
         )),
         0
     );
@@ -270,10 +270,10 @@ async fn a_session_that_never_compacts_still_reports_what_the_provider_counted()
         with_input_tokens(text_response("OK"), 90),
     )])
     .model("test/small")
-    .options(SessionOptions {
+    .options(CodingSessionOptions {
         enable_context_compaction: false,
         compaction_preserve_turns: 1,
-        ..SessionOptions::default()
+        ..CodingSessionOptions::default()
     })
     .build();
     let mut events = session.subscribe();
@@ -292,7 +292,7 @@ async fn a_session_that_never_compacts_still_reports_what_the_provider_counted()
     assert_eq!(
         count(&published, |event| matches!(
             event,
-            AgentEvent::CompactionStarted { .. } | AgentEvent::CompactionCompleted { .. }
+            CodingEvent::CompactionStarted { .. } | CodingEvent::CompactionCompleted { .. }
         )),
         0
     );
@@ -311,10 +311,10 @@ async fn a_failed_compaction_neither_stops_the_prompt_nor_repeats() {
     .completing(vec![ScriptedCompletion::Failure(
         ScriptedFailure::terminal(LlmErrorKind::Server, "summarization failed"),
     )])
-    .options(SessionOptions {
+    .options(CodingSessionOptions {
         enable_context_compaction: true,
         compaction_preserve_turns: 1,
-        ..SessionOptions::default()
+        ..CodingSessionOptions::default()
     })
     .build();
     let mut events = session.subscribe();
@@ -333,7 +333,7 @@ async fn a_failed_compaction_neither_stops_the_prompt_nor_repeats() {
     assert!(
         published.iter().any(|event| matches!(
             event,
-            AgentEvent::Error { error } if error.kind == ErrorKind::Compaction
+            CodingEvent::Error { error } if error.kind == ErrorKind::Compaction
         )),
         "the failure is reported as compaction's, not as the prompt's"
     );
@@ -366,10 +366,10 @@ async fn the_summarizing_call_carries_the_prompt_and_the_files() {
     .completing(vec![ScriptedCompletion::response(text_response(
         "## Goal\nSummary goes here.",
     ))])
-    .options(SessionOptions {
+    .options(CodingSessionOptions {
         enable_context_compaction: true,
         compaction_preserve_turns: 1,
-        ..SessionOptions::default()
+        ..CodingSessionOptions::default()
     })
     .build();
     let mut events = session.subscribe();
@@ -406,7 +406,7 @@ async fn the_summarizing_call_carries_the_prompt_and_the_files() {
     assert!(
         published
             .iter()
-            .any(|event| matches!(event, AgentEvent::CompactionCompleted {
+            .any(|event| matches!(event, CodingEvent::CompactionCompleted {
                 tracked_file_count: 1,
                 ..
             })),
@@ -433,9 +433,9 @@ async fn initializing_reports_the_memory_it_loaded() {
     let environment = environment_with(vec![("/home/test/AGENTS.md", "Hello world")], Vec::new());
     let (mut session, _provider) = TestSession::new(answers("ok"))
         .environment(environment)
-        .options(SessionOptions {
+        .options(CodingSessionOptions {
             memory_files: vec!["/home/test/AGENTS.md".to_owned()],
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         })
         .build();
     let mut events = session.subscribe();
@@ -446,7 +446,7 @@ async fn initializing_reports_the_memory_it_loaded() {
     let loaded = published
         .iter()
         .find_map(|event| match event {
-            AgentEvent::MemoryLoaded {
+            CodingEvent::MemoryLoaded {
                 profile,
                 files,
                 budget_bytes,
@@ -476,7 +476,7 @@ async fn initializing_reports_an_empty_memory_too() {
     assert!(
         published.iter().any(|event| matches!(
             event,
-            AgentEvent::MemoryLoaded { files, .. } if files.is_empty()
+            CodingEvent::MemoryLoaded { files, .. } if files.is_empty()
         )),
         "a session with no memory says so"
     );
@@ -493,9 +493,9 @@ async fn initializing_reports_the_skills_it_found() {
     );
     let (mut session, _provider) = TestSession::new(answers("ok"))
         .environment(environment)
-        .options(SessionOptions {
+        .options(CodingSessionOptions {
             skill_dirs: vec!["/skills".to_owned()],
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         })
         .build();
     let mut events = session.subscribe();
@@ -506,7 +506,7 @@ async fn initializing_reports_the_skills_it_found() {
     let discovered = published
         .iter()
         .find_map(|event| match event {
-            AgentEvent::SkillsDiscovered {
+            CodingEvent::SkillsDiscovered {
                 profile,
                 source_dirs,
                 skills,
@@ -533,7 +533,7 @@ async fn initializing_reports_an_empty_skill_list_too() {
     assert!(
         published.iter().any(|event| matches!(
             event,
-            AgentEvent::SkillsDiscovered { skills, .. } if skills.is_empty()
+            CodingEvent::SkillsDiscovered { skills, .. } if skills.is_empty()
         )),
         "a session with no skills says so"
     );
@@ -550,9 +550,9 @@ async fn a_slash_command_activates_the_skill_it_names() {
     );
     let (mut session, _provider) = TestSession::new(answers("ok"))
         .environment(environment)
-        .options(SessionOptions {
+        .options(CodingSessionOptions {
             skill_dirs: vec!["/skills".to_owned()],
-            ..SessionOptions::default()
+            ..CodingSessionOptions::default()
         })
         .build();
     session.initialize().await.expect("initialization succeeds");
@@ -567,7 +567,7 @@ async fn a_slash_command_activates_the_skill_it_names() {
     assert!(
         published.iter().any(|event| matches!(
             event,
-            AgentEvent::SkillActivated { skill_name, source }
+            CodingEvent::SkillActivated { skill_name, source }
                 if skill_name == "commit" && *source == SkillActivationSource::Slash
         )),
         "the slash command is reported as the activation it is: {published:?}"

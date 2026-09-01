@@ -118,7 +118,7 @@ pub struct ContextWindowSnapshot {
     /// When the measurement was taken.
     #[serde(with = "crate::types::rfc3339_millis")]
     pub generated_at:          SystemTime,
-    /// The session event sequence that produced a stored snapshot.
+    /// The coding event sequence that produced a stored snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event_seq:             Option<u64>,
     /// The per-category breakdown, in category order.

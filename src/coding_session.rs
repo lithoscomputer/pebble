@@ -10,7 +10,7 @@ use thiserror::Error;
 use tokio::sync::{Notify, broadcast};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::SessionOptions;
+use crate::config::CodingSessionOptions;
 use crate::environment::Environment;
 use crate::error::{Error, InterruptReason};
 use crate::event::{EventCapacity, EventSink};
@@ -24,7 +24,7 @@ use crate::session::{
 };
 use crate::subagent::{SessionFactory, SubagentLimits};
 use crate::tool::{RegisteredTool, ToolEnvProvider};
-use crate::types::{Message, SessionEvent, SessionState, TokenUsage};
+use crate::types::{CodingSessionEvent, Message, SessionState, TokenUsage};
 
 /// Why a ready coding session could not be built.
 #[derive(Debug, Error)]
@@ -150,7 +150,7 @@ impl CodingSessionBuilder {
     }
 
     /// Replaces coding-session policy.
-    pub fn options(mut self, options: SessionOptions) -> Self {
+    pub fn options(mut self, options: CodingSessionOptions) -> Self {
         self.inner = self.inner.options(options);
         self
     }
@@ -385,7 +385,7 @@ impl CodingSession {
         CodingSessionBuilder::new(client, environment)
     }
 
-    /// Runs one user prompt and every queued follow-up to completion.
+    /// Processes one user prompt and every queued follow-up to completion.
     ///
     /// # Errors
     ///
@@ -415,7 +415,7 @@ impl CodingSession {
 
     /// Subscribes to coding-agent events.
     #[must_use]
-    pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<CodingSessionEvent> {
         self.inner.subscribe()
     }
 

@@ -20,7 +20,7 @@ use crate::config::NativeToolOptions;
 use crate::environment::{ExecOutcome, ExecRequest};
 use crate::tool::{NativeTool, RegisteredTool, ToolContext, ToolError, required_str};
 use crate::truncation::{DEFAULT_TOOL_OUTPUT_RETENTION_BYTES, retain_tool_output};
-use crate::types::{AgentEvent, CommandTermination, ToolSource};
+use crate::types::{CodingEvent, CommandTermination, ToolSource};
 
 /// What a shell failure that never produced a process result is called.
 ///
@@ -161,7 +161,7 @@ pub(crate) fn retain_shell_output(
 /// can be a megabyte long, and runs the redactor on a blocking thread because
 /// an application's redactor scans every byte the process wrote.
 pub(crate) async fn emit_shell_process_completed(ctx: &ToolContext, outcome: ExecOutcome) {
-    if ctx.agent_event_emitter.is_none() {
+    if ctx.coding_event_emitter.is_none() {
         return;
     }
 
@@ -181,7 +181,7 @@ pub(crate) async fn emit_shell_process_completed(ctx: &ToolContext, outcome: Exe
             }
         };
 
-    ctx.emit_agent_event(AgentEvent::ToolProcessCompleted {
+    ctx.emit_coding_event(CodingEvent::ToolProcessCompleted {
         exit_code,
         termination,
         duration_ms,
@@ -252,22 +252,22 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::*;
-    use crate::Result as RunResult;
+    use crate::Result as PumpResult;
     use crate::environment::{ExecResult, LocalEnvironment};
     use crate::event::{Emitter, EventOptions, EventPump, SessionBoundEmitter};
     use crate::redact::Redactor;
     use crate::test_support::MockEnvironment;
-    use crate::tool::{AgentEventEmitter, StaticEnvProvider, ToolEnvProvider};
+    use crate::tool::{CodingEventEmitter, StaticEnvProvider, ToolEnvProvider};
     use crate::tools::testing::{context, context_for, schema_of};
     use crate::truncation::{ToolOutputLimits, truncate_tool_output};
-    use crate::types::{SessionEvent, ToolErrorKind};
+    use crate::types::{CodingSessionEvent, ToolErrorKind};
 
     /// A session-shaped event pipeline: what the tool publishes through, and
     /// what a test reads it back from.
     struct Events {
         emitter:  Emitter,
-        receiver: broadcast::Receiver<SessionEvent>,
-        pump:     JoinHandle<RunResult<()>>,
+        receiver: broadcast::Receiver<CodingSessionEvent>,
+        pump:     JoinHandle<PumpResult<()>>,
     }
 
     impl Events {
@@ -281,7 +281,7 @@ mod tests {
             }
         }
 
-        fn bound(&self) -> Arc<dyn AgentEventEmitter> {
+        fn bound(&self) -> Arc<dyn CodingEventEmitter> {
             Arc::new(SessionBoundEmitter::new(
                 self.emitter.clone(),
                 "test-session",
@@ -295,9 +295,9 @@ mod tests {
         /// A marker is published after it, so "the tool published nothing
         /// else" is decided by what arrives rather than by how long the test
         /// is willing to wait.
-        async fn only_event(&mut self) -> AgentEvent {
+        async fn only_event(&mut self) -> CodingEvent {
             self.emitter
-                .emit("test-session".to_owned(), AgentEvent::SessionEnded);
+                .emit("test-session".to_owned(), CodingEvent::SessionEnded);
             let event = self.receiver.recv().await.expect("an event is published");
             assert_eq!(event.session_id, "test-session");
             assert_eq!(event.tool_call_id.as_deref(), Some("call_1"));
@@ -307,7 +307,7 @@ mod tests {
                     .await
                     .expect("the marker is published")
                     .event,
-                AgentEvent::SessionEnded,
+                CodingEvent::SessionEnded,
                 "the tool published more than one event"
             );
             event.event
@@ -316,14 +316,14 @@ mod tests {
         /// Asserts the tool published nothing at all.
         async fn no_events(&mut self) {
             self.emitter
-                .emit("test-session".to_owned(), AgentEvent::SessionEnded);
+                .emit("test-session".to_owned(), CodingEvent::SessionEnded);
             assert_eq!(
                 self.receiver
                     .recv()
                     .await
                     .expect("the marker is published")
                     .event,
-                AgentEvent::SessionEnded
+                CodingEvent::SessionEnded
             );
         }
 
@@ -540,7 +540,7 @@ mod tests {
 
         let error = (tool.executor)(
             json!({"command": "make test"}),
-            context(environment).with_event_emitter(events.bound()),
+            context(environment).with_coding_event_emitter(events.bound()),
         )
         .await
         .expect_err("an environment failure is a failed tool result");
@@ -576,13 +576,13 @@ mod tests {
         let _ = (tool.executor)(
             json!({"command": "printf out; printf err >&2; exit 7"}),
             context(environment)
-                .with_event_emitter(events.bound())
+                .with_coding_event_emitter(events.bound())
                 .with_redactor(Arc::new(DropKeys)),
         )
         .await;
 
         match events.only_event().await {
-            AgentEvent::ToolProcessCompleted {
+            CodingEvent::ToolProcessCompleted {
                 exit_code,
                 termination,
                 duration_ms,
@@ -620,7 +620,7 @@ mod tests {
 
         let output = (tool.executor)(
             json!({"command": "echo interleaved"}),
-            context(environment).with_event_emitter(events.bound()),
+            context(environment).with_coding_event_emitter(events.bound()),
         )
         .await
         .expect("exit 0 is a successful tool result");
@@ -631,7 +631,7 @@ mod tests {
         );
         assert!(!output.contains("stderr:"), "got: {output}");
         match events.only_event().await {
-            AgentEvent::ToolProcessCompleted {
+            CodingEvent::ToolProcessCompleted {
                 streams_separated, ..
             } => assert!(!streams_separated),
             other => panic!("expected a process event, got {other:?}"),
@@ -691,7 +691,7 @@ mod tests {
 
         let _ = (tool.executor)(
             json!({"command": "cat big"}),
-            context(environment).with_event_emitter(Arc::new(bound.clone())),
+            context(environment).with_coding_event_emitter(Arc::new(bound.clone())),
         )
         .await;
 
@@ -708,7 +708,7 @@ mod tests {
         );
         // The event and the model see the same accounting.
         match events.only_event().await {
-            AgentEvent::ToolProcessCompleted {
+            CodingEvent::ToolProcessCompleted {
                 output_bytes_omitted,
                 ..
             } => assert!(output_bytes_omitted > 0),
@@ -730,7 +730,7 @@ mod tests {
 
         let error = (tool.executor)(
             json!({"command": "printf 'out'; printf 'err' >&2; exit 7"}),
-            context_for(environment).with_event_emitter(events.bound()),
+            context_for(environment).with_coding_event_emitter(events.bound()),
         )
         .await
         .expect_err("exit 7 is a failed tool result");
@@ -742,7 +742,7 @@ mod tests {
         assert!(output.contains("stderr:\nerr"), "got: {output}");
 
         match events.only_event().await {
-            AgentEvent::ToolProcessCompleted {
+            CodingEvent::ToolProcessCompleted {
                 exit_code,
                 termination,
                 streams_separated,

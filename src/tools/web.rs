@@ -27,7 +27,7 @@ const WEB_FETCH_USER_AGENT: &str = "pebble/0.1";
 /// A session that has one lets `web_fetch` answer a question about what it
 /// fetched instead of returning the whole page; a session without one returns
 /// the page and says the summary was unavailable. Configure it with
-/// [`SessionBuilder::web_fetch_summarizer`](crate::SessionBuilder::web_fetch_summarizer).
+/// [`SessionBuilder::web_fetch_summarizer`](crate::advanced::SessionBuilder::web_fetch_summarizer).
 ///
 /// The model is named the way every other selector in pebble is — a catalog
 /// id, an alias, or a `provider/model` pair — and is resolved by the client
@@ -99,9 +99,9 @@ impl WebFetchSummarizer {
 /// and under whatever network policy that place has.
 ///
 /// The summarizer is captured here, at construction, the way
-/// [`make_web_search_tool`](crate::make_web_search_tool) captures its engine.
-/// Without one, a call carrying a prompt returns the page and says the summary
-/// was unavailable.
+/// [`make_web_search_tool`](crate::tools::make_web_search_tool) captures its
+/// engine. Without one, a call carrying a prompt returns the page and says the
+/// summary was unavailable.
 #[must_use]
 pub fn make_web_fetch_tool(summarizer: Option<Arc<WebFetchSummarizer>>) -> RegisteredTool {
     RegisteredTool {

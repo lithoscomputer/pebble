@@ -8,20 +8,20 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use pebble::{
-    AgentEvent, ErrorKind, EventCapacity, EventOptions, EventPump, EventSink, EventSinkError,
-    SessionEvent,
+use pebble::events::{
+    CodingEvent, CodingSessionEvent, ErrorKind, EventCapacity, EventOptions, EventPump, EventSink,
+    EventSinkError,
 };
 
 /// A sink an application could plausibly write: it appends to a log and can be
 /// told to start failing.
 #[derive(Default)]
-struct RunLog {
+struct EventLog {
     recorded:    Mutex<Vec<(u64, String)>>,
     refuse_from: Option<usize>,
 }
 
-impl RunLog {
+impl EventLog {
     fn refusing_from(count: usize) -> Self {
         Self {
             recorded:    Mutex::new(Vec::new()),
@@ -35,8 +35,8 @@ impl RunLog {
 }
 
 #[async_trait]
-impl EventSink for RunLog {
-    async fn record(&self, event: &SessionEvent) -> Result<(), EventSinkError> {
+impl EventSink for EventLog {
+    async fn record(&self, event: &CodingSessionEvent) -> Result<(), EventSinkError> {
         let mut recorded = self.recorded.lock().expect("the log lock is held");
         if self.refuse_from == Some(recorded.len()) {
             return Err(EventSinkError::new("the event log is not writable"));
@@ -46,13 +46,13 @@ impl EventSink for RunLog {
     }
 }
 
-fn user_input(text: &str) -> AgentEvent {
-    AgentEvent::UserInput { text: text.into() }
+fn user_input(text: &str) -> CodingEvent {
+    CodingEvent::UserInput { text: text.into() }
 }
 
 #[tokio::test]
 async fn an_application_records_and_watches_the_same_ordered_stream() {
-    let log = Arc::new(RunLog::default());
+    let log = Arc::new(EventLog::default());
     let (emitter, pump) = EventPump::new(EventOptions {
         capacity: EventCapacity::new(8),
         sink: Some(Arc::clone(&log) as Arc<dyn EventSink>),
@@ -63,7 +63,7 @@ async fn an_application_records_and_watches_the_same_ordered_stream() {
 
     emitter.emit("ses_root", user_input("one"));
     emitter.emit("ses_root", user_input("two"));
-    emitter.emit("ses_root", AgentEvent::SessionEnded);
+    emitter.emit("ses_root", CodingEvent::SessionEnded);
     drop(emitter);
 
     pump.await
@@ -88,7 +88,7 @@ async fn an_application_records_and_watches_the_same_ordered_stream() {
 
 #[tokio::test]
 async fn a_refusing_sink_stops_the_prompt_with_a_typed_error() {
-    let log = Arc::new(RunLog::refusing_from(1));
+    let log = Arc::new(EventLog::refusing_from(1));
     let (emitter, pump) = EventPump::new(EventOptions {
         sink: Some(Arc::clone(&log) as Arc<dyn EventSink>),
         ..EventOptions::default()
@@ -139,7 +139,7 @@ async fn a_forwarded_child_event_keeps_its_identity_in_the_parent_stream() {
     let child_pump = tokio::spawn(child_pump.run());
 
     parent.emit("ses_root", user_input("delegate this"));
-    child.emit("ses_child", AgentEvent::SessionStarted {
+    child.emit("ses_child", CodingEvent::SessionStarted {
         provider: Some("anthropic".into()),
         model:    Some("claude-sonnet-5".into()),
     });

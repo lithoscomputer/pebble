@@ -1,7 +1,7 @@
 //! The tools pebble ships.
 //!
 //! Each one is built by a `make_*` function that answers a
-//! [`RegisteredTool`](crate::RegisteredTool): what the model is told, and what
+//! [`RegisteredTool`]: what the model is told, and what
 //! runs when it calls. A profile decides which of them a session starts with,
 //! and the registry decides what the model sees them called, so the same
 //! `read_file` here is `Read` to a model that expects that name.
@@ -50,6 +50,20 @@ pub use self::todo::{
 };
 pub use self::web::{WebFetchSummarizer, make_web_fetch_tool};
 pub use self::web_search::make_web_search_tool;
+pub use crate::config::{
+    NativeToolOptions, ToolAccess, ToolAccessPolicy, ToolApprovalAdapter, ToolApprovalFn,
+    ToolExposureMode, ToolHookCallback, ToolHookDecision,
+};
+pub use crate::tool::{
+    CodingEventEmitter, NativeTool, RegisteredTool, StaticEnvProvider, ToolContext,
+    ToolDefinitionWithSource, ToolDispatch, ToolEnvProvider, ToolError, ToolExecutor, ToolRegistry,
+    ToolVocabulary, canonical_tool_name, known_tool_category, tool_category, validate_tool_args,
+};
+pub use crate::truncation::{
+    DEFAULT_TOOL_OUTPUT_RETENTION_BYTES, DEFAULT_TOOL_OUTPUT_SERIALIZED_BYTES, OutputBudgets,
+    ToolOutputLimits, TruncationMode, truncate_lines, truncate_output, truncate_tool_output,
+};
+pub use crate::types::{PermissionLevel, ToolCategory, ToolErrorKind, ToolSource, ToolSummary};
 
 #[cfg(test)]
 mod tests {

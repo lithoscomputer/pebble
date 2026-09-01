@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::context::ContextTransformError;
 use crate::turn::TurnBoundaryError;
 
-/// A result returned by a running agent.
+/// A result returned while an agent processes a prompt.
 pub type Result<T> = StdResult<T, AgentError>;
 
 /// Why an agent could not be built.

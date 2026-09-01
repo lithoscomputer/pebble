@@ -120,11 +120,11 @@ pub struct ExpandedInput {
 /// the template with its surrounding blank lines trimmed.
 ///
 /// ```
-/// # use pebble::parse_skill;
+/// # use pebble::resources::{SkillParseError, parse_skill};
 /// let skill = parse_skill("---\nname: commit\n---\nWrite a commit.")?;
 /// assert_eq!(skill.name, "commit");
 /// assert_eq!(skill.template, "Write a commit.");
-/// # Ok::<(), pebble::SkillParseError>(())
+/// # Ok::<(), SkillParseError>(())
 /// ```
 pub fn parse_skill(content: &str) -> StdResult<Skill, SkillParseError> {
     let trimmed = content.trim();
@@ -165,7 +165,7 @@ pub fn parse_skill(content: &str) -> StdResult<Skill, SkillParseError> {
 /// input entirely.
 ///
 /// ```
-/// # use pebble::{Skill, expand_skill};
+/// # use pebble::resources::{Skill, SkillExpansionError, expand_skill};
 /// let skills = [Skill {
 ///     name:        "commit".to_owned(),
 ///     description: "Make a commit".to_owned(),
@@ -176,7 +176,7 @@ pub fn parse_skill(content: &str) -> StdResult<Skill, SkillParseError> {
 ///
 /// assert_eq!(expanded.skill_name.as_deref(), Some("commit"));
 /// assert!(expanded.text.ends_with("only the staged files"));
-/// # Ok::<(), pebble::SkillExpansionError>(())
+/// # Ok::<(), SkillExpansionError>(())
 /// ```
 pub fn expand_skill(
     skills: &[Skill],
