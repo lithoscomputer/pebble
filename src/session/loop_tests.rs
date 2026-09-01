@@ -8,11 +8,11 @@
 //! The submodules split the suite by subject: what the session sends
 //! ([`requests`]), what it does with a broken stream ([`replay`]), what happens
 //! when someone interrupts it ([`interrupts`]), what it does as the window
-//! fills ([`compaction`]), and which harness a model resolves to
-//! ([`profiles`]).
+//! fills ([`compaction`]), which harness a model resolves to ([`profiles`]),
+//! and what it does with the children it spawns ([`subagents`]).
 //!
-//! Fabro's tests whose subject lands in a later phase — the subagent tests and
-//! the `use_skill` tests — are listed by name in
+//! The subagent tests ([`subagents`]) arrived with the supervisor. Fabro's
+//! remaining deferred tests — the `use_skill` ones — are listed by name in
 //! `.ai/porting/11-deferred-tests.md`, so the phase that lands the subject
 //! ports them rather than rediscovering them.
 
@@ -21,6 +21,7 @@ mod interrupts;
 mod profiles;
 mod replay;
 mod requests;
+mod subagents;
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -29,8 +30,8 @@ use lithos_llm::types::{TokenCounts, ToolDefinition, ToolResult};
 use serde_json::json;
 
 use super::testing::{
-    TestSession, blocking_tool, count, drained, echo_tool, failing_tool, noop_tool, position,
-    settled, wait_for_event,
+    TestSession, blocking_tool, count, drain, drained, echo_tool, failing_tool, noop_tool,
+    position, settled, wait_for_event,
 };
 use super::*;
 use crate::test_support::{

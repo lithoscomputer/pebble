@@ -1742,12 +1742,55 @@ mod tests {
             r#"{"SubAgentSpawned":{"agent_id":"sa-1","depth":0,"task":"test"}}"#,
         )
         .expect("parses");
-
         assert!(matches!(event, AgentEvent::SubAgentSpawned {
             generation: 1,
             ..
         }));
+
+        let event: AgentEvent = serde_json::from_str(
+            r#"{"SubAgentCompleted":{"agent_id":"sa-1","depth":0,"success":true,"turns_used":2}}"#,
+        )
+        .expect("parses");
+        assert!(matches!(event, AgentEvent::SubAgentCompleted {
+            generation: 1,
+            ..
+        }));
+
+        let error = serde_json::to_value(ErrorData::from(&Error::ToolExecution("boom".into())))
+            .expect("serializes");
+        let event: AgentEvent = serde_json::from_value(
+            json!({ "SubAgentFailed": { "agent_id": "sa-1", "depth": 0, "error": error } }),
+        )
+        .expect("parses");
+        assert!(matches!(event, AgentEvent::SubAgentFailed {
+            generation: 1,
+            ..
+        }));
+
+        let event: AgentEvent =
+            serde_json::from_str(r#"{"SubAgentClosed":{"agent_id":"sa-1","depth":0}}"#)
+                .expect("parses");
+        assert!(matches!(event, AgentEvent::SubAgentClosed {
+            generation: 1,
+            ..
+        }));
+
         assert_eq!(initial_subagent_generation(), INITIAL_SUBAGENT_GENERATION);
+    }
+
+    #[test]
+    fn a_subagent_turn_has_no_legacy_generation_to_default() {
+        // The asymmetry is deliberate, and this pins it: the other four
+        // subagent events existed before the generation field and default it,
+        // while a turn has never been published without one. Harmonizing the
+        // serde attributes across all five would invent a first generation for
+        // an event that is simply malformed.
+        let error = serde_json::from_str::<AgentEvent>(
+            r#"{"SubAgentTurnStarted":{"agent_id":"sa-1","depth":0,"task":"test"}}"#,
+        )
+        .expect_err("a turn with no generation does not parse");
+
+        assert!(error.to_string().contains("generation"), "{error}");
     }
 
     #[test]

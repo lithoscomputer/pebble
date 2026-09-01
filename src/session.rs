@@ -55,7 +55,7 @@ mod control;
 mod loop_tests;
 mod retry;
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 mod turn;
 
 use std::collections::{HashMap, VecDeque};
@@ -91,10 +91,13 @@ use crate::file_tracker::FileTracker;
 use crate::history::History;
 use crate::human_input::HumanInputProvider;
 use crate::memory::{MEMORY_BUDGET_BYTES, MemoryDocument, load_memory};
-use crate::profile::{AgentProfile, EnvContext, ModelFacts, builtin_profile};
+use crate::profile::{AgentProfile, EnvContext, ModelFacts, SubagentSupport, builtin_profile};
 use crate::record::{SESSION_RECORD_FORMAT_VERSION, SessionRecord};
 use crate::skills::{Skill, SkillExpansion, discover_skills};
-use crate::subagent::SubagentSupervisor;
+use crate::subagent::{
+    ChildDeps, ChildIdentity, OpenSessions, SessionFactory, SubagentCallbackEvent,
+    SubagentEventCallback, SubagentLimits, SubagentSupervisor,
+};
 use crate::tool::{
     RegisteredTool, StaticEnvProvider, ToolDefinitionWithSource, ToolEnvProvider, ToolRegistry,
 };
@@ -294,6 +297,9 @@ pub struct SessionBuilder {
     options:           SessionOptions,
     events:            EventOptions,
     profile:           Option<Arc<dyn AgentProfile>>,
+    subagents:         Option<SessionFactory>,
+    subagent_limits:   SubagentLimits,
+    child:             Option<ChildIdentity>,
 }
 
 impl SessionBuilder {
@@ -309,6 +315,9 @@ impl SessionBuilder {
             options: SessionOptions::default(),
             events: EventOptions::default(),
             profile: None,
+            subagents: None,
+            subagent_limits: SubagentLimits::default(),
+            child: None,
         }
     }
 
@@ -384,6 +393,43 @@ impl SessionBuilder {
         self
     }
 
+    /// Lets this session spawn children, built by `factory`.
+    ///
+    /// Registering a factory is the whole switch: the profile's subagent tools
+    /// are registered only when there is one, and a session without one answers
+    /// every spawn with a tool error. The builder also wires the supervisor to
+    /// this session's event pipeline, so a child's events cannot be lost by an
+    /// application that forgot to connect them.
+    ///
+    /// Pebble builds the [`ChildSessionSpec`](crate::ChildSessionSpec) each
+    /// call receives from this
+    /// session, so a child inherits the environment, the tools, the access
+    /// policy, and the hooks its parent had, and never a
+    /// [`HumanInputProvider`]: a child cannot ask a person a question.
+    pub fn subagents(mut self, factory: SessionFactory) -> Self {
+        self.subagents = Some(factory);
+        self
+    }
+
+    /// Sets how many sessions this tree may hold open at once.
+    ///
+    /// Set on the root; children inherit the root's counter, so the limit
+    /// covers the whole tree however deep it goes. Without a
+    /// [`SessionFactory`](Self::subagents) it does nothing.
+    pub const fn subagent_limits(mut self, limits: SubagentLimits) -> Self {
+        self.subagent_limits = limits;
+        self
+    }
+
+    /// Builds this session as a child of another.
+    ///
+    /// Crate-internal: the identity, the depth, and the tree's open-session
+    /// budget come from the spawning session, never from an application.
+    pub(crate) fn child_of(mut self, child: ChildIdentity) -> Self {
+        self.child = Some(child);
+        self
+    }
+
     /// Overrides the profile the catalog would select.
     ///
     /// Crate-internal on purpose: an application picks a harness by picking a
@@ -446,15 +492,59 @@ impl SessionBuilder {
         for tool in profile.base_tools() {
             registry.register(tool);
         }
-        for tool in self.tools {
+        for tool in &self.tools {
+            registry.register(tool.clone());
+        }
+
+        // A child was placed in its tree by whoever spawned it; a root names
+        // itself and starts the tree's budget.
+        let (parent_session_id, root_session_id, depth, open_sessions, built_from) =
+            match self.child {
+                Some(child) => (
+                    Some(child.parent_session_id),
+                    child.root_session_id,
+                    child.depth,
+                    child.open_sessions,
+                    Some(child.built_from),
+                ),
+                None => (
+                    None,
+                    id.clone(),
+                    0,
+                    OpenSessions::root(self.subagent_limits),
+                    None,
+                ),
+            };
+
+        let supervisor = self.subagents.map(|factory| {
+            SubagentSupervisor::new(Arc::new(ChildDeps {
+                client: self.client.clone(),
+                model_selector: handle.to_string(),
+                profile: Arc::clone(&profile),
+                environment: Arc::clone(&environment),
+                tools: self.tools,
+                options: child_options(&self.options),
+                tool_env_provider: self.tool_env_provider.clone(),
+                event_capacity: self.events.capacity,
+                factory,
+                open_sessions,
+                depth,
+            }))
+        });
+        // Asked for whether or not there is a supervisor: a profile answers
+        // with no tools when subagents are off, and this is the only place a
+        // profile's subagent family reaches the registry.
+        for tool in profile.subagent_tools(&SubagentSupport::new(depth, supervisor.clone())) {
             registry.register(tool);
         }
 
         let (emitter, pump) = EventPump::new(self.events);
         let pump = tokio::spawn(pump.run());
 
-        Ok(Session {
-            root_session_id: id.clone(),
+        let session = Session {
+            root_session_id,
+            parent_session_id,
+            built_from,
             id,
             created_at,
             config: self.options,
@@ -487,12 +577,37 @@ impl SessionBuilder {
             system_prompt: String::new(),
             activated_skill_context_observed: false,
             file_tracker: FileTracker::default(),
-            subagents: None,
+            subagents: supervisor,
             completion_coordinator: None,
             last_run_timing: RunTiming::default(),
             last_run_usage: TokenUsage::default(),
             last_run_cost_usd_micros: None,
-        })
+        };
+
+        // Wired here rather than by the application: a supervisor with no
+        // callback loses every child event, silently.
+        if let Some(supervisor) = session.subagents.as_ref() {
+            supervisor.set_event_callback(session.sub_agent_event_callback());
+        }
+
+        Ok(session)
+    }
+}
+
+/// What a child session inherits from its parent's options.
+///
+/// Everything that bounds or governs the child comes across unchanged — the
+/// access policy, the hooks, the permission level, the output budgets, the
+/// wall-clock budget — so a factory cannot be handed anything wider than the
+/// parent had. What does not come across is what the root loads once: the
+/// memory files and the skill directories. A child is given a task, not a
+/// project briefing, and paying for the briefing again in every child is how a
+/// tree of agents spends a context window on nothing.
+fn child_options(parent: &SessionOptions) -> SessionOptions {
+    SessionOptions {
+        memory_files: Vec::new(),
+        skill_dirs: Vec::new(),
+        ..parent.clone()
     }
 }
 
@@ -586,6 +701,11 @@ pub struct Session {
     /// inherits its parent's root, which is how root-scoped tools — one shared
     /// todo list across a tree of agents — know where they belong.
     root_session_id: String,
+    /// The session that spawned this one, for a child. A root has none.
+    parent_session_id: Option<String>,
+    /// What this child was built from, for the supervisor to recognize its own
+    /// specification in the session a factory answered with. A root has none.
+    built_from: Option<Arc<ChildDeps>>,
     created_at: SystemTime,
     config: SessionOptions,
     history: History,
@@ -682,16 +802,25 @@ impl Session {
         deps.events.resume_after_seq = record.last_event_seq;
         let mut session = deps.build_with_id(record.session_id.clone(), record.created_at)?;
         session.history = History::from_stored_messages(&record.messages);
+        // The parentage the record carries is restored, so storing a resumed
+        // child again says the same thing. The tree itself is not: a resumed
+        // child has no supervisor above it, and rebuilding one is the
+        // application's to do.
+        session
+            .parent_session_id
+            .clone_from(&record.parent_session_id);
         Ok(session)
     }
 
     /// The session as it should be stored.
     ///
     /// Everything a resumed session needs and nothing an application could not
-    /// supply again. A child session's root is not recorded: the tree is the
-    /// application's to rebuild.
+    /// supply again. A child records which session spawned it, so a stored tree
+    /// can be read back in shape; the tree itself is the application's to
+    /// rebuild, because a child's supervisor is not stored.
     pub fn to_record(&self) -> SessionRecord {
         let mut record = SessionRecord::new(self.id.clone());
+        record.parent_session_id.clone_from(&self.parent_session_id);
         record.provider = Some(self.provider.clone());
         record.model = Some(self.model.clone());
         record.created_at = self.created_at;
@@ -858,13 +987,14 @@ impl Session {
 
     /// The root of this session's tree, which a root session answers with its
     /// own [`id`](Self::id).
+    ///
+    /// Read-only for the same reason [`child_of`](SessionBuilder::child_of) is
+    /// crate-internal: a session's place in its tree is settled when it is
+    /// built, by whoever spawned it. Root-scoped tools, forwarded events and
+    /// stored records all key on this, so a session that could be re-rooted
+    /// afterwards could be detached from the tree that owns it.
     pub fn root_session_id(&self) -> &str {
         &self.root_session_id
-    }
-
-    /// Places this session under a root, as a child of a tree.
-    pub fn set_root_session_id(&mut self, root: impl Into<String>) {
-        self.root_session_id = root.into();
     }
 
     /// Which harness this session runs.
@@ -1021,6 +1151,52 @@ impl Session {
     /// The token that ends this session's run.
     pub fn cancel_token(&self) -> CancellationToken {
         self.cancel_token.clone()
+    }
+
+    /// Where this session's supervisor sends what its children produce.
+    ///
+    /// Lifecycle facts about a child are the parent's own news, so they are
+    /// published under the parent's identity. A child's own event is forwarded
+    /// as it stands — its `session_id` untouched — and only gains a
+    /// `parent_session_id` when it does not already have one, so a grandchild's
+    /// event keeps naming its real parent. Forwarded events go through this
+    /// session's pump, which is what gives them parent-stream sequence numbers.
+    pub(crate) fn sub_agent_event_callback(&self) -> SubagentEventCallback {
+        let emitter = self.emitter.clone();
+        let parent_session_id = self.id.clone();
+        Arc::new(move |event| match event {
+            SubagentCallbackEvent::Lifecycle(event) => {
+                emitter.emit(parent_session_id.clone(), event);
+            }
+            SubagentCallbackEvent::Forwarded(mut event) => {
+                if event.parent_session_id.is_none() {
+                    event.parent_session_id = Some(parent_session_id.clone());
+                }
+                emitter.forward(event);
+            }
+        })
+    }
+
+    /// Whether this session was built from `deps`, which is how a supervisor
+    /// recognizes the child it specified in the session a factory answered
+    /// with.
+    pub(crate) fn was_built_from(&self, deps: &Arc<ChildDeps>) -> bool {
+        self.built_from
+            .as_ref()
+            .is_some_and(|built_from| Arc::ptr_eq(built_from, deps))
+    }
+
+    /// This session's children, for the crate's own tests.
+    #[cfg(test)]
+    pub(crate) const fn subagent_supervisor(&self) -> Option<&SubagentSupervisor> {
+        self.subagents.as_ref()
+    }
+
+    /// Whether this session can ask a person a question, for the crate's own
+    /// tests: a child never can.
+    #[cfg(test)]
+    pub(crate) const fn has_human_input(&self) -> bool {
+        self.human_input.is_some()
     }
 
     /// The reason slot an outside task can fill before cancelling.

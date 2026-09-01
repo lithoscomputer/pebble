@@ -21,8 +21,10 @@ use tokio::task::yield_now;
 use super::{RetryEventObserver, Session, SessionBuilder, ShutdownReason};
 use crate::config::SessionOptions;
 use crate::environment::Environment;
-use crate::profile::{AgentProfile, EnvContext, SubagentSupport};
+use crate::human_input::HumanInputProvider;
+use crate::profile::{AgentProfile, EnvContext};
 use crate::skills::{Skill, format_skills_prompt_section};
+use crate::subagent::{ChildSessionSpec, SessionFactory, SubagentLimits};
 use crate::test_support::{
     MockEnvironment, ScriptedCall, ScriptedCompletion, ScriptedProvider, client_from,
     scripted_client_builder,
@@ -31,18 +33,18 @@ use crate::tool::{RegisteredTool, ToolError, ToolVocabulary};
 use crate::types::{AgentEvent, AgentProfileKind, SessionEvent, ToolSource};
 
 /// A profile that names a harness and contributes only what it is given.
-pub(super) struct TestProfile {
+pub(crate) struct TestProfile {
     tools: Vec<RegisteredTool>,
 }
 
 impl TestProfile {
     /// A profile with no tools of its own.
-    pub(super) fn shared() -> Arc<dyn AgentProfile> {
+    pub(crate) fn shared() -> Arc<dyn AgentProfile> {
         Arc::new(Self { tools: Vec::new() })
     }
 
     /// A profile that contributes `tools`.
-    pub(super) fn with_tools(tools: Vec<RegisteredTool>) -> Arc<dyn AgentProfile> {
+    pub(crate) fn with_tools(tools: Vec<RegisteredTool>) -> Arc<dyn AgentProfile> {
         Arc::new(Self { tools })
     }
 }
@@ -82,10 +84,6 @@ impl AgentProfile for TestProfile {
             env_context.working_directory
         )
     }
-
-    fn subagent_tools(&self, _subagents: &SubagentSupport) -> Vec<RegisteredTool> {
-        Vec::new()
-    }
 }
 
 /// Assembles one session over a scripted provider.
@@ -93,7 +91,7 @@ impl AgentProfile for TestProfile {
 /// Every part has an answer that suits most tests, so a test names only what it
 /// is about: the script, and whichever of the tools, the options, the model, or
 /// the environment it depends on.
-pub(super) struct TestSession {
+pub(crate) struct TestSession {
     calls:       Vec<ScriptedCall>,
     delay:       Duration,
     completions: Vec<ScriptedCompletion>,
@@ -103,11 +101,14 @@ pub(super) struct TestSession {
     environment: Option<Arc<dyn Environment>>,
     retries:     Option<RetryPolicy>,
     concurrency: Option<NonZeroUsize>,
+    subagents:   Option<SessionFactory>,
+    limits:      SubagentLimits,
+    human_input: Option<Arc<dyn HumanInputProvider>>,
 }
 
 impl TestSession {
     /// A session whose provider answers `calls`, one per round.
-    pub(super) fn new(calls: Vec<ScriptedCall>) -> Self {
+    pub(crate) fn new(calls: Vec<ScriptedCall>) -> Self {
         Self {
             calls,
             delay: Duration::ZERO,
@@ -118,53 +119,80 @@ impl TestSession {
             environment: None,
             retries: None,
             concurrency: None,
+            subagents: None,
+            limits: SubagentLimits::default(),
+            human_input: None,
         }
     }
 
+    /// Lets the session spawn children, built the plain way.
+    pub(crate) fn with_subagents(mut self) -> Self {
+        self.subagents = Some(Arc::new(ChildSessionSpec::build));
+        self
+    }
+
+    /// Lets the session spawn children, built by `factory`.
+    pub(crate) fn subagents(mut self, factory: SessionFactory) -> Self {
+        self.subagents = Some(factory);
+        self
+    }
+
+    /// Gives the session someone to ask, which only a root ever has.
+    pub(crate) fn human_input(mut self, provider: Arc<dyn HumanInputProvider>) -> Self {
+        self.human_input = Some(provider);
+        self
+    }
+
+    /// Sets how many sessions the tree may hold open at once.
+    pub(crate) const fn subagent_limits(mut self, limits: SubagentLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
     /// A session whose provider answers every round with one response.
-    pub(super) fn answering(calls: Vec<ScriptedCall>) -> (Session, Arc<ScriptedProvider>) {
+    pub(crate) fn answering(calls: Vec<ScriptedCall>) -> (Session, Arc<ScriptedProvider>) {
         Self::new(calls).build()
     }
 
     /// Scripts what compaction's summarizing call answers with.
-    pub(super) fn completing(mut self, completions: Vec<ScriptedCompletion>) -> Self {
+    pub(crate) fn completing(mut self, completions: Vec<ScriptedCompletion>) -> Self {
         self.completions = completions;
         self
     }
 
     /// Registers tools on top of the profile's own.
-    pub(super) fn tools(mut self, tools: impl IntoIterator<Item = RegisteredTool>) -> Self {
+    pub(crate) fn tools(mut self, tools: impl IntoIterator<Item = RegisteredTool>) -> Self {
         self.tools.extend(tools);
         self
     }
 
     /// Sets how the session behaves.
-    pub(super) fn options(mut self, options: SessionOptions) -> Self {
+    pub(crate) fn options(mut self, options: SessionOptions) -> Self {
         self.options = options;
         self
     }
 
     /// Names a different model in the test catalog, such as `test/small`.
-    pub(super) fn model(mut self, model: impl Into<String>) -> Self {
+    pub(crate) fn model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
         self
     }
 
     /// Sets where the session's tools act.
-    pub(super) fn environment(mut self, environment: Arc<dyn Environment>) -> Self {
+    pub(crate) fn environment(mut self, environment: Arc<dyn Environment>) -> Self {
         self.environment = Some(environment);
         self
     }
 
     /// Makes every model call take `delay` to answer.
-    pub(super) fn delayed(mut self, delay: Duration) -> Self {
+    pub(crate) fn delayed(mut self, delay: Duration) -> Self {
         self.delay = delay;
         self
     }
 
     /// Installs the retry middleware an application is asked to install, with
     /// pebble's observer on it.
-    pub(super) fn retrying(mut self, policy: RetryPolicy) -> Self {
+    pub(crate) fn retrying(mut self, policy: RetryPolicy) -> Self {
         self.retries = Some(policy);
         self
     }
@@ -175,13 +203,13 @@ impl TestSession {
     /// # Panics
     ///
     /// Panics when `limit` is zero, which no test asks for.
-    pub(super) fn limited(mut self, limit: usize) -> Self {
+    pub(crate) fn limited(mut self, limit: usize) -> Self {
         self.concurrency = Some(NonZeroUsize::new(limit).expect("a limit of at least one"));
         self
     }
 
     /// Builds the session, and the provider handle its script is read from.
-    pub(super) fn build(self) -> (Session, Arc<ScriptedProvider>) {
+    pub(crate) fn build(self) -> (Session, Arc<ScriptedProvider>) {
         let provider = ScriptedProvider::new(self.calls)
             .completing(self.completions)
             .delayed(self.delay);
@@ -204,19 +232,25 @@ impl TestSession {
         let environment = self
             .environment
             .unwrap_or_else(|| Arc::new(MockEnvironment::linux()));
-        let session = Session::builder(client)
+        let mut builder = Session::builder(client)
             .model(self.model)
             .environment(environment)
             .with_profile(TestProfile::with_tools(self.tools))
             .options(self.options)
-            .build()
-            .expect("the test session builds");
+            .subagent_limits(self.limits);
+        if let Some(factory) = self.subagents {
+            builder = builder.subagents(factory);
+        }
+        if let Some(provider) = self.human_input {
+            builder = builder.human_input(provider);
+        }
+        let session = builder.build().expect("the test session builds");
         (session, provider)
     }
 }
 
 /// A builder for a session on `client`, with nothing scripted.
-pub(super) fn builder(client: Client) -> SessionBuilder {
+pub(crate) fn builder(client: Client) -> SessionBuilder {
     Session::builder(client)
         .model("test/model")
         .environment(Arc::new(MockEnvironment::linux()))
@@ -228,7 +262,7 @@ pub(super) fn builder(client: Client) -> SessionBuilder {
 ///
 /// Shutting down first is what makes the list complete: nothing is published
 /// until the pump runs, and the pump stops only when the session tells it to.
-pub(super) async fn settled(
+pub(crate) async fn settled(
     session: &mut Session,
     receiver: &mut broadcast::Receiver<SessionEvent>,
 ) -> Vec<AgentEvent> {
@@ -243,14 +277,14 @@ pub(super) async fn settled(
 ///
 /// The session queues events for a task to publish, so a test that reads the
 /// stream while the session is still open has to let that task run first.
-pub(super) async fn drained(receiver: &mut broadcast::Receiver<SessionEvent>) -> Vec<AgentEvent> {
+pub(crate) async fn drained(receiver: &mut broadcast::Receiver<SessionEvent>) -> Vec<AgentEvent> {
     yield_now().await;
     yield_now().await;
     drain(receiver)
 }
 
 /// Everything the receiver already holds.
-pub(super) fn drain(receiver: &mut broadcast::Receiver<SessionEvent>) -> Vec<AgentEvent> {
+pub(crate) fn drain(receiver: &mut broadcast::Receiver<SessionEvent>) -> Vec<AgentEvent> {
     let mut events = Vec::new();
     while let Ok(event) = receiver.try_recv() {
         events.push(event.event);
@@ -259,7 +293,7 @@ pub(super) fn drain(receiver: &mut broadcast::Receiver<SessionEvent>) -> Vec<Age
 }
 
 /// Waits for the first event that satisfies `predicate`.
-pub(super) async fn wait_for_event(
+pub(crate) async fn wait_for_event(
     receiver: &mut broadcast::Receiver<SessionEvent>,
     predicate: impl Fn(&AgentEvent) -> bool,
 ) {
@@ -275,7 +309,7 @@ pub(super) async fn wait_for_event(
 }
 
 /// Where `matcher` first matched, which a test uses to assert on ordering.
-pub(super) fn position(
+pub(crate) fn position(
     events: &[AgentEvent],
     matcher: impl Fn(&AgentEvent) -> bool,
 ) -> Option<usize> {
@@ -283,12 +317,12 @@ pub(super) fn position(
 }
 
 /// A short name for each event, for asserting on a whole stream at once.
-pub(super) fn event_names(events: &[AgentEvent]) -> Vec<&'static str> {
+pub(crate) fn event_names(events: &[AgentEvent]) -> Vec<&'static str> {
     events.iter().map(event_name).collect()
 }
 
 /// A short name for one event.
-pub(super) fn event_name(event: &AgentEvent) -> &'static str {
+pub(crate) fn event_name(event: &AgentEvent) -> &'static str {
     match event {
         AgentEvent::SessionStarted { .. } => "started",
         AgentEvent::SessionEnded => "ended",
@@ -305,12 +339,12 @@ pub(super) fn event_name(event: &AgentEvent) -> &'static str {
 }
 
 /// How many events `matcher` matched.
-pub(super) fn count(events: &[AgentEvent], matcher: impl Fn(&AgentEvent) -> bool) -> usize {
+pub(crate) fn count(events: &[AgentEvent], matcher: impl Fn(&AgentEvent) -> bool) -> usize {
     events.iter().filter(|event| matcher(event)).count()
 }
 
 /// A tool that answers with `echo: <text>`.
-pub(super) fn echo_tool() -> RegisteredTool {
+pub(crate) fn echo_tool() -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
             "echo",
@@ -331,7 +365,7 @@ pub(super) fn echo_tool() -> RegisteredTool {
 }
 
 /// A tool that always fails.
-pub(super) fn failing_tool() -> RegisteredTool {
+pub(crate) fn failing_tool() -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
             "fail_tool",
@@ -346,7 +380,7 @@ pub(super) fn failing_tool() -> RegisteredTool {
 }
 
 /// A tool named `name` that answers `ok`.
-pub(super) fn noop_tool(name: &str) -> RegisteredTool {
+pub(crate) fn noop_tool(name: &str) -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
             name,
@@ -359,7 +393,7 @@ pub(super) fn noop_tool(name: &str) -> RegisteredTool {
 }
 
 /// A tool that waits until the round or the run is cancelled.
-pub(super) fn blocking_tool(name: &'static str) -> RegisteredTool {
+pub(crate) fn blocking_tool(name: &'static str) -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
             name,

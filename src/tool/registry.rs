@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::result::Result as StdResult;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -454,6 +455,24 @@ impl Default for ToolRegistry {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// One required string argument, or the error the model is given instead.
+///
+/// Pebble's structural schema check accepts a call whose argument is missing or
+/// wrongly typed only where the schema could not say otherwise, so a tool still
+/// asks for what it needs rather than assuming.
+///
+/// # Errors
+///
+/// Returns a [`ToolError`] of kind
+/// [`InvalidArguments`](crate::ToolErrorKind::InvalidArguments) when `key` is
+/// absent or is not a string.
+pub(crate) fn required_str<'a>(arguments: &'a Value, key: &str) -> StdResult<&'a str, ToolError> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::invalid_arguments(format!("Missing required parameter: {key}")))
 }
 
 #[cfg(test)]

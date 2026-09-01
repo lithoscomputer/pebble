@@ -232,6 +232,7 @@ pub use self::skills::{
     ExpandedInput, Skill, SkillExpansion, SkillExpansionError, SkillParseError, discover_skills,
     expand_skill, format_skills_prompt_section, parse_skill,
 };
+pub use self::subagent::{ChildSessionSpec, SessionFactory, SubagentLimits};
 pub use self::task_reminder::{TASK_REMINDER_TEXT, maybe_task_reminder};
 pub use self::tool::{
     AgentEventEmitter, NativeTool, RegisteredTool, StaticEnvProvider, ToolContext,

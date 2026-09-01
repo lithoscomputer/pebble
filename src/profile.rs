@@ -16,12 +16,14 @@
 //! gathers what the prompt needs once, and a profile turns it into text without
 //! running anything.
 
+use std::fmt;
 use std::sync::Arc;
 
 use lithos_llm::catalog::CatalogModel;
 
 use crate::environment::Environment;
 use crate::skills::Skill;
+use crate::subagent::{SubagentSupervisor, subagent_tools};
 use crate::tool::{RegisteredTool, ToolVocabulary};
 use crate::types::AgentProfileKind;
 
@@ -85,16 +87,60 @@ impl EnvContext {
 /// agents, while the Claude 5 harness expects a background-agent family
 /// instead — so a profile builds them rather than a builder choosing for it.
 ///
-/// It carries only the session's place in the tree today; the supervisor and
-/// the session factory arrive here when subagents land. Both are shared
-/// handles, so this type deliberately derives neither `Copy` nor `Eq`: growing
-/// it must not have to remove a derive that callers depend on.
-#[derive(Debug, Clone, Default)]
+/// It carries the session's place in the tree, and — when the application
+/// configured a [`SessionFactory`](crate::SessionFactory) — the supervisor the
+/// tools drive. The supervisor is a shared handle, so this type deliberately
+/// derives neither `Copy` nor `Eq`: growing it must not have to remove a derive
+/// that callers depend on.
+///
+/// A profile outside pebble reads [`depth`](Self::depth) and contributes
+/// whatever tools it likes; pebble's own four are reached through
+/// [`AgentProfile::subagent_tools`]'s default implementation, which is what a
+/// profile with no subagent story of its own inherits.
+#[derive(Clone, Default)]
 #[non_exhaustive]
 pub struct SubagentSupport {
     /// How deep in the session tree the session being built sits, counting the
     /// root as zero.
-    pub depth: usize,
+    pub depth:             usize,
+    /// The supervisor this session's children run under, when the application
+    /// configured subagents at all.
+    pub(crate) supervisor: Option<SubagentSupervisor>,
+}
+
+impl fmt::Debug for SubagentSupport {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SubagentSupport")
+            .field("depth", &self.depth)
+            .field("supervisor", &self.supervisor)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SubagentSupport {
+    /// The support a session with a configured factory hands its profile.
+    pub(crate) const fn new(depth: usize, supervisor: Option<SubagentSupervisor>) -> Self {
+        Self { depth, supervisor }
+    }
+
+    /// Whether this session may spawn children at all.
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        self.supervisor.is_some()
+    }
+
+    /// Pebble's own four subagent tools: spawn, send input, wait, close.
+    ///
+    /// Empty when the application configured no session factory, which is how
+    /// omitting one disables subagents without any profile having to check.
+    #[must_use]
+    pub(crate) fn pebble_tools(&self) -> Vec<RegisteredTool> {
+        self.supervisor
+            .as_ref()
+            .map(subagent_tools)
+            .unwrap_or_default()
+    }
 }
 
 /// What the machinery around a session needs to know about its model.
@@ -241,10 +287,12 @@ pub trait AgentProfile: Send + Sync {
 
     /// The subagent tools this profile gives the session.
     ///
-    /// Answered only when the application configured subagents. The default is
-    /// no tools, so a profile that has no subagent story says nothing.
-    fn subagent_tools(&self, _subagents: &SubagentSupport) -> Vec<RegisteredTool> {
-        Vec::new()
+    /// The default is pebble's own four — spawn, send input, wait, close —
+    /// which is nothing at all when the application configured no session
+    /// factory. A profile whose model family expects a different family of
+    /// subagent tools overrides this and builds those instead.
+    fn subagent_tools(&self, subagents: &SubagentSupport) -> Vec<RegisteredTool> {
+        subagents.pebble_tools()
     }
 }
 
