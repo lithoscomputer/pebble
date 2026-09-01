@@ -14,7 +14,8 @@ use std::fmt::Write as _;
 use lithos_llm::types::{ToolCall, ToolResult};
 use serde_json::Value;
 
-use crate::tool::{NativeTool, canonical_tool_name, result_text};
+use crate::tool::{NativeTool, canonical_tool_name};
+use crate::tools::{PatchOperation, parse_apply_patch};
 
 /// What a session did to one file.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -116,24 +117,49 @@ impl FileTracker {
                         self.record_edit(path);
                     }
                 }
-                Some(NativeTool::ApplyPatch) => self.record_from_patch_summary(result),
+                Some(NativeTool::ApplyPatch) => self.record_from_patch_arguments(&call.arguments),
                 _ => {}
             }
         }
     }
 
-    /// Reads the file list `apply_patch` prints, which names each path by the
-    /// change it made: `A` added, `M` modified.
-    fn record_from_patch_summary(&mut self, result: &ToolResult) {
-        for line in result_text(result).lines() {
-            let line = line.trim();
-            if let Some(path) = line.strip_prefix("A ") {
-                self.record_write(path.trim());
-            } else if let Some(path) = line.strip_prefix("M ") {
-                self.record_edit(path.trim());
+    /// Reads the operations out of the patch the call carried.
+    ///
+    /// Parsed from the arguments rather than from the rendered summary: the
+    /// arguments survive per-tool output truncation, which can cut the leading
+    /// lines of a very large patch's file list, and the parser is the one the
+    /// tool itself ran. A patch that stopped parsing records nothing, matching
+    /// the failed call it produced.
+    ///
+    /// Deletions are deliberately not recorded, as fabro's tracker skipped
+    /// them: this list exists so files can be revisited after compaction, and
+    /// a deleted file cannot be. An update that moves a file records the
+    /// destination, which is where the result lives now.
+    fn record_from_patch_arguments(&mut self, arguments: &Value) {
+        let Some(patch) = patch_text(arguments) else {
+            return;
+        };
+        let Ok(operations) = parse_apply_patch(patch) else {
+            return;
+        };
+        for operation in operations {
+            match operation {
+                PatchOperation::Add { path, .. } => self.record_write(&path),
+                PatchOperation::Update { path, new_path, .. } => {
+                    self.record_edit(new_path.as_deref().unwrap_or(&path));
+                }
+                PatchOperation::Delete { .. } => {}
             }
         }
     }
+}
+
+/// The patch text a call carried: raw text from the grammar tool, or a
+/// `patch` member where a harness wraps it in JSON.
+fn patch_text(arguments: &Value) -> Option<&str> {
+    arguments
+        .as_str()
+        .or_else(|| arguments.get("patch")?.as_str())
 }
 
 /// The path a file tool was given, under either name the vocabularies use.
@@ -279,21 +305,94 @@ mod tests {
         assert!(tracker.is_empty());
     }
 
+    const PATCH: &str = "\
+*** Begin Patch
+*** Add File: src/new.rs
++fn main() {}
+*** Update File: src/old.rs
+@@ fn old():
+-    pass
++    return 1
+*** End Patch";
+
     #[test]
-    fn a_patch_summary_records_added_and_modified_files() {
+    fn a_patch_records_added_and_modified_files_from_its_arguments() {
         let mut tracker = FileTracker::default();
 
-        tracker.record_from_tool_calls(&[call("apply_patch", json!({ "patch": "..." }))], &[
-            success(
-                "tc1",
-                "Success. Updated the following files:\nA src/new.rs\nM src/old.rs\n",
-            ),
+        // The grammar tool carries the patch as raw text.
+        tracker.record_from_tool_calls(&[call("apply_patch", json!(PATCH))], &[success(
+            "tc1", "ok",
+        )]);
+
+        assert_eq!(
+            tracker.render(),
+            "- src/new.rs (written)\n- src/old.rs (edited)\n"
+        );
+    }
+
+    #[test]
+    fn a_json_wrapped_patch_is_read_from_its_patch_member() {
+        let mut tracker = FileTracker::default();
+
+        tracker.record_from_tool_calls(&[call("apply_patch", json!({ "patch": PATCH }))], &[
+            success("tc1", "ok"),
         ]);
 
         assert_eq!(
             tracker.render(),
             "- src/new.rs (written)\n- src/old.rs (edited)\n"
         );
+    }
+
+    /// The arguments survive output truncation, so a summary whose leading
+    /// lines were cut still records every file the patch touched.
+    #[test]
+    fn a_truncated_summary_does_not_lose_the_patchs_files() {
+        let mut tracker = FileTracker::default();
+
+        tracker.record_from_tool_calls(&[call("apply_patch", json!(PATCH))], &[success(
+            "tc1",
+            "[... output truncated ...]\nM src/other.rs\n",
+        )]);
+
+        assert_eq!(
+            tracker.render(),
+            "- src/new.rs (written)\n- src/old.rs (edited)\n"
+        );
+    }
+
+    #[test]
+    fn a_moved_file_is_recorded_at_its_destination() {
+        let patch = "\
+*** Begin Patch
+*** Update File: src/old.py
+*** Move to: src/new.py
+@@ def hello():
+-    pass
++    return 1
+*** End Patch";
+        let mut tracker = FileTracker::default();
+
+        tracker.record_from_tool_calls(&[call("apply_patch", json!(patch))], &[success(
+            "tc1", "ok",
+        )]);
+
+        assert_eq!(tracker.render(), "- src/new.py (edited)\n");
+    }
+
+    #[test]
+    fn a_deletion_is_not_recorded() {
+        let patch = "\
+*** Begin Patch
+*** Delete File: src/gone.rs
+*** End Patch";
+        let mut tracker = FileTracker::default();
+
+        tracker.record_from_tool_calls(&[call("apply_patch", json!(patch))], &[success(
+            "tc1", "ok",
+        )]);
+
+        assert!(tracker.is_empty());
     }
 
     #[test]

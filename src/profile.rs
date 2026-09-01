@@ -128,12 +128,6 @@ impl SubagentSupport {
         Self { depth, supervisor }
     }
 
-    /// Whether this session may spawn children at all.
-    #[must_use]
-    pub const fn is_enabled(&self) -> bool {
-        self.supervisor.is_some()
-    }
-
     /// Pebble's own four subagent tools: spawn, send input, wait, close.
     ///
     /// Empty when the application configured no session factory, which is how

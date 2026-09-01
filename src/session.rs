@@ -150,40 +150,6 @@ pub struct RunTiming {
     pub tool:      Duration,
 }
 
-/// What one call to [`Session::run_with_options`] does differently.
-///
-/// A plain configuration record: name the fields that differ and take the rest
-/// from [`Default`].
-///
-/// ```
-/// # use pebble::RunOptions;
-/// let options = RunOptions {
-///     human_input: None,
-///     ..RunOptions::default()
-/// };
-/// # let _ = options;
-/// ```
-#[derive(Clone, Default)]
-pub struct RunOptions {
-    /// Where this run's questions go, in place of the session's own provider.
-    ///
-    /// An application that reuses one session across stages binds each stage's
-    /// questions here rather than mutating the session between runs.
-    pub human_input: Option<Arc<dyn HumanInputProvider>>,
-}
-
-impl fmt::Debug for RunOptions {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("RunOptions")
-            .field(
-                "human_input",
-                &self.human_input.as_ref().map(|_| "<provider>"),
-            )
-            .finish()
-    }
-}
-
 /// What one run accumulated across every input it processed.
 #[derive(Debug, Default)]
 struct RunTotals {
@@ -1398,28 +1364,12 @@ impl Session {
     /// wall-clock time, [`Error::Llm`] when the model call failed for good, and
     /// [`Error::EventSink`] when the configured sink refused an event.
     pub async fn run(&mut self, input: &str) -> Result<Option<String>> {
-        self.run_with_options(input, RunOptions::default()).await
-    }
-
-    /// Runs one input with per-run overrides.
-    ///
-    /// # Errors
-    ///
-    /// The same failures as [`Session::run`].
-    pub async fn run_with_options(
-        &mut self,
-        input: &str,
-        options: RunOptions,
-    ) -> Result<Option<String>> {
         self.last_run = RunTotals::default();
         if self.state == SessionState::Closed {
             return Err(Error::SessionClosed);
         }
 
-        let human_input = options
-            .human_input
-            .clone()
-            .or_else(|| self.human_input.clone());
+        let human_input = self.human_input.clone();
         let timer = self.start_wall_clock_timer();
         let mut totals = RunTotals::default();
 

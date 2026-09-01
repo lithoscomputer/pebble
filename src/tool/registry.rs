@@ -359,33 +359,6 @@ impl ToolRegistry {
         self.tools.insert(tool.definition.name.clone(), tool);
     }
 
-    /// Replaces a built-in tool's description, keeping its executor and
-    /// schema.
-    ///
-    /// Resolves through the registry's vocabulary, so a caller names the tool
-    /// by identity rather than by whatever string it is currently exposed
-    /// under. Does nothing when the tool is not registered.
-    pub fn redescribe(&mut self, tool: NativeTool, description: impl Into<String>) {
-        let exposed = tool.name(self.vocabulary);
-        if let Some(registered) = self.tools.get_mut(exposed) {
-            registered.definition.description = description.into();
-        }
-    }
-
-    /// Removes the tool exposed under `name`.
-    pub fn unregister(&mut self, name: &str) -> Option<RegisteredTool> {
-        self.tools.remove(name)
-    }
-
-    /// Removes a built-in tool by identity, whatever vocabulary it is exposed
-    /// under.
-    ///
-    /// This is how a profile's tool set is trimmed: the caller names the tool
-    /// it means rather than the string the current vocabulary spells it with.
-    pub fn unregister_native(&mut self, tool: NativeTool) -> Option<RegisteredTool> {
-        self.tools.remove(tool.name(self.vocabulary))
-    }
-
     /// The tool exposed under `name`.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&RegisteredTool> {
@@ -626,36 +599,6 @@ mod tests {
     }
 
     #[test]
-    fn unregister_removes_tool() {
-        let mut registry = ToolRegistry::new();
-        registry.register(make_tool("read_file"));
-
-        assert!(registry.unregister("read_file").is_some());
-        assert!(registry.get("read_file").is_none());
-    }
-
-    #[test]
-    fn unregister_missing_returns_none() {
-        let mut registry = ToolRegistry::new();
-        assert!(registry.unregister("nonexistent").is_none());
-    }
-
-    #[test]
-    fn unregister_native_resolves_the_exposed_vocabulary() {
-        let mut registry = ToolRegistry::with_vocabulary(ToolVocabulary::Codex);
-        registry.register(make_tool("shell"));
-        assert!(registry.get("shell_command").is_some());
-
-        let removed = registry.unregister_native(NativeTool::Shell);
-
-        assert_eq!(
-            removed.map(|tool| tool.definition.name),
-            Some("shell_command".to_owned())
-        );
-        assert!(registry.get("shell_command").is_none());
-    }
-
-    #[test]
     fn get_native_resolves_the_exposed_vocabulary() {
         let mut registry = ToolRegistry::with_vocabulary(ToolVocabulary::Claude5);
         registry.register(make_tool("read_file"));
@@ -665,26 +608,6 @@ mod tests {
             .expect("registered under the Claude 5 name");
         assert_eq!(tool.definition.name, "Read");
         assert!(registry.get_native(NativeTool::Shell).is_none());
-    }
-
-    #[test]
-    fn redescribe_resolves_the_exposed_vocabulary() {
-        let mut registry = ToolRegistry::with_vocabulary(ToolVocabulary::Codex);
-        registry.register(make_tool("shell"));
-
-        registry.redescribe(NativeTool::Shell, "Run a command in the workspace");
-        // A tool that is not registered is left alone rather than added.
-        registry.redescribe(NativeTool::ReadFile, "unused");
-
-        assert_eq!(
-            registry
-                .get("shell_command")
-                .expect("registered")
-                .definition
-                .description,
-            "Run a command in the workspace"
-        );
-        assert!(registry.get("read_file").is_none());
     }
 
     #[test]

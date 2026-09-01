@@ -119,20 +119,6 @@ pub enum AnswerStatus {
     Timeout,
 }
 
-impl AnswerStatus {
-    /// The wire spelling of this status.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Answered => "answered",
-            Self::Cancelled => "cancelled",
-            Self::Interrupted => "interrupted",
-            Self::Skipped => "skipped",
-            Self::Timeout => "timeout",
-        }
-    }
-}
-
 /// What came back for one [`Question`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {
@@ -386,16 +372,16 @@ mod tests {
 
     #[test]
     fn answer_statuses_are_snake_case_on_the_wire() {
-        for status in [
-            AnswerStatus::Answered,
-            AnswerStatus::Cancelled,
-            AnswerStatus::Interrupted,
-            AnswerStatus::Skipped,
-            AnswerStatus::Timeout,
+        for (status, wire) in [
+            (AnswerStatus::Answered, "answered"),
+            (AnswerStatus::Cancelled, "cancelled"),
+            (AnswerStatus::Interrupted, "interrupted"),
+            (AnswerStatus::Skipped, "skipped"),
+            (AnswerStatus::Timeout, "timeout"),
         ] {
             assert_eq!(
                 serde_json::to_value(status).expect("serializes"),
-                json!(status.as_str())
+                json!(wire)
             );
         }
     }

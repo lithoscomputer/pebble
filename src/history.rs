@@ -104,10 +104,11 @@ impl History {
     /// described a prompt that no longer exists, and a later context-window
     /// estimate must not read them as its baseline. The authoritative
     /// accounting is on the emitted events.
-    pub fn compact(&mut self, preserve_count: usize, summary: String) {
-        if self.turns.len() <= preserve_count {
-            return;
-        }
+    ///
+    /// Production compaction drives the two steps itself, so this one-call
+    /// form exists for the tests that pin their combined behavior.
+    #[cfg(test)]
+    pub(crate) fn compact(&mut self, preserve_count: usize, summary: String) {
         let preserve_start = self.compact_preserve_start(preserve_count);
         self.compact_from(preserve_start, summary);
     }

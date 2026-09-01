@@ -336,8 +336,8 @@ pub use self::record::{SESSION_RECORD_FORMAT_VERSION, SessionRecord, StoredMessa
 pub use self::redact::{NoRedaction, Redactor};
 pub use self::search::{SearchError, SearchErrorKind, SearchProvider, SearchRequest, SearchResult};
 pub use self::session::{
-    CompletionCoordinator, InterruptReasonHandle, RetryEventObserver, RunOptions, RunTiming,
-    Session, SessionBuildError, SessionBuilder, SessionControlHandle, ShutdownReason, SteeringItem,
+    CompletionCoordinator, InterruptReasonHandle, RetryEventObserver, RunTiming, Session,
+    SessionBuildError, SessionBuilder, SessionControlHandle, ShutdownReason, SteeringItem,
     SteeringMessage,
 };
 pub use self::skills::{

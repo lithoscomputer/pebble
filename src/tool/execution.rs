@@ -410,6 +410,11 @@ impl<'a> ToolDispatch<'a> {
         output_stats: OutputCaptureStats,
         error_kind: Option<ToolErrorKind>,
     ) {
+        // The same bounded output goes out twice on purpose: the delta is the
+        // live-streaming feed and `ToolCallCompleted` is the durable record,
+        // so a store keeps the completed event and drops deltas as ephemeral.
+        // No tool streams incremental deltas yet, which makes the two payloads
+        // equal today.
         self.emit(call, AgentEvent::ToolCallOutputDelta {
             delta: result_text(result).into_owned(),
         });
