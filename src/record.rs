@@ -72,7 +72,8 @@ pub struct SessionRecord {
     #[serde(with = "rfc3339_millis")]
     pub updated_at: SystemTime,
 
-    /// The sequence number of the last event the session published.
+    /// The highest sequence number the session had claimed for an event,
+    /// counting an event that was still queued when the record was taken.
     ///
     /// A resumed session continues numbering from here, so one session's
     /// events stay uniquely numbered across restarts.

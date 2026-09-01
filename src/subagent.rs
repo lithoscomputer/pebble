@@ -67,6 +67,16 @@ use crate::types::{
 /// How long a closing child has to stop on its own before it is aborted.
 const SUBAGENT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// How long the forwarder has to deliver what the child already published,
+/// once the runner it was following has been joined.
+///
+/// Its own window rather than what the runner left of the grace period: a
+/// runner that used the whole grace would otherwise leave the forwarder none,
+/// and a forwarder that is draining cooperatively would be aborted with the
+/// child's last events still in hand. Short, because a drain only re-emits
+/// what is already buffered.
+const SUBAGENT_EVENT_DRAIN_GRACE: Duration = Duration::from_secs(1);
+
 /// One idle child accepts one next turn. `send_input` reserves this single slot
 /// before it makes the agent running, so an agent can never be running with no
 /// turn on its way; input for a running agent goes to the follow-up queue
@@ -683,13 +693,34 @@ fn signal_notifications(changed: &watch::Sender<u64>) {
     });
 }
 
-/// Clears the draining flag however the drain ends, so one panicking callback
+/// Clears the draining flag if a callback panics, so one panicking callback
 /// cannot silence every later lifecycle event.
-struct DrainingGuard<'a>(&'a Arc<Mutex<SupervisorState>>);
+///
+/// A drain that ends normally clears the flag itself, under the same lock that
+/// found the queue empty, and disarms this guard: clearing it twice would let a
+/// second drainer start while a third is still running.
+struct DrainingGuard<'a> {
+    state: &'a Arc<Mutex<SupervisorState>>,
+    armed: bool,
+}
+
+impl<'a> DrainingGuard<'a> {
+    fn new(state: &'a Arc<Mutex<SupervisorState>>) -> Self {
+        Self { state, armed: true }
+    }
+
+    /// Says the drain has already cleared the flag.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
 
 impl Drop for DrainingGuard<'_> {
     fn drop(&mut self) {
-        self.0
+        if !self.armed {
+            return;
+        }
+        self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .lifecycle_draining = false;
@@ -715,12 +746,20 @@ fn drain_lifecycle_events(
         }
         locked.lifecycle_draining = true;
     }
-    let _draining = DrainingGuard(state);
+    let mut draining = DrainingGuard::new(state);
 
     loop {
         let event = {
             let mut locked = state.lock().unwrap_or_else(PoisonError::into_inner);
             let Some(event) = locked.lifecycle_events.pop_front() else {
+                // Finding the queue empty and clearing the flag are one
+                // critical section, so a publisher racing this exit either
+                // queues before the clear, and this loop takes the event, or
+                // takes the lock after it, and drains the event itself.
+                // Clearing the flag first and releasing the lock second would
+                // strand that event until an unrelated later publish.
+                locked.lifecycle_draining = false;
+                draining.disarm();
                 return;
             };
             event
@@ -1640,8 +1679,8 @@ impl SubagentSupervisor {
     /// Stops one child and joins everything it owned.
     ///
     /// Cooperative first: the runner is asked to stop, a running child is
-    /// cancelled, and each task gets the same grace period to end on its own
-    /// before it is aborted and joined anyway.
+    /// cancelled, and each task gets its own window to end on its own before it
+    /// is aborted and joined anyway.
     async fn run_shutdown(mut work: ShutdownWork) {
         let _cleanup_done = CleanupDoneGuard(work.cleanup_done.clone());
         let deadline = Instant::now() + SUBAGENT_SHUTDOWN_GRACE;
@@ -1659,10 +1698,13 @@ impl SubagentSupervisor {
 
         // The runner has been joined, so the child has published everything it
         // ever will and the forwarder has it all in hand: it may drain and
-        // stop. A forwarder that ignores the signal is aborted like the runner.
+        // stop. A forwarder that ignores the signal is aborted like the runner,
+        // after a window that starts here rather than one the runner may have
+        // spent.
         work.forwarder_stop.cancel();
+        let drain_deadline = Instant::now() + SUBAGENT_EVENT_DRAIN_GRACE;
         if let Some(mut task) = work.event_forwarder.take()
-            && timeout_at(deadline, &mut task).await.is_err()
+            && timeout_at(drain_deadline, &mut task).await.is_err()
         {
             task.abort();
             let _ = task.await;
@@ -1874,9 +1916,10 @@ impl SubagentSupervisor {
 #[cfg(test)]
 mod tests {
     use std::future::pending;
-    use std::iter;
+    use std::sync::Barrier;
     use std::sync::atomic::AtomicBool;
     use std::time::SystemTime;
+    use std::{iter, thread};
 
     use futures_util::poll;
     use lithos_llm::types::{Role, ToolDefinitionKind};
@@ -2111,6 +2154,103 @@ mod tests {
             ToolDefinitionKind::Function { input_schema } => input_schema.clone(),
             other => panic!("a subagent tool is a function tool, not {other:?}"),
         }
+    }
+
+    /// Where a drain sends what it delivers.
+    type CallbackSlot = Arc<RwLock<Option<SubagentEventCallback>>>;
+    /// What a drain delivered.
+    type SeenEvents = Arc<Mutex<Vec<AgentEvent>>>;
+
+    /// A callback slot that records the lifecycle events a drain delivers.
+    fn recording_lifecycle_callback() -> (CallbackSlot, SeenEvents) {
+        let seen: SeenEvents = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&seen);
+        let callback: SubagentEventCallback = Arc::new(move |event| {
+            if let SubagentCallbackEvent::Lifecycle(event) = event {
+                recorder
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(event);
+            }
+        });
+        (Arc::new(RwLock::new(Some(callback))), seen)
+    }
+
+    fn closed_event(agent_id: &str) -> AgentEvent {
+        AgentEvent::SubAgentClosed {
+            agent_id:   agent_id.to_owned(),
+            depth:      1,
+            generation: INITIAL_SUBAGENT_GENERATION,
+        }
+    }
+
+    #[test]
+    fn a_finished_drain_leaves_the_queue_empty_and_the_flag_clear() {
+        let state = Arc::new(Mutex::new(SupervisorState::default()));
+        let (callback, seen) = recording_lifecycle_callback();
+        state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .queue_lifecycle_event(closed_event("sa-1"));
+
+        drain_lifecycle_events(&state, &callback);
+
+        let locked = state.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(locked.lifecycle_events.is_empty());
+        assert!(
+            !locked.lifecycle_draining,
+            "a finished drain leaves the flag clear for the next publisher"
+        );
+        assert_eq!(*seen.lock().unwrap_or_else(PoisonError::into_inner), vec![
+            closed_event("sa-1")
+        ]);
+    }
+
+    #[test]
+    fn a_publisher_that_defers_to_a_running_drain_never_loses_its_event() {
+        // A publisher returns as soon as it sees another thread draining,
+        // trusting that thread to take the event it just queued. That trust
+        // holds only while the drain clears its flag under the same lock that
+        // found the queue empty. The window between the two is a few
+        // instructions wide, so two threads publish into it round after round,
+        // and each round is checked on its own: a stranded event is delivered
+        // by the next round's publish, which would hide it from a check made
+        // only at the end.
+        const ROUNDS: usize = 30_000;
+
+        let state = Arc::new(Mutex::new(SupervisorState::default()));
+        let (callback, _seen) = recording_lifecycle_callback();
+        let barrier = Barrier::new(2);
+        let stranded = AtomicUsize::new(0);
+
+        thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    for _ in 0..ROUNDS {
+                        barrier.wait();
+                        state
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .queue_lifecycle_event(closed_event("sa-1"));
+                        drain_lifecycle_events(&state, &callback);
+                        // Both publishers have returned, so nothing is left to
+                        // deliver this round's events.
+                        if barrier.wait().is_leader() {
+                            let mut locked = state.lock().unwrap_or_else(PoisonError::into_inner);
+                            stranded.fetch_add(locked.lifecycle_events.len(), Ordering::SeqCst);
+                            locked.lifecycle_events.clear();
+                        }
+                        barrier.wait();
+                    }
+                });
+            }
+        });
+
+        assert_eq!(
+            stranded.load(Ordering::SeqCst),
+            0,
+            "no round left an event queued after both publishers returned"
+        );
     }
 
     #[test]

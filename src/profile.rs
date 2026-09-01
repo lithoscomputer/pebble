@@ -252,8 +252,11 @@ impl Default for ModelFacts {
 /// One model family's harness: its tools, their names, and its prompt.
 ///
 /// Pebble ships a profile for each family it supports and selects one from the
-/// catalog. An application implements this only to run a model pebble does not
-/// know, or to change what a known family is given.
+/// catalog metadata of the model a session resolved to. A session cannot be
+/// given a profile written outside the crate: the trait is public because it
+/// describes what a harness is and is named by pebble's own types, not because
+/// it is an installation point. Opening one is additive, so it stays a later
+/// decision rather than a promise made now.
 ///
 /// Everything here is asked once, while a session is being built. A profile is
 /// then shared and read-only, so implementations must be cheap to call and must

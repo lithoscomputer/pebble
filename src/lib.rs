@@ -13,6 +13,18 @@
 //! [`SessionControlHandle`] steers or interrupts a run already in progress, and
 //! [`Session::shutdown`] closes the session and joins everything it owns.
 //!
+//! # Embedding pebble
+//!
+//! An application needs one dependency for all of this: `pebble`. What a
+//! session is built from that pebble does not define is re-exported here — the
+//! model layer as [`lithos_llm`], whose [`Client`](lithos_llm::Client),
+//! catalog and credentials build the client a session talks through; the
+//! [`async_trait`](macro@async_trait) attribute every seam trait is written
+//! with; and [`CancellationToken`], which those seams take and
+//! [`Session::cancel_token`] hands out. Naming lithos-llm as a dependency of
+//! its own works too, but a version that resolves apart from pebble's produces
+//! a `Client` a session will not take.
+//!
 //! # Repeating a failed call
 //!
 //! Pebble replays a turn only when it must: a stream that fails after the model
@@ -64,8 +76,8 @@
 //! selects one from the catalog metadata of the model a session resolved to,
 //! from the six it ships — one per [`AgentProfileKind`], covering the Claude,
 //! Claude 5, Gemini CLI, OpenAI, Codex and Kimi Code families. An application
-//! picks a harness by picking a model; the built-in ones are not otherwise
-//! nameable, and one written outside the crate implements the same trait.
+//! picks a harness by picking a model: the built-in ones are not otherwise
+//! nameable, and a session takes no profile of an application's own.
 //!
 //! Pebble's own are the ones a coding agent cannot work without: reading,
 //! writing and editing files ([`make_read_file_tool`],
@@ -142,6 +154,35 @@
 //! should ignore members they do not know and tolerate variants they do not
 //! know.
 //!
+//! Ignoring an unknown member is free: [`AgentEvent`] and its payloads skip
+//! members they were not built to read. Tolerating an unknown *variant* is the
+//! reader's own work, because a variant this build has never heard of fails
+//! the whole envelope with it. A consumer that reads a stream a newer pebble
+//! may have written keeps the payload as JSON until it has recognized it:
+//!
+//! ```
+//! use pebble::AgentEvent;
+//! use serde::Deserialize;
+//!
+//! /// The envelope, with the event left unread.
+//! #[derive(Deserialize)]
+//! struct Envelope {
+//!     seq:   u64,
+//!     event: serde_json::Value,
+//! }
+//!
+//! # fn read(line: &str) -> Result<(), serde_json::Error> {
+//! let envelope: Envelope = serde_json::from_str(line)?;
+//! match serde_json::from_value::<AgentEvent>(envelope.event) {
+//!     Ok(event) => println!("{}: {event:?}", envelope.seq),
+//!     // Newer than this build: keep the sequence number, skip the payload.
+//!     Err(_) => println!("{}: an event this build does not know", envelope.seq),
+//! }
+//! # Ok(())
+//! # }
+//! # read(r#"{"seq":7,"event":{"SomethingNewer":{}},"session_id":"ses_1"}"#).unwrap();
+//! ```
+//!
 //! [`SessionRecord`] is the same kind of contract, with one addition: it
 //! carries a [`format_version`](SessionRecord::format_version), so a record
 //! written by an older pebble is still readable by a newer one.
@@ -199,6 +240,15 @@ pub mod test_support;
 #[doc = include_str!("../README.md")]
 mod readme {}
 
+/// The attribute pebble's own async traits are written with, so an
+/// implementation of [`Environment`], [`EventSink`], [`HumanInputProvider`],
+/// [`SearchProvider`] or [`ToolExecutor`] can be written without naming the
+/// desugared lifetimes.
+pub use async_trait::async_trait;
+/// The model layer pebble is built on, re-exported whole because a session
+/// cannot be built without a [`Client`](lithos_llm::Client) and an application
+/// resolving its own copy could resolve a different version.
+pub use lithos_llm;
 /// How a failed model call is spaced before it is tried again, carried by
 /// [`SessionOptions::retry_policy`].
 ///
@@ -234,6 +284,10 @@ pub use lithos_llm::types::{ToolCall, ToolCallKind};
 /// What the model is told about one tool, carried by [`RegisteredTool`].
 #[doc(inline)]
 pub use lithos_llm::types::{ToolDefinition, ToolDefinitionKind};
+/// The signal a session passes into the work it starts, so an application's
+/// [`HumanInputProvider`] or [`ToolExecutor`] can stop when the round it is
+/// running in does. [`Session::cancel_token`] hands out the session's own.
+pub use tokio_util::sync::CancellationToken;
 
 pub use self::compaction::{
     CompactionRequest, ContextEstimate, ContextEstimateMethod, check_context_usage,
@@ -273,8 +327,9 @@ pub use self::record::{SESSION_RECORD_FORMAT_VERSION, SessionRecord, StoredMessa
 pub use self::redact::{NoRedaction, Redactor};
 pub use self::search::{SearchError, SearchErrorKind, SearchProvider, SearchRequest, SearchResult};
 pub use self::session::{
-    CompletionCoordinator, RetryEventObserver, RunOptions, RunTiming, Session, SessionBuildError,
-    SessionBuilder, SessionControlHandle, ShutdownReason, SteeringItem, SteeringMessage,
+    CompletionCoordinator, InterruptReasonHandle, RetryEventObserver, RunOptions, RunTiming,
+    Session, SessionBuildError, SessionBuilder, SessionControlHandle, ShutdownReason, SteeringItem,
+    SteeringMessage,
 };
 pub use self::skills::{
     ExpandedInput, Skill, SkillExpansion, SkillExpansionError, SkillParseError, discover_skills,

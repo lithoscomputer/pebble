@@ -2,8 +2,14 @@
 
 ## Project purpose
 
-This repository is a Rust project template. Replace this section with the
-project's purpose and authoritative documents after copying the repository.
+Pebble is the coding-agent loop as a library crate, built on `lithos-llm`. It
+owns the turn loop between a model and a machine: model calls, tool execution,
+history and compaction, the event stream, the control plane, and subagents. It
+does not own transport, storage, credentials, or process isolation, which
+belong to the application that embeds it.
+
+The authoritative documents are `README.md` (what pebble is and what an
+application supplies) and `DEVELOPING.md` (setup, tasks, tests, and policy).
 
 ## Rust style
 

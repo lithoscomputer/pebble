@@ -400,6 +400,37 @@ fn an_event_with_unknown_members_still_parses() {
 }
 
 #[test]
+fn an_event_variant_this_build_does_not_know_is_read_through_the_envelope() {
+    // The lenient-read pattern the crate docs give a consumer: an additive
+    // variant fails the typed parse, so the envelope is read first and the
+    // payload is recognized second. Without it, one unknown variant would cost
+    // the reader the sequence number and the session identity too.
+    #[derive(serde::Deserialize)]
+    struct RawEnvelope {
+        seq:        u64,
+        session_id: String,
+        event:      serde_json::Value,
+    }
+
+    let line = json!({
+        "seq": 9,
+        "event": { "SandboxEscaped": { "detail": "from a newer pebble" } },
+        "timestamp": "2026-01-01T00:00:00.500Z",
+        "session_id": "ses_root",
+    });
+
+    serde_json::from_value::<SessionEvent>(line.clone())
+        .expect_err("the typed envelope refuses a variant this build does not know");
+
+    let envelope: RawEnvelope =
+        serde_json::from_value(line).expect("the envelope parses without the payload");
+    assert_eq!(envelope.seq, 9);
+    assert_eq!(envelope.session_id, "ses_root");
+    serde_json::from_value::<AgentEvent>(envelope.event)
+        .expect_err("the payload is what this build cannot read");
+}
+
+#[test]
 fn an_event_without_its_optional_members_still_parses() {
     let envelope: SessionEvent = serde_json::from_value(json!({
         "event": "SessionEnded",

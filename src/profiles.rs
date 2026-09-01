@@ -36,13 +36,15 @@ use std::fmt;
 use std::sync::Arc;
 
 use lithos_llm::catalog::{CodecId, codec_ids};
+use lithos_llm::types::ToolDefinition;
+use serde_json::Value;
 
 use crate::config::NativeToolOptions;
 use crate::profile::EnvContext;
 use crate::search::SearchProvider;
 use crate::skills::{Skill, format_skills_prompt_section};
 use crate::template::{TemplateContext, TemplateValue, render_named};
-use crate::tool::{RegisteredTool, ToolVocabulary};
+use crate::tool::{NativeTool, RegisteredTool, ToolVocabulary};
 use crate::tools::{
     make_apply_patch_tool, make_edit_file_tool, make_glob_tool, make_grep_tool,
     make_read_file_tool, make_shell_tool_with_options, make_web_fetch_tool, make_write_file_tool,
@@ -190,6 +192,20 @@ pub(crate) fn core_tools(options: &NativeToolOptions) -> Vec<RegisteredTool> {
 /// Split out because the Kimi harness takes these and replaces the rest.
 pub(crate) fn discovery_and_web_tools() -> Vec<RegisteredTool> {
     vec![make_glob_tool(), make_web_fetch_tool()]
+}
+
+/// A tool definition under `tool`'s canonical name, which the registry renames
+/// into the session's vocabulary.
+///
+/// The harness modules that build a family's own tools go through this so the
+/// name a tool is registered under always comes from [`NativeTool`]'s table
+/// rather than from a literal beside it.
+pub(crate) fn definition(
+    tool: NativeTool,
+    description: impl Into<String>,
+    parameters: Value,
+) -> ToolDefinition {
+    ToolDefinition::function(tool.canonical_name(), description, parameters)
 }
 
 /// A checked-in system-prompt template and the inputs it reads.

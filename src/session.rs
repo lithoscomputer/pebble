@@ -760,6 +760,39 @@ fn new_session_id() -> String {
     format!("ses_{}", uuid::Uuid::new_v4())
 }
 
+/// Where an outside task names why it is about to cancel a run.
+///
+/// [`Session::interrupt_reason_handle`] hands one out before the run starts, so
+/// a watchdog holding it can say what it is doing — a budget spent, a deadline
+/// passed — and the run then ends with that reason rather than a plain
+/// cancellation. Cloning is cheap and every clone names the same session.
+///
+/// First writer wins: the reason a run reports is the first one recorded, and
+/// [`record`](Self::record) is the only way to write, so a later task cannot
+/// overwrite what already explains the interrupt.
+#[derive(Clone, Debug)]
+pub struct InterruptReasonHandle(Arc<Mutex<Option<InterruptReason>>>);
+
+impl InterruptReasonHandle {
+    /// Records `reason` unless one is already recorded.
+    ///
+    /// Answers whether this call is the one the run will report.
+    pub fn record(&self, reason: InterruptReason) -> bool {
+        let mut recorded = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if recorded.is_some() {
+            return false;
+        }
+        *recorded = Some(reason);
+        true
+    }
+
+    /// The reason recorded so far, if any.
+    #[must_use]
+    pub fn reason(&self) -> Option<InterruptReason> {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
 /// One conversation with one model.
 ///
 /// A session is used from one place at a time: [`Session::run`] borrows it for
@@ -895,6 +928,11 @@ impl Session {
     /// supply again. A child records which session spawned it, so a stored tree
     /// can be read back in shape; the tree itself is the application's to
     /// rebuild, because a child's supervisor is not stored.
+    ///
+    /// A record can be taken at any time, including mid-run as a crash
+    /// checkpoint: the event numbering it stores covers every event emitted
+    /// before the call, whether or not the pipeline has published it yet, so a
+    /// session resumed from the record never reuses a number.
     pub fn to_record(&self) -> SessionRecord {
         let mut record = SessionRecord::new(self.id.clone());
         record.parent_session_id.clone_from(&self.parent_session_id);
@@ -1084,7 +1122,7 @@ impl Session {
     /// The root of this session's tree, which a root session answers with its
     /// own [`id`](Self::id).
     ///
-    /// Read-only for the same reason [`child_of`](SessionBuilder::child_of) is
+    /// Read-only for the same reason [`SessionBuilder`]'s `child_of` is
     /// crate-internal: a session's place in its tree is settled when it is
     /// built, by whoever spawned it. Root-scoped tools, forwarded events and
     /// stored records all key on this, so a session that could be re-rooted
@@ -1299,8 +1337,9 @@ impl Session {
     ///
     /// First writer wins, so a watchdog that names its own reason before
     /// cancelling gets that reason reported instead of a plain cancellation.
-    pub fn interrupt_reason_handle(&self) -> Arc<Mutex<Option<InterruptReason>>> {
-        Arc::clone(&self.interrupt_reason)
+    #[must_use]
+    pub fn interrupt_reason_handle(&self) -> InterruptReasonHandle {
+        InterruptReasonHandle(Arc::clone(&self.interrupt_reason))
     }
 
     /// Changes how hard the model is asked to think, from the next round on.
@@ -1479,17 +1518,13 @@ impl Session {
         let duration = self.config.wall_clock_timeout?;
         let stop = CancellationToken::new();
         let cancel = self.cancel_token.clone();
-        let reason = Arc::clone(&self.interrupt_reason);
+        let reason = self.interrupt_reason_handle();
         let watched = stop.clone();
         let task = tokio::spawn(async move {
             tokio::select! {
                 () = watched.cancelled() => {}
                 () = sleep(duration) => {
-                    let mut guard = reason.lock().unwrap_or_else(PoisonError::into_inner);
-                    if guard.is_none() {
-                        *guard = Some(InterruptReason::WallClockTimeout);
-                    }
-                    drop(guard);
+                    reason.record(InterruptReason::WallClockTimeout);
                     cancel.cancel();
                 }
             }
@@ -1576,13 +1611,7 @@ impl Session {
     }
 
     fn set_interrupt_reason(&self, reason: InterruptReason) {
-        let mut guard = self
-            .interrupt_reason
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if guard.is_none() {
-            *guard = Some(reason);
-        }
+        self.interrupt_reason_handle().record(reason);
     }
 
     /// The error an interrupted run ends with, naming whatever reason was
@@ -2113,8 +2142,6 @@ mod tests {
     async fn a_session_round_trips_through_its_record() {
         let mut session = session();
         session.run("do a thing").await.expect("the run succeeds");
-        // Sequence numbers are assigned as events are published, so the record
-        // is taken once the pipeline has caught up.
         session
             .shutdown(ShutdownReason::Completed)
             .await
@@ -2157,6 +2184,40 @@ mod tests {
             events.recv().await.expect("the event is published").seq,
             last_seq + 1
         );
+    }
+
+    #[tokio::test]
+    async fn a_record_taken_mid_life_covers_the_events_still_queued() {
+        // The checkpoint case: a record is stored while the session runs on,
+        // and the numbers a resumed session would issue must start above every
+        // event this one has already emitted, published or not.
+        let mut session = session();
+        let mut events = session.subscribe();
+        session.run("do a thing").await.expect("the run succeeds");
+
+        let record = session.to_record();
+
+        let mut published = Vec::new();
+        for _ in 0..8 {
+            while let Ok(event) = events.try_recv() {
+                published.push(event.seq);
+            }
+            yield_now().await;
+        }
+        assert!(
+            !published.is_empty(),
+            "the run published events for the record to cover"
+        );
+        assert!(
+            published.iter().all(|seq| *seq <= record.last_event_seq),
+            "a record taken while the pipeline is behind still covers what the \
+             run emitted: {published:?} against {}",
+            record.last_event_seq
+        );
+        session
+            .shutdown(ShutdownReason::Completed)
+            .await
+            .expect("the shutdown succeeds");
     }
 
     #[tokio::test]

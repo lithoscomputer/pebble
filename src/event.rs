@@ -115,35 +115,51 @@ impl StdError for EventSinkError {
 /// [`EventOptions::resume_after_seq`].
 #[derive(Debug)]
 pub(crate) struct EventSequence {
-    last: AtomicU64,
+    stamped:  AtomicU64,
+    reserved: AtomicU64,
 }
 
 impl EventSequence {
     /// Starts a fresh session's numbering, so the first event is 1.
     pub(crate) const fn new() -> Self {
         Self {
-            last: AtomicU64::new(0),
+            stamped:  AtomicU64::new(0),
+            reserved: AtomicU64::new(0),
         }
     }
 
     /// Continues numbering after the last event a previous run published.
     pub(crate) const fn resuming_after(last_seq: u64) -> Self {
         Self {
-            last: AtomicU64::new(last_seq),
+            stamped:  AtomicU64::new(last_seq),
+            reserved: AtomicU64::new(last_seq),
         }
     }
 
-    /// Reserves the next sequence number.
-    pub(crate) fn assign(&self) -> u64 {
-        self.last.fetch_add(1, Ordering::Relaxed).saturating_add(1)
+    /// Claims the number one newly queued event will be published with.
+    ///
+    /// An emitter claims the number as it queues; the pump stamps it as it
+    /// publishes. The two counters run in step, one event apart at a time, and
+    /// the claim is what a stored record has to cover: an event waiting in the
+    /// queue is already numbered in every sense that matters to a session
+    /// resumed from that record.
+    pub(crate) fn reserve(&self) {
+        self.reserved.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// The last number [`EventSequence::assign`] handed out.
+    /// Takes the next sequence number for an event being published.
+    pub(crate) fn assign(&self) -> u64 {
+        self.stamped
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    /// The highest number any event queued so far can be published with.
     ///
-    /// Read from outside the publishing task this is a snapshot: the pump may
-    /// assign another number before the caller acts on it.
-    pub(crate) fn last_assigned(&self) -> u64 {
-        self.last.load(Ordering::Relaxed)
+    /// Read from outside the publishing task this is a snapshot: another
+    /// producer may claim the next number before the caller acts on it.
+    pub(crate) fn last_reserved(&self) -> u64 {
+        self.reserved.load(Ordering::Relaxed)
     }
 }
 
@@ -292,17 +308,21 @@ impl Emitter {
         self.published.subscribe()
     }
 
-    /// The last sequence number the pump assigned.
+    /// The highest sequence number this session has claimed for an event.
     ///
-    /// This is a snapshot taken from outside the publishing task, so the pump
-    /// may assign another number before the caller acts on it. It counts
-    /// assignment, not delivery: the number is stamped before the sink sees
-    /// the event, so mid-publish it runs one ahead of what subscribers have
-    /// observed, and after a sink refusal it names an event that was never
-    /// published.
+    /// Every event emitted so far will be published with this number or a
+    /// lower one, including events still queued, so a record storing it names
+    /// a point the live stream has passed rather than one it is about to
+    /// reach.
+    ///
+    /// This is a snapshot taken from outside the publishing task, so another
+    /// producer may claim the next number before the caller acts on it. It
+    /// counts claims, not delivery: an event still in the queue is counted,
+    /// and after a sink refusal, or an emit into a stopped pipeline, the
+    /// number names an event that was never published.
     #[must_use]
     pub fn last_seq(&self) -> u64 {
-        self.sequence.last_assigned()
+        self.sequence.last_reserved()
     }
 
     /// Whether the pump has stopped, so nothing further will be published.
@@ -324,7 +344,12 @@ impl Emitter {
     ///
     /// A session that has shut down still holds emitter clones — a tool task
     /// unwinding, say — and emitting from one must not panic.
+    ///
+    /// The number is claimed before the event is queued, so a record taken
+    /// from another task never names a number the pump is still about to
+    /// stamp.
     fn queue(&self, event: SessionEvent) {
+        self.sequence.reserve();
         let _ = self.outbox.send(Some(event));
     }
 }
@@ -880,7 +905,49 @@ mod tests {
         let second = shared.assign();
 
         assert_eq!((first, second), (1, 2));
-        assert_eq!(sequence.last_assigned(), 2);
         assert_eq!(EventSequence::resuming_after(7).assign(), 8);
+    }
+
+    #[test]
+    fn a_claimed_number_is_the_one_the_pump_stamps() {
+        let sequence = EventSequence::resuming_after(7);
+
+        sequence.reserve();
+        sequence.reserve();
+
+        assert_eq!(sequence.last_reserved(), 9);
+        assert_eq!(sequence.assign(), 8);
+        assert_eq!(sequence.assign(), 9);
+        assert_eq!(
+            sequence.last_reserved(),
+            9,
+            "the claims and the stamps meet once the queue is drained"
+        );
+    }
+
+    #[tokio::test]
+    async fn last_seq_counts_events_the_pump_has_not_reached() {
+        // Nothing drives this pump until the assertions are made, so every
+        // event is still queued.
+        let (emitter, pump) = EventPump::new(EventOptions::default());
+        let mut receiver = emitter.subscribe();
+
+        for _ in 0..3 {
+            emitter.emit("ses_1", AgentEvent::LoopDetected);
+        }
+
+        assert_eq!(
+            emitter.last_seq(),
+            3,
+            "a queued event has already claimed its number"
+        );
+
+        emitter.close();
+        pump.run().await.unwrap();
+        let published: Vec<u64> = (0..3)
+            .map(|_| receiver.try_recv().expect("the event is published").seq)
+            .collect();
+        assert_eq!(published, vec![1, 2, 3]);
+        assert_eq!(emitter.last_seq(), 3);
     }
 }

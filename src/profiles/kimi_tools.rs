@@ -22,9 +22,9 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use lithos_llm::types::ToolDefinition;
 use serde_json::{Value, json};
 
+use super::definition;
 use crate::environment::{GrepOptions, format_lines_numbered};
 use crate::tool::{NativeTool, RegisteredTool, ToolError, optional_usize_arg, required_str};
 use crate::tools::files::DEFAULT_READ_LINES;
@@ -44,15 +44,6 @@ const MAX_GREP_RESULTS: usize = 2000;
 /// How many matches the underlying search is allowed to produce, which bounds
 /// paging.
 const MAX_GREP_MATCHES_SCANNED: usize = 20_000;
-
-/// A definition under `tool`'s canonical name, which the registry renames.
-fn definition(
-    tool: NativeTool,
-    description: impl Into<String>,
-    parameters: Value,
-) -> ToolDefinition {
-    ToolDefinition::function(tool.canonical_name(), description, parameters)
-}
 
 /// `Bash`, taking `timeout` in seconds and an optional `cwd`.
 #[must_use]

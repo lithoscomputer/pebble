@@ -34,6 +34,7 @@ mise run setup
 | `mise run lint` | Run Clippy with warnings denied |
 | `mise run test` | Run the test suite |
 | `mise run test:doc` | Run the documentation tests |
+| `mise run doc` | Build the API documentation with warnings denied |
 | `mise run check` | Run the routine verification gate |
 | `mise run check:nightly` | Run the extended verification gate |
 
@@ -105,9 +106,9 @@ each night. Both workflows test these native platforms:
 
 The workflows check out only this repository. They cannot build until the
 `lithos-llm` path dependency is available on the runner, because `lithos-llm`
-is a separate private repository. Both workflows fail at manifest load until
-the port adds a second checkout step (or the dependency changes form). Verify
-changes locally with `mise run check` in the meantime.
+is a separate private repository. Both workflows fail at manifest load until a
+second checkout step is added, or the dependency changes form. Verify changes
+locally with `mise run check` in the meantime.
 
 ## Cargo.lock policy
 

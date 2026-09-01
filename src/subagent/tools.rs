@@ -15,7 +15,7 @@ use lithos_llm::types::ToolDefinition;
 use serde_json::json;
 
 use super::SubagentSupervisor;
-use crate::tool::{RegisteredTool, ToolError, required_str};
+use crate::tool::{NativeTool, RegisteredTool, ToolError, required_str};
 use crate::types::ToolSource;
 
 /// The four tools a session drives its own children with.
@@ -32,7 +32,7 @@ pub(crate) fn subagent_tools(supervisor: &SubagentSupervisor) -> Vec<RegisteredT
 fn spawn_agent_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
-            "spawn_agent",
+            NativeTool::SpawnAgent.canonical_name(),
             "Spawn a subagent for independent work or context isolation. Use it for tasks that \
              can proceed separately, and avoid duplicating the same work in the parent session.",
             json!({
@@ -69,7 +69,7 @@ fn spawn_agent_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
 fn send_input_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
-            "send_input",
+            NativeTool::SendInput.canonical_name(),
             "Send a follow-up message to a subagent. A running agent receives it at a safe turn \
              boundary. A completed agent starts another turn in the same session with its \
              existing history.",
@@ -105,7 +105,7 @@ fn send_input_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
 fn wait_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
-            "wait",
+            NativeTool::Wait.canonical_name(),
             "Wait for a subagent to complete, then use the result to synthesize the outcome for \
              the user.",
             json!({
@@ -143,7 +143,7 @@ fn wait_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
 fn close_agent_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
-            "close_agent",
+            NativeTool::CloseAgent.canonical_name(),
             "Close a running or completed subagent that is no longer needed.",
             json!({
                 "type": "object",

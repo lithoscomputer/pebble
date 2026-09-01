@@ -43,6 +43,11 @@ run = "cargo nextest run --locked --all-targets --all-features --no-tests=pass"
 description = "Run the documentation tests, which Nextest does not cover"
 run = "cargo test --doc --locked --all-features"
 
+[tasks.doc]
+description = "Build the API documentation with warnings denied"
+env = { CARGO_TARGET_DIR = "{{config_root}}/target/doc-check", RUSTDOCFLAGS = "-D warnings" }
+run = "cargo doc --no-deps --locked --all-features"
+
 [tasks."test:release"]
 description = "Run all Rust tests in release mode"
 run = "cargo nextest run --locked --release --all-targets --all-features --no-tests=pass"
@@ -62,7 +67,15 @@ run = "bin/check-whitespace"
 
 [tasks.check]
 description = "Run the complete routine verification gate"
-depends = ["fmt:check", "lint", "test", "test:doc", "check:actions", "check:whitespace"]
+depends = [
+  "fmt:check",
+  "lint",
+  "test",
+  "test:doc",
+  "doc",
+  "check:actions",
+  "check:whitespace",
+]
 
 [tasks."check:nightly"]
 description = "Run the extended nightly verification gate"

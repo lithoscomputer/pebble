@@ -17,10 +17,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use lithos_llm::types::{ToolDefinition, ToolDefinitionKind};
+use lithos_llm::types::ToolDefinitionKind;
 use serde_json::{Value, json};
 use tokio::time;
 
+use super::definition;
 use crate::config::NativeToolOptions;
 use crate::search::SearchProvider;
 use crate::subagent::{SubagentResult, SubagentStatus, SubagentSupervisor};
@@ -39,15 +40,6 @@ const TASK_OUTPUT_DEFAULT_BLOCK: bool = true;
 const TASK_OUTPUT_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// The longest `TaskOutput` waits, whatever the model asks for.
 const TASK_OUTPUT_MAX_TIMEOUT_MS: u64 = 600_000;
-
-/// A definition under `tool`'s canonical name, which the registry renames.
-fn definition(
-    tool: NativeTool,
-    description: impl Into<String>,
-    parameters: Value,
-) -> ToolDefinition {
-    ToolDefinition::function(tool.canonical_name(), description, parameters)
-}
 
 /// The same tool, refusing a top-level field its schema does not name.
 ///

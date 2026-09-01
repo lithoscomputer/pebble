@@ -15,6 +15,7 @@ use tokio::io::{AsyncRead, AsyncReadExt as _};
 use tokio::process::{Child, Command};
 use tokio::task::{JoinHandle, spawn_blocking};
 use tokio::{fs, time};
+use tokio_util::sync::CancellationToken;
 
 use super::capture::OutputCaptureBuffer;
 use super::glob::WorkspaceGlob;
@@ -40,6 +41,10 @@ const BASH_PROBE_TIMEOUT_MS: u64 = 10_000;
 
 /// Grace period between SIGTERM and SIGKILL.
 const TERMINATION_GRACE: Duration = Duration::from_secs(2);
+
+/// How long a stopped command's output is still collected before the call
+/// returns with what was read.
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 /// Bytes read from a pipe at a time.
 const PIPE_CHUNK_BYTES: usize = 8192;
@@ -106,8 +111,15 @@ enum BashExecutable {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CallerEnvPolicy {
-    /// Apply the same sensitive-name filter the ambient environment gets, so
-    /// a variable named like a credential never reaches a command.
+    /// Apply the same name filter the ambient environment gets: a variable
+    /// whose name ends in one of a fixed set of credential-like suffixes is
+    /// dropped unless it is safelisted.
+    ///
+    /// The filter reads names, never values, and the set of suffixes is
+    /// pebble's rather than exhaustive, so a secret under a name it does not
+    /// recognize still reaches the command. It is hygiene against forwarding
+    /// the orchestrator's own credentials, not a boundary: a command can read
+    /// whatever the process can.
     #[default]
     FilterSensitive,
     /// Pass caller-supplied variables through untouched. Choose this only when
@@ -544,8 +556,17 @@ impl Environment for LocalEnvironment {
         // parent blocked on `wait` never would.
         let stdout_pipe = child.stdout.take();
         let stderr_pipe = child.stderr.take();
-        let stdout_task = tokio::spawn(drain_pipe(stdout_pipe, output_bytes_cap));
-        let stderr_task = tokio::spawn(drain_pipe(stderr_pipe, output_bytes_cap));
+        let drain_stop = CancellationToken::new();
+        let stdout_task = tokio::spawn(drain_pipe(
+            stdout_pipe,
+            output_bytes_cap,
+            drain_stop.clone(),
+        ));
+        let stderr_task = tokio::spawn(drain_pipe(
+            stderr_pipe,
+            output_bytes_cap,
+            drain_stop.clone(),
+        ));
 
         let deadline = optional_timeout(timeout_ms);
         tokio::pin!(deadline);
@@ -571,8 +592,14 @@ impl Environment for LocalEnvironment {
         };
 
         let duration_ms = elapsed_ms(started);
-        let stdout_buffer = join_drain(stdout_task, "standard output").await?;
-        let stderr_buffer = join_drain(stderr_task, "standard error").await?;
+        // A command that ended on its own is read to the end, however long its
+        // output takes to arrive. A command that had to be stopped is not: what
+        // survived the kill may hold the pipes for as long as it likes, and the
+        // caller asked for this call to be over.
+        let drain_grace =
+            (!matches!(termination, CommandTermination::Exited)).then_some(OUTPUT_DRAIN_GRACE);
+        let (stdout_buffer, stderr_buffer) =
+            join_drains(stdout_task, stderr_task, &drain_stop, drain_grace).await?;
         let (stdout_bytes, stdout_capture) = stdout_buffer.into_parts();
         let (stderr_bytes, stderr_capture) = stderr_buffer.into_parts();
 
@@ -758,7 +785,16 @@ async fn walk_root(
 /// ran, and its exit status and other stream are worth more to a caller than
 /// failing the whole call over a pipe. The failure is logged, and the byte
 /// counts then describe what was read rather than what the process wrote.
-async fn drain_pipe<R>(pipe: Option<R>, output_bytes_cap: Option<usize>) -> OutputCaptureBuffer
+///
+/// `stop` ends the read early and keeps what was read, for the one case where
+/// end of file may never come: a descendant that outlived the command holds
+/// the same pipe open. `read` is cancel-safe, so nothing already in the pipe
+/// is dropped by stopping between reads.
+async fn drain_pipe<R>(
+    pipe: Option<R>,
+    output_bytes_cap: Option<usize>,
+    stop: CancellationToken,
+) -> OutputCaptureBuffer
 where
     R: AsyncRead + Unpin,
 {
@@ -769,7 +805,12 @@ where
 
     let mut chunk = [0_u8; PIPE_CHUNK_BYTES];
     loop {
-        match reader.read(&mut chunk).await {
+        let read = tokio::select! {
+            biased;
+            read = reader.read(&mut chunk) => read,
+            () = stop.cancelled() => return captured,
+        };
+        match read {
             Ok(0) => return captured,
             Ok(read) => captured.push(&chunk[..read]),
             Err(error) => {
@@ -778,6 +819,35 @@ where
             }
         }
     }
+}
+
+/// Joins both drain tasks, and where the command had to be stopped, gives them
+/// a bounded window to finish before asking them for what they have.
+///
+/// A command that was terminated may leave a descendant holding the pipes,
+/// which never reach end of file. Without the window, `exec` would wait on
+/// that descendant for as long as it lives, past the timeout or cancellation
+/// that stopped the command.
+async fn join_drains(
+    stdout_task: JoinHandle<OutputCaptureBuffer>,
+    stderr_task: JoinHandle<OutputCaptureBuffer>,
+    stop: &CancellationToken,
+    grace: Option<Duration>,
+) -> EnvResult<(OutputCaptureBuffer, OutputCaptureBuffer)> {
+    let joined = async {
+        let stdout_buffer = join_drain(stdout_task, "standard output").await?;
+        let stderr_buffer = join_drain(stderr_task, "standard error").await?;
+        Ok((stdout_buffer, stderr_buffer))
+    };
+    tokio::pin!(joined);
+
+    if let Some(grace) = grace {
+        tokio::select! {
+            joined = &mut joined => return joined,
+            () = time::sleep(grace) => stop.cancel(),
+        }
+    }
+    joined.await
 }
 
 async fn join_drain(
@@ -815,6 +885,10 @@ async fn terminate(child: &mut Child) {
         if time::timeout(TERMINATION_GRACE, child.wait()).await.is_ok() {
             return;
         }
+        // The group again, for the same reason: a descendant that ignored the
+        // SIGTERM survives a signal sent to the shell alone, and it holds the
+        // pipes this command's output is read through.
+        let _ = kill_process_group(pid, Signal::KILL);
     }
 
     let _ = child.kill().await;
@@ -878,49 +952,9 @@ fn binary_path_on_path(binary: &str) -> Option<PathBuf> {
 mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-
-    /// A directory that deletes itself when the test ends.
-    struct TempDir {
-        path: PathBuf,
-    }
-
-    impl TempDir {
-        fn new() -> Self {
-            static COUNTER: AtomicUsize = AtomicUsize::new(0);
-            let path = env::temp_dir().join(format!(
-                "pebble-local-env-{}-{}",
-                process::id(),
-                COUNTER.fetch_add(1, Ordering::Relaxed)
-            ));
-            sync_fs::create_dir_all(&path).expect("temporary directory is creatable");
-            Self { path }
-        }
-
-        fn path(&self) -> &Path {
-            &self.path
-        }
-
-        fn join(&self, relative: &str) -> PathBuf {
-            self.path.join(relative)
-        }
-
-        fn write(&self, relative: &str, content: &str) {
-            let path = self.join(relative);
-            if let Some(parent) = path.parent() {
-                sync_fs::create_dir_all(parent).expect("parent directory is creatable");
-            }
-            sync_fs::write(path, content).expect("fixture is writable");
-        }
-    }
-
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = sync_fs::remove_dir_all(&self.path);
-        }
-    }
+    use crate::tools::testing::TempDir;
 
     fn environment(directory: &TempDir) -> LocalEnvironment {
         LocalEnvironment::new(directory.path())
@@ -934,7 +968,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_numbers_its_lines() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("local-env");
         directory.write("test.txt", "hello\nworld\nfoo");
 
         let read = environment(&directory)
@@ -947,7 +981,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_pads_line_numbers_to_the_widest() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("local-env");
         let content = (1..=12)
             .map(|number| format!("line {number}"))
             .collect::<Vec<_>>()
@@ -965,7 +999,7 @@ mod tests {
 
     #[tokio::test]
     async fn reading_a_missing_file_reports_not_found() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("local-env");
 
         let error = environment(&directory)
             .read_file("nonexistent.txt", None, None)
@@ -979,7 +1013,7 @@ mod tests {
 
     #[tokio::test]
     async fn reading_bytes_that_are_not_text_reports_invalid_utf8() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("local-env");
         sync_fs::write(directory.join("binary.bin"), [0xff_u8, 0xfe]).expect("fixture is writable");
 
         let error = environment(&directory)
@@ -992,7 +1026,7 @@ mod tests {
 
     #[tokio::test]
     async fn writing_creates_missing_parent_directories() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("local-env");
 
         environment(&directory)
             .write_file("sub/dir/test.txt", "content")
@@ -1006,7 +1040,7 @@ mod tests {
 
     #[tokio::test]
     async fn writing_an_existing_file_replaces_its_content() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("local-env");
         directory.write("test.txt", "before");
 
         environment(&directory)
@@ -1022,7 +1056,7 @@ mod tests {
 
     #[tokio::test]
     async fn deleting_removes_the_file() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("local-env");
         directory.write("gone.txt", "data");
         let environment = environment(&directory);
 
@@ -1036,7 +1070,7 @@ mod tests {
 
     #[tokio::test]
     async fn existence_reflects_the_filesystem() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("local-env");
         directory.write("exists.txt", "data");
         let environment = environment(&directory);
 
@@ -1051,7 +1085,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_listing_is_sorted_and_marks_directories() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("local-env");
         directory.write("b.txt", "b");
         directory.write("a.txt", "a");
         sync_fs::create_dir(directory.join("c_dir")).expect("directory is creatable");
@@ -1073,7 +1107,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_deeper_listing_joins_nested_names_with_slashes() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("local-env");
         directory.write("nested/inner.txt", "x");
 
         let entries = environment(&directory)
@@ -1202,7 +1236,12 @@ mod tests {
             }
         }
 
-        let captured = drain_pipe(Some(FailingReader { wrote: false }), None).await;
+        let captured = drain_pipe(
+            Some(FailingReader { wrote: false }),
+            None,
+            CancellationToken::new(),
+        )
+        .await;
 
         let (bytes, stats) = captured.into_parts();
         assert_eq!(
@@ -1224,7 +1263,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_command_reports_its_output_and_status() {
-            let directory = TempDir::new();
+            let directory = TempDir::new("local-env");
 
             let outcome = environment(&directory)
                 .exec(ExecRequest {
@@ -1247,7 +1286,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_command_runs_under_bash_not_a_posix_shell() {
-            let directory = TempDir::new();
+            let directory = TempDir::new("local-env");
 
             let outcome = environment(&directory)
                 .exec(ExecRequest {
@@ -1268,7 +1307,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_command_runs_under_a_non_login_shell_with_no_startup_source() {
-            let directory = TempDir::new();
+            let directory = TempDir::new("local-env");
             directory.write("bash-env", "printf 'startup-source-loaded\\n'\n");
             let env_vars = HashMap::from([(
                 BASH_ENV_VAR.to_owned(),
@@ -1294,7 +1333,7 @@ mod tests {
 
         #[tokio::test]
         async fn preparing_accepts_the_local_bash() {
-            let directory = TempDir::new();
+            let directory = TempDir::new("local-env");
 
             environment(&directory)
                 .prepare()
@@ -1318,7 +1357,7 @@ mod tests {
 
         #[tokio::test]
         async fn preparing_fails_when_the_machine_has_no_bash() {
-            let directory = TempDir::new();
+            let directory = TempDir::new("local-env");
             let environment = LocalEnvironment::with_bash_executable(
                 directory.path(),
                 BashExecutable::Unavailable,
@@ -1335,7 +1374,7 @@ mod tests {
 
         #[tokio::test]
         async fn preparing_fails_when_the_interpreter_is_not_bash() {
-            let directory = TempDir::new();
+            let directory = TempDir::new("local-env");
             // `sh` is Bash in POSIX mode on macOS and dash on most Linux
             // images. The probe rejects both, for different reasons.
             let shim = write_shim(&directory, "not-bash", "#!/bin/sh\nexec /bin/sh \"$@\"\n");
@@ -1366,7 +1405,7 @@ mod tests {
         /// broken part of the contract belongs in an error a caller logs.
         #[tokio::test]
         async fn a_failed_probe_quotes_only_its_first_diagnostic() {
-            let directory = TempDir::new();
+            let directory = TempDir::new("local-env");
             let shim = write_shim(
                 &directory,
                 "chatty",
@@ -1389,7 +1428,7 @@ mod tests {
 
         #[tokio::test]
         async fn preparing_creates_a_missing_working_directory() {
-            let directory = TempDir::new();
+            let directory = TempDir::new("local-env");
             let nested = directory.join("created/by/prepare");
             let environment = LocalEnvironment::new(&nested);
 
@@ -1400,7 +1439,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_failing_command_reports_its_exit_code() {
-            let directory = TempDir::new();
+            let directory = TempDir::new("local-env");
 
             let outcome = environment(&directory)
                 .exec(ExecRequest {
@@ -1417,7 +1456,7 @@ mod tests {
 
         #[tokio::test]
         async fn standard_error_is_captured_separately() {
-            let directory = TempDir::new();
+            let directory = TempDir::new("local-env");
 
             let outcome = environment(&directory)
                 .exec(ExecRequest {
@@ -1433,7 +1472,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_command_that_overruns_its_timeout_is_stopped() {
-            let directory = TempDir::new();
+            let directory = TempDir::new("local-env");
 
             let outcome = environment(&directory)
                 .exec(ExecRequest {
@@ -1449,7 +1488,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_cancelled_command_is_stopped() {
-            let directory = TempDir::new();
+            let directory = TempDir::new("local-env");
             let cancel = CancellationToken::new();
             cancel.cancel();
 
@@ -1467,8 +1506,37 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn a_descendant_that_ignores_the_signal_cannot_hold_the_call_open() {
+            // The shell and the grandchild both refuse SIGTERM, and the
+            // grandchild inherited the pipes. Nothing here reaches end of file
+            // on its own, so the call returns only because the group is killed
+            // and the drain is bounded.
+            let directory = TempDir::new("local-env");
+
+            let outcome = time::timeout(
+                Duration::from_secs(20),
+                environment(&directory).exec(ExecRequest {
+                    timeout_ms: Some(200),
+                    ..ExecRequest::new(
+                        "trap '' TERM; ( trap '' TERM; sleep 60 ) & echo started; sleep 60",
+                    )
+                }),
+            )
+            .await
+            .expect("a stopped command does not wait on what outlived it")
+            .expect("the command runs");
+
+            assert_eq!(outcome.result.termination, CommandTermination::TimedOut);
+            assert_eq!(
+                outcome.result.stdout.trim(),
+                "started",
+                "what was written before the kill is still reported"
+            );
+        }
+
+        #[tokio::test]
         async fn output_is_drained_past_the_retention_cap() {
-            let directory = TempDir::new();
+            let directory = TempDir::new("local-env");
 
             let outcome = environment(&directory)
                 .exec(ExecRequest {
@@ -1489,7 +1557,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_command_writing_more_than_a_pipe_holds_still_finishes() {
-            let directory = TempDir::new();
+            let directory = TempDir::new("local-env");
 
             let outcome = environment(&directory)
                 .exec(ExecRequest {
@@ -1507,7 +1575,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_command_runs_in_the_working_directory_by_default() {
-            let directory = TempDir::new();
+            let directory = TempDir::new("local-env");
             sync_fs::create_dir(directory.join("elsewhere")).expect("directory is creatable");
             let environment = environment(&directory);
 
@@ -1551,7 +1619,7 @@ mod tests {
 
         #[tokio::test]
         async fn credential_shaped_caller_variables_are_filtered() {
-            let directory = TempDir::new();
+            let directory = TempDir::new("local-env");
             let env_vars = HashMap::from([
                 ("PEBBLE_WORKER_TOKEN".to_owned(), "leaked".to_owned()),
                 ("MY_VAR".to_owned(), "ok".to_owned()),
@@ -1572,7 +1640,7 @@ mod tests {
 
         #[tokio::test]
         async fn a_trusting_environment_passes_caller_variables_through() {
-            let directory = TempDir::new();
+            let directory = TempDir::new("local-env");
             let env_vars = HashMap::from([("PEBBLE_WORKER_TOKEN".to_owned(), "wanted".to_owned())]);
 
             let outcome = LocalEnvironment::new(directory.path())
@@ -1590,7 +1658,7 @@ mod tests {
 
         #[tokio::test]
         async fn grep_finds_matching_lines() {
-            let directory = TempDir::new();
+            let directory = TempDir::new("local-env");
             directory.write("test.rs", "fn main() {\n    println!(\"hello\");\n}\n");
 
             let matches = environment(&directory)
@@ -1604,7 +1672,7 @@ mod tests {
 
         #[tokio::test]
         async fn grep_can_ignore_case() {
-            let directory = TempDir::new();
+            let directory = TempDir::new("local-env");
             directory.write("test.txt", "Hello\nhello\nHELLO\n");
 
             let matches = environment(&directory)
@@ -1620,7 +1688,7 @@ mod tests {
 
         #[tokio::test]
         async fn grep_stops_at_the_result_limit() {
-            let directory = TempDir::new();
+            let directory = TempDir::new("local-env");
             directory.write("test.txt", "match1\nmatch2\nmatch3\nmatch4\n");
 
             let matches = environment(&directory)
@@ -1637,7 +1705,7 @@ mod tests {
 
     #[tokio::test]
     async fn glob_matches_within_one_segment() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("local-env");
         directory.write("a.rs", "");
         directory.write("b.rs", "");
         directory.write("c.txt", "");
@@ -1655,7 +1723,7 @@ mod tests {
 
     #[tokio::test]
     async fn glob_resolves_a_relative_search_path_against_the_working_directory() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("local-env");
         directory.write("src/lib.rs", "");
 
         let matches = environment(&directory)
@@ -1668,7 +1736,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_recursive_pattern_finds_files_at_any_depth() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("local-env");
         directory.write("a.rs", "");
         directory.write("src/lib.rs", "");
         directory.write("src/nested/main.rs", "");
@@ -1688,7 +1756,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_single_segment_pattern_finds_files_one_level_down() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("local-env");
         directory.write("skills/SKILL.md", "");
         directory.write("skills/patch/SKILL.md", "");
         directory.write("skills/nested/deeper/SKILL.md", "");
@@ -1704,7 +1772,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_invalid_pattern_is_reported_as_bad_input() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("local-env");
 
         let error = environment(&directory)
             .glob("/absolute/*.rs", None)
@@ -1717,7 +1785,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_glob_over_a_missing_directory_finds_nothing() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("local-env");
 
         let matches = environment(&directory)
             .glob("*.rs", Some("absent"))
@@ -1730,7 +1798,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_glob_does_not_follow_symlinked_directories() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("local-env");
         directory.write("target/lib.rs", "");
         symlink(directory.join("target"), directory.join("linked")).expect("symlink is creatable");
 
@@ -1745,7 +1813,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_glob_follows_only_the_declared_symlinked_root() {
-        let directory = TempDir::new();
+        let directory = TempDir::new("local-env");
         directory.write("workspace/README.md", "");
         directory.write("outside/outside.md", "");
         let search_root = directory.join("workspace-link");

@@ -14,8 +14,8 @@
 //!
 //! The subagent tests ([`subagents`]) arrived with the supervisor, and the
 //! `use_skill`, `web_search` and `apply_patch` ones ([`tools`]) with the tools
-//! they are about. `.ai/porting/11-deferred-tests.md` records where each of
-//! fabro's deferred tests landed.
+//! they are about: a test written for a part of the loop lands beside that
+//! part rather than in the order fabro happened to hold it.
 
 mod compaction;
 mod interrupts;

@@ -920,8 +920,9 @@ mod tests {
         }
     }
 
-    /// A stand-in for the phase-5 question tool: it answers through whatever
-    /// provider the context carries.
+    /// The smallest tool that asks a person something: it answers through
+    /// whatever provider the context carries, so what is under test here is
+    /// the dispatch path rather than any shipped question tool's schema.
     fn question_tool() -> RegisteredTool {
         RegisteredTool {
             definition: ToolDefinition::function(

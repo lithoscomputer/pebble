@@ -83,6 +83,12 @@ itself only when a stream fails *after* the model produced visible output,
 which no middleware can reconnect underneath a reader, and one failure should
 be spaced the same way whichever layer handles it.
 
+The model layer is re-exported as `pebble::lithos_llm`, along with the
+`async_trait` attribute the seams are written with and `CancellationToken`, so
+an application needs `pebble` alone in its manifest. Naming lithos-llm again
+works, but a copy that resolves apart from pebble's builds a `Client` a session
+will not take.
+
 **Credentials.** They belong to the client, and lithos-llm resolves them per
 call — `EnvironmentCredentials::conventional()` reads the usual variables
 (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and the rest), and an application with
@@ -132,6 +138,11 @@ The serialized form of `SessionEvent` and `AgentEvent` is public API, and so is
 `SessionRecord`, which carries a format version. Evolution is additive: new
 variants and new optional fields. Consumers should ignore members they do not
 know and tolerate variants they do not know.
+
+Ignoring an unknown member is free; tolerating an unknown *variant* is the
+reader's own work, because a variant a build has never heard of fails the whole
+envelope with it. The crate documentation shows the pattern: read the envelope
+with the event held as raw JSON, then parse the payload on its own.
 
 ## Setup
 

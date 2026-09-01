@@ -38,7 +38,7 @@ const OPTION_PREVIEW_MAX_CHARS: usize = 4_000;
 
 /// What a call outside a root session is told.
 const ROOT_SESSION_REQUIRED_ERROR: &str =
-    "human-question tools are available only during a root workflow agent session";
+    "human-question tools are available only during a root agent session";
 
 /// The tool that asks a person a question in `profile`'s vocabulary, or `None`
 /// where the harness has none.
@@ -378,8 +378,8 @@ async fn ask(ctx: ToolContext, questions: Vec<Question>) -> Result<Vec<Answer>, 
     })?;
     let provider = ctx.human_input.as_ref().ok_or_else(|| {
         ToolError::unavailable(
-            "human-question tools are available only inside a workflow run with an active \
-             interviewer",
+            "human-question tools are available only where the application gave the session \
+             someone to ask",
         )
     })?;
 
@@ -1108,7 +1108,7 @@ mod tests {
         .expect_err("there is nobody to ask");
 
         assert_eq!(error.kind(), ToolErrorKind::Unavailable);
-        assert!(error.message().contains("active interviewer"));
+        assert!(error.message().contains("someone to ask"), "{error:?}");
     }
 
     #[tokio::test]

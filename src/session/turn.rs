@@ -228,7 +228,7 @@ impl Session {
             // ends here rather than working on with nothing recording it.
             self.check_pump().await?;
 
-            let round_was_interrupted = self.refresh_round_token();
+            self.refresh_round_token();
 
             // Ending the run beats a park: a session waiting for a steer that
             // was also cancelled is cancelled.
@@ -236,9 +236,12 @@ impl Session {
                 return Err(self.close_cancelled().await);
             }
 
-            if round_was_interrupted {
-                self.settle_interrupts();
-            }
+            // Every round, whether or not this one looks interrupted: a
+            // gesture that raised its generation and then cancelled the token
+            // this loop was already replacing leaves an announcement owing on a
+            // round that ended normally, and it is owed now rather than at the
+            // next interrupt.
+            self.settle_interrupts();
 
             // Steering pushed mid-round arrives as the first turn of the next
             // one. Drain, park if a bare interrupt left nothing to say, then
@@ -608,10 +611,7 @@ impl Session {
     }
 
     /// Arms a fresh round token when the last round's was cancelled.
-    ///
-    /// Answers whether the round that just ended was interrupted, which is what
-    /// tells the loop there are interrupt generations to settle.
-    fn refresh_round_token(&self) -> bool {
+    fn refresh_round_token(&self) {
         let cancelled = self
             .round_token
             .read()
@@ -623,7 +623,6 @@ impl Session {
                 .write()
                 .unwrap_or_else(PoisonError::into_inner) = CancellationToken::new();
         }
-        cancelled
     }
 
     /// Publishes one event per interrupt gesture that has not been announced.

@@ -22,7 +22,7 @@ use lithos_llm::types::ToolDefinition;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-use crate::tool::{RegisteredTool, ToolContext, ToolError};
+use crate::tool::{NativeTool, RegisteredTool, ToolContext, ToolError};
 use crate::types::{TodoListKind, TodoProjection, TodoStatus, TodoUpdatedProps, ToolSource};
 
 mod runtime;
@@ -183,7 +183,7 @@ fn reconcile_replacement_list(
 pub fn make_update_plan_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
-            "update_plan",
+            NativeTool::UpdatePlan.canonical_name(),
             "Update the multi-step plan for the current task. Submit the entire plan; existing \
              steps are reconciled by exact step text.",
             serde_json::json!({
@@ -312,7 +312,7 @@ fn render_kimi_todos<'a>(items: impl IntoIterator<Item = (TodoStatus, &'a str)>)
 pub fn make_todo_list_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
-            "TodoList",
+            NativeTool::TodoList.canonical_name(),
             "Maintain a structured TODO list for the current task. Use it proactively for \
              multi-step work. Pass `todos` to replace the entire list, omit `todos` to read the \
              current list without changing it, and pass an empty array to clear it. Keep exactly \
@@ -466,7 +466,7 @@ fn format_task_details(todo: &TodoProjection) -> String {
 pub fn make_task_create_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
-            "TaskCreate",
+            NativeTool::TaskCreate.canonical_name(),
             TASK_CREATE_DESCRIPTION,
             serde_json::json!({
                 "type": "object",
@@ -524,7 +524,7 @@ fn required_argument(args: &Value, key: &str) -> Result<String, ToolError> {
 pub fn make_task_update_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
-            "TaskUpdate",
+            NativeTool::TaskUpdate.canonical_name(),
             TASK_UPDATE_DESCRIPTION,
             serde_json::json!({
                 "type": "object",
@@ -592,7 +592,7 @@ pub fn make_task_update_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
 pub fn make_task_get_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
-            "TaskGet",
+            NativeTool::TaskGet.canonical_name(),
             TASK_GET_DESCRIPTION,
             serde_json::json!({
                 "type": "object",
@@ -627,7 +627,7 @@ pub fn make_task_get_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
 pub fn make_task_list_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
-            "TaskList",
+            NativeTool::TaskList.canonical_name(),
             TASK_LIST_DESCRIPTION,
             serde_json::json!({
                 "type": "object",

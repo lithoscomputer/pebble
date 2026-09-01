@@ -18,7 +18,7 @@ use tracing::{debug, warn};
 
 use crate::config::NativeToolOptions;
 use crate::environment::{ExecOutcome, ExecRequest};
-use crate::tool::{RegisteredTool, ToolContext, ToolError, required_str};
+use crate::tool::{NativeTool, RegisteredTool, ToolContext, ToolError, required_str};
 use crate::truncation::{DEFAULT_TOOL_OUTPUT_RETENTION_BYTES, retain_tool_output};
 use crate::types::{AgentEvent, CommandTermination, ToolSource};
 
@@ -44,7 +44,7 @@ pub fn make_shell_tool_with_options(options: &NativeToolOptions) -> RegisteredTo
     let max_timeout = options.max_command_timeout_ms;
     RegisteredTool {
         definition: ToolDefinition::function(
-            "shell",
+            NativeTool::Shell.canonical_name(),
             "Execute Bash commands for terminal operations, package managers, tests and builds. \
              Use dedicated tools for file reads, file edits, filename searches, and content \
              searches. Provide timeout_ms for long-running commands.",

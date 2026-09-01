@@ -6,7 +6,9 @@ use lithos_llm::types::ToolDefinition;
 use serde_json::Value;
 
 use crate::environment::GrepOptions;
-use crate::tool::{RegisteredTool, ToolContext, ToolError, optional_usize_arg, required_str};
+use crate::tool::{
+    NativeTool, RegisteredTool, ToolContext, ToolError, optional_usize_arg, required_str,
+};
 use crate::types::ToolSource;
 
 /// Searches file contents for a regular expression.
@@ -14,7 +16,7 @@ use crate::types::ToolSource;
 pub fn make_grep_tool() -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
-            "grep",
+            NativeTool::Grep.canonical_name(),
             "Search file contents with a regex pattern. Use path to choose the search root, \
              glob_filter to limit matching files, case_insensitive for case folding, and \
              max_results to cap output.",
@@ -109,7 +111,7 @@ pub fn grep_result_path<'a>(line: &'a str, searched: &'a str) -> &'a str {
 pub fn make_glob_tool() -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
-            "glob",
+            NativeTool::Glob.canonical_name(),
             "Find files by search-root-relative path using a glob pattern. Use path to choose the \
              search root. `*` stays within one path segment and `**` searches recursively. Prefer \
              this over shell find or ls when locating repository files.",
@@ -140,7 +142,7 @@ pub fn make_glob_tool() -> RegisteredTool {
 pub fn make_list_dir_tool() -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
-            "list_dir",
+            NativeTool::ListDir.canonical_name(),
             "List directory contents with depth control",
             serde_json::json!({
                 "type": "object",

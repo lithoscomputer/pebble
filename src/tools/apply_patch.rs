@@ -29,7 +29,7 @@ use std::sync::Arc;
 use lithos_llm::types::ToolDefinition;
 
 use crate::environment::{Environment, EnvironmentError};
-use crate::tool::{RegisteredTool, ToolError};
+use crate::tool::{NativeTool, RegisteredTool, ToolError};
 use crate::types::ToolSource;
 
 /// The grammar the model is given, comments and all.
@@ -595,7 +595,7 @@ fn format_summary(added: &[String], modified: &[String], deleted: &[String]) -> 
 pub fn make_apply_patch_tool() -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::custom(
-            "apply_patch",
+            NativeTool::ApplyPatch.canonical_name(),
             "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap \
              the patch in JSON.",
             serde_json::json!({

@@ -153,6 +153,36 @@ async fn an_interrupt_that_lands_while_the_session_is_parked_is_announced_too() 
 }
 
 #[tokio::test]
+async fn a_gesture_whose_round_cancel_was_lost_is_still_announced() {
+    // What a race between two gestures can leave behind: the generation is
+    // raised, but the cancel landed on the token the loop was already
+    // replacing, so the round that follows ends normally. The announcement is
+    // owed all the same, and waiting for the next interrupt to pay it would
+    // break the exactly-once promise.
+    let (mut session, _provider) = TestSession::answering(answers("OK"));
+    let mut events = session.subscribe();
+    {
+        let mut control = session
+            .control_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        control.interrupt_generation = control.interrupt_generation.saturating_add(1);
+    }
+
+    session.run("start").await.expect("the run succeeds");
+
+    let published = settled(&mut session, &mut events).await;
+    let generations: Vec<u64> = published
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::RoundInterrupted { generation } => Some(*generation),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(generations, [1], "the raised generation is announced once");
+}
+
+#[tokio::test]
 async fn an_interrupt_settles_before_the_steer_that_replaces_it() {
     let (mut session, _provider) = TestSession::answering(answers("OK"));
     let mut events = session.subscribe();
@@ -574,6 +604,32 @@ async fn a_run_that_outlasts_its_budget_ends_with_the_budget_as_its_reason() {
         "{error:?}"
     );
     assert_eq!(session.state(), SessionState::Closed);
+}
+
+#[tokio::test]
+async fn the_reason_an_outside_task_recorded_first_is_the_one_reported() {
+    // What the handle is for: a watchdog names why it is stopping the run, and
+    // the cancellation that follows does not overwrite it.
+    let (mut session, _provider) = TestSession::answering(answers("never reached"));
+    let reason = session.interrupt_reason_handle();
+
+    assert!(reason.record(InterruptReason::WallClockTimeout));
+    assert!(
+        !reason.record(InterruptReason::Cancelled),
+        "a second writer does not replace the reason already recorded"
+    );
+    session.interrupt();
+
+    let error = session
+        .run("Do something")
+        .await
+        .expect_err("the run was cancelled");
+
+    assert!(
+        matches!(error, Error::Interrupted(InterruptReason::WallClockTimeout)),
+        "{error:?}"
+    );
+    assert_eq!(reason.reason(), Some(InterruptReason::WallClockTimeout));
 }
 
 #[tokio::test]

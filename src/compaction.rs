@@ -96,6 +96,11 @@ pub struct CompactionRequest<'a> {
     /// The budgets that model works within.
     pub facts:          ModelFacts,
     /// How many recent turns to leave untouched.
+    ///
+    /// One turn is always left, whatever this says. Compaction runs at a turn
+    /// boundary where the newest turn may hold tool calls whose results have
+    /// not been recorded yet, and summarizing that turn away would leave the
+    /// results that follow it answering calls no provider can see.
     pub preserve_turns: usize,
     /// The estimate that triggered this run, reported on the started event.
     pub estimate:       ContextEstimate,
@@ -144,7 +149,9 @@ pub fn check_context_usage(
 ///
 /// Does nothing when preserving the recent turns safely would preserve all of
 /// them: no call is made and no event is emitted, so an application never sees
-/// a compaction start that cannot finish.
+/// a compaction start that cannot finish. The newest turn is always among the
+/// preserved, however small
+/// [`preserve_turns`](CompactionRequest::preserve_turns) is.
 ///
 /// The summary text is bounded to the visible budget after the call, because a
 /// provider enforces one combined ceiling for reasoning and output and cannot
@@ -158,7 +165,10 @@ pub async fn compact_context(
     session_id: &str,
 ) -> Result<()> {
     let original_turn_count = history.len();
-    let preserve_start = history.compact_preserve_start(request.preserve_turns);
+    // The newest turn stays whatever the caller asked for: it may be an
+    // assistant turn whose tool calls are about to be answered, and its
+    // results are pushed after this point.
+    let preserve_start = history.compact_preserve_start(request.preserve_turns.max(1));
     if preserve_start == 0 {
         return Ok(());
     }
@@ -1052,6 +1062,49 @@ limits = { context_tokens = 200000, max_output_tokens = 32000 }
             .expect("the summary turn separates its header from the generated text");
         assert!(retained.len() <= max_bytes);
         assert!(!retained.contains("END"));
+    }
+
+    #[tokio::test]
+    async fn compaction_keeps_the_turn_whose_tool_calls_are_still_open() {
+        // Compaction runs between committing an assistant turn and executing
+        // the calls it made, so preserving nothing would summarize away the
+        // calls the results about to be pushed answer.
+        let mut history = history_from(vec![user("first"), user("second"), Message::Assistant {
+            content:        "working on it".to_owned(),
+            tool_calls:     vec![ToolCall::function("call_1", "shell", json!({}))],
+            provider_parts: Vec::new(),
+            usage:          TokenUsage::default(),
+            response_id:    "resp_1".to_owned(),
+            timestamp:      now(),
+        }]);
+        let (client, _) = client(Script::Summary("Brief handoff.".to_owned()));
+        let events = Events::new();
+
+        compact_context(
+            &mut history,
+            &client,
+            &FileTracker::default(),
+            CompactionRequest {
+                preserve_turns: 0,
+                ..compaction_request(1_000)
+            },
+            &events.emitter,
+            "sess",
+        )
+        .await
+        .expect("the summary compacts");
+
+        history.push(tool_results("call_1", "done"));
+        assert!(
+            history.turns().iter().any(|turn| matches!(
+                turn,
+                Message::Assistant { tool_calls, .. }
+                    if tool_calls.iter().any(|call| call.id == "call_1")
+            )),
+            "the open call survives its own compaction: {:?}",
+            history.turns()
+        );
+        let _ = events.drain().await;
     }
 
     #[tokio::test]

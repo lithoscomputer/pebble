@@ -269,7 +269,9 @@ pub struct SessionOptions {
     pub enable_context_compaction: bool,
     /// The share of the context window that triggers compaction.
     pub compaction_threshold_percent: usize,
-    /// How many recent turns compaction leaves untouched.
+    /// How many recent turns compaction leaves untouched. Compaction leaves
+    /// the newest turn whatever this says, because it may hold tool calls that
+    /// have not been answered yet.
     pub compaction_preserve_turns: usize,
     /// How long one run may take before the session cancels itself.
     pub wall_clock_timeout: Option<Duration>,

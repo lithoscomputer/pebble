@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::char_boundary::floor_char_boundary;
 use crate::environment::ExecRequest;
-use crate::tool::{RegisteredTool, ToolError, required_str};
+use crate::tool::{NativeTool, RegisteredTool, ToolError, required_str};
 use crate::types::{ToolErrorKind, ToolSource};
 
 mod markdown;
@@ -101,7 +101,7 @@ impl WebFetchSummarizer {
 pub fn make_web_fetch_tool() -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
-            "web_fetch",
+            NativeTool::WebFetch.canonical_name(),
             "Fetch content from a URL that starts with http:// or https://. Pass a prompt to \
              extract specific information or summarize the page; omit prompt to return the page \
              content.",

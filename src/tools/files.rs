@@ -11,7 +11,7 @@ use futures_util::{StreamExt as _, stream};
 use lithos_llm::types::ToolDefinition;
 use serde_json::Value;
 
-use crate::tool::{RegisteredTool, ToolError, optional_usize_arg, required_str};
+use crate::tool::{NativeTool, RegisteredTool, ToolError, optional_usize_arg, required_str};
 use crate::types::ToolSource;
 
 /// How many lines `read_file` returns when the model names no limit.
@@ -28,7 +28,7 @@ const MAX_READ_MANY_FILES_CONCURRENCY: usize = 8;
 pub fn make_read_file_tool() -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
-            "read_file",
+            NativeTool::ReadFile.canonical_name(),
             "Read files before editing them. Returns line-numbered text and supports offset/limit \
              for large files. Use this instead of shell cat, head, tail, or sed when inspecting \
              repository files.",
@@ -60,7 +60,7 @@ pub fn make_read_file_tool() -> RegisteredTool {
 pub fn make_write_file_tool() -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
-            "write_file",
+            NativeTool::WriteFile.canonical_name(),
             "Create new files, or overwrite an existing file only when replacement is explicitly \
              intended. Prefer edit_file for targeted changes to existing files because write_file \
              overwrites the full file content.",
@@ -94,7 +94,7 @@ pub fn make_write_file_tool() -> RegisteredTool {
 pub fn make_edit_file_tool() -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
-            "edit_file",
+            NativeTool::EditFile.canonical_name(),
             "Edit a file by replacing an exact string. The old_string must be an exact match and \
              unique unless replace_all is true; include surrounding context when needed. Read the \
              file first and preserve existing indentation.",
@@ -158,7 +158,7 @@ pub fn make_edit_file_tool() -> RegisteredTool {
 pub fn make_read_many_files_tool() -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
-            "read_many_files",
+            NativeTool::ReadManyFiles.canonical_name(),
             "Read multiple files at once",
             serde_json::json!({
                 "type": "object",

@@ -282,7 +282,11 @@ pub(crate) mod rfc3339_millis {
 /// drops. [`Message::to_llm_message`] is the single conversion to the wire
 /// form, shared by durable history and staged turns so a staged turn produces
 /// the same shape it will have once committed.
+///
+/// Non-exhaustive, like the [`StoredMessage`] it mirrors: a turn kind added to
+/// the record has to be readable as a `Message` too, so the two grow together.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Message {
     /// Input from the person or system driving the session.
     User {
@@ -484,6 +488,7 @@ impl Message {
 
 /// What a session is doing right now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionState {
     /// Waiting for input.
     Idle,
@@ -1123,7 +1128,7 @@ impl AgentEvent {
             } => {
                 debug!(
                     session_id,
-                    agent_id, depth, generation, task, "Sub-agent spawned"
+                    agent_id, depth, generation, task, "Subagent spawned"
                 );
             }
             Self::SubAgentTurnStarted {
@@ -1134,7 +1139,7 @@ impl AgentEvent {
             } => {
                 debug!(
                     session_id,
-                    agent_id, depth, generation, task, "Sub-agent turn started"
+                    agent_id, depth, generation, task, "Subagent turn started"
                 );
             }
             Self::SubAgentCompleted {
@@ -1146,7 +1151,7 @@ impl AgentEvent {
             } => {
                 debug!(
                     session_id,
-                    agent_id, depth, generation, success, turns_used, "Sub-agent completed"
+                    agent_id, depth, generation, success, turns_used, "Subagent completed"
                 );
             }
             Self::SubAgentFailed {
@@ -1161,7 +1166,7 @@ impl AgentEvent {
                     depth,
                     generation,
                     error = error.message.as_str(),
-                    "Sub-agent failed"
+                    "Subagent failed"
                 );
             }
             Self::SubAgentClosed {
@@ -1169,7 +1174,7 @@ impl AgentEvent {
                 depth,
                 generation,
             } => {
-                debug!(session_id, agent_id, depth, generation, "Sub-agent closed");
+                debug!(session_id, agent_id, depth, generation, "Subagent closed");
             }
             Self::MemoryLoaded {
                 profile,

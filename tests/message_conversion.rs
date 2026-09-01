@@ -22,8 +22,9 @@ fn moment() -> SystemTime {
 
 /// The name of a turn's variant.
 ///
-/// The match is exhaustive on purpose: a new turn kind must be added to
-/// `every_variant` before this file compiles again.
+/// `Message` is non-exhaustive, so this arm is what a reader outside pebble
+/// has to write. A turn kind this file does not know reaches it and fails the
+/// run, which is the reminder to cover the new kind in `every_variant`.
 fn variant_of(turn: &Message) -> &'static str {
     match turn {
         Message::User { .. } => "user",
@@ -31,6 +32,7 @@ fn variant_of(turn: &Message) -> &'static str {
         Message::ToolResults { .. } => "tool_results",
         Message::System { .. } => "system",
         Message::Steering { .. } => "steering",
+        _ => panic!("a turn kind this test does not know: add it to `every_variant`"),
     }
 }
 

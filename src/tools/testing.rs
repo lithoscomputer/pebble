@@ -57,9 +57,14 @@ impl TempDir {
         &self.path
     }
 
+    /// A path inside the directory.
+    pub(crate) fn join(&self, relative: &str) -> PathBuf {
+        self.path.join(relative)
+    }
+
     /// Writes a fixture file, creating the directories above it.
     pub(crate) fn write(&self, relative: &str, content: &str) {
-        let path = self.path.join(relative);
+        let path = self.join(relative);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("parent directory is creatable");
         }
