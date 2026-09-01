@@ -9,8 +9,8 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
+use pebble::advanced::llm::types::{ContentPart, ToolCall, ToolDefinition, ToolResult};
 use pebble::events::{CodingEvent, CodingSessionEvent, Emitter, EventOptions, EventPump};
-use pebble::llm::types::{ContentPart, ToolCall, ToolDefinition, ToolResult};
 use pebble::test_support::MockEnvironment;
 use pebble::tools::{
     RegisteredTool, ToolContext, ToolDispatch, ToolError, ToolErrorKind, ToolHookCallback,

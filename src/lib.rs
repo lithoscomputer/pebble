@@ -1,6 +1,6 @@
 //! Pebble is a coding agent as a library. It builds coding profiles,
 //! environment-backed tools, memory, skills, compaction, subagents, and durable
-//! events on the provider-neutral [`agent`] loop.
+//! events on the provider-neutral [`advanced::agent`] loop.
 //!
 //! Start with [`CodingSession`]. Use [`CodingSession::builder`] to configure a
 //! session, [`CodingSession::prompt`] to process one prompt, and
@@ -54,19 +54,6 @@ pub mod test_support;
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 mod readme {}
-
-/// The attribute used by Pebble's async extension traits.
-pub use async_trait::async_trait;
-/// The model layer used by Pebble's public contracts.
-///
-/// Model requests, responses, tools, catalogs, credentials, and client
-/// middleware live under this one namespace rather than being mixed into the
-/// coding-agent root.
-pub use lithos_llm as llm;
-/// The provider-neutral agent layer used below Pebble's coding facade.
-pub use pebble_agent as agent;
-/// The cancellation signal used by Pebble's extension traits.
-pub use tokio_util::sync::CancellationToken;
 
 pub use self::coding_session::{
     CodingSession, CodingSessionBuildError, CodingSessionBuilder, CodingSessionControlHandle,

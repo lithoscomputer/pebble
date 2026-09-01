@@ -372,8 +372,9 @@ impl fmt::Debug for CodingSessionControlHandle {
 /// A ready coding-agent conversation.
 ///
 /// This facade owns coding profiles, resources, tools, environment access,
-/// compaction policy, and subagents. Use [`pebble::agent`](crate::agent) when
-/// those coding-specific facilities are not needed.
+/// compaction policy, and subagents. Use
+/// [`pebble::advanced::agent`](crate::advanced::agent) when those
+/// coding-specific facilities are not needed.
 pub struct CodingSession {
     inner:   CodingRuntime,
     control: Arc<CodingControl>,

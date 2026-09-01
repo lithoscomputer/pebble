@@ -290,8 +290,8 @@ pub struct CodingSessionOptions {
     /// default of four allows the three replays Pebble is willing to spend on
     /// one turn.
     ///
-    /// The type is available as
-    /// [`pebble::llm::middleware::RetryPolicy`](crate::llm::middleware::RetryPolicy).
+    /// The type is reexported as
+    /// `pebble::advanced::llm::middleware::RetryPolicy`.
     pub turn_replay: RetryPolicy,
 }
 

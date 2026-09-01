@@ -108,10 +108,11 @@ stream; without it a session still runs correctly and simply never reports one.
 after a response stream opens. The two policies can share settings, but they
 have different ownership and do not have to match.
 
-The model layer is available under one namespace, `pebble::llm`, along with the
-`async_trait` attribute the seams are written with and `CancellationToken`, so
-an application can use `pebble` alone in its manifest. A direct `lithos-llm`
-dependency is also appropriate when the application configures providers.
+The model layer is available under `pebble::advanced::llm`. The same module
+exports the `async_trait` attribute used by the seams and `CancellationToken`,
+so an application can use `pebble` alone in its manifest. A direct
+`lithos-llm` dependency is also appropriate when the application configures
+providers.
 
 **Credentials.** They belong to the client, and lithos-llm resolves them per
 call — `EnvironmentCredentials::conventional()` reads the usual variables
@@ -154,10 +155,10 @@ no question tool), an `advanced::SearchProvider` (no provider, no
 
 Use `pebble-agent` directly when the application supplies its own tools and
 does not need coding profiles or environment policy. Pebble also exposes the
-exact crate as `pebble::agent`:
+exact crate as `pebble::advanced::agent`:
 
 ```rust,no_run
-use pebble::agent::{Agent, Tool};
+use pebble::advanced::agent::{Agent, Tool};
 use serde_json::json;
 
 # async fn example(client: lithos_llm::Client) -> Result<(), Box<dyn std::error::Error>> {
