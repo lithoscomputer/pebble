@@ -5,6 +5,12 @@
 //! does not know about files, shells, coding profiles, memory, skills,
 //! subagents, persistence, credentials, or provider construction.
 //!
+//! Specialized layers can resolve and filter tools for each turn with
+//! [`ToolProvider`] and [`ToolAccessPolicy`]. [`ToolCallHooks`] surround tool
+//! execution, [`TurnBoundaryHooks`] own compaction and background-result
+//! boundaries, and [`EventProjection`] maps the generic lifecycle into a
+//! durable application event model.
+//!
 //! # One agent
 //!
 //! ```no_run
@@ -44,6 +50,7 @@ mod event;
 mod model;
 mod stream;
 mod tool;
+mod turn;
 mod validation;
 
 pub use self::agent::{
@@ -53,9 +60,13 @@ pub use self::agent::{
 pub use self::context::{ContextTransform, ContextTransformError, TransformContext};
 pub use self::control::AgentControlHandle;
 pub use self::error::{AgentBuildError, AgentError, Result};
-pub use self::event::{AgentEvent, FirstOutputKind};
+pub use self::event::{AgentEvent, EventProjection, FirstOutputKind};
 pub use self::model::ModelService;
-pub use self::tool::{Tool, ToolContext, ToolError, ToolExecutor, ToolOutput};
+pub use self::tool::{
+    BeforeToolCall, Tool, ToolAccess, ToolAccessContext, ToolAccessPolicy, ToolCallContext,
+    ToolCallHooks, ToolContext, ToolError, ToolExecutor, ToolOutput, ToolProvider,
+};
+pub use self::turn::{TurnBoundaryContext, TurnBoundaryError, TurnBoundaryHooks, TurnContext};
 
 /// Lower-level turn primitives for specialized agent layers.
 pub mod advanced {

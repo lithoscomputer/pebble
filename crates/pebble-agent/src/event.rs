@@ -1,7 +1,10 @@
 //! The small lifecycle event stream emitted by a generic agent.
 
+use std::sync::Arc;
+
 use lithos_llm::types::{ErrorKind, Message, Response, ToolCall, ToolResult};
 use serde::{Deserialize, Serialize};
+use tokio::sync::broadcast;
 
 /// The first model output observed in one stream attempt.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -105,4 +108,47 @@ pub enum AgentEvent {
     PromptAborted,
     /// The agent was closed.
     AgentClosed,
+}
+
+/// Projects generic lifecycle events into an embedding layer's event model.
+///
+/// Projection is synchronous and ordered. It runs before the event is sent to
+/// generic live subscribers. Implementations should enqueue durable work and
+/// return promptly.
+pub trait EventProjection: Send + Sync {
+    /// Projects one event.
+    fn project(&self, event: &AgentEvent);
+}
+
+impl<F> EventProjection for F
+where
+    F: Fn(&AgentEvent) + Send + Sync,
+{
+    fn project(&self, event: &AgentEvent) {
+        self(event);
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct EventHub {
+    live:       broadcast::Sender<AgentEvent>,
+    projection: Option<Arc<dyn EventProjection>>,
+}
+
+impl EventHub {
+    pub(crate) fn new(capacity: usize, projection: Option<Arc<dyn EventProjection>>) -> Self {
+        let (live, _) = broadcast::channel(capacity);
+        Self { live, projection }
+    }
+
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
+        self.live.subscribe()
+    }
+
+    pub(crate) fn emit(&self, event: AgentEvent) {
+        if let Some(projection) = &self.projection {
+            projection.project(&event);
+        }
+        let _ = self.live.send(event);
+    }
 }

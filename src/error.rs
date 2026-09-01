@@ -1,7 +1,7 @@
 //! Pebble's runtime error type and the serializable projection that rides the
 //! event stream.
 //!
-//! The prompttime [`Error`] keeps full fidelity: it wraps
+//! The runtime [`Error`] keeps full fidelity: it wraps
 //! [`lithos_llm::types::Error`], which is neither `Clone` nor serializable
 //! because it owns a live source chain. [`ErrorData`] is the projection that
 //! events carry instead — cloneable, serializable, and free of raw provider
@@ -155,7 +155,7 @@ pub type Result<T> = StdResult<T, Error>;
 /// The stable category of a projected pebble failure.
 ///
 /// Mirrors the [`Error`] variants so a consumer can branch on a serialized
-/// failure the same way it would branch on the prompttime error.
+/// failure the same way it would branch on the runtime error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]

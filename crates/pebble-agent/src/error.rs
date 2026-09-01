@@ -6,6 +6,7 @@ use lithos_llm::types::{Error as LlmError, RequestBuildError};
 use thiserror::Error;
 
 use crate::context::ContextTransformError;
+use crate::turn::TurnBoundaryError;
 
 /// A result returned by a running agent.
 pub type Result<T> = StdResult<T, AgentError>;
@@ -38,6 +39,12 @@ pub enum AgentError {
     /// The input carried no content.
     #[error("the user message must contain at least one content part")]
     EmptyInput,
+    /// Two tools resolved to the same model-visible name for one turn.
+    #[error("tool `{name}` was resolved more than once for one turn")]
+    DuplicateTool {
+        /// The duplicated name.
+        name: String,
+    },
     /// The current prompt was aborted.
     #[error("the agent prompt was aborted")]
     Aborted,
@@ -61,5 +68,12 @@ pub enum AgentError {
         /// The transformation failure.
         #[source]
         source: ContextTransformError,
+    },
+    /// A configured turn-boundary hook failed.
+    #[error("processing a model-turn boundary")]
+    TurnBoundary {
+        /// The hook failure.
+        #[source]
+        source: TurnBoundaryError,
     },
 }

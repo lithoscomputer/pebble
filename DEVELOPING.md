@@ -107,7 +107,7 @@ each night. Both workflows test these native platforms:
 - Linux arm64.
 
 The workflows check out only this repository. They cannot build until the
-`lithos-llm` path dependency is available on the promptner, because `lithos-llm`
+`lithos-llm` path dependency is available on the runner, because `lithos-llm`
 is a separate private repository. Both workflows fail at manifest load until a
 second checkout step is added, or the dependency changes form. Verify changes
 locally with `mise run check` in the meantime.

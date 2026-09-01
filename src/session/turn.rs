@@ -64,7 +64,7 @@ const STREAM_CONSUME_RETRIES: usize = 3;
 const LOOP_WARNING: &str = "WARNING: Loop detected. You appear to be repeating the same tool \
                             calls. Please try a different approach or ask for clarification.";
 
-/// Takes the promptning span out of `start` and adds it to `total`.
+/// Takes the running span out of `start` and adds it to `total`.
 fn record_elapsed(start: &mut Option<Instant>, total: &mut Duration) {
     if let Some(started) = start.take() {
         *total = total.saturating_add(started.elapsed());
@@ -98,7 +98,7 @@ fn provider_parts_of(response: &Response) -> Vec<ContentPart> {
 }
 
 impl Session {
-    /// Runs one input until the model stops asking for tools.
+    /// Processes one input until the model stops asking for tools.
     ///
     /// Answers with the assistant's final text when it ended with any, and
     /// `None` when it ended with nothing worth showing.

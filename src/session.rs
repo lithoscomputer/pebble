@@ -364,7 +364,7 @@ impl SessionBuilder {
     /// Lets `web_fetch` answer a prompt about a page by asking `model`.
     ///
     /// The selector is resolved through this session's client, so the
-    /// summarizing model can be smaller and cheaper than the one promptning the
+    /// summarizing model can be smaller and cheaper than the one running the
     /// session. Without one, a `web_fetch` call carrying a prompt returns the
     /// page and says the summary was unavailable.
     ///

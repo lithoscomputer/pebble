@@ -553,7 +553,7 @@ impl SessionBoundEmitter {
         );
     }
 
-    /// Reports how much output the promptning tool produced.
+    /// Reports how much output the running tool produced.
     ///
     /// The last report wins; the execution layer drains it once the tool
     /// returns.

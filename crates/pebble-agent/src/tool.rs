@@ -7,12 +7,146 @@ use std::result::Result as StdResult;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lithos_llm::types::{ContentPart, ToolDefinition};
+use lithos_llm::types::{ContentPart, ToolCall, ToolDefinition, ToolResult};
 use serde_json::Value;
-use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::event::AgentEvent;
+use crate::event::{AgentEvent, EventHub};
+use crate::turn::TurnContext;
+
+/// Resolves tools from the current conversation before each model turn.
+pub trait ToolProvider: Send + Sync {
+    /// Returns the tools available for this turn.
+    fn tools_for_turn(&self, context: TurnContext<'_>) -> Vec<Tool>;
+}
+
+impl<F> ToolProvider for F
+where
+    F: for<'a> Fn(TurnContext<'a>) -> Vec<Tool> + Send + Sync,
+{
+    fn tools_for_turn(&self, context: TurnContext<'_>) -> Vec<Tool> {
+        self(context)
+    }
+}
+
+/// What an access policy decided for one tool in one turn.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ToolAccess {
+    /// Advertise and execute the tool.
+    #[default]
+    Allowed,
+    /// Do not advertise or execute the tool.
+    Denied {
+        /// The explanation returned if the model still requests the tool.
+        reason: String,
+    },
+}
+
+/// The input to a per-turn tool access decision.
+#[derive(Clone, Copy, Debug)]
+pub struct ToolAccessContext<'a> {
+    turn:       TurnContext<'a>,
+    definition: &'a ToolDefinition,
+}
+
+impl<'a> ToolAccessContext<'a> {
+    pub(crate) const fn new(turn: TurnContext<'a>, definition: &'a ToolDefinition) -> Self {
+        Self { turn, definition }
+    }
+
+    /// The model turn being prepared.
+    #[must_use]
+    pub const fn turn(&self) -> TurnContext<'a> {
+        self.turn
+    }
+
+    /// The tool definition under consideration.
+    #[must_use]
+    pub const fn definition(&self) -> &ToolDefinition {
+        self.definition
+    }
+}
+
+/// Decides which resolved tools may be advertised and executed in each turn.
+pub trait ToolAccessPolicy: Send + Sync {
+    /// Returns this turn's access for one tool.
+    fn access(&self, context: ToolAccessContext<'_>) -> ToolAccess;
+}
+
+impl<F> ToolAccessPolicy for F
+where
+    F: for<'a> Fn(ToolAccessContext<'a>) -> ToolAccess + Send + Sync,
+{
+    fn access(&self, context: ToolAccessContext<'_>) -> ToolAccess {
+        self(context)
+    }
+}
+
+/// The context supplied to tool-call hooks.
+#[derive(Clone, Copy, Debug)]
+pub struct ToolCallContext<'a> {
+    turn: usize,
+    call: &'a ToolCall,
+}
+
+impl<'a> ToolCallContext<'a> {
+    pub(crate) const fn new(turn: usize, call: &'a ToolCall) -> Self {
+        Self { turn, call }
+    }
+
+    /// The zero-based model turn that requested this call.
+    #[must_use]
+    pub const fn turn(&self) -> usize {
+        self.turn
+    }
+
+    /// The requested call.
+    #[must_use]
+    pub const fn call(&self) -> &ToolCall {
+        self.call
+    }
+}
+
+/// What a before-call hook decided.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum BeforeToolCall {
+    /// Continue to argument validation and execution.
+    #[default]
+    Proceed,
+    /// Return an error result without executing the tool.
+    Block {
+        /// The explanation returned to the model.
+        reason: String,
+    },
+}
+
+/// Hooks around each tool call.
+///
+/// Completion events are projected before
+/// [`after_tool_call`](Self::after_tool_call) runs. The after hook therefore
+/// observes the same final result as event consumers and the next model turn.
+#[async_trait]
+pub trait ToolCallHooks: Send + Sync {
+    /// Runs after access policy and before argument validation.
+    async fn before_tool_call(
+        &self,
+        _context: ToolCallContext<'_>,
+        _cancel: &CancellationToken,
+    ) -> BeforeToolCall {
+        BeforeToolCall::Proceed
+    }
+
+    /// Runs after the call's completion event is projected.
+    async fn after_tool_call(
+        &self,
+        _context: ToolCallContext<'_>,
+        _result: &ToolResult,
+        _cancel: &CancellationToken,
+    ) {
+    }
+}
 
 /// The context supplied to one tool call.
 #[derive(Clone)]
@@ -20,7 +154,7 @@ pub struct ToolContext {
     tool_call_id: String,
     tool_name:    String,
     cancel:       CancellationToken,
-    events:       broadcast::Sender<AgentEvent>,
+    events:       EventHub,
 }
 
 impl ToolContext {
@@ -28,7 +162,7 @@ impl ToolContext {
         tool_call_id: String,
         tool_name: String,
         cancel: CancellationToken,
-        events: broadcast::Sender<AgentEvent>,
+        events: EventHub,
     ) -> Self {
         Self {
             tool_call_id,
@@ -60,7 +194,7 @@ impl ToolContext {
     ///
     /// This does not add the fragment to the result returned to the model.
     pub fn emit_output_delta(&self, delta: impl Into<String>) {
-        let _ = self.events.send(AgentEvent::ToolOutputDelta {
+        self.events.emit(AgentEvent::ToolOutputDelta {
             tool_call_id: self.tool_call_id.clone(),
             delta:        delta.into(),
         });

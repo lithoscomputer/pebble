@@ -34,7 +34,7 @@ pub trait AgentEventEmitter: Send + Sync {
     /// Publishes one event on the owning session's stream.
     fn emit(&self, event: AgentEvent);
 
-    /// Reports how many bytes of model-facing output the promptning tool
+    /// Reports how many bytes of model-facing output the running tool
     /// produced.
     ///
     /// A side channel, not an event: the execution layer drains it once the

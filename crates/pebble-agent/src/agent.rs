@@ -18,9 +18,13 @@ use crate::advanced::{StreamObserver, StreamOutcome, stream_response};
 use crate::context::{ContextTransform, TransformContext};
 use crate::control::{AgentControlHandle, Control};
 use crate::error::{AgentBuildError, AgentError, Result};
-use crate::event::{AgentEvent, FirstOutputKind};
+use crate::event::{AgentEvent, EventHub, EventProjection, FirstOutputKind};
 use crate::model::ModelService;
-use crate::tool::{Tool, ToolContext};
+use crate::tool::{
+    BeforeToolCall, Tool, ToolAccess, ToolAccessContext, ToolAccessPolicy, ToolCallContext,
+    ToolCallHooks, ToolContext, ToolProvider,
+};
+use crate::turn::{TurnBoundaryContext, TurnBoundaryHooks, TurnContext};
 use crate::validation::validate_tool_arguments;
 
 /// The default number of lifecycle events held for each subscriber.
@@ -119,7 +123,12 @@ pub struct AgentBuilder {
     system_prompt:     String,
     messages:          Vec<Message>,
     tools:             Vec<Tool>,
+    tool_provider:     Option<Arc<dyn ToolProvider>>,
+    tool_access:       Option<Arc<dyn ToolAccessPolicy>>,
+    tool_hooks:        Option<Arc<dyn ToolCallHooks>>,
     context_transform: Option<Arc<dyn ContextTransform>>,
+    turn_hooks:        Option<Arc<dyn TurnBoundaryHooks>>,
+    event_projection:  Option<Arc<dyn EventProjection>>,
     config:            AgentConfig,
 }
 
@@ -131,7 +140,12 @@ impl AgentBuilder {
             system_prompt:     String::new(),
             messages:          Vec::new(),
             tools:             Vec::new(),
+            tool_provider:     None,
+            tool_access:       None,
+            tool_hooks:        None,
             context_transform: None,
+            turn_hooks:        None,
+            event_projection:  None,
             config:            AgentConfig::default(),
         }
     }
@@ -154,9 +168,42 @@ impl AgentBuilder {
         self
     }
 
+    /// Adds tools resolved from conversation state before each model turn.
+    ///
+    /// Resolved tools are combined with tools added through
+    /// [`tools`](Self::tools).
+    pub fn tool_provider(mut self, provider: Arc<dyn ToolProvider>) -> Self {
+        self.tool_provider = Some(provider);
+        self
+    }
+
+    /// Sets the access policy evaluated for every resolved tool in every turn.
+    pub fn tool_access_policy(mut self, policy: Arc<dyn ToolAccessPolicy>) -> Self {
+        self.tool_access = Some(policy);
+        self
+    }
+
+    /// Sets the hooks called before and after every tool call.
+    pub fn tool_call_hooks(mut self, hooks: Arc<dyn ToolCallHooks>) -> Self {
+        self.tool_hooks = Some(hooks);
+        self
+    }
+
     /// Sets the transformation run before each model request.
     pub fn context_transform(mut self, transform: Arc<dyn ContextTransform>) -> Self {
         self.context_transform = Some(transform);
+        self
+    }
+
+    /// Sets hooks at model-turn and natural-answer boundaries.
+    pub fn turn_boundary_hooks(mut self, hooks: Arc<dyn TurnBoundaryHooks>) -> Self {
+        self.turn_hooks = Some(hooks);
+        self
+    }
+
+    /// Projects lifecycle events into an embedding layer's event model.
+    pub fn event_projection(mut self, projection: Arc<dyn EventProjection>) -> Self {
+        self.event_projection = Some(projection);
         self
     }
 
@@ -187,14 +234,18 @@ impl AgentBuilder {
             }
         }
 
-        let (events, _) = broadcast::channel(self.config.event_capacity);
+        let events = EventHub::new(self.config.event_capacity, self.event_projection);
         Ok(Agent {
             model_service: self.model_service,
             model: self.model,
             system_prompt: self.system_prompt,
             messages: self.messages,
             tools: self.tools,
+            tool_provider: self.tool_provider,
+            tool_access: self.tool_access,
+            tool_hooks: self.tool_hooks,
             context_transform: self.context_transform,
+            turn_hooks: self.turn_hooks,
             config: self.config,
             events,
             control: Control::new(),
@@ -289,9 +340,13 @@ pub struct Agent {
     system_prompt:     String,
     messages:          Vec<Message>,
     tools:             Vec<Tool>,
+    tool_provider:     Option<Arc<dyn ToolProvider>>,
+    tool_access:       Option<Arc<dyn ToolAccessPolicy>>,
+    tool_hooks:        Option<Arc<dyn ToolCallHooks>>,
     context_transform: Option<Arc<dyn ContextTransform>>,
+    turn_hooks:        Option<Arc<dyn TurnBoundaryHooks>>,
     config:            AgentConfig,
-    events:            broadcast::Sender<AgentEvent>,
+    events:            EventHub,
     control:           Arc<Control>,
 }
 
@@ -443,6 +498,19 @@ impl Agent {
                 }
 
                 let round_cancel = self.control.begin_round();
+                if let Some(hooks) = self.turn_hooks.clone() {
+                    let context =
+                        TurnBoundaryContext::new(&self.model, turn_count, &mut self.messages);
+                    let prepared = hooks.before_model(context, &round_cancel).await;
+                    if prompt_cancel.is_cancelled() {
+                        return Err(AgentError::Aborted);
+                    }
+                    if round_cancel.is_cancelled() {
+                        self.emit(AgentEvent::TurnInterrupted);
+                        continue;
+                    }
+                    prepared.map_err(|source| AgentError::TurnBoundary { source })?;
+                }
                 if let Some(transform) = &self.context_transform {
                     let context = TransformContext::new(&self.model, &mut self.messages);
                     let transformed = transform.transform(context, &round_cancel).await;
@@ -456,8 +524,9 @@ impl Agent {
                     transformed.map_err(|source| AgentError::ContextTransform { source })?;
                 }
 
+                let tools = self.resolve_tools(turn_count)?;
                 self.emit(AgentEvent::TurnStarted { turn: turn_count });
-                let request = self.build_request()?;
+                let request = self.build_request(&tools)?;
                 self.emit(AgentEvent::ModelRequestStarted {
                     model: self.model.clone(),
                 });
@@ -472,6 +541,7 @@ impl Agent {
                         continue;
                     }
                 };
+                let turn = turn_count;
                 turn_count += 1;
 
                 let assistant = response_message(&response);
@@ -480,14 +550,49 @@ impl Agent {
                     response: response.clone(),
                 });
 
+                if let Some(hooks) = self.turn_hooks.clone() {
+                    let context = TurnBoundaryContext::new(&self.model, turn, &mut self.messages);
+                    hooks
+                        .after_model(context, &response, &round_cancel)
+                        .await
+                        .map_err(|source| AgentError::TurnBoundary { source })?;
+                    if prompt_cancel.is_cancelled() {
+                        return Err(AgentError::Aborted);
+                    }
+                }
+
                 let calls = tool_calls(&response);
                 if calls.is_empty() {
+                    if round_cancel.is_cancelled() {
+                        self.emit(AgentEvent::TurnInterrupted);
+                        continue;
+                    }
+                    if let Some(hooks) = self.turn_hooks.clone() {
+                        let context = TurnContext::new(&self.model, turn, &self.messages);
+                        let boundary_message = hooks
+                            .after_answer(context, &response, prompt_cancel)
+                            .await
+                            .map_err(|source| AgentError::TurnBoundary { source })?;
+                        if prompt_cancel.is_cancelled() {
+                            return Err(AgentError::Aborted);
+                        }
+                        if let Some(message) = boundary_message {
+                            let message = message.into_message();
+                            self.messages.push(message.clone());
+                            self.emit(AgentEvent::UserMessage { message });
+                            continue;
+                        }
+                        if round_cancel.is_cancelled() {
+                            self.emit(AgentEvent::TurnInterrupted);
+                            continue;
+                        }
+                    }
                     break response;
                 }
                 tool_call_count += calls.len();
 
                 let results = self
-                    .execute_tools(&calls, prompt_cancel, &round_cancel)
+                    .execute_tools(turn, &calls, &tools, prompt_cancel, &round_cancel)
                     .await;
                 self.messages.push(tool_results_message(&results));
 
@@ -509,7 +614,32 @@ impl Agent {
         }
     }
 
-    fn build_request(&self) -> Result<Request> {
+    fn resolve_tools(&self, turn: usize) -> Result<Vec<ResolvedTool>> {
+        let context = TurnContext::new(&self.model, turn, &self.messages);
+        let mut tools = self.tools.clone();
+        if let Some(provider) = &self.tool_provider {
+            tools.extend(provider.tools_for_turn(context));
+        }
+
+        let mut names = HashSet::new();
+        let mut resolved = Vec::with_capacity(tools.len());
+        for tool in tools {
+            let name = tool.definition().name.clone();
+            if !names.insert(name.clone()) {
+                return Err(AgentError::DuplicateTool { name });
+            }
+            let access = self
+                .tool_access
+                .as_ref()
+                .map_or_else(ToolAccess::default, |policy| {
+                    policy.access(ToolAccessContext::new(context, tool.definition()))
+                });
+            resolved.push(ResolvedTool { tool, access });
+        }
+        Ok(resolved)
+    }
+
+    fn build_request(&self, tools: &[ResolvedTool]) -> Result<Request> {
         let mut builder = Request::builder().model(self.model.clone());
         if !self.system_prompt.trim().is_empty() {
             builder = builder.system(self.system_prompt.clone());
@@ -517,10 +647,10 @@ impl Agent {
         for message in &self.messages {
             builder = builder.message(message.clone());
         }
-        for tool in &self.tools {
-            builder = builder.tool(tool.definition().clone());
+        for tool in tools.iter().filter(|tool| tool.is_allowed()) {
+            builder = builder.tool(tool.tool.definition().clone());
         }
-        if !self.tools.is_empty() {
+        if tools.iter().any(ResolvedTool::is_allowed) {
             builder = builder.tool_choice(ToolChoice::Auto);
         }
         if let Some(tokens) = self.config.max_output_tokens {
@@ -567,7 +697,9 @@ impl Agent {
 
     async fn execute_tools(
         &self,
+        turn: usize,
         calls: &[ToolCall],
+        tools: &[ResolvedTool],
         prompt_cancel: &CancellationToken,
         round_cancel: &CancellationToken,
     ) -> Vec<ToolResult> {
@@ -577,12 +709,17 @@ impl Agent {
                 ToolExecution::Sequential => {
                     let mut results = Vec::with_capacity(calls.len());
                     for call in calls {
-                        results.push(self.execute_tool(call, &cancel).await);
+                        results.push(self.execute_tool(turn, call, tools, &cancel).await);
                     }
                     results
                 }
                 ToolExecution::Parallel => {
-                    join_all(calls.iter().map(|call| self.execute_tool(call, &cancel))).await
+                    join_all(
+                        calls
+                            .iter()
+                            .map(|call| self.execute_tool(turn, call, tools, &cancel)),
+                    )
+                    .await
                 }
             }
         };
@@ -606,46 +743,87 @@ impl Agent {
         }
     }
 
-    async fn execute_tool(&self, call: &ToolCall, cancel: &CancellationToken) -> ToolResult {
+    async fn execute_tool(
+        &self,
+        turn: usize,
+        call: &ToolCall,
+        tools: &[ResolvedTool],
+        cancel: &CancellationToken,
+    ) -> ToolResult {
         self.emit(AgentEvent::ToolStarted { call: call.clone() });
-        let result = if let Some(tool) = self
-            .tools
+        let resolved = tools
             .iter()
-            .find(|tool| tool.definition().name == call.name)
-        {
-            if let Err(error) = validate_tool_arguments(&tool.definition().kind, &call.arguments) {
-                let result = error_tool_result(call, error.to_string());
-                self.emit(AgentEvent::ToolCompleted {
-                    result: result.clone(),
-                });
-                return result;
-            }
-            let context = ToolContext::new(
-                call.id.clone(),
-                call.name.clone(),
-                cancel.clone(),
-                self.events.clone(),
-            );
-            match tool.execute(context, call.arguments.clone()).await {
-                Ok(output) => ToolResult {
-                    tool_call_id: call.id.clone(),
-                    name:         Some(call.name.clone()),
-                    content:      nonempty_content(output.into_content()),
-                    is_error:     false,
-                },
-                Err(error) => error_tool_result(call, error.to_string()),
-            }
+            .find(|tool| tool.tool.definition().name == call.name);
+        let denied = resolved.and_then(|resolved| match &resolved.access {
+            ToolAccess::Allowed => None,
+            ToolAccess::Denied { reason } => Some(reason.clone()),
+        });
+        let (result, call_after_hook) = if let Some(reason) = denied {
+            (error_tool_result(call, reason), false)
         } else {
-            error_tool_result(call, format!("unknown tool `{}`", call.name))
+            let hook_context = ToolCallContext::new(turn, call);
+            let decision = match &self.tool_hooks {
+                Some(hooks) => hooks.before_tool_call(hook_context, cancel).await,
+                None => BeforeToolCall::Proceed,
+            };
+            match decision {
+                BeforeToolCall::Block { reason } => (error_tool_result(call, reason), false),
+                BeforeToolCall::Proceed => {
+                    let result = match resolved {
+                        Some(resolved) => {
+                            if let Err(error) = validate_tool_arguments(
+                                &resolved.tool.definition().kind,
+                                &call.arguments,
+                            ) {
+                                error_tool_result(call, error.to_string())
+                            } else {
+                                let context = ToolContext::new(
+                                    call.id.clone(),
+                                    call.name.clone(),
+                                    cancel.clone(),
+                                    self.events.clone(),
+                                );
+                                match resolved.tool.execute(context, call.arguments.clone()).await {
+                                    Ok(output) => ToolResult {
+                                        tool_call_id: call.id.clone(),
+                                        name:         Some(call.name.clone()),
+                                        content:      nonempty_content(output.into_content()),
+                                        is_error:     false,
+                                    },
+                                    Err(error) => error_tool_result(call, error.to_string()),
+                                }
+                            }
+                        }
+                        None => error_tool_result(call, format!("unknown tool `{}`", call.name)),
+                    };
+                    (result, true)
+                }
+            }
         };
         self.emit(AgentEvent::ToolCompleted {
             result: result.clone(),
         });
+        if call_after_hook && let Some(hooks) = &self.tool_hooks {
+            hooks
+                .after_tool_call(ToolCallContext::new(turn, call), &result, cancel)
+                .await;
+        }
         result
     }
 
     fn emit(&self, event: AgentEvent) {
-        let _ = self.events.send(event);
+        self.events.emit(event);
+    }
+}
+
+struct ResolvedTool {
+    tool:   Tool,
+    access: ToolAccess,
+}
+
+impl ResolvedTool {
+    const fn is_allowed(&self) -> bool {
+        matches!(&self.access, ToolAccess::Allowed)
     }
 }
 
@@ -655,7 +833,7 @@ enum StreamResult {
 }
 
 struct AgentStreamObserver<'a> {
-    events: &'a broadcast::Sender<AgentEvent>,
+    events: &'a EventHub,
 }
 
 impl StreamObserver for AgentStreamObserver<'_> {
@@ -690,7 +868,7 @@ impl StreamObserver for AgentStreamObserver<'_> {
 
 impl AgentStreamObserver<'_> {
     fn emit(&self, event: AgentEvent) {
-        let _ = self.events.send(event);
+        self.events.emit(event);
     }
 }
 
@@ -755,13 +933,28 @@ mod tests {
 
     struct ScriptedModel {
         responses: Mutex<VecDeque<Response>>,
+        requests:  Option<Arc<Mutex<Vec<Request>>>>,
     }
 
     impl ScriptedModel {
         fn new(responses: impl IntoIterator<Item = Response>) -> Self {
             Self {
                 responses: Mutex::new(responses.into_iter().collect()),
+                requests:  None,
             }
+        }
+
+        fn recording(
+            responses: impl IntoIterator<Item = Response>,
+        ) -> (Self, Arc<Mutex<Vec<Request>>>) {
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            (
+                Self {
+                    responses: Mutex::new(responses.into_iter().collect()),
+                    requests:  Some(Arc::clone(&requests)),
+                },
+                requests,
+            )
         }
     }
 
@@ -769,9 +962,15 @@ mod tests {
     impl ModelService for ScriptedModel {
         async fn stream(
             &self,
-            _request: Request,
+            request: Request,
             _context: CallContext,
         ) -> StdResult<ResponseStream, LlmError> {
+            if let Some(requests) = &self.requests {
+                requests
+                    .lock()
+                    .expect("the request lock is healthy")
+                    .push(request);
+            }
             let response = self
                 .responses
                 .lock()
@@ -796,6 +995,82 @@ mod tests {
         response([ContentPart::Text {
             text: text.to_owned(),
         }])
+    }
+
+    struct RecordingToolHooks {
+        trace: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait]
+    impl ToolCallHooks for RecordingToolHooks {
+        async fn before_tool_call(
+            &self,
+            _context: ToolCallContext<'_>,
+            _cancel: &CancellationToken,
+        ) -> BeforeToolCall {
+            self.trace
+                .lock()
+                .expect("the trace lock is healthy")
+                .push("hook:before");
+            BeforeToolCall::Proceed
+        }
+
+        async fn after_tool_call(
+            &self,
+            _context: ToolCallContext<'_>,
+            _result: &ToolResult,
+            _cancel: &CancellationToken,
+        ) {
+            self.trace
+                .lock()
+                .expect("the trace lock is healthy")
+                .push("hook:after");
+        }
+    }
+
+    struct BackgroundBoundary {
+        trace: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl TurnBoundaryHooks for BackgroundBoundary {
+        async fn before_model(
+            &self,
+            context: TurnBoundaryContext<'_>,
+            _cancel: &CancellationToken,
+        ) -> StdResult<(), crate::TurnBoundaryError> {
+            self.trace
+                .lock()
+                .expect("the trace lock is healthy")
+                .push(format!("before:{}", context.turn()));
+            Ok(())
+        }
+
+        async fn after_model(
+            &self,
+            context: TurnBoundaryContext<'_>,
+            _response: &Response,
+            _cancel: &CancellationToken,
+        ) -> StdResult<(), crate::TurnBoundaryError> {
+            self.trace
+                .lock()
+                .expect("the trace lock is healthy")
+                .push(format!("after:{}", context.turn()));
+            Ok(())
+        }
+
+        async fn after_answer(
+            &self,
+            context: TurnContext<'_>,
+            _response: &Response,
+            _cancel: &CancellationToken,
+        ) -> StdResult<Option<UserMessage>, crate::TurnBoundaryError> {
+            self.trace
+                .lock()
+                .expect("the trace lock is healthy")
+                .push(format!("answer:{}", context.turn()));
+            Ok((context.turn() == 0).then(|| UserMessage::text("background result")))
+        }
     }
 
     #[tokio::test]
@@ -846,6 +1121,153 @@ mod tests {
             &tool_message.content()[0],
             ContentPart::ToolResult(result) if !result.is_error
         ));
+    }
+
+    #[tokio::test]
+    async fn tools_and_access_are_resolved_for_each_turn() {
+        let calls_hidden = response([ContentPart::ToolCall(ToolCall::function(
+            "call_1",
+            "hidden",
+            json!({}),
+        ))]);
+        let (model, requests) = ScriptedModel::recording([calls_hidden, text_response("finished")]);
+        let hidden_executions = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&hidden_executions);
+        let provider = Arc::new(move |context: TurnContext<'_>| {
+            let tool = |name: &'static str| {
+                let observed = Arc::clone(&observed);
+                Tool::function(name, name, json!({}), move |_context, _arguments| {
+                    let observed = Arc::clone(&observed);
+                    async move {
+                        if name == "hidden" {
+                            observed.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Ok(name.into())
+                    }
+                })
+            };
+            if context.turn() == 0 {
+                vec![tool("allowed"), tool("hidden")]
+            } else {
+                vec![tool("later")]
+            }
+        });
+        let policy = Arc::new(|context: ToolAccessContext<'_>| {
+            if context.definition().name == "hidden" {
+                ToolAccess::Denied {
+                    reason: "hidden for this turn".to_owned(),
+                }
+            } else {
+                ToolAccess::Allowed
+            }
+        });
+        let mut agent = Agent::builder(model, "test/model")
+            .tool_provider(provider)
+            .tool_access_policy(policy)
+            .build()
+            .expect("the agent builds");
+
+        agent.prompt("work").await.expect("the prompt succeeds");
+
+        assert_eq!(hidden_executions.load(Ordering::SeqCst), 0);
+        let requests = requests.lock().expect("the request lock is healthy");
+        let names = |request: &Request| {
+            request
+                .tools()
+                .iter()
+                .map(|tool| tool.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&requests[0]), ["allowed".to_owned()]);
+        assert_eq!(names(&requests[1]), ["later".to_owned()]);
+        let ContentPart::ToolResult(result) = &agent.messages()[2].content()[0] else {
+            panic!("the denied tool call has a result");
+        };
+        assert!(result.is_error);
+        assert!(matches!(
+            &result.content[0],
+            ContentPart::Text { text } if text == "hidden for this turn"
+        ));
+    }
+
+    #[tokio::test]
+    async fn tool_hooks_and_event_projection_keep_call_order() {
+        let calls_tool = response([ContentPart::ToolCall(ToolCall::function(
+            "call_1",
+            "inspect",
+            json!({}),
+        ))]);
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let projected = Arc::clone(&trace);
+        let projection = Arc::new(move |event: &AgentEvent| {
+            let item = match event {
+                AgentEvent::ToolStarted { .. } => Some("event:start"),
+                AgentEvent::ToolCompleted { .. } => Some("event:complete"),
+                _ => None,
+            };
+            if let Some(item) = item {
+                projected
+                    .lock()
+                    .expect("the trace lock is healthy")
+                    .push(item);
+            }
+        });
+        let executed = Arc::clone(&trace);
+        let tool = Tool::function(
+            "inspect",
+            "inspect",
+            json!({}),
+            move |_context, _arguments| {
+                executed
+                    .lock()
+                    .expect("the trace lock is healthy")
+                    .push("tool");
+                async { Ok("done".into()) }
+            },
+        );
+        let mut agent = Agent::builder(
+            ScriptedModel::new([calls_tool, text_response("finished")]),
+            "test/model",
+        )
+        .tools([tool])
+        .tool_call_hooks(Arc::new(RecordingToolHooks {
+            trace: Arc::clone(&trace),
+        }))
+        .event_projection(projection)
+        .build()
+        .expect("the agent builds");
+
+        agent.prompt("work").await.expect("the prompt succeeds");
+
+        assert_eq!(*trace.lock().expect("the trace lock is healthy"), [
+            "event:start",
+            "hook:before",
+            "tool",
+            "event:complete",
+            "hook:after"
+        ]);
+    }
+
+    #[tokio::test]
+    async fn turn_boundary_hooks_can_continue_with_a_background_result() {
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = Agent::builder(
+            ScriptedModel::new([text_response("first"), text_response("second")]),
+            "test/model",
+        )
+        .turn_boundary_hooks(Arc::new(BackgroundBoundary {
+            trace: Arc::clone(&trace),
+        }))
+        .build()
+        .expect("the agent builds");
+
+        let outcome = agent.prompt("work").await.expect("the prompt succeeds");
+
+        assert_eq!(outcome.text(), "second");
+        assert_eq!(agent.messages().len(), 4);
+        assert_eq!(*trace.lock().expect("the trace lock is healthy"), [
+            "before:0", "after:0", "answer:0", "before:1", "after:1", "answer:1"
+        ]);
     }
 
     #[tokio::test]
