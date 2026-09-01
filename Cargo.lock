@@ -756,7 +756,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
-name = "pebble"
+name = "pebble-agent"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "lithos-llm",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "pebble-coding-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -773,21 +788,6 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "pebble-agent"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures-util",
- "lithos-llm",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
 ]
 
 [[package]]

@@ -75,9 +75,3 @@ pub mod advanced {
     pub use crate::tool::{ToolRoundContext, ToolRoundExecutor};
     pub use crate::validation::{ToolArgumentsError, validate_tool_arguments};
 }
-
-/// The model layer used by this crate.
-///
-/// Re-exported under one namespace so applications can use the exact request,
-/// response, and tool types in this crate's public contracts.
-pub use lithos_llm as llm;

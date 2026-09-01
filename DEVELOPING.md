@@ -1,10 +1,12 @@
 # Developing
 
 Pebble is a two-crate library workspace with one example binary.
-`crates/pebble-agent` is the provider-neutral agent loop. The root `pebble`
-crate is the coding-agent facade and owns the example. Most coding-agent work
-is a change to `src/`, its unit tests beside it, and the contract tests in
-`tests/`. Generic turn-loop work belongs in `crates/pebble-agent/src/`.
+`crates/pebble-agent` is the provider-neutral agent loop.
+`crates/pebble-coding-agent` is the coding-agent layer and owns the example.
+Most coding-agent work is a change to `crates/pebble-coding-agent/src/`, its
+unit tests beside it, and the contract tests in
+`crates/pebble-coding-agent/tests/`. Generic turn-loop work belongs in
+`crates/pebble-agent/src/`.
 
 ## Setup
 
@@ -44,17 +46,17 @@ Run `mise run check` before opening a pull request.
 
 ## Running the example
 
-`examples/coding_agent.rs` runs a real session: it builds a client, works in a
-new directory under the system temporary directory, steers one prompt, interrupts
-another, and prints what the session used. It is the only thing in the
-repository that calls a provider.
+`crates/pebble-coding-agent/examples/coding_agent.rs` runs a real coding agent.
+It builds a client, works in a new directory under the system temporary
+directory, steers one prompt, interrupts another, and prints what the agent
+used. It is the only thing in the repository that calls a provider.
 
 ```sh
 # The default model, claude-sonnet-5.
 mise run dev
 
 # Any selector the built-in catalog knows.
-cargo run --locked -p pebble --example coding_agent -- gpt-5.6
+cargo run --locked -p pebble-coding-agent --example coding_agent -- gpt-5.6
 ```
 
 It needs a key for whichever provider the model resolves to, in the variable
@@ -76,7 +78,7 @@ mise run test
 mise run test:doc
 
 # Just the end-to-end suite.
-cargo nextest run --locked -p pebble --all-features --test e2e
+cargo nextest run --locked -p pebble-coding-agent --all-features --test e2e
 ```
 
 Unit tests live beside the code they cover. `tests/` holds the contract tests:
@@ -85,7 +87,7 @@ the serialized event stream and record format (`event_contract.rs`,
 and `e2e.rs` — the example's own flow, driven through the scripted provider
 and a real temporary directory, so it needs no credentials and no network.
 
-Tests that reach `pebble::test_support` need the `test-util` feature, which is
+Tests that reach `pebble_coding_agent::test_support` need the `test-util` feature, which is
 why the test tasks pass `--all-features`.
 
 ## Rust policy

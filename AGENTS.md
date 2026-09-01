@@ -5,10 +5,11 @@
 Pebble is a two-crate library workspace built on `lithos-llm`.
 `pebble-agent` owns the provider-neutral turn loop: model calls, generic tool
 execution, conversation history, lifecycle events, steering, follow-up, and
-cancellation. `pebble` is the coding-agent facade. It adds coding profiles,
-environment-backed tools, memory, skills, compaction policy, durable events,
-and subagents. The workspace does not own transport, storage, credentials, or
-process isolation, which belong to the application that embeds it.
+cancellation. `pebble-coding-agent` is the coding-agent layer. It adds coding
+profiles, environment-backed tools, memory, skills, compaction policy, durable
+events, and subagents. The workspace does not own transport, storage,
+credentials, or process isolation, which belong to the application that
+embeds it.
 
 The authoritative documents are `README.md` (what pebble is and what an
 application supplies) and `DEVELOPING.md` (setup, tasks, tests, and policy).

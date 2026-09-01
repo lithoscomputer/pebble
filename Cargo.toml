@@ -1,12 +1,5 @@
-[package]
-name = "pebble"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.88"
-publish = false
-
 [workspace]
-members = [".", "crates/pebble-agent"]
+members = ["crates/*"]
 resolver = "3"
 
 [workspace.package]
@@ -24,51 +17,6 @@ thiserror = "2.0.16"
 tokio = { version = "1.49.0", features = ["sync", "time"] }
 tokio-util = "0.7.19"
 tracing = "0.1.41"
-
-[features]
-# Test doubles (`pebble::test_support`) for applications that embed pebble.
-test-util = []
-
-[dependencies]
-async-trait.workspace = true
-futures-util.workspace = true
-lithos-llm = { path = "../lithos-llm" }
-pebble-agent = { path = "crates/pebble-agent" }
-serde.workspace = true
-serde_json.workspace = true
-# Deterministic todo identities: a whole-list tool identifies an item by its
-# text, so the id is a hash of it. Pinned to the version lithos-llm already
-# resolves, along with every crate underneath it.
-sha2 = "0.10.9"
-thiserror.workspace = true
-tokio = { workspace = true, features = [
-  "fs",
-  "io-util",
-  "macros",
-  "process",
-  "rt",
-  "sync",
-  "time",
-] }
-tokio-util.workspace = true
-tracing.workspace = true
-# Session identifiers. Pinned to the version lithos-llm already resolves, so
-# the shared lockfile gains no entry.
-uuid = { version = "1.18.1", features = ["v4"] }
-
-# Signalling a command's process group without writing unsafe code.
-[target.'cfg(unix)'.dependencies]
-rustix = { version = "1.1.4", features = ["process"] }
-
-[dev-dependencies]
-insta = { version = "1.48.0", features = ["json"] }
-# `start_paused` test runtimes, so a test that waits out a retry delay does not
-# actually wait, and the multi-threaded runtime the example's `#[tokio::main]`
-# asks for. Adds no package to the lockfile: tokio is already a dependency.
-tokio = { version = "1.49.0", features = ["rt-multi-thread", "test-util"] }
-
-[lints]
-workspace = true
 
 [workspace.lints.rust]
 unsafe_code = "deny"
