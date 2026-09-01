@@ -22,7 +22,8 @@ use lithos_llm::estimate::{
 use lithos_llm::types::{ContentPart, Message, Request, Role};
 
 use crate::memory::MemoryDocument;
-use crate::skills::{Skill, format_skills_prompt_section};
+use crate::profiles::{memory_prompt_suffix, skills_prompt_suffix};
+use crate::skills::Skill;
 use crate::tool::{ToolDefinitionWithSource, ToolVocabulary};
 use crate::types::{
     ContextWindowBreakdownItem, ContextWindowCategory, ContextWindowCountMethod,
@@ -284,7 +285,9 @@ fn message_text_is(message: &Message, expected: &str) -> bool {
 /// life.
 #[must_use]
 pub fn memory_prompt_tokens(memory: &[MemoryDocument]) -> u64 {
-    text_tokens(&memory_prompt_suffix(memory))
+    text_tokens(&memory_prompt_suffix(
+        memory.iter().map(|document| document.content.as_str()),
+    ))
 }
 
 /// The tokens the skills section contributes to the system prompt.
@@ -293,35 +296,6 @@ pub fn memory_prompt_tokens(memory: &[MemoryDocument]) -> u64 {
 #[must_use]
 pub fn skills_prompt_tokens(skills: &[Skill], vocabulary: ToolVocabulary) -> u64 {
     text_tokens(&skills_prompt_suffix(skills, vocabulary))
-}
-
-/// The memory text a profile appends to the system prompt.
-///
-/// This mirrors what prompt assembly does, so the tokens attributed to memory
-/// are the tokens memory actually contributed.
-fn memory_prompt_suffix(memory: &[MemoryDocument]) -> String {
-    if memory.is_empty() {
-        return String::new();
-    }
-
-    format!(
-        "\n\n{}",
-        memory
-            .iter()
-            .map(|document| document.content.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    )
-}
-
-/// The skills section a profile appends to the system prompt.
-fn skills_prompt_suffix(skills: &[Skill], vocabulary: ToolVocabulary) -> String {
-    let section = format_skills_prompt_section(skills, vocabulary);
-    if section.is_empty() {
-        String::new()
-    } else {
-        format!("\n\n{section}")
-    }
 }
 
 /// Accumulates tokens per category, in category order.
@@ -527,7 +501,7 @@ mod tests {
         let skills = skills();
         let system_prompt = format!(
             "core prompt{}{}",
-            memory_prompt_suffix(&memory),
+            memory_prompt_suffix(memory.iter().map(|document| document.content.as_str())),
             skills_prompt_suffix(&skills, ToolVocabulary::Canonical)
         );
         let tools = vec![
@@ -594,7 +568,7 @@ mod tests {
         let skills = skills();
         let system_prompt = format!(
             "core prompt{}{}",
-            memory_prompt_suffix(&memory),
+            memory_prompt_suffix(memory.iter().map(|document| document.content.as_str())),
             skills_prompt_suffix(&skills, ToolVocabulary::Canonical)
         );
         let tools = vec![tool("read_file", ToolSource::Native)];

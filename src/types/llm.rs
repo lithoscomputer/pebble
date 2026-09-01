@@ -32,6 +32,18 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
+    /// Adds every bucket without wrapping a counter that reached its limit.
+    #[must_use]
+    pub const fn saturating_add(self, other: Self) -> Self {
+        Self {
+            input:       self.input.saturating_add(other.input),
+            output:      self.output.saturating_add(other.output),
+            reasoning:   self.reasoning.saturating_add(other.reasoning),
+            cache_read:  self.cache_read.saturating_add(other.cache_read),
+            cache_write: self.cache_write.saturating_add(other.cache_write),
+        }
+    }
+
     /// The sum of all five disjoint buckets.
     #[must_use]
     pub const fn total(self) -> u64 {
@@ -211,6 +223,25 @@ mod tests {
         assert_eq!(usage.total(), 260);
         assert_eq!(usage.billable_output(), 70);
         assert_eq!(usage.prompt(), 190);
+    }
+
+    #[test]
+    fn token_usage_addition_saturates_each_bucket() {
+        let almost_full = TokenUsage {
+            input: u64::MAX,
+            output: 2,
+            ..TokenUsage::default()
+        };
+        let added = almost_full.saturating_add(TokenUsage {
+            input: 1,
+            output: 3,
+            cache_read: 4,
+            ..TokenUsage::default()
+        });
+
+        assert_eq!(added.input, u64::MAX);
+        assert_eq!(added.output, 5);
+        assert_eq!(added.cache_read, 4);
     }
 
     #[test]

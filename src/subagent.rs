@@ -164,10 +164,7 @@ impl OpenSessions {
     }
 
     /// How many sessions in this tree are open right now.
-    #[cfg_attr(
-        not(test),
-        allow(dead_code, reason = "the count is asserted on by the crate's tests")
-    )]
+    #[cfg(test)]
     fn open(&self) -> usize {
         self.open.load(Ordering::Relaxed)
     }

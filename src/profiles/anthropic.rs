@@ -6,7 +6,7 @@ use super::{EmbeddedPrompt, ProfileDeps, assemble_system_prompt, core_tools};
 use crate::config::NativeToolOptions;
 use crate::profile::{AgentProfile, EnvContext};
 use crate::skills::Skill;
-use crate::tool::{RegisteredTool, ToolRegistry, ToolVocabulary};
+use crate::tool::{NativeTool, RegisteredTool, ToolRegistry, ToolVocabulary};
 use crate::tools::{
     TodoRuntime, make_edit_file_tool, make_task_create_tool, make_task_get_tool,
     make_task_list_tool, make_task_update_tool,
@@ -24,16 +24,18 @@ const CORE_PROMPT: &str = include_str!("prompts/anthropic.md.j2");
 /// session, rather than replacing a whole plan. Every session in one tree runs
 /// the same profile, so a child's tasks land on the same list as its parent's.
 pub(crate) struct AnthropicProfile {
-    tools:           Vec<RegisteredTool>,
-    has_spawn_agent: bool,
-    has_web_search:  bool,
+    tools: Vec<RegisteredTool>,
 }
 
 impl AnthropicProfile {
     /// The harness for a session built from `deps`.
     pub(crate) fn new(deps: &ProfileDeps) -> Self {
         let options = NativeToolOptions::for_profile(AgentProfileKind::Anthropic);
-        let mut tools = core_tools(&options, deps.web_fetch_summarizer.clone());
+        let mut tools = core_tools(
+            &options,
+            deps.search_provider.clone(),
+            deps.web_fetch_summarizer.clone(),
+        );
         tools.push(make_edit_file_tool());
         // One runtime behind all four, so a task created through one tool is
         // the task the others read.
@@ -43,11 +45,7 @@ impl AnthropicProfile {
         tools.push(make_task_get_tool(Arc::clone(&todo_runtime)));
         tools.push(make_task_list_tool(todo_runtime));
 
-        Self {
-            tools,
-            has_spawn_agent: deps.has_subagents,
-            has_web_search: deps.has_web_search(),
-        }
+        Self { tools }
     }
 }
 
@@ -66,15 +64,21 @@ impl AgentProfile for AnthropicProfile {
 
     fn build_system_prompt(
         &self,
-        _registry: &ToolRegistry,
+        registry: &ToolRegistry,
         env_context: &EnvContext,
         memory: &[String],
         user_instructions: Option<&str>,
         skills: &[Skill],
     ) -> String {
         let template = EmbeddedPrompt::new("anthropic.md.j2", CORE_PROMPT)
-            .with_bool("has_spawn_agent", self.has_spawn_agent)
-            .with_bool("has_web_search", self.has_web_search);
+            .with_bool(
+                "has_spawn_agent",
+                registry.get_native(NativeTool::SpawnAgent).is_some(),
+            )
+            .with_bool(
+                "has_web_search",
+                registry.get_native(NativeTool::WebSearch).is_some(),
+            );
 
         assemble_system_prompt(
             template,
@@ -91,22 +95,31 @@ impl AgentProfile for AnthropicProfile {
 mod tests {
     use super::*;
     use crate::profiles::tests::{
-        advertises, search_provider, shell_timeout_ms, snapshot_context, system_prompt, tool_names,
-        web_search_name,
+        advertises, native_marker, search_provider, shell_timeout_ms, snapshot_context,
+        system_prompt_with_tools, tool_names, web_search_name,
     };
 
-    /// The harness a session with `has_web_search` and `has_subagents` gets.
-    fn profile(has_web_search: bool, has_subagents: bool) -> AnthropicProfile {
+    /// The harness a session with `has_web_search` gets.
+    fn profile(has_web_search: bool) -> AnthropicProfile {
         AnthropicProfile::new(&ProfileDeps {
             search_provider: search_provider(has_web_search),
-            has_subagents,
             ..ProfileDeps::default()
         })
     }
 
+    /// The prompt from a completed registry with these optional capabilities.
+    fn prompt(has_web_search: bool, has_subagents: bool) -> String {
+        let profile = profile(has_web_search);
+        let extra = has_subagents
+            .then(|| native_marker(NativeTool::SpawnAgent))
+            .into_iter()
+            .collect();
+        system_prompt_with_tools(&profile, extra)
+    }
+
     #[test]
     fn the_profile_names_its_harness_and_pebbles_own_vocabulary() {
-        let profile = profile(false, false);
+        let profile = profile(false);
 
         assert_eq!(profile.profile_kind(), AgentProfileKind::Anthropic);
         assert_eq!(profile.tool_vocabulary(), ToolVocabulary::Canonical);
@@ -114,7 +127,7 @@ mod tests {
 
     #[test]
     fn the_harness_offers_eleven_tools() {
-        assert_eq!(tool_names(&profile(false, false)), [
+        assert_eq!(tool_names(&profile(false)), [
             "TaskCreate",
             "TaskGet",
             "TaskList",
@@ -131,7 +144,7 @@ mod tests {
 
     #[test]
     fn the_harness_leaves_out_the_tools_other_harnesses_own() {
-        let profile = profile(false, false);
+        let profile = profile(false);
 
         // `update_plan` is Codex's whole-plan surface, and this harness keeps
         // an incremental list instead.
@@ -148,12 +161,12 @@ mod tests {
     async fn a_command_with_no_timeout_gets_this_harnesses_own() {
         // Anthropic's harness documents two minutes, where pebble's own
         // default is ten seconds.
-        assert_eq!(shell_timeout_ms(&profile(false, false)).await, 120_000);
+        assert_eq!(shell_timeout_ms(&profile(false)).await, 120_000);
     }
 
     #[test]
     fn the_prompt_says_who_the_model_is_and_where_it_is_working() {
-        let prompt = system_prompt(&profile(false, false));
+        let prompt = prompt(false, false);
 
         assert!(prompt.contains("You are Claude, an AI coding assistant made by Anthropic"));
         assert!(prompt.contains("<environment>"));
@@ -163,7 +176,7 @@ mod tests {
 
     #[test]
     fn the_prompt_keeps_the_claude_code_style_sections() {
-        let prompt = system_prompt(&profile(false, false));
+        let prompt = prompt(false, false);
 
         for heading in [
             "# System",
@@ -180,7 +193,7 @@ mod tests {
 
     #[test]
     fn the_prompt_drills_the_habits_this_harness_was_trained_on() {
-        let prompt = system_prompt(&profile(false, false));
+        let prompt = prompt(false, false);
 
         assert!(prompt.contains(
             "Do NOT use the shell tool to run commands when a relevant dedicated tool is provided"
@@ -204,10 +217,10 @@ mod tests {
 
     #[test]
     fn the_prompt_mentions_a_search_tool_exactly_when_the_session_has_one() {
-        let without = system_prompt(&profile(false, false));
-        let with = system_prompt(&profile(true, false));
+        let without = prompt(false, false);
+        let with = prompt(true, false);
 
-        assert!(!without.contains(web_search_name(&profile(false, false))));
+        assert!(!without.contains(web_search_name(&profile(false))));
         assert!(without.contains("To inspect a specific URL use web_fetch."));
         assert!(
             with.contains("To search the internet use web_search, and to inspect a specific URL")
@@ -216,8 +229,8 @@ mod tests {
 
     #[test]
     fn the_prompt_mentions_subagents_exactly_when_the_session_can_spawn_one() {
-        let without = system_prompt(&profile(false, false));
-        let with = system_prompt(&profile(false, true));
+        let without = prompt(false, false);
+        let with = prompt(false, true);
 
         assert!(!without.contains("Subagents are valuable for independent work"));
         assert!(with.contains("Subagents are valuable for independent work"));
@@ -227,7 +240,7 @@ mod tests {
 
     #[test]
     fn the_prompt_carries_memory_and_user_instructions() {
-        let profile = profile(false, false);
+        let profile = profile(false);
 
         let prompt = profile.build_system_prompt(
             &ToolRegistry::new(),
@@ -256,13 +269,8 @@ mod tests {
             ..snapshot_context()
         };
 
-        let prompt = profile(false, false).build_system_prompt(
-            &ToolRegistry::new(),
-            &context,
-            &[],
-            None,
-            &[],
-        );
+        let prompt =
+            profile(false).build_system_prompt(&ToolRegistry::new(), &context, &[], None, &[]);
 
         assert!(prompt.contains("Git branch: feature-branch"));
         assert!(prompt.contains("Is git repository: true"));
@@ -273,21 +281,21 @@ mod tests {
 
     #[test]
     fn default_prompt_snapshot() {
-        insta::assert_snapshot!(system_prompt(&profile(false, false)));
+        insta::assert_snapshot!(prompt(false, false));
     }
 
     #[test]
     fn web_search_prompt_snapshot() {
-        insta::assert_snapshot!(system_prompt(&profile(true, false)));
+        insta::assert_snapshot!(prompt(true, false));
     }
 
     #[test]
     fn subagents_prompt_snapshot() {
-        insta::assert_snapshot!(system_prompt(&profile(false, true)));
+        insta::assert_snapshot!(prompt(false, true));
     }
 
     #[test]
     fn web_search_and_subagents_prompt_snapshot() {
-        insta::assert_snapshot!(system_prompt(&profile(true, true)));
+        insta::assert_snapshot!(prompt(true, true));
     }
 }

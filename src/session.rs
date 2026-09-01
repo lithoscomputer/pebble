@@ -108,7 +108,8 @@ use crate::subagent::{
     SubagentEventCallback, SubagentLimits, SubagentSupervisor,
 };
 use crate::tool::{
-    RegisteredTool, StaticEnvProvider, ToolDefinitionWithSource, ToolEnvProvider, ToolRegistry,
+    NativeTool, RegisteredTool, StaticEnvProvider, ToolDefinitionWithSource, ToolEnvProvider,
+    ToolRegistry,
 };
 use crate::tools::{
     WebFetchSummarizer, make_question_tool, make_use_skill_tool_for_vocabulary,
@@ -553,18 +554,23 @@ impl SessionBuilder {
             file_edit_tool: FileEditToolKind::for_codec(route.provider().codec()),
             search_provider: self.search_provider.clone(),
             web_fetch_summarizer,
-            has_subagents: self.subagents.is_some(),
         };
         let profile = self.profile.unwrap_or_else(|| builtin_profile(kind, &deps));
 
         let mut registry = ToolRegistry::with_vocabulary(profile.tool_vocabulary());
-        // Registered ahead of the profile's own tools, so a profile whose model
-        // expects a search tool of a different shape replaces this one by
-        // contributing it.
-        if let Some(provider) = &self.search_provider {
+        let profile_tools = profile.base_tools();
+        // Built-in profiles contribute the search shape their models expect.
+        // An injected profile that contributes no search tool gets the
+        // canonical one, preserving the builder's public search-provider
+        // contract without replacing a profile's own definition.
+        if let Some(provider) = &self.search_provider
+            && !profile_tools
+                .iter()
+                .any(|tool| tool.definition.name == NativeTool::WebSearch.canonical_name())
+        {
             registry.register(make_web_search_tool(Arc::clone(provider)));
         }
-        for tool in profile.base_tools() {
+        for tool in profile_tools {
             registry.register(tool);
         }
         // Root-only, and only where the application named somewhere to ask: a
@@ -654,8 +660,6 @@ impl SessionBuilder {
             cancel_token: CancellationToken::new(),
             round_token: Arc::new(RwLock::new(CancellationToken::new())),
             interrupt_reason: Arc::new(Mutex::new(None)),
-            memory: Vec::new(),
-            env_context: EnvContext::default(),
             skills: Vec::new(),
             memory_tokens: 0,
             skills_tokens: 0,
@@ -855,8 +859,6 @@ pub struct Session {
     /// the loop swaps a fresh token in as each round starts.
     round_token: Arc<RwLock<CancellationToken>>,
     interrupt_reason: Arc<Mutex<Option<InterruptReason>>>,
-    memory: Vec<MemoryDocument>,
-    env_context: EnvContext,
     skills: Vec<Skill>,
     /// What the memory files and the skills section contribute to the system
     /// prompt, measured once at initialization: both are fixed for the
@@ -993,17 +995,13 @@ impl Session {
             discover_skills(self.env.as_ref(), &self.config.skill_dirs, &cancel),
         );
 
-        self.memory = memory?;
+        let memory = memory?;
         // The files are described, never quoted: the durable stream must not
         // carry the bytes of a project's own instructions.
         self.emit(AgentEvent::MemoryLoaded {
             profile:            profile.clone(),
-            files:              self.memory.iter().map(MemoryDocument::to_summary).collect(),
-            total_loaded_bytes: self
-                .memory
-                .iter()
-                .map(|document| document.loaded_bytes)
-                .sum(),
+            files:              memory.iter().map(MemoryDocument::to_summary).collect(),
+            total_loaded_bytes: memory.iter().map(|document| document.loaded_bytes).sum(),
             budget_bytes:       MEMORY_BUDGET_BYTES,
         });
 
@@ -1028,29 +1026,28 @@ impl Session {
         // Measured once: memory and skills never change again, and the context
         // snapshot built every round reads these numbers instead of
         // re-tokenizing the same text.
-        self.memory_tokens = memory_prompt_tokens(&self.memory);
+        self.memory_tokens = memory_prompt_tokens(&memory);
         self.skills_tokens = skills_prompt_tokens(&self.skills, self.registry.vocabulary());
 
-        self.env_context = self.build_env_context(&cancel).await?;
+        let env_context = self.build_env_context(&cancel).await?;
         debug!(
-            is_git_repo = self.env_context.is_git_repo,
-            model = self.env_context.model.as_str(),
+            is_git_repo = env_context.is_git_repo,
+            model = env_context.model.as_str(),
             "Environment context built"
         );
 
         // Built once and fixed for the session's life. Only the loaded text
         // reaches the profile; the file metadata is already on the stream.
-        let memory: Vec<String> = self
-            .memory
-            .iter()
-            .map(|document| document.content.clone())
+        let memory: Vec<String> = memory
+            .into_iter()
+            .map(|document| document.content)
             .collect();
         // The registry is complete by now — the builder froze it and the skill
         // tool above is the last addition — so a profile that gates a prompt
         // section on a tool reads the session's real answer.
         self.system_prompt = self.profile.build_system_prompt(
             &self.registry,
-            &self.env_context,
+            &env_context,
             &memory,
             self.config.user_instructions.as_deref(),
             &self.skills,
@@ -1923,6 +1920,10 @@ mod tests {
     async fn initializing_reports_what_it_loaded_and_where_it_is_working() {
         let mut session = session();
         let mut events = session.subscribe();
+        let env_context = session
+            .build_env_context(&CancellationToken::new())
+            .await
+            .expect("the environment is described");
 
         session.initialize().await.expect("initialization succeeds");
 
@@ -1944,11 +1945,11 @@ mod tests {
                 .system_prompt
                 .contains("test assistant working in /home/test")
         );
-        assert_eq!(session.env_context.knowledge_cutoff, "May 2026");
-        assert_eq!(session.env_context.model, "model");
-        assert_eq!(session.env_context.platform, "linux");
+        assert_eq!(env_context.knowledge_cutoff, "May 2026");
+        assert_eq!(env_context.model, "model");
+        assert_eq!(env_context.platform, "linux");
         assert_eq!(
-            session.env_context.current_date.len(),
+            env_context.current_date.len(),
             10,
             "an environment that cannot date itself still dates the prompt"
         );

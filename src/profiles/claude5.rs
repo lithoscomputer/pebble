@@ -26,9 +26,7 @@ const CORE_PROMPT: &str = include_str!("prompts/claude5.md.j2");
 /// And its subagents are background agents that announce themselves when they
 /// finish, rather than handles the model has to remember to wait on.
 pub(crate) struct Claude5Profile {
-    tools:          Vec<RegisteredTool>,
-    has_agent:      bool,
-    has_web_search: bool,
+    tools: Vec<RegisteredTool>,
 }
 
 impl Claude5Profile {
@@ -62,11 +60,7 @@ impl Claude5Profile {
             tools.push(claude5_tools::strict_object_tool(task_tool));
         }
 
-        Self {
-            tools,
-            has_agent: deps.has_subagents,
-            has_web_search: deps.has_web_search(),
-        }
+        Self { tools }
     }
 }
 
@@ -93,17 +87,20 @@ impl AgentProfile for Claude5Profile {
     ) -> String {
         let template = EmbeddedPrompt::new("claude5.md.j2", CORE_PROMPT)
             // A prompt section for a tool the session does not have costs a
-            // wasted call, so every conditional comes from what the session
-            // holds rather than from what the harness could offer. The first
-            // two are what the builder registered from; the third is read off
-            // the session's own registry, because a child runs this same
-            // profile and never has a person to ask.
-            .with_bool("has_agent", self.has_agent)
+            // wasted call, so every conditional comes from what this session
+            // actually holds.
+            .with_bool(
+                "has_agent",
+                registry.get_native(NativeTool::BackgroundAgent).is_some(),
+            )
             .with_bool(
                 "has_ask_user_question",
                 registry.get_native(NativeTool::AskUserQuestion).is_some(),
             )
-            .with_bool("has_web_search", self.has_web_search);
+            .with_bool(
+                "has_web_search",
+                registry.get_native(NativeTool::WebSearch).is_some(),
+            );
 
         assemble_system_prompt(
             template,
@@ -133,16 +130,15 @@ impl AgentProfile for Claude5Profile {
 mod tests {
     use super::*;
     use crate::profiles::tests::{
-        advertises, registry_of, search_provider, shell_timeout_ms, snapshot_context,
-        system_prompt, system_prompt_with_tools, tool_names, web_search_name,
+        advertises, native_marker, registry_of, search_provider, shell_timeout_ms,
+        snapshot_context, system_prompt_with_tools, tool_names, web_search_name,
     };
     use crate::tools::make_question_tool;
 
-    /// The harness a session with these capabilities gets.
-    fn profile(has_web_search: bool, has_subagents: bool) -> Claude5Profile {
+    /// The harness a session with `has_web_search` gets.
+    fn profile(has_web_search: bool) -> Claude5Profile {
         Claude5Profile::new(&ProfileDeps {
             search_provider: search_provider(has_web_search),
-            has_subagents,
             ..ProfileDeps::default()
         })
     }
@@ -158,9 +154,19 @@ mod tests {
             .collect()
     }
 
+    /// The prompt from a completed registry with these optional capabilities.
+    fn prompt(has_web_search: bool, has_subagents: bool, has_question: bool) -> String {
+        let profile = profile(has_web_search);
+        let mut extra = asked(has_question);
+        if has_subagents {
+            extra.push(native_marker(NativeTool::BackgroundAgent));
+        }
+        system_prompt_with_tools(&profile, extra)
+    }
+
     #[test]
     fn the_profile_names_its_harness_and_claude_5s_own_vocabulary() {
-        let profile = profile(false, false);
+        let profile = profile(false);
 
         assert_eq!(profile.profile_kind(), AgentProfileKind::Claude5);
         assert_eq!(profile.tool_vocabulary(), ToolVocabulary::Claude5);
@@ -168,7 +174,7 @@ mod tests {
 
     #[test]
     fn the_harness_offers_nine_tools() {
-        assert_eq!(tool_names(&profile(false, false)), [
+        assert_eq!(tool_names(&profile(false)), [
             "TaskCreate",
             "TaskGet",
             "TaskList",
@@ -189,7 +195,7 @@ mod tests {
         use crate::tool::ToolRegistry;
 
         let mut registry = ToolRegistry::with_vocabulary(ToolVocabulary::Claude5);
-        for tool in profile(false, false).base_tools() {
+        for tool in profile(false).base_tools() {
             registry.register(tool);
         }
         let mut names = registry.names();
@@ -212,7 +218,7 @@ mod tests {
     /// second way to search is a decision the model has to make every turn.
     #[test]
     fn the_harness_leaves_out_the_search_tools_it_drives_through_bash() {
-        let profile = profile(false, false);
+        let profile = profile(false);
 
         assert!(!advertises(&profile, "grep"));
         assert!(!advertises(&profile, "glob"));
@@ -225,7 +231,7 @@ mod tests {
     fn every_tool_this_harness_offers_refuses_a_field_it_does_not_name() {
         use crate::tools::testing::schema_of;
 
-        for tool in profile(true, false).base_tools() {
+        for tool in profile(true).base_tools() {
             assert_eq!(
                 schema_of(&tool)["additionalProperties"],
                 serde_json::Value::Bool(false),
@@ -241,7 +247,7 @@ mod tests {
     fn the_search_tool_is_this_harnesss_own_narrower_one() {
         use crate::tools::testing::schema_of;
 
-        let searching = profile(true, false);
+        let searching = profile(true);
         assert!(advertises(&searching, "web_search"));
 
         let search = searching
@@ -254,17 +260,17 @@ mod tests {
                 .get("max_results")
                 .is_none()
         );
-        assert!(!advertises(&profile(false, false), "web_search"));
+        assert!(!advertises(&profile(false), "web_search"));
     }
 
     #[tokio::test]
     async fn a_command_with_no_timeout_gets_this_harnesses_own() {
-        assert_eq!(shell_timeout_ms(&profile(false, false)).await, 120_000);
+        assert_eq!(shell_timeout_ms(&profile(false)).await, 120_000);
     }
 
     #[test]
     fn the_prompt_says_who_the_model_is_and_where_it_is_working() {
-        let prompt = system_prompt(&profile(false, false));
+        let prompt = prompt(false, false, false);
 
         assert!(prompt.contains("You are Claude, a software engineering agent running in Pebble."));
         assert!(prompt.contains("<environment>"));
@@ -274,7 +280,7 @@ mod tests {
 
     #[test]
     fn the_prompt_keeps_the_sections_this_harness_was_trained_on() {
-        let prompt = system_prompt(&profile(false, false));
+        let prompt = prompt(false, false, false);
 
         for heading in [
             "# Harness",
@@ -302,10 +308,7 @@ mod tests {
         for has_web_search in [false, true] {
             for has_subagents in [false, true] {
                 for has_question in [false, true] {
-                    let prompt = system_prompt_with_tools(
-                        &profile(has_web_search, has_subagents),
-                        asked(has_question),
-                    );
+                    let prompt = prompt(has_web_search, has_subagents, has_question);
                     let label = format!(
                         "web_search={has_web_search} subagents={has_subagents} \
                          question={has_question}"
@@ -333,14 +336,14 @@ mod tests {
 
     #[test]
     fn the_prompt_names_the_search_tool_the_way_the_registry_will() {
-        let searching = profile(true, false);
+        let searching = profile(true);
 
-        assert!(system_prompt(&searching).contains(web_search_name(&searching)));
+        assert!(prompt(true, false, false).contains(web_search_name(&searching)));
     }
 
     #[test]
     fn the_prompt_carries_memory_and_user_instructions() {
-        let profile = profile(false, false);
+        let profile = profile(false);
         let prompt = profile.build_system_prompt(
             &registry_of(&profile, Vec::new()),
             &snapshot_context(),
@@ -356,7 +359,7 @@ mod tests {
     #[test]
     fn a_session_with_no_factory_is_given_no_background_agent_tools() {
         assert!(
-            profile(false, false)
+            profile(false)
                 .subagent_tools(&SubagentSupport::default())
                 .is_empty()
         );
@@ -364,11 +367,11 @@ mod tests {
 
     #[test]
     fn default_prompt_snapshot() {
-        insta::assert_snapshot!(system_prompt(&profile(false, false)));
+        insta::assert_snapshot!(prompt(false, false, false));
     }
 
     #[test]
     fn all_conditionals_prompt_snapshot() {
-        insta::assert_snapshot!(system_prompt_with_tools(&profile(true, true), asked(true)));
+        insta::assert_snapshot!(prompt(true, true, true));
     }
 }

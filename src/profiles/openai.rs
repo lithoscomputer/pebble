@@ -7,7 +7,7 @@ use super::{EmbeddedPrompt, FileEditToolKind, ProfileDeps, assemble_system_promp
 use crate::config::NativeToolOptions;
 use crate::profile::{AgentProfile, EnvContext};
 use crate::skills::Skill;
-use crate::tool::{RegisteredTool, ToolRegistry, ToolVocabulary};
+use crate::tool::{NativeTool, RegisteredTool, ToolRegistry, ToolVocabulary};
 use crate::tools::{TodoRuntime, make_update_plan_tool};
 use crate::types::AgentProfileKind;
 
@@ -27,14 +27,17 @@ pub(crate) struct OpenAiProfile {
     tools:                 Vec<RegisteredTool>,
     provider_display_name: String,
     file_edit_tool:        FileEditToolKind,
-    has_web_search:        bool,
 }
 
 impl OpenAiProfile {
     /// The harness for a session built from `deps`.
     pub(crate) fn new(deps: &ProfileDeps) -> Self {
         let options = NativeToolOptions::for_profile(AgentProfileKind::OpenAi);
-        let mut tools = core_tools(&options, deps.web_fetch_summarizer.clone());
+        let mut tools = core_tools(
+            &options,
+            deps.search_provider.clone(),
+            deps.web_fetch_summarizer.clone(),
+        );
         tools.push(deps.file_edit_tool.tool());
         // Codex's `update_plan` replaces a whole plan at once, so the list
         // behind it belongs to this session rather than to the tree.
@@ -44,7 +47,6 @@ impl OpenAiProfile {
             tools,
             provider_display_name: deps.provider_display_name.clone(),
             file_edit_tool: deps.file_edit_tool,
-            has_web_search: deps.has_web_search(),
         }
     }
 }
@@ -64,7 +66,7 @@ impl AgentProfile for OpenAiProfile {
 
     fn build_system_prompt(
         &self,
-        _registry: &ToolRegistry,
+        registry: &ToolRegistry,
         env_context: &EnvContext,
         memory: &[String],
         user_instructions: Option<&str>,
@@ -73,7 +75,10 @@ impl AgentProfile for OpenAiProfile {
         let template = EmbeddedPrompt::new("openai.md.j2", CORE_PROMPT)
             .with_string("provider_name", self.provider_display_name.clone())
             .with_string("file_edit_tool", self.file_edit_tool.as_str())
-            .with_bool("has_web_search", self.has_web_search);
+            .with_bool(
+                "has_web_search",
+                registry.get_native(NativeTool::WebSearch).is_some(),
+            );
 
         assemble_system_prompt(
             template,

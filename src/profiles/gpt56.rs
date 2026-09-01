@@ -26,7 +26,7 @@ use crate::profile::{AgentProfile, EnvContext};
 use crate::skills::Skill;
 use crate::tool::{NativeTool, RegisteredTool, ToolRegistry, ToolVocabulary, required_str};
 use crate::tools::shell::run_shell_command;
-use crate::tools::{TodoRuntime, make_update_plan_tool};
+use crate::tools::{TodoRuntime, make_update_plan_tool, make_web_search_tool};
 use crate::types::{AgentProfileKind, ToolSource};
 
 /// The system prompt this harness starts from.
@@ -37,26 +37,27 @@ pub(crate) struct Gpt56Profile {
     tools:                 Vec<RegisteredTool>,
     provider_display_name: String,
     file_edit_tool:        FileEditToolKind,
-    has_web_search:        bool,
 }
 
 impl Gpt56Profile {
     /// The harness for a session built from `deps`.
     pub(crate) fn new(deps: &ProfileDeps) -> Self {
         let options = NativeToolOptions::for_profile(AgentProfileKind::Gpt56);
-        let tools = vec![
+        let mut tools = vec![
             make_shell_command_tool(&options, deps.file_edit_tool),
             deps.file_edit_tool.tool(),
             // Codex's `update_plan` replaces a whole plan at once, so the list
             // behind it belongs to this session rather than to the tree.
             make_update_plan_tool(Arc::new(TodoRuntime::new())),
         ];
+        if let Some(provider) = &deps.search_provider {
+            tools.push(make_web_search_tool(Arc::clone(provider)));
+        }
 
         Self {
             tools,
             provider_display_name: deps.provider_display_name.clone(),
             file_edit_tool: deps.file_edit_tool,
-            has_web_search: deps.has_web_search(),
         }
     }
 }
@@ -157,7 +158,7 @@ impl AgentProfile for Gpt56Profile {
 
     fn build_system_prompt(
         &self,
-        _registry: &ToolRegistry,
+        registry: &ToolRegistry,
         env_context: &EnvContext,
         memory: &[String],
         user_instructions: Option<&str>,
@@ -166,7 +167,10 @@ impl AgentProfile for Gpt56Profile {
         let template = EmbeddedPrompt::new("gpt56.md.j2", CORE_PROMPT)
             .with_string("provider_name", self.provider_display_name.clone())
             .with_string("file_edit_tool", self.file_edit_tool.as_str())
-            .with_bool("has_web_search", self.has_web_search);
+            .with_bool(
+                "has_web_search",
+                registry.get_native(NativeTool::WebSearch).is_some(),
+            );
 
         assemble_system_prompt(
             template,

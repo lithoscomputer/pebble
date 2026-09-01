@@ -141,17 +141,6 @@ fn first_output_kind(event: &StreamEvent) -> Option<LlmOutputKind> {
     }
 }
 
-/// Adds one response's tokens to a run's running total.
-fn add_usage(total: TokenUsage, one: TokenUsage) -> TokenUsage {
-    TokenUsage {
-        input:       total.input.saturating_add(one.input),
-        output:      total.output.saturating_add(one.output),
-        reasoning:   total.reasoning.saturating_add(one.reasoning),
-        cache_read:  total.cache_read.saturating_add(one.cache_read),
-        cache_write: total.cache_write.saturating_add(one.cache_write),
-    }
-}
-
 /// The tool calls a response asked for, in the order it asked.
 fn tool_calls_of(response: &Response) -> Vec<ToolCall> {
     response
@@ -301,7 +290,6 @@ impl Session {
             'attempts: for attempt in 0..=STREAM_CONSUME_RETRIES {
                 let mut completed: Option<Response> = None;
                 let mut stream_error: Option<LlmError> = None;
-                let mut attempt_emitted_output = false;
                 // Re-armed per attempt: a replay discards everything the last
                 // attempt produced, so its first output is a new observation.
                 let mut first_output_emitted = false;
@@ -330,12 +318,10 @@ impl Session {
                             }
                             match event {
                                 StreamEvent::TextDelta { text, .. } => {
-                                    attempt_emitted_output = true;
                                     visible_output_present = true;
                                     self.emit(AgentEvent::TextDelta { delta: text });
                                 }
                                 StreamEvent::ReasoningDelta { text, .. } => {
-                                    attempt_emitted_output = true;
                                     visible_output_present = true;
                                     self.emit(AgentEvent::ReasoningDelta { delta: text });
                                 }
@@ -425,7 +411,7 @@ impl Session {
                     }
                 };
 
-                if attempt_emitted_output {
+                if visible_output_present {
                     self.replace_visible_output();
                     visible_output_present = false;
                 }
@@ -953,7 +939,7 @@ impl Session {
             usage,
         ));
 
-        totals.usage = add_usage(totals.usage, usage);
+        totals.usage = totals.usage.saturating_add(usage);
         if let Some(cost) = response.cost {
             totals.cost_usd_micros = Some(
                 totals
@@ -1248,7 +1234,7 @@ mod tests {
             cache_write: 4,
         };
 
-        assert_eq!(add_usage(first, second), TokenUsage {
+        assert_eq!(first.saturating_add(second), TokenUsage {
             input:       13,
             output:      12,
             reasoning:   2,

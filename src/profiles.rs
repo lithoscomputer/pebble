@@ -17,19 +17,10 @@
 //! Fabro's profiles owned a registry and mutated it; whoever wanted a tool
 //! registered reached in. Pebble's builder owns the registry and a profile
 //! contributes to it, so what a profile can say about the session is exactly
-//! what it returns. The two facts a profile would otherwise have read back out
-//! of its registry — whether a search tool is registered, whether subagents are
-//! on — reach it through [`ProfileDeps`] instead, from the same values the
-//! builder registers from. Both are inherited: a child session is given its
-//! parent's engine and its parent's factory, so what the profile was built with
-//! is true of every session that runs it.
-//!
-//! The third such fact is not inherited. A child has nobody to ask, so whether
-//! a question tool is registered is answered per session, from the registry
-//! [`AgentProfile::build_system_prompt`](crate::AgentProfile::build_system_prompt)
-//! is handed. That is what keeps a prompt from advertising a tool the session
-//! does not have — for a child as well as for the root it shares a profile
-//! with.
+//! what it returns. Optional prompt sections read the completed registry. This
+//! keeps a prompt from advertising a search, subagent, or question tool the
+//! session does not have — including in a child, which shares its parent's
+//! profile but has its own registry.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -47,7 +38,8 @@ use crate::template::{TemplateContext, TemplateValue, render_named};
 use crate::tool::{NativeTool, RegisteredTool, ToolVocabulary};
 use crate::tools::{
     WebFetchSummarizer, make_apply_patch_tool, make_edit_file_tool, make_glob_tool, make_grep_tool,
-    make_read_file_tool, make_shell_tool_with_options, make_web_fetch_tool, make_write_file_tool,
+    make_read_file_tool, make_shell_tool_with_options, make_web_fetch_tool, make_web_search_tool,
+    make_write_file_tool,
 };
 
 pub(crate) mod anthropic;
@@ -83,12 +75,9 @@ pub(crate) struct ProfileDeps {
     /// The engine a search tool runs through, when the application gave the
     /// session one.
     ///
-    /// Carried rather than reduced to a flag because a harness whose model
-    /// expects a differently shaped search tool — Claude 5's `WebSearch` takes
-    /// a query and nothing else — contributes its own, and needs the engine to
-    /// build it. Every other harness reads only
-    /// [`has_web_search`](Self::has_web_search) and lets the builder's
-    /// canonical tool stand.
+    /// Carried rather than reduced to a flag because each profile contributes
+    /// the search tool its model expects. Claude 5's `WebSearch`, for example,
+    /// takes a query and nothing else.
     pub(crate) search_provider:       Option<Arc<dyn SearchProvider>>,
     /// The model that answers a `web_fetch` prompt about a page, when the
     /// application named one.
@@ -97,8 +86,6 @@ pub(crate) struct ProfileDeps {
     /// way a search tool captures its engine — including by every child
     /// session, which runs the same profile.
     pub(crate) web_fetch_summarizer:  Option<Arc<WebFetchSummarizer>>,
-    /// Whether the session may spawn child agents.
-    pub(crate) has_subagents:         bool,
 }
 
 impl fmt::Debug for ProfileDeps {
@@ -115,15 +102,7 @@ impl fmt::Debug for ProfileDeps {
                 "web_fetch_summarizer",
                 &self.web_fetch_summarizer.as_ref().map(|_| "<summarizer>"),
             )
-            .field("has_subagents", &self.has_subagents)
             .finish()
-    }
-}
-
-impl ProfileDeps {
-    /// Whether the session advertises a web search tool at all.
-    pub(crate) fn has_web_search(&self) -> bool {
-        self.search_provider.is_some()
     }
 }
 
@@ -183,12 +162,11 @@ impl FileEditToolKind {
 
 /// The tools every built-in profile starts from.
 ///
-/// Fabro called this `register_core_tools`. What is missing beside fabro's list
-/// is `web_search`: pebble's is registered by the session builder, because
-/// whether there is a search engine at all is the application's answer rather
-/// than the profile's.
+/// Fabro called this `register_core_tools`. Search is optional: the application
+/// supplies the engine and the profile contributes the shape its model expects.
 pub(crate) fn core_tools(
     options: &NativeToolOptions,
+    search_provider: Option<Arc<dyn SearchProvider>>,
     web_fetch_summarizer: Option<Arc<WebFetchSummarizer>>,
 ) -> Vec<RegisteredTool> {
     let mut tools = vec![
@@ -197,7 +175,10 @@ pub(crate) fn core_tools(
         make_shell_tool_with_options(options),
         make_grep_tool(),
     ];
-    tools.extend(discovery_and_web_tools(web_fetch_summarizer));
+    tools.extend(discovery_and_web_tools(
+        search_provider,
+        web_fetch_summarizer,
+    ));
     tools
 }
 
@@ -205,9 +186,14 @@ pub(crate) fn core_tools(
 ///
 /// Split out because the Kimi harness takes these and replaces the rest.
 pub(crate) fn discovery_and_web_tools(
+    search_provider: Option<Arc<dyn SearchProvider>>,
     web_fetch_summarizer: Option<Arc<WebFetchSummarizer>>,
 ) -> Vec<RegisteredTool> {
-    vec![make_glob_tool(), make_web_fetch_tool(web_fetch_summarizer)]
+    let mut tools = vec![make_glob_tool(), make_web_fetch_tool(web_fetch_summarizer)];
+    if let Some(provider) = search_provider {
+        tools.push(make_web_search_tool(provider));
+    }
+    tools
 }
 
 /// A tool definition under `tool`'s canonical name, which the registry renames
@@ -277,6 +263,32 @@ impl EmbeddedPrompt {
     }
 }
 
+/// The memory text every profile appends to its system prompt.
+pub(crate) fn memory_prompt_suffix<'a>(memory: impl IntoIterator<Item = &'a str>) -> String {
+    let mut memory = memory.into_iter();
+    let Some(first) = memory.next() else {
+        return String::new();
+    };
+
+    let mut section = String::from("\n\n");
+    section.push_str(first);
+    for document in memory {
+        section.push_str("\n\n");
+        section.push_str(document);
+    }
+    section
+}
+
+/// The skills text every profile appends to its system prompt.
+pub(crate) fn skills_prompt_suffix(skills: &[Skill], vocabulary: ToolVocabulary) -> String {
+    let section = format_skills_prompt_section(skills, vocabulary);
+    if section.is_empty() {
+        String::new()
+    } else {
+        memory_prompt_suffix([section.as_str()])
+    }
+}
+
 /// One complete system prompt: the profile's template, then the sections every
 /// profile ends with.
 ///
@@ -300,19 +312,8 @@ pub(crate) fn assemble_system_prompt(
     let env_block = build_env_context_block(env_context);
     let prompt = template.render(env_block);
 
-    let memory_section = if memory.is_empty() {
-        String::new()
-    } else {
-        format!("\n\n{}", memory.join("\n\n"))
-    };
-    let skills_section = {
-        let section = format_skills_prompt_section(skills, vocabulary);
-        if section.is_empty() {
-            String::new()
-        } else {
-            format!("\n\n{section}")
-        }
-    };
+    let memory_section = memory_prompt_suffix(memory.iter().map(String::as_str));
+    let skills_section = skills_prompt_suffix(skills, vocabulary);
     let user_section = match user_instructions {
         Some(instructions) => format!("\n\n# User Instructions\n{instructions}"),
         None => String::new(),
@@ -376,6 +377,7 @@ pub(crate) mod tests {
     use crate::search::{SearchError, SearchRequest, SearchResult};
     use crate::test_support::MockEnvironment;
     use crate::tool::{NativeTool, ToolContext, ToolRegistry};
+    use crate::types::ToolSource;
 
     /// A search engine no prompt test ever asks anything: what these tests are
     /// about is whether the tool is offered at all, and under what name.
@@ -394,6 +396,19 @@ pub(crate) mod tests {
     /// The engine a harness built with `configured` is given.
     pub(crate) fn search_provider(configured: bool) -> Option<Arc<dyn SearchProvider>> {
         configured.then(|| Arc::new(UnusedSearch) as Arc<dyn SearchProvider>)
+    }
+
+    /// A built-in identity that only marks a prompt test's completed registry.
+    pub(crate) fn native_marker(tool: NativeTool) -> RegisteredTool {
+        RegisteredTool {
+            definition: ToolDefinition::function(
+                tool.canonical_name(),
+                "Prompt capability marker",
+                json!({ "type": "object" }),
+            ),
+            executor:   Arc::new(|_arguments, _context| Box::pin(async { Ok(String::new()) })),
+            source:     ToolSource::Native,
+        }
     }
 
     /// The environment every prompt test renders against, which is also what
@@ -676,7 +691,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_core_tools_are_the_ones_no_coding_agent_works_without() {
-        let names: Vec<String> = core_tools(&NativeToolOptions::default(), None)
+        let names: Vec<String> = core_tools(&NativeToolOptions::default(), None, None)
             .iter()
             .map(|tool| tool.definition.name.clone())
             .collect();

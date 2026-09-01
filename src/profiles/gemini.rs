@@ -4,7 +4,7 @@ use super::{EmbeddedPrompt, ProfileDeps, assemble_system_prompt, core_tools};
 use crate::config::NativeToolOptions;
 use crate::profile::{AgentProfile, EnvContext};
 use crate::skills::Skill;
-use crate::tool::{RegisteredTool, ToolRegistry, ToolVocabulary};
+use crate::tool::{NativeTool, RegisteredTool, ToolRegistry, ToolVocabulary};
 use crate::tools::{make_edit_file_tool, make_list_dir_tool, make_read_many_files_tool};
 use crate::types::AgentProfileKind;
 
@@ -20,23 +20,23 @@ const CORE_PROMPT: &str = include_str!("prompts/gemini.md.j2");
 /// question: the session builder registers no question tool for this harness,
 /// because Gemini CLI has none.
 pub(crate) struct GeminiProfile {
-    tools:          Vec<RegisteredTool>,
-    has_web_search: bool,
+    tools: Vec<RegisteredTool>,
 }
 
 impl GeminiProfile {
     /// The harness for a session built from `deps`.
     pub(crate) fn new(deps: &ProfileDeps) -> Self {
         let options = NativeToolOptions::for_profile(AgentProfileKind::Gemini);
-        let mut tools = core_tools(&options, deps.web_fetch_summarizer.clone());
+        let mut tools = core_tools(
+            &options,
+            deps.search_provider.clone(),
+            deps.web_fetch_summarizer.clone(),
+        );
         tools.push(make_edit_file_tool());
         tools.push(make_read_many_files_tool());
         tools.push(make_list_dir_tool());
 
-        Self {
-            tools,
-            has_web_search: deps.has_web_search(),
-        }
+        Self { tools }
     }
 }
 
@@ -55,14 +55,16 @@ impl AgentProfile for GeminiProfile {
 
     fn build_system_prompt(
         &self,
-        _registry: &ToolRegistry,
+        registry: &ToolRegistry,
         env_context: &EnvContext,
         memory: &[String],
         user_instructions: Option<&str>,
         skills: &[Skill],
     ) -> String {
-        let template = EmbeddedPrompt::new("gemini.md.j2", CORE_PROMPT)
-            .with_bool("has_web_search", self.has_web_search);
+        let template = EmbeddedPrompt::new("gemini.md.j2", CORE_PROMPT).with_bool(
+            "has_web_search",
+            registry.get_native(NativeTool::WebSearch).is_some(),
+        );
 
         assemble_system_prompt(
             template,

@@ -337,13 +337,7 @@ impl Totals {
     /// Adds what the run that just finished reported.
     fn add(&mut self, session: &Session) {
         let usage = session.last_run_usage();
-        self.usage = TokenUsage {
-            input:       self.usage.input + usage.input,
-            output:      self.usage.output + usage.output,
-            reasoning:   self.usage.reasoning + usage.reasoning,
-            cache_read:  self.usage.cache_read + usage.cache_read,
-            cache_write: self.usage.cache_write + usage.cache_write,
-        };
+        self.usage = self.usage.saturating_add(usage);
         if let Some(cost) = session.last_run_cost_usd_micros() {
             self.cost_usd_micros += cost;
             self.priced = true;

@@ -78,7 +78,10 @@ impl KimiProfile {
         // contract in both vocabularies, so the rename is all they need. The
         // rest are adapters, reusing pebble's execution where the behavior
         // agrees.
-        let mut tools = discovery_and_web_tools(deps.web_fetch_summarizer.clone());
+        let mut tools = discovery_and_web_tools(
+            deps.search_provider.clone(),
+            deps.web_fetch_summarizer.clone(),
+        );
         for tool in &mut tools {
             if tool.definition.name == NativeTool::Glob.canonical_name() {
                 GLOB_DESCRIPTION.clone_into(&mut tool.definition.description);
