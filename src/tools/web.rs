@@ -97,8 +97,13 @@ impl WebFetchSummarizer {
 /// than from pebble's own process, so a page is retrieved from wherever the
 /// session's work happens — inside the container, on the remote workspace —
 /// and under whatever network policy that place has.
+///
+/// The summarizer is captured here, at construction, the way
+/// [`make_web_search_tool`](crate::make_web_search_tool) captures its engine.
+/// Without one, a call carrying a prompt returns the page and says the summary
+/// was unavailable.
 #[must_use]
-pub fn make_web_fetch_tool() -> RegisteredTool {
+pub fn make_web_fetch_tool(summarizer: Option<Arc<WebFetchSummarizer>>) -> RegisteredTool {
     RegisteredTool {
         definition: ToolDefinition::function(
             NativeTool::WebFetch.canonical_name(),
@@ -115,7 +120,8 @@ pub fn make_web_fetch_tool() -> RegisteredTool {
                 "required": ["url"]
             }),
         ),
-        executor:   Arc::new(|args, ctx| {
+        executor:   Arc::new(move |args, ctx| {
+            let summarizer = summarizer.clone();
             Box::pin(async move {
                 let url = required_str(&args, "url")?;
                 let prompt = args.get("prompt").and_then(Value::as_str);
@@ -159,7 +165,7 @@ pub fn make_web_fetch_tool() -> RegisteredTool {
 
                 let content = bounded(html_to_markdown(&result.stdout));
 
-                match (prompt, ctx.web_fetch_summarizer.as_ref()) {
+                match (prompt, summarizer.as_ref()) {
                     (Some(prompt), Some(summarizer)) => {
                         summarizer.summarize(url, &content, prompt).await
                     }
@@ -227,23 +233,26 @@ mod tests {
         }
     }
 
-    /// A context whose summarizer answers one call with `text`, and the
-    /// provider that answered it.
-    fn summarizing(text: &str) -> (ToolContext, Arc<ScriptedProvider>) {
+    /// A fetch tool whose summarizer answers one call with `text`, the context
+    /// it fetches through, and the provider that answered.
+    fn summarizing(text: &str) -> (RegisteredTool, ToolContext, Arc<ScriptedProvider>) {
         let (client, provider) = client_from(
             ScriptedProvider::new(Vec::new())
                 .completing(vec![ScriptedCompletion::response(text_response(text))]),
         );
         (
-            context(fetched("<html><body><p>Page content</p></body></html>"))
-                .with_web_fetch_summarizer(Arc::new(WebFetchSummarizer::new(client, "test/model"))),
+            make_web_fetch_tool(Some(Arc::new(WebFetchSummarizer::new(
+                client,
+                "test/model",
+            )))),
+            context(fetched("<html><body><p>Page content</p></body></html>")),
             provider,
         )
     }
 
     #[tokio::test]
     async fn the_curl_command_carries_the_timeout_the_agent_and_the_url() {
-        let tool = make_web_fetch_tool();
+        let tool = make_web_fetch_tool(None);
         let environment = Arc::new(fetched("<html><body><h1>hello</h1></body></html>"));
 
         let output = (tool.executor)(
@@ -274,7 +283,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_url_with_another_scheme_is_refused_before_anything_runs() {
-        let tool = make_web_fetch_tool();
+        let tool = make_web_fetch_tool(None);
         let environment = Arc::new(MockEnvironment::default());
 
         let error = (tool.executor)(
@@ -297,7 +306,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_models_timeout_reaches_both_curl_and_the_environment() {
-        let tool = make_web_fetch_tool();
+        let tool = make_web_fetch_tool(None);
         let environment = Arc::new(MockEnvironment::default());
 
         let _ = (tool.executor)(
@@ -326,7 +335,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_timeout_beyond_a_minute_is_capped() {
-        let tool = make_web_fetch_tool();
+        let tool = make_web_fetch_tool(None);
         let environment = Arc::new(MockEnvironment::default());
 
         let _ = (tool.executor)(
@@ -355,7 +364,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_page_beyond_the_budget_is_cut_and_says_so() {
-        let tool = make_web_fetch_tool();
+        let tool = make_web_fetch_tool(None);
 
         let output = (tool.executor)(
             json!({"url": "https://example.com"}),
@@ -372,7 +381,7 @@ mod tests {
     /// usually inside a character.
     #[tokio::test]
     async fn a_page_is_cut_at_a_character_boundary() {
-        let tool = make_web_fetch_tool();
+        let tool = make_web_fetch_tool(None);
         // Four-byte characters, so the 100 KiB mark is inside one of them.
         let page = "😀".repeat(40 * 1024);
 
@@ -392,7 +401,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_curl_that_failed_reports_its_exit_code_and_message() {
-        let tool = make_web_fetch_tool();
+        let tool = make_web_fetch_tool(None);
         let environment = MockEnvironment {
             exec_result: ExecResult {
                 stdout:      String::new(),
@@ -419,7 +428,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_calls_environment_variables_reach_curl() {
-        let tool = make_web_fetch_tool();
+        let tool = make_web_fetch_tool(None);
         let environment = Arc::new(fetched("fetched content"));
         let tool_env = HashMap::from([("API_KEY".to_owned(), "secret".to_owned())]);
 
@@ -441,8 +450,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_prompt_is_answered_by_the_summarizer() {
-        let tool = make_web_fetch_tool();
-        let (context, provider) = summarizing("Rust is a systems programming language.");
+        let (tool, context, provider) = summarizing("Rust is a systems programming language.");
 
         let output = (tool.executor)(
             json!({"url": "https://example.com", "prompt": "What is Rust?"}),
@@ -469,7 +477,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_prompt_without_a_summarizer_returns_the_page_and_says_why() {
-        let tool = make_web_fetch_tool();
+        let tool = make_web_fetch_tool(None);
 
         let output = (tool.executor)(
             json!({"url": "https://example.com", "prompt": "What is Rust?"}),
@@ -489,18 +497,20 @@ mod tests {
 
     #[tokio::test]
     async fn a_summarizer_that_fails_says_which_model_it_asked() {
-        let tool = make_web_fetch_tool();
         let (client, _provider) = client_from(ScriptedProvider::new(Vec::new()).completing(vec![
             ScriptedCompletion::Failure(ScriptedFailure::terminal(
                 LlmErrorKind::Provider,
                 "the model is overloaded",
             )),
         ]));
+        let tool = make_web_fetch_tool(Some(Arc::new(WebFetchSummarizer::new(
+            client,
+            "test/model",
+        ))));
 
         let error = (tool.executor)(
             json!({"url": "https://example.com", "prompt": "What is Rust?"}),
-            context(fetched("<html><body><p>content</p></body></html>"))
-                .with_web_fetch_summarizer(Arc::new(WebFetchSummarizer::new(client, "test/model"))),
+            context(fetched("<html><body><p>content</p></body></html>")),
         )
         .await
         .expect_err("the summarizing call failed");
@@ -579,14 +589,13 @@ capabilities = { text = true }
             .expect("the client builds")
             .client;
 
-        let tool = make_web_fetch_tool();
+        let tool = make_web_fetch_tool(Some(Arc::new(WebFetchSummarizer::new(
+            client,
+            "summarizing/small",
+        ))));
         let output = (tool.executor)(
             json!({"url": "https://example.com", "prompt": "Summarize this"}),
-            context(fetched("<html><body><p>Page content</p></body></html>"))
-                .with_web_fetch_summarizer(Arc::new(WebFetchSummarizer::new(
-                    client,
-                    "summarizing/small",
-                ))),
+            context(fetched("<html><body><p>Page content</p></body></html>")),
         )
         .await
         .expect("the named provider answers");

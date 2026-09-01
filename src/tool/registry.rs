@@ -19,7 +19,6 @@ use crate::environment::Environment;
 use crate::event::{OutputCaptureStats, SessionBoundEmitter};
 use crate::human_input::HumanInputProvider;
 use crate::redact::{NoRedaction, Redactor};
-use crate::tools::WebFetchSummarizer;
 use crate::types::{AgentEvent, ToolCategory, ToolSource, ToolSummary};
 
 /// The narrow handle a running tool publishes events through.
@@ -94,7 +93,7 @@ impl ToolEnvProvider for StaticEnvProvider {
 #[non_exhaustive]
 pub struct ToolContext {
     /// Where the tool's work lands.
-    pub env:                  Arc<dyn Environment>,
+    pub env:                 Arc<dyn Environment>,
     /// Fires when this call should stop. Composed from the session's terminal
     /// cancellation and the current round's interrupt, so a tool that watches
     /// it observes both.
@@ -104,22 +103,22 @@ pub struct ToolContext {
     /// with no result is a conversation the provider will refuse. A tool that
     /// ignores this token therefore holds its round — and the run ending it —
     /// open until it returns, so long work must watch it and answer.
-    pub cancel:               CancellationToken,
+    pub cancel:              CancellationToken,
     /// Extra environment variables for a command this call runs.
-    pub tool_env_provider:    Option<Arc<dyn ToolEnvProvider>>,
+    pub tool_env_provider:   Option<Arc<dyn ToolEnvProvider>>,
     /// The session that called the tool.
-    pub session_id:           Option<String>,
+    pub session_id:          Option<String>,
     /// The root of the session tree this call belongs to. Equal to
     /// [`session_id`](Self::session_id) in a root session; a child inherits
     /// its parent's root.
-    pub root_session_id:      Option<String>,
+    pub root_session_id:     Option<String>,
     /// The model-native identifier of this call.
-    pub tool_call_id:         Option<String>,
+    pub tool_call_id:        Option<String>,
     /// Where the tool publishes events.
-    pub agent_event_emitter:  Option<Arc<dyn AgentEventEmitter>>,
+    pub agent_event_emitter: Option<Arc<dyn AgentEventEmitter>>,
     /// Where the tool asks the person a question. Absent in child sessions and
     /// wherever the application installed no provider.
-    pub human_input:          Option<Arc<dyn HumanInputProvider>>,
+    pub human_input:         Option<Arc<dyn HumanInputProvider>>,
     /// What strips secrets out of text the tool publishes.
     ///
     /// Only output leaving the session through an event goes through it — the
@@ -127,12 +126,7 @@ pub struct ToolContext {
     /// which is the same text the model would have read from the terminal.
     /// [`NoRedaction`](crate::NoRedaction) unless the application installed
     /// one.
-    pub redactor:             Arc<dyn Redactor>,
-    /// Where `web_fetch` asks a model to answer a prompt about a page.
-    ///
-    /// Absent unless the application named a summarizing model, in which case
-    /// a prompt about a page is answered by returning the page.
-    pub web_fetch_summarizer: Option<Arc<WebFetchSummarizer>>,
+    pub redactor:            Arc<dyn Redactor>,
 }
 
 impl ToolContext {
@@ -149,7 +143,6 @@ impl ToolContext {
             agent_event_emitter: None,
             human_input: None,
             redactor: Arc::new(NoRedaction),
-            web_fetch_summarizer: None,
         }
     }
 
@@ -204,13 +197,6 @@ impl ToolContext {
     #[must_use]
     pub fn with_redactor(mut self, redactor: Arc<dyn Redactor>) -> Self {
         self.redactor = redactor;
-        self
-    }
-
-    /// Sets which model answers a `web_fetch` prompt about a page.
-    #[must_use]
-    pub fn with_web_fetch_summarizer(mut self, summarizer: Arc<WebFetchSummarizer>) -> Self {
-        self.web_fetch_summarizer = Some(summarizer);
         self
     }
 
@@ -424,13 +410,8 @@ impl ToolRegistry {
     /// Every registered tool's definition and origin, in no particular order.
     #[must_use]
     pub fn definitions_with_source(&self) -> Vec<ToolDefinitionWithSource> {
-        self.tools
-            .values()
-            .map(|tool| ToolDefinitionWithSource {
-                definition: tool.definition.clone(),
-                source:     tool.source.clone(),
-            })
-            .collect()
+        // With no policy the exposure mode is never consulted.
+        self.definitions_with_source_for_policy(None, ToolExposureMode::AutoApprovedOnly)
     }
 
     /// The definitions `policy` allows a session to advertise.

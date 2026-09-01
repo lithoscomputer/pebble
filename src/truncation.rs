@@ -25,6 +25,7 @@ use serde::Serialize;
 
 use crate::char_boundary::{ceil_char_boundary, floor_char_boundary};
 use crate::event::OutputCaptureStats;
+use crate::tool::NativeTool;
 
 /// Bytes of one tool's output a session retains by default.
 pub const DEFAULT_TOOL_OUTPUT_RETENTION_BYTES: usize = 1024 * 1024;
@@ -349,13 +350,18 @@ pub struct ToolOutputLimits {
 impl ToolOutputLimits {
     /// Pebble's built-in limits for a tool, addressed by its canonical name.
     ///
-    /// A tool pebble does not know keeps its whole output.
+    /// The limits themselves live on [`NativeTool`], where the compiler makes
+    /// a new built-in tool state its answer. A tool pebble does not know keeps
+    /// its whole output.
     #[must_use]
     pub fn defaults_for(canonical_tool_name: &str) -> Self {
-        Self {
-            max_chars: default_char_limit(canonical_tool_name),
-            max_lines: default_line_limit(canonical_tool_name),
-            mode:      default_truncation_mode(canonical_tool_name),
+        match NativeTool::from_canonical_name(canonical_tool_name) {
+            Some(tool) => tool.default_output_limits(),
+            None => Self {
+                max_chars: None,
+                max_lines: None,
+                mode:      TruncationMode::HeadTail,
+            },
         }
     }
 
@@ -383,12 +389,13 @@ impl ToolOutputLimits {
                 .copied()
         }
 
+        let defaults = Self::defaults_for(canonical_tool_name);
         Self {
             max_chars: lookup(char_overrides, tool_name, canonical_tool_name)
-                .or_else(|| default_char_limit(canonical_tool_name)),
+                .or(defaults.max_chars),
             max_lines: lookup(line_overrides, tool_name, canonical_tool_name)
-                .or_else(|| default_line_limit(canonical_tool_name)),
-            mode:      default_truncation_mode(canonical_tool_name),
+                .or(defaults.max_lines),
+            mode:      defaults.mode,
         }
     }
 }
@@ -404,33 +411,6 @@ pub fn truncate_tool_output(output: &str, limits: ToolOutputLimits) -> String {
     match limits.max_lines {
         Some(limit) => truncate_lines(&after_chars, limit),
         None => after_chars,
-    }
-}
-
-fn default_char_limit(canonical_tool_name: &str) -> Option<usize> {
-    match canonical_tool_name {
-        "read_file" => Some(50_000),
-        "shell" => Some(30_000),
-        "grep" | "glob" | "spawn_agent" => Some(20_000),
-        "edit_file" | "apply_patch" => Some(10_000),
-        "write_file" => Some(1_000),
-        _ => None,
-    }
-}
-
-fn default_line_limit(canonical_tool_name: &str) -> Option<usize> {
-    match canonical_tool_name {
-        "shell" => Some(256),
-        "grep" => Some(200),
-        "glob" => Some(500),
-        _ => None,
-    }
-}
-
-fn default_truncation_mode(canonical_tool_name: &str) -> TruncationMode {
-    match canonical_tool_name {
-        "grep" | "glob" | "edit_file" | "apply_patch" | "write_file" => TruncationMode::Tail,
-        _ => TruncationMode::HeadTail,
     }
 }
 

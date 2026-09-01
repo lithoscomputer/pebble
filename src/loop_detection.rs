@@ -116,6 +116,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::session::testing::history_from;
     use crate::types::TokenUsage;
 
     fn assistant_with_tool(name: &str, arguments: Value) -> Message {
@@ -127,14 +128,6 @@ mod tests {
             response_id:    "resp".into(),
             timestamp:      SystemTime::now(),
         }
-    }
-
-    fn history_from(turns: Vec<Message>) -> History {
-        let mut history = History::default();
-        for turn in turns {
-            history.push(turn);
-        }
-        history
     }
 
     #[test]

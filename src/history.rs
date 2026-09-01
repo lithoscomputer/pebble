@@ -22,8 +22,8 @@ use crate::types::{Message, TokenUsage};
 /// How many tokens of discarded user input compaction carries forward.
 const COMPACTION_USER_MESSAGE_TOKEN_BUDGET: usize = 20_000;
 
-/// The rough characters-per-token ratio the compaction budget assumes.
-const CHARS_PER_TOKEN: usize = 4;
+/// The rough characters-per-token ratio pebble's local estimates assume.
+pub(crate) const APPROX_CHARS_PER_TOKEN: usize = 4;
 
 /// Opaque parts that stop being replayable once compaction rewrites the turns
 /// around them.
@@ -171,7 +171,7 @@ fn is_stale_after_compaction(part: &ContentPart) -> bool {
 /// Collects the most recent user turns from the discarded head, newest-first
 /// until the budget is spent, and returns them in conversation order.
 fn extract_recent_user_messages(discarded: Vec<Message>, token_budget: usize) -> Vec<Message> {
-    let char_budget = token_budget.saturating_mul(CHARS_PER_TOKEN);
+    let char_budget = token_budget.saturating_mul(APPROX_CHARS_PER_TOKEN);
     let mut spent = 0;
     let mut first_kept = discarded.len();
 

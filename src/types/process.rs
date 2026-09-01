@@ -48,19 +48,11 @@ pub struct ExecOutputTail {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr:           Option<String>,
     /// Whether `stdout` dropped earlier output.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stdout_truncated: bool,
     /// Whether `stderr` dropped earlier output.
-    #[serde(default, skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stderr_truncated: bool,
-}
-
-#[expect(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "serde skip_serializing_if predicates receive fields by reference"
-)]
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 impl ExecOutputTail {

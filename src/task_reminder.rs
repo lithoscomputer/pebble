@@ -127,6 +127,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::session::testing::history_from;
     use crate::types::TokenUsage;
 
     fn assistant(tool_name: Option<&str>) -> Message {
@@ -147,14 +148,6 @@ mod tests {
             content:   content.into(),
             timestamp: SystemTime::now(),
         }
-    }
-
-    fn history_from(turns: Vec<Message>) -> History {
-        let mut history = History::default();
-        for turn in turns {
-            history.push(turn);
-        }
-        history
     }
 
     const BOTH_TOOLS: [&str; 2] = ["TaskCreate", "TaskUpdate"];

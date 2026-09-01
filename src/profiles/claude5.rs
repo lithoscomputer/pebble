@@ -40,7 +40,7 @@ impl Claude5Profile {
             claude5_tools::make_write_tool(),
             claude5_tools::make_edit_tool(),
             claude5_tools::make_bash_tool(&options),
-            claude5_tools::make_claude5_web_fetch_tool(),
+            claude5_tools::make_claude5_web_fetch_tool(deps.web_fetch_summarizer.clone()),
         ];
         // The one harness that gives its model a search tool of a different
         // shape, so it replaces the canonical one the builder registered.

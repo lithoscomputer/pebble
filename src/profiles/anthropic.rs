@@ -33,7 +33,7 @@ impl AnthropicProfile {
     /// The harness for a session built from `deps`.
     pub(crate) fn new(deps: &ProfileDeps) -> Self {
         let options = NativeToolOptions::for_profile(AgentProfileKind::Anthropic);
-        let mut tools = core_tools(&options);
+        let mut tools = core_tools(&options, deps.web_fetch_summarizer.clone());
         tools.push(make_edit_file_tool());
         // One runtime behind all four, so a task created through one tool is
         // the task the others read.

@@ -5,7 +5,7 @@ use std::sync::{Mutex, PoisonError};
 
 use crate::tool::ToolContext;
 use crate::types::{
-    AgentEvent, TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoListProjection, TodoPatch,
+    AgentEvent, TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoListProjection,
     TodoProjection, TodoStatus, TodoUpdatedProps,
 };
 
@@ -111,7 +111,7 @@ impl TodoRuntime {
             let Some(list) = guard.lists.get_mut(&props.list_id) else {
                 return false;
             };
-            list.apply_patch(&props.todo_id, &TodoPatch::from_props(&props))
+            list.apply_patch(&props.todo_id, &props)
         };
         if applied {
             ctx.emit_agent_event(AgentEvent::TodoUpdated(props));

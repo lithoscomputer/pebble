@@ -307,7 +307,8 @@ pub use self::config::{
 };
 pub use self::context_window::{
     ACTIVATED_SKILL_WARNING, ContextWindowInput, build_local_snapshot,
-    context_window_from_response_usage, scaled_snapshot,
+    context_window_from_response_usage, memory_prompt_tokens, scaled_snapshot,
+    skills_prompt_tokens,
 };
 pub use self::environment::{
     CallerEnvPolicy, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, EnvResult, Environment,
@@ -371,7 +372,6 @@ pub use self::types::{
     ContextWindowWarning, CostSource, ExecOutputTail, ExecOutputTailTrace,
     INITIAL_SUBAGENT_GENERATION, LlmOutputKind, LlmRetryPhase, MemoryFileSummary, Message,
     PermissionLevel, SessionEvent, SessionState, SkillActivationSource, SkillSummary,
-    TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoListProjection, TodoPatch,
-    TodoProjection, TodoStatus, TodoUpdatedProps, TokenUsage, ToolCategory, ToolErrorKind,
-    ToolSource, ToolSummary,
+    TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoListProjection, TodoProjection,
+    TodoStatus, TodoUpdatedProps, TokenUsage, ToolCategory, ToolErrorKind, ToolSource, ToolSummary,
 };

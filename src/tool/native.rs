@@ -20,6 +20,7 @@
 
 use std::fmt;
 
+use crate::truncation::{ToolOutputLimits, TruncationMode};
 use crate::types::ToolCategory;
 
 /// A naming scheme for built-in tools.
@@ -294,6 +295,56 @@ impl NativeTool {
             .iter()
             .copied()
             .find(|tool| tool.canonical_name() == name || tool.aliases().contains(&name))
+    }
+
+    /// The output limits history keeps for this tool's results by default.
+    ///
+    /// Matched exhaustively so a new built-in tool has to state its answer.
+    /// `None` budgets keep everything, which is also what tools pebble does
+    /// not know get.
+    #[must_use]
+    pub(crate) const fn default_output_limits(self) -> ToolOutputLimits {
+        const fn limits(
+            max_chars: Option<usize>,
+            max_lines: Option<usize>,
+            mode: TruncationMode,
+        ) -> ToolOutputLimits {
+            ToolOutputLimits {
+                max_chars,
+                max_lines,
+                mode,
+            }
+        }
+
+        match self {
+            Self::ReadFile => limits(Some(50_000), None, TruncationMode::HeadTail),
+            Self::Shell => limits(Some(30_000), Some(256), TruncationMode::HeadTail),
+            Self::Grep => limits(Some(20_000), Some(200), TruncationMode::Tail),
+            Self::Glob => limits(Some(20_000), Some(500), TruncationMode::Tail),
+            Self::SpawnAgent => limits(Some(20_000), None, TruncationMode::HeadTail),
+            Self::EditFile | Self::ApplyPatch => limits(Some(10_000), None, TruncationMode::Tail),
+            Self::WriteFile => limits(Some(1_000), None, TruncationMode::Tail),
+            Self::ReadManyFiles
+            | Self::ListDir
+            | Self::WebSearch
+            | Self::WebFetch
+            | Self::SendInput
+            | Self::Wait
+            | Self::CloseAgent
+            | Self::BackgroundAgent
+            | Self::AgentOutput
+            | Self::StopAgent
+            | Self::MessageAgent
+            | Self::UseSkill
+            | Self::UpdatePlan
+            | Self::TaskCreate
+            | Self::TaskUpdate
+            | Self::TaskGet
+            | Self::TaskList
+            | Self::TodoList
+            | Self::AskUserQuestion
+            | Self::RequestUserInput => limits(None, None, TruncationMode::HeadTail),
+        }
     }
 
     /// The coarse access category, or `None` when the tool is not part of the

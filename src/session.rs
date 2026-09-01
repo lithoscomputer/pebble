@@ -89,6 +89,7 @@ pub use self::control::{
 };
 pub use self::retry::RetryEventObserver;
 use crate::config::SessionOptions;
+use crate::context_window::{memory_prompt_tokens, skills_prompt_tokens};
 use crate::environment::{Environment, ExecRequest};
 use crate::error::{Error, ErrorData, InterruptReason, Result};
 use crate::event::{Emitter, EventCapacity, EventOptions, EventPump, EventSink};
@@ -399,6 +400,11 @@ impl SessionBuilder {
     /// summarizing model can be smaller and cheaper than the one running the
     /// session. Without one, a `web_fetch` call carrying a prompt returns the
     /// page and says the summary was unavailable.
+    ///
+    /// The built-in profiles' fetch tool captures the summarizer when the
+    /// profile is constructed; an application registering
+    /// [`make_web_fetch_tool`](crate::make_web_fetch_tool) itself passes a
+    /// [`WebFetchSummarizer`](crate::WebFetchSummarizer) directly instead.
     pub fn web_fetch_summarizer(mut self, model: impl Into<String>) -> Self {
         self.web_fetch_summarizer = Some(model.into());
         self
@@ -536,11 +542,18 @@ impl SessionBuilder {
             .human_input
             .as_ref()
             .and_then(|_| make_question_tool(kind));
+        // Built before the profile, because the profile's `web_fetch` tool
+        // captures it at construction the way a search tool captures its
+        // engine.
+        let web_fetch_summarizer = self
+            .web_fetch_summarizer
+            .map(|model| Arc::new(WebFetchSummarizer::new(self.client.clone(), model)));
         let deps = ProfileDeps {
             provider_display_name: route.provider().display_name().to_owned(),
-            file_edit_tool:        FileEditToolKind::for_codec(route.provider().codec()),
-            search_provider:       self.search_provider.clone(),
-            has_subagents:         self.subagents.is_some(),
+            file_edit_tool: FileEditToolKind::for_codec(route.provider().codec()),
+            search_provider: self.search_provider.clone(),
+            web_fetch_summarizer,
+            has_subagents: self.subagents.is_some(),
         };
         let profile = self.profile.unwrap_or_else(|| builtin_profile(kind, &deps));
 
@@ -584,10 +597,6 @@ impl SessionBuilder {
                 ),
             };
 
-        let web_fetch_summarizer = self
-            .web_fetch_summarizer
-            .map(|model| Arc::new(WebFetchSummarizer::new(self.client.clone(), model)));
-
         let supervisor = self.subagents.map(|factory| {
             SubagentSupervisor::new(Arc::new(ChildDeps {
                 client: self.client.clone(),
@@ -598,7 +607,6 @@ impl SessionBuilder {
                 options: child_options(&self.options),
                 tool_env_provider: self.tool_env_provider.clone(),
                 redactor: Arc::clone(&self.redactor),
-                web_fetch_summarizer: web_fetch_summarizer.clone(),
                 search_provider: self.search_provider.clone(),
                 event_capacity: self.events.capacity,
                 factory,
@@ -629,7 +637,6 @@ impl SessionBuilder {
             state: SessionState::Idle,
             ended: false,
             client: self.client,
-            profile_kind: profile.profile_kind(),
             profile,
             provider: handle.provider().as_str().to_owned(),
             model: handle.model().as_str().to_owned(),
@@ -641,7 +648,6 @@ impl SessionBuilder {
             human_input: self.human_input,
             tool_env_provider: self.tool_env_provider,
             redactor: self.redactor,
-            web_fetch_summarizer,
             control_state: Arc::new(Mutex::new(ControlState::default())),
             control_notify: Arc::new(Notify::new()),
             followup_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -651,14 +657,14 @@ impl SessionBuilder {
             memory: Vec::new(),
             env_context: EnvContext::default(),
             skills: Vec::new(),
+            memory_tokens: 0,
+            skills_tokens: 0,
             system_prompt: String::new(),
             activated_skill_context_observed: false,
             file_tracker: FileTracker::default(),
             subagents: supervisor,
             completion_coordinator: None,
-            last_run_timing: RunTiming::default(),
-            last_run_usage: TokenUsage::default(),
-            last_run_cost_usd_micros: None,
+            last_run: RunTotals::default(),
         };
 
         // Wired here rather than by the application: a supervisor with no
@@ -826,7 +832,6 @@ pub struct Session {
     ended: bool,
     client: Client,
     profile: Arc<dyn AgentProfile>,
-    profile_kind: AgentProfileKind,
     provider: String,
     model: String,
     /// What every request names, which is the resolved `provider/model` pair
@@ -841,9 +846,6 @@ pub struct Session {
     tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
     /// What strips secrets out of the process output this session publishes.
     redactor: Arc<dyn Redactor>,
-    /// Which model answers a `web_fetch` prompt about a page, when the
-    /// application named one.
-    web_fetch_summarizer: Option<Arc<WebFetchSummarizer>>,
     control_state: Arc<Mutex<ControlState>>,
     control_notify: Arc<Notify>,
     followup_queue: Arc<Mutex<VecDeque<String>>>,
@@ -856,14 +858,17 @@ pub struct Session {
     memory: Vec<MemoryDocument>,
     env_context: EnvContext,
     skills: Vec<Skill>,
+    /// What the memory files and the skills section contribute to the system
+    /// prompt, measured once at initialization: both are fixed for the
+    /// session's life, and every round's context snapshot reads them.
+    memory_tokens: u64,
+    skills_tokens: u64,
     system_prompt: String,
     activated_skill_context_observed: bool,
     file_tracker: FileTracker,
     subagents: Option<SubagentSupervisor>,
     completion_coordinator: Option<Arc<dyn CompletionCoordinator>>,
-    last_run_timing: RunTiming,
-    last_run_usage: TokenUsage,
-    last_run_cost_usd_micros: Option<u64>,
+    last_run: RunTotals,
 }
 
 impl fmt::Debug for Session {
@@ -874,7 +879,7 @@ impl fmt::Debug for Session {
             .field("root_session_id", &self.root_session_id)
             .field("provider", &self.provider)
             .field("model", &self.model)
-            .field("profile", &self.profile_kind)
+            .field("profile", &self.profile.profile_kind())
             .field("state", &self.state)
             .field("ended", &self.ended)
             .field("turns", &self.history.len())
@@ -979,9 +984,16 @@ impl Session {
             return Err(Error::Interrupted(InterruptReason::Cancelled));
         }
 
-        let profile = self.profile_kind.as_str().to_owned();
+        let profile = self.profile.profile_kind().as_str().to_owned();
 
-        self.memory = load_memory(self.env.as_ref(), &self.config.memory_files, &cancel).await?;
+        // Independent reads of the environment, overlapped; the events they
+        // feed stay in their documented order below.
+        let (memory, skills) = tokio::join!(
+            load_memory(self.env.as_ref(), &self.config.memory_files, &cancel),
+            discover_skills(self.env.as_ref(), &self.config.skill_dirs, &cancel),
+        );
+
+        self.memory = memory?;
         // The files are described, never quoted: the durable stream must not
         // carry the bytes of a project's own instructions.
         self.emit(AgentEvent::MemoryLoaded {
@@ -995,7 +1007,7 @@ impl Session {
             budget_bytes:       MEMORY_BUDGET_BYTES,
         });
 
-        self.skills = discover_skills(self.env.as_ref(), &self.config.skill_dirs, &cancel).await?;
+        self.skills = skills?;
         debug!(skill_count = self.skills.len(), "Skills discovered");
         self.emit(AgentEvent::SkillsDiscovered {
             profile,
@@ -1012,6 +1024,12 @@ impl Session {
                 vocabulary,
             ));
         }
+
+        // Measured once: memory and skills never change again, and the context
+        // snapshot built every round reads these numbers instead of
+        // re-tokenizing the same text.
+        self.memory_tokens = memory_prompt_tokens(&self.memory);
+        self.skills_tokens = skills_prompt_tokens(&self.skills, self.registry.vocabulary());
 
         self.env_context = self.build_env_context(&cancel).await?;
         debug!(
@@ -1050,24 +1068,20 @@ impl Session {
     /// environment.
     async fn build_env_context(&self, cancel: &CancellationToken) -> Result<EnvContext> {
         stop_if_cancelled(cancel)?;
-        let current_date = self.probe_date(cancel).await;
-
-        stop_if_cancelled(cancel)?;
-        let git_branch = self.probe(cancel, "git rev-parse --abbrev-ref HEAD").await;
+        let (current_date, git_branch) = tokio::join!(
+            self.probe_date(cancel),
+            self.probe(cancel, "git rev-parse --abbrev-ref HEAD"),
+        );
         let is_git_repo = git_branch.is_some();
 
         stop_if_cancelled(cancel)?;
-        let git_status_short = if is_git_repo {
-            self.probe(cancel, "git status --short").await
+        let (git_status_short, git_recent_commits) = if is_git_repo {
+            tokio::join!(
+                self.probe(cancel, "git status --short"),
+                self.probe(cancel, "git log --oneline -10"),
+            )
         } else {
-            None
-        };
-
-        stop_if_cancelled(cancel)?;
-        let git_recent_commits = if is_git_repo {
-            self.probe(cancel, "git log --oneline -10").await
-        } else {
-            None
+            (None, None)
         };
 
         stop_if_cancelled(cancel)?;
@@ -1138,7 +1152,7 @@ impl Session {
 
     /// Which harness this session runs.
     pub fn profile_kind(&self) -> AgentProfileKind {
-        self.profile_kind
+        self.profile.profile_kind()
     }
 
     /// The provider the session resolved to.
@@ -1188,18 +1202,18 @@ impl Session {
 
     /// Where the last run spent its time.
     pub const fn last_run_timing(&self) -> RunTiming {
-        self.last_run_timing
+        self.last_run.timing
     }
 
     /// What the last run cost in tokens, summed over every response.
     pub const fn last_run_usage(&self) -> TokenUsage {
-        self.last_run_usage
+        self.last_run.usage
     }
 
     /// What the last run cost in USD micros, where the catalog or the provider
     /// priced it.
     pub const fn last_run_cost_usd_micros(&self) -> Option<u64> {
-        self.last_run_cost_usd_micros
+        self.last_run.cost_usd_micros
     }
 
     /// The tools the model is actually shown, after the access policy.
@@ -1400,9 +1414,7 @@ impl Session {
         input: &str,
         options: RunOptions,
     ) -> Result<Option<String>> {
-        self.last_run_timing = RunTiming::default();
-        self.last_run_usage = TokenUsage::default();
-        self.last_run_cost_usd_micros = None;
+        self.last_run = RunTotals::default();
         if self.state == SessionState::Closed {
             return Err(Error::SessionClosed);
         }
@@ -1449,9 +1461,7 @@ impl Session {
             }
         }
 
-        self.last_run_timing = totals.timing;
-        self.last_run_usage = totals.usage;
-        self.last_run_cost_usd_micros = totals.cost_usd_micros;
+        self.last_run = totals;
 
         match (result, task_failure) {
             // The run's own failure is the story; a task that also failed on

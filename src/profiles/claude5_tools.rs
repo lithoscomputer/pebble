@@ -24,12 +24,12 @@ use tokio::time;
 use super::definition;
 use crate::config::NativeToolOptions;
 use crate::search::SearchProvider;
-use crate::subagent::{SubagentResult, SubagentStatus, SubagentSupervisor};
-use crate::tool::{NativeTool, RegisteredTool, ToolContext, ToolError, required_str};
+use crate::subagent::{SubagentResult, SubagentStatus, SubagentSupervisor, tree_position};
+use crate::tool::{NativeTool, RegisteredTool, ToolError, required_str};
 use crate::tools::shell::run_shell_command;
 use crate::tools::{
-    make_edit_file_tool, make_read_file_tool, make_web_fetch_tool, make_web_search_tool,
-    make_write_file_tool,
+    WebFetchSummarizer, make_edit_file_tool, make_read_file_tool, make_web_fetch_tool,
+    make_web_search_tool, make_write_file_tool,
 };
 use crate::types::ToolSource;
 
@@ -162,8 +162,10 @@ pub(crate) fn make_claude5_web_search_tool(provider: Arc<dyn SearchProvider>) ->
 
 /// `WebFetch`, which requires the prompt pebble's own tool leaves optional.
 #[must_use]
-pub(crate) fn make_claude5_web_fetch_tool() -> RegisteredTool {
-    let mut tool = make_web_fetch_tool();
+pub(crate) fn make_claude5_web_fetch_tool(
+    summarizer: Option<Arc<WebFetchSummarizer>>,
+) -> RegisteredTool {
+    let mut tool = make_web_fetch_tool(summarizer);
     tool.definition = definition(
         NativeTool::WebFetch,
         "Fetch an HTTP or HTTPS URL and answer the supplied prompt from its contents.",
@@ -207,20 +209,6 @@ fn format_agent_result(result: &SubagentResult) -> String {
         "Agent completed (success: {}, turns: {})\n\n{}",
         result.success, result.turns_used, result.output
     )
-}
-
-/// Where in the tree a call sits, as the supervisor needs it named.
-///
-/// A child inherits the root of its parent's tree, so root-scoped tools — one
-/// shared task list — cover the whole tree.
-fn tree_position(context: &ToolContext) -> Result<(&str, &str), ToolError> {
-    let Some(session_id) = context.session_id.as_deref() else {
-        return Err(ToolError::execution(
-            "A subagent can only be spawned from inside a session",
-        ));
-    };
-    let root_session_id = context.root_session_id.as_deref().unwrap_or(session_id);
-    Ok((session_id, root_session_id))
 }
 
 /// `Agent`: starts a child, in the background unless told otherwise.
@@ -478,6 +466,7 @@ mod tests {
     use crate::profiles::tests::UnusedSearch;
     use crate::session::testing::TestSession;
     use crate::test_support::{MockEnvironment, ScriptedCall, text_response};
+    use crate::tool::ToolContext;
     use crate::tools::testing::{context, schema_of};
     use crate::tools::{
         TodoRuntime, make_task_create_tool, make_task_get_tool, make_task_list_tool,
@@ -544,7 +533,7 @@ mod tests {
             schema_of(&bash)["properties"]["timeout"]["maximum"],
             600_000
         );
-        assert_schema(&make_claude5_web_fetch_tool(), &["prompt", "url"], &[
+        assert_schema(&make_claude5_web_fetch_tool(None), &["prompt", "url"], &[
             "prompt", "url",
         ]);
         assert_schema(
@@ -587,7 +576,7 @@ mod tests {
     #[test]
     fn the_narrowed_search_and_fetch_tools_keep_their_own_wording() {
         let search = make_claude5_web_search_tool(Arc::new(UnusedSearch));
-        let fetch = make_claude5_web_fetch_tool();
+        let fetch = make_claude5_web_fetch_tool(None);
 
         assert!(search.definition.description.contains("use WebFetch"));
         assert!(!search.definition.description.contains("web_fetch"));

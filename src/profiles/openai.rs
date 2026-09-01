@@ -34,7 +34,7 @@ impl OpenAiProfile {
     /// The harness for a session built from `deps`.
     pub(crate) fn new(deps: &ProfileDeps) -> Self {
         let options = NativeToolOptions::for_profile(AgentProfileKind::OpenAi);
-        let mut tools = core_tools(&options);
+        let mut tools = core_tools(&options, deps.web_fetch_summarizer.clone());
         tools.push(deps.file_edit_tool.tool());
         // Codex's `update_plan` replaces a whole plan at once, so the list
         // behind it belongs to this session rather than to the tree.

@@ -25,6 +25,7 @@ use tokio::task::yield_now;
 use super::{RetryEventObserver, Session, SessionBuilder, ShutdownReason};
 use crate::config::SessionOptions;
 use crate::environment::Environment;
+use crate::history::History;
 use crate::human_input::HumanInputProvider;
 use crate::profile::{AgentProfile, EnvContext};
 use crate::redact::Redactor;
@@ -36,7 +37,7 @@ use crate::test_support::{
     scripted_client_builder,
 };
 use crate::tool::{RegisteredTool, ToolError, ToolRegistry, ToolVocabulary};
-use crate::types::{AgentEvent, AgentProfileKind, SessionEvent, ToolSource};
+use crate::types::{AgentEvent, AgentProfileKind, Message, SessionEvent, ToolSource};
 
 /// A profile that names a harness and contributes only what it is given.
 pub(crate) struct TestProfile {
@@ -112,7 +113,6 @@ pub(crate) struct TestSession {
     limits:          SubagentLimits,
     human_input:     Option<Arc<dyn HumanInputProvider>>,
     redactor:        Option<Arc<dyn Redactor>>,
-    summarizer:      Option<String>,
     search_provider: Option<Arc<dyn SearchProvider>>,
 }
 
@@ -133,7 +133,6 @@ impl TestSession {
             limits: SubagentLimits::default(),
             human_input: None,
             redactor: None,
-            summarizer: None,
             search_provider: None,
         }
     }
@@ -141,12 +140,6 @@ impl TestSession {
     /// Strips secrets out of what the session publishes.
     pub(crate) fn redacting(mut self, redactor: Arc<dyn Redactor>) -> Self {
         self.redactor = Some(redactor);
-        self
-    }
-
-    /// Lets `web_fetch` answer a prompt by asking `model`.
-    pub(crate) fn summarizing_with(mut self, model: impl Into<String>) -> Self {
-        self.summarizer = Some(model.into());
         self
     }
 
@@ -278,9 +271,6 @@ impl TestSession {
         if let Some(redactor) = self.redactor {
             builder = builder.redactor(redactor);
         }
-        if let Some(model) = self.summarizer {
-            builder = builder.web_fetch_summarizer(model);
-        }
         if let Some(provider) = self.search_provider {
             builder = builder.search_provider(provider);
         }
@@ -295,6 +285,15 @@ pub(crate) fn builder(client: Client) -> SessionBuilder {
         .model("test/model")
         .environment(Arc::new(MockEnvironment::linux()))
         .with_profile(TestProfile::shared())
+}
+
+/// A history holding `turns`, oldest first.
+pub(crate) fn history_from(turns: Vec<Message>) -> History {
+    let mut history = History::default();
+    for turn in turns {
+        history.push(turn);
+    }
+    history
 }
 
 /// Closes the session, which publishes everything queued and joins the pump,

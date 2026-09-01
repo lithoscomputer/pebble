@@ -148,7 +148,7 @@ impl TodoProjection {
     /// `metadata_patch` keys with a `null` value delete that key; non-null
     /// values overwrite. Returns whether `order` changed, which is what
     /// [`TodoListProjection`] uses to decide whether to re-sort.
-    pub fn apply_patch(&mut self, patch: &TodoPatch<'_>) -> bool {
+    pub fn apply_patch(&mut self, patch: &TodoUpdatedProps) -> bool {
         let order_changed = patch.order.is_some_and(|order| order != self.order);
         if let Some(status) = patch.status {
             self.status = status;
@@ -156,35 +156,35 @@ impl TodoProjection {
         if let Some(order) = patch.order {
             self.order = order;
         }
-        if let Some(subject) = patch.subject {
+        if let Some(subject) = patch.subject.as_deref() {
             self.subject.clear();
             self.subject.push_str(subject);
         }
-        if let Some(description) = patch.description {
+        if let Some(description) = patch.description.as_deref() {
             self.description.clear();
             self.description.push_str(description);
         }
-        if let Some(active_form) = patch.active_form {
+        if let Some(active_form) = patch.active_form.as_ref() {
             self.active_form.clone_from(active_form);
         }
-        if let Some(owner) = patch.owner {
+        if let Some(owner) = patch.owner.as_ref() {
             self.owner.clone_from(owner);
         }
-        if let Some(extra) = patch.add_blocks {
+        if let Some(extra) = patch.add_blocks.as_deref() {
             for id in extra {
                 if !self.blocks.contains(id) {
                     self.blocks.push(id.clone());
                 }
             }
         }
-        if let Some(extra) = patch.add_blocked_by {
+        if let Some(extra) = patch.add_blocked_by.as_deref() {
             for id in extra {
                 if !self.blocked_by.contains(id) {
                     self.blocked_by.push(id.clone());
                 }
             }
         }
-        for (key, value) in patch.metadata_patch {
+        for (key, value) in &patch.metadata_patch {
             if value.is_null() {
                 self.metadata.remove(key);
             } else {
@@ -192,52 +192,6 @@ impl TodoProjection {
             }
         }
         order_changed
-    }
-}
-
-/// A borrowed view of an update, shared by the in-memory todo runtime and any
-/// reducer replaying persisted events.
-///
-/// Each field follows the same "absent means no change" convention as
-/// [`TodoUpdatedProps`]. `active_form` and `owner` are double-`Option` so
-/// "unchanged" and "cleared" stay distinguishable.
-#[derive(Debug, Clone, Copy)]
-pub struct TodoPatch<'a> {
-    /// The new status, when it changes.
-    pub status:         Option<TodoStatus>,
-    /// The new order, when it changes.
-    pub order:          Option<u32>,
-    /// The new subject, when it changes.
-    pub subject:        Option<&'a str>,
-    /// The new description, when it changes.
-    pub description:    Option<&'a str>,
-    /// The new in-progress phrasing; the inner `None` clears it.
-    pub active_form:    Option<&'a Option<String>>,
-    /// The new owner; the inner `None` clears it.
-    pub owner:          Option<&'a Option<String>>,
-    /// Identifiers to add to `blocks`.
-    pub add_blocks:     Option<&'a [String]>,
-    /// Identifiers to add to `blocked_by`.
-    pub add_blocked_by: Option<&'a [String]>,
-    /// Metadata keys to set, or to delete with a `null` value.
-    pub metadata_patch: &'a BTreeMap<String, serde_json::Value>,
-}
-
-impl<'a> TodoPatch<'a> {
-    /// Borrows an update event body as a patch view.
-    #[must_use]
-    pub fn from_props(props: &'a TodoUpdatedProps) -> Self {
-        Self {
-            status:         props.status,
-            order:          props.order,
-            subject:        props.subject.as_deref(),
-            description:    props.description.as_deref(),
-            active_form:    props.active_form.as_ref(),
-            owner:          props.owner.as_ref(),
-            add_blocks:     props.add_blocks.as_deref(),
-            add_blocked_by: props.add_blocked_by.as_deref(),
-            metadata_patch: &props.metadata_patch,
-        }
     }
 }
 
@@ -288,7 +242,7 @@ impl TodoListProjection {
 
     /// Applies `patch` to the todo with identifier `todo_id`, reporting
     /// whether the todo was found. Re-sorts only when `order` changed.
-    pub fn apply_patch(&mut self, todo_id: &str, patch: &TodoPatch<'_>) -> bool {
+    pub fn apply_patch(&mut self, todo_id: &str, patch: &TodoUpdatedProps) -> bool {
         let Some(index) = self.items.iter().position(|todo| todo.id == todo_id) else {
             return false;
         };
@@ -559,7 +513,7 @@ mod tests {
             metadata_patch: BTreeMap::from([("k".to_owned(), serde_json::Value::Null)]),
             ..TodoUpdatedProps::new("openai_plan:s", TodoListKind::OpenAiPlan, "a")
         };
-        let order_changed = todo.apply_patch(&TodoPatch::from_props(&props));
+        let order_changed = todo.apply_patch(&props);
 
         assert!(!order_changed);
         assert_eq!(todo.active_form, None);
@@ -577,7 +531,7 @@ mod tests {
             add_blocks: Some(vec!["b".into(), "b".into()]),
             ..TodoUpdatedProps::new("openai_plan:s", TodoListKind::OpenAiPlan, "a")
         };
-        assert!(list.apply_patch("a", &TodoPatch::from_props(&props)));
+        assert!(list.apply_patch("a", &props));
 
         let ids: Vec<&str> = list.items.iter().map(|todo| todo.id.as_str()).collect();
         assert_eq!(ids, vec!["b", "a"]);
@@ -588,7 +542,7 @@ mod tests {
     fn a_patch_for_an_unknown_todo_reports_a_miss() {
         let mut list = TodoListProjection::new(TodoListKind::OpenAiPlan, "openai_plan:s");
         let props = TodoUpdatedProps::new("openai_plan:s", TodoListKind::OpenAiPlan, "missing");
-        assert!(!list.apply_patch("missing", &TodoPatch::from_props(&props)));
+        assert!(!list.apply_patch("missing", &props));
     }
 
     #[test]

@@ -1,12 +1,12 @@
 //! What a session hands its own tools.
 //!
-//! The built-in tools are given four things a session owns rather than a
-//! profile: what strips secrets out of what they publish, which model answers
-//! a `web_fetch` prompt, where a `web_search` goes, and the skills a
-//! `use_skill` call loads from. Each is configured on the builder — the skills
-//! are discovered by `initialize` — and each reaches a tool only through the
-//! whole chain, so they are tested through a real run rather than by reading a
-//! field back.
+//! The built-in tools are given things a session owns rather than a profile:
+//! what strips secrets out of what they publish, where a `web_search` goes,
+//! and the skills a `use_skill` call loads from — configured on the builder,
+//! with the skills discovered by `initialize` — plus the summarizer a
+//! `web_fetch` tool captures at construction. Each reaches a tool only
+//! through the whole chain, so they are tested through a real run rather than
+//! by reading a field back.
 //!
 //! The two `apply_patch` tests here are the pair fabro ran through its own
 //! executor: a custom tool call is free-form text rather than JSON, and it
@@ -26,10 +26,12 @@ use crate::search::{SearchError, SearchProvider, SearchRequest, SearchResult};
 use crate::session::testing::{TestProfile, builder};
 use crate::subagent::{ChildSessionSpec, SessionFactory};
 use crate::test_support::{
-    MockEnvironment, MutableMockEnvironment, ScriptedCompletion, ScriptedProvider,
+    MockEnvironment, MutableMockEnvironment, ScriptedCompletion, ScriptedProvider, client_from,
     custom_tool_call_response, scripted_client,
 };
-use crate::tools::{make_apply_patch_tool, make_shell_tool, make_web_fetch_tool};
+use crate::tools::{
+    WebFetchSummarizer, make_apply_patch_tool, make_shell_tool, make_web_fetch_tool,
+};
 use crate::types::{CommandTermination, ExecOutputTail, SkillActivationSource};
 
 const SECRET: &str = "AKIAYRWQG5EJLPZLBYNP";
@@ -124,7 +126,7 @@ async fn a_session_without_a_redactor_publishes_what_the_process_wrote() {
 }
 
 #[tokio::test]
-async fn a_sessions_summarizer_answers_a_web_fetch_prompt() {
+async fn the_fetch_tools_summarizer_answers_a_web_fetch_prompt() {
     let environment = Arc::new(MockEnvironment {
         exec_result: ExecResult {
             stdout:      "<html><body><p>Rust is a language.</p></body></html>".to_owned(),
@@ -135,21 +137,27 @@ async fn a_sessions_summarizer_answers_a_web_fetch_prompt() {
         },
         ..MockEnvironment::default()
     });
-    let (mut session, provider) = TestSession::new(vec![
-        ScriptedCall::response(tool_call_response(
-            "web_fetch",
-            "call_1",
-            json!({"url": "https://example.com", "prompt": "What is Rust?"}),
-        )),
-        ScriptedCall::response(text_response("done")),
-    ])
-    .completing(vec![ScriptedCompletion::response(text_response(
-        "Rust is a language.",
-    ))])
-    .tools([make_web_fetch_tool()])
-    .environment(environment)
-    .summarizing_with("test/model")
-    .build();
+    let (client, provider) = client_from(
+        ScriptedProvider::new(vec![
+            ScriptedCall::response(tool_call_response(
+                "web_fetch",
+                "call_1",
+                json!({"url": "https://example.com", "prompt": "What is Rust?"}),
+            )),
+            ScriptedCall::response(text_response("done")),
+        ])
+        .completing(vec![ScriptedCompletion::response(text_response(
+            "Rust is a language.",
+        ))]),
+    );
+    let summarizer = Arc::new(WebFetchSummarizer::new(client.clone(), "test/model"));
+    let mut session = builder(client)
+        .with_profile(TestProfile::with_tools(vec![make_web_fetch_tool(Some(
+            summarizer,
+        ))]))
+        .environment(environment as Arc<dyn Environment>)
+        .build()
+        .expect("the session builds");
 
     session
         .run("read that page")
@@ -167,7 +175,7 @@ async fn a_sessions_summarizer_answers_a_web_fetch_prompt() {
 }
 
 #[tokio::test]
-async fn a_session_without_a_summarizer_returns_the_page_instead() {
+async fn a_fetch_tool_without_a_summarizer_returns_the_page_instead() {
     let environment = Arc::new(MockEnvironment {
         exec_result: ExecResult {
             stdout:      "<html><body><p>Rust is a language.</p></body></html>".to_owned(),
@@ -186,7 +194,7 @@ async fn a_session_without_a_summarizer_returns_the_page_instead() {
         )),
         ScriptedCall::response(text_response("done")),
     ])
-    .tools([make_web_fetch_tool()])
+    .tools([make_web_fetch_tool(None)])
     .environment(environment)
     .build();
 

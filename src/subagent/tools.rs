@@ -15,7 +15,7 @@ use lithos_llm::types::ToolDefinition;
 use serde_json::json;
 
 use super::SubagentSupervisor;
-use crate::tool::{NativeTool, RegisteredTool, ToolError, required_str};
+use crate::tool::{NativeTool, RegisteredTool, ToolContext, ToolError, required_str};
 use crate::types::ToolSource;
 
 /// The four tools a session drives its own children with.
@@ -26,6 +26,21 @@ pub(crate) fn subagent_tools(supervisor: &SubagentSupervisor) -> Vec<RegisteredT
         wait_tool(supervisor.clone()),
         close_agent_tool(supervisor.clone()),
     ]
+}
+
+/// Where in the tree a call sits, as the supervisor needs it named.
+///
+/// A child inherits the root of its parent's tree, so root-scoped tools — one
+/// shared todo list — cover the whole tree. Both spawn-tool families read
+/// their position through this one function, error string included.
+pub(crate) fn tree_position(context: &ToolContext) -> Result<(&str, &str), ToolError> {
+    let Some(session_id) = context.session_id.as_deref() else {
+        return Err(ToolError::execution(
+            "A subagent can only be spawned from inside a session",
+        ));
+    };
+    let root_session_id = context.root_session_id.as_deref().unwrap_or(session_id);
+    Ok((session_id, root_session_id))
 }
 
 /// Starts a child on a task and answers with its identifier.
@@ -50,14 +65,7 @@ fn spawn_agent_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
             let supervisor = supervisor.clone();
             Box::pin(async move {
                 let task = required_str(&arguments, "task")?;
-                let Some(session_id) = context.session_id.as_deref() else {
-                    return Err(ToolError::execution(
-                        "A subagent can only be spawned from inside a session",
-                    ));
-                };
-                // The child inherits the root of this tree, so root-scoped
-                // tools — one shared todo list — cover the whole tree.
-                let root_session_id = context.root_session_id.as_deref().unwrap_or(session_id);
+                let (session_id, root_session_id) = tree_position(&context)?;
                 supervisor.spawn(session_id, root_session_id, task.to_owned())
             })
         }),

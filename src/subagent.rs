@@ -49,7 +49,7 @@ use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-pub(crate) use self::tools::subagent_tools;
+pub(crate) use self::tools::{subagent_tools, tree_position};
 use crate::config::SessionOptions;
 use crate::environment::Environment;
 use crate::error::{Error, ErrorData, ErrorKind, InterruptReason, Result};
@@ -59,7 +59,6 @@ use crate::redact::Redactor;
 use crate::search::SearchProvider;
 use crate::session::{Session, SessionBuildError, ShutdownReason};
 use crate::tool::{RegisteredTool, ToolEnvProvider, ToolError};
-use crate::tools::WebFetchSummarizer;
 use crate::types::{
     AgentEvent, INITIAL_SUBAGENT_GENERATION, SessionEvent, SessionState, ToolErrorKind,
 };
@@ -336,9 +335,6 @@ impl ChildSessionSpec {
             builder = builder.tool_env_provider(Arc::clone(provider));
         }
         builder = builder.redactor(Arc::clone(&deps.redactor));
-        if let Some(summarizer) = deps.web_fetch_summarizer.as_ref() {
-            builder = builder.web_fetch_summarizer(summarizer.model());
-        }
         if let Some(provider) = deps.search_provider.as_ref() {
             builder = builder.search_provider(Arc::clone(provider));
         }
@@ -353,27 +349,25 @@ impl ChildSessionSpec {
 /// human-input provider, which is why a child can never ask a person a
 /// question.
 pub(crate) struct ChildDeps {
-    pub(crate) client:               Client,
-    pub(crate) model_selector:       String,
-    pub(crate) profile:              Arc<dyn AgentProfile>,
-    pub(crate) environment:          Arc<dyn Environment>,
-    pub(crate) tools:                Vec<RegisteredTool>,
-    pub(crate) options:              SessionOptions,
-    pub(crate) tool_env_provider:    Option<Arc<dyn ToolEnvProvider>>,
+    pub(crate) client:            Client,
+    pub(crate) model_selector:    String,
+    pub(crate) profile:           Arc<dyn AgentProfile>,
+    pub(crate) environment:       Arc<dyn Environment>,
+    pub(crate) tools:             Vec<RegisteredTool>,
+    pub(crate) options:           SessionOptions,
+    pub(crate) tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
     /// What strips secrets out of what a child publishes. Inherited, because
     /// a child's process output reaches the same stream its parent's does.
-    pub(crate) redactor:             Arc<dyn Redactor>,
-    /// Which model answers a child's `web_fetch` prompt about a page.
-    pub(crate) web_fetch_summarizer: Option<Arc<WebFetchSummarizer>>,
+    pub(crate) redactor:          Arc<dyn Redactor>,
     /// Where a child's web searches go. Inherited, because a child researches
     /// the task its parent gave it.
-    pub(crate) search_provider:      Option<Arc<dyn SearchProvider>>,
-    pub(crate) event_capacity:       EventCapacity,
-    pub(crate) factory:              SessionFactory,
-    pub(crate) open_sessions:        Arc<OpenSessions>,
+    pub(crate) search_provider:   Option<Arc<dyn SearchProvider>>,
+    pub(crate) event_capacity:    EventCapacity,
+    pub(crate) factory:           SessionFactory,
+    pub(crate) open_sessions:     Arc<OpenSessions>,
     /// The depth of the session these deps belong to. Its children sit one
     /// deeper.
-    pub(crate) depth:                usize,
+    pub(crate) depth:             usize,
 }
 
 /// Where a child sits in its tree, and which budget it spends.
@@ -473,18 +467,9 @@ pub(crate) enum SubagentStatus {
     Running,
     /// The turn ended. `reusable` reports whether the child session survived it
     /// and can start another turn, so a finished-but-spent agent and a
-    /// finished-and-ready one cannot be confused.
+    /// finished-and-ready one cannot be confused. What the turn produced lives
+    /// in the results cache, where `wait` answers from.
     Finished {
-        /// What the turn produced, projected for transport.
-        #[cfg_attr(
-            not(test),
-            allow(
-                dead_code,
-                reason = "only the crate's own tests read the result off a status: the tools that \
-                          report one answer from the wait cache instead"
-            )
-        )]
-        result:   StdResult<SubagentResult, ErrorData>,
         /// Whether the child session survived the turn.
         reusable: bool,
     },
@@ -622,8 +607,8 @@ fn already_closed(agent_id: &str) -> ToolError {
 /// unchanged, which is the whole failure on one line.
 ///
 /// [`ToolErrorKind`] is a narrower vocabulary than [`ErrorKind`], so a caller
-/// that needs the exact category reads it from
-/// [`SubagentStatus::Finished`](SubagentStatus::Finished), which keeps the
+/// that needs the exact category reads it from the
+/// [`SubAgentFailed`](AgentEvent::SubAgentFailed) event, which carries the
 /// projection whole.
 fn child_failure(error: ErrorData) -> ToolError {
     let kind = match error.kind {
@@ -828,9 +813,8 @@ impl SubagentHandle {
     /// final boundary.
     ///
     /// This is where the runtime error becomes the projection everything else
-    /// carries: the results cache, the status channel, the notification batch,
-    /// and the failure event all hold [`ErrorData`], and the error itself is
-    /// never stored.
+    /// carries: the results cache, the notification batch, and the failure
+    /// event all hold [`ErrorData`], and the error itself is never stored.
     ///
     /// The supervisor state lock is acquired before the follow-up queue lock,
     /// which is also the ordering used by `send_input`.
@@ -870,10 +854,9 @@ impl SubagentHandle {
             }
 
             agent.results.insert(generation, projected.clone());
-            agent.status.send_replace(SubagentStatus::Finished {
-                result: projected.clone(),
-                reusable,
-            });
+            agent
+                .status
+                .send_replace(SubagentStatus::Finished { reusable });
             locked.queue_lifecycle_event(completion_event(
                 &self.agent_id,
                 self.depth,
@@ -1769,9 +1752,14 @@ impl SubagentSupervisor {
         }
     }
 
-    /// Closes a child, and does nothing to one that is already closed.
-    async fn ensure_closed(&self, agent_id: &str) -> StdResult<(), ToolError> {
-        let disposition = self.begin_shutdown(agent_id, false)?;
+    /// Closes one child: leads the shutdown, follows one already underway, or
+    /// returns at once for a child already closed.
+    ///
+    /// `strict` decides what an agent that is closing or closed means:
+    /// `begin_shutdown` answers it with an error for the model-facing close and
+    /// a no-op for internal cleanup.
+    async fn close(&self, agent_id: &str, strict: bool) -> StdResult<(), ToolError> {
+        let disposition = self.begin_shutdown(agent_id, strict)?;
         // Signalled before the close finishes, so a parent parked on a result
         // this child will never produce re-evaluates immediately.
         signal_notifications(&self.notifications_changed);
@@ -1784,6 +1772,11 @@ impl SubagentSupervisor {
         Ok(())
     }
 
+    /// Closes a child, and does nothing to one that is already closed.
+    async fn ensure_closed(&self, agent_id: &str) -> StdResult<(), ToolError> {
+        self.close(agent_id, false).await
+    }
+
     /// Closes a running or idle child that is no longer needed.
     ///
     /// # Errors
@@ -1792,18 +1785,7 @@ impl SubagentSupervisor {
     /// already closed, because a model closing the same agent twice has lost
     /// track of it and should be told.
     pub(crate) async fn close_agent(&self, agent_id: &str) -> StdResult<(), ToolError> {
-        let disposition = self.begin_shutdown(agent_id, true)?;
-        signal_notifications(&self.notifications_changed);
-        let cleanup_done = match disposition {
-            ShutdownDisposition::Lead(work) => self.spawn_shutdown(*work),
-            ShutdownDisposition::Follow(_) | ShutdownDisposition::Done => {
-                return Err(ToolError::execution(format!(
-                    "Agent {agent_id} is already closed"
-                )));
-            }
-        };
-        self.await_shutdown(agent_id, cleanup_done).await;
-        Ok(())
+        self.close(agent_id, true).await
     }
 
     /// Closes every child and waits for each to finish.
@@ -2413,7 +2395,7 @@ mod tests {
         assert!(result.turns_used > 0);
         assert!(matches!(
             supervisor.status(&agent_id),
-            Some(SubagentStatus::Finished { result: Ok(_), .. })
+            Some(SubagentStatus::Finished { .. })
         ));
         supervisor.shutdown_all().await;
     }
@@ -2519,7 +2501,7 @@ mod tests {
         supervisor.wait(&agent_id).await.expect("the child answers");
         assert!(matches!(
             supervisor.status(&agent_id),
-            Some(SubagentStatus::Finished { result: Ok(_), .. })
+            Some(SubagentStatus::Finished { .. })
         ));
 
         supervisor
@@ -3558,10 +3540,7 @@ mod tests {
         );
         assert!(matches!(
             supervisor.status(&agent_id),
-            Some(SubagentStatus::Finished {
-                result:   Err(_),
-                reusable: true,
-            })
+            Some(SubagentStatus::Finished { reusable: true })
         ));
         supervisor.shutdown_all().await;
     }
@@ -3572,7 +3551,6 @@ mod tests {
         // is where the projection is fitted to it: a child that was interrupted
         // — cancelled, or out of wall-clock time — is a cancellation to
         // whoever waited on it, and every other failure is an execution error.
-        // The whole projection stays readable through `status`.
         let (_parent, supervisor) = parent_over(vec!["unused"]);
         let timed_out = tokio::spawn(async {
             Err::<SubagentResult, Error>(Error::Interrupted(InterruptReason::WallClockTimeout))
@@ -3594,16 +3572,6 @@ mod tests {
             .expect_err("an interrupted child has no result to give");
         assert_eq!(interrupted.kind(), ToolErrorKind::Cancelled);
         assert_eq!(interrupted.message(), "interrupted: wall clock timeout");
-        assert!(
-            matches!(
-                supervisor.status("timed-out"),
-                Some(SubagentStatus::Finished {
-                    result: Err(error),
-                    ..
-                }) if error.kind == ErrorKind::Interrupted
-            ),
-            "the projection keeps the category the tool vocabulary cannot spell"
-        );
 
         let failed = supervisor
             .wait("broken")

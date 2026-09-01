@@ -461,13 +461,7 @@ fn normalize_anthropic_questions(
                 ));
             }
 
-            // The lenient contract shows the question and header exactly as
-            // they were sent; the strict one has already trimmed them.
-            let text = if limits.require_header_and_descriptions {
-                display_text(header.as_deref(), &original_question)
-            } else {
-                display_text(header.as_deref(), &question.question)
-            };
+            let text = display_text(header.as_deref(), &original_question);
 
             Ok(Question {
                 original_id: None,

@@ -22,7 +22,7 @@ use lithos_llm::types::ToolDefinition;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
-use crate::tool::{NativeTool, RegisteredTool, ToolContext, ToolError};
+use crate::tool::{NativeTool, RegisteredTool, ToolContext, ToolError, required_str};
 use crate::types::{TodoListKind, TodoProjection, TodoStatus, TodoUpdatedProps, ToolSource};
 
 mod runtime;
@@ -483,8 +483,8 @@ pub fn make_task_create_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
             let runtime = Arc::clone(&runtime);
             Box::pin(async move {
                 let list_id = anthropic_task_scope(&ctx)?;
-                let subject = required_argument(&args, "subject")?;
-                let description = required_argument(&args, "description")?;
+                let subject = required_str(&args, "subject")?.to_owned();
+                let description = required_str(&args, "description")?.to_owned();
                 let task_id = runtime.next_task_id(&list_id);
                 let order = u32::try_from(task_id.saturating_sub(1)).unwrap_or(u32::MAX);
 
@@ -501,18 +501,6 @@ pub fn make_task_create_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
         }),
         source:     ToolSource::Native,
     }
-}
-
-/// One required string argument, as the task tools name it.
-///
-/// The task tools spell their arguments the way Claude does — `taskId`,
-/// `activeForm` — so they read them by hand rather than through the snake-case
-/// helper the rest of the tools share.
-fn required_argument(args: &Value, key: &str) -> Result<String, ToolError> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| ToolError::invalid_arguments(format!("Missing required parameter: {key}")))
 }
 
 /// Changes one task.
@@ -549,7 +537,7 @@ pub fn make_task_update_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
             let runtime = Arc::clone(&runtime);
             Box::pin(async move {
                 let list_id = anthropic_task_scope(&ctx)?;
-                let task_id = required_argument(&args, "taskId")?;
+                let task_id = required_str(&args, "taskId")?.to_owned();
 
                 let status = args
                     .get("status")
@@ -606,7 +594,7 @@ pub fn make_task_get_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
             let runtime = Arc::clone(&runtime);
             Box::pin(async move {
                 let list_id = anthropic_task_scope(&ctx)?;
-                let task_id = required_argument(&args, "taskId")?;
+                let task_id = required_str(&args, "taskId")?.to_owned();
 
                 let Some(snapshot) = runtime.snapshot(&list_id) else {
                     return Ok("Task not found".to_owned());

@@ -163,7 +163,6 @@ pub enum CallerEnvPolicy {
 #[derive(Debug)]
 pub struct LocalEnvironment {
     working_directory: PathBuf,
-    display_directory: String,
     env_safelist:      Vec<String>,
     caller_env_policy: CallerEnvPolicy,
     bash_executable:   BashExecutable,
@@ -179,22 +178,17 @@ impl LocalEnvironment {
     /// create it and check the interpreter before the first command.
     #[must_use]
     pub fn new(working_directory: impl Into<PathBuf>) -> Self {
-        let working_directory = working_directory.into();
-        let display_directory = working_directory
-            .to_str()
-            .map_or_else(|| ".".to_owned(), ToOwned::to_owned);
         Self {
-            working_directory,
-            display_directory,
-            env_safelist: DEFAULT_ENV_SAFELIST
+            working_directory: working_directory.into(),
+            env_safelist:      DEFAULT_ENV_SAFELIST
                 .iter()
                 .map(|name| (*name).to_owned())
                 .collect(),
             caller_env_policy: CallerEnvPolicy::default(),
-            bash_executable: BashExecutable::ResolveFromPath,
-            bash_path: OnceLock::new(),
+            bash_executable:   BashExecutable::ResolveFromPath,
+            bash_path:         OnceLock::new(),
             ripgrep_available: OnceLock::new(),
-            os_version: OnceLock::new(),
+            os_version:        OnceLock::new(),
         }
     }
 
@@ -364,7 +358,8 @@ impl LocalEnvironment {
 #[async_trait]
 impl Environment for LocalEnvironment {
     fn working_directory(&self) -> &str {
-        &self.display_directory
+        // A path that is not UTF-8 is reported as the current directory.
+        self.working_directory.to_str().unwrap_or(".")
     }
 
     fn platform(&self) -> &str {
@@ -676,77 +671,88 @@ fn list_recursive(
 /// the base directory. The base itself is resolved, so an environment rooted
 /// at a symlink still works.
 async fn walk_files(base: &Path, relative_start: &str) -> EnvResult<Vec<WalkedFile>> {
-    let Some((root, root_metadata)) = walk_root(base, relative_start).await? else {
-        return Ok(Vec::new());
-    };
+    let base = base.to_path_buf();
+    let display = base.display().to_string();
+    let relative_start = relative_start.to_owned();
 
-    let mut files = Vec::new();
-    let mut pending = vec![(root, Some(root_metadata))];
-    while let Some((path, known_metadata)) = pending.pop() {
-        let metadata = match known_metadata {
-            Some(metadata) => metadata,
-            None => match fs::symlink_metadata(&path).await {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == ErrorKind::NotFound => continue,
-                Err(error) => {
-                    return Err(EnvironmentError::io(
-                        format!("Failed to inspect {}", path.display()),
-                        error,
-                    ));
-                }
-            },
+    // The walk is a synchronous loop over `read_dir`, so it runs off the
+    // runtime's worker threads in one dispatch rather than one per entry.
+    spawn_blocking(move || {
+        let Some((root, root_metadata)) = walk_root(&base, &relative_start)? else {
+            return Ok(Vec::new());
         };
 
-        let file_type = metadata.file_type();
-        if file_type.is_file() {
-            let relative_path = path.strip_prefix(base).map_err(|error| {
-                EnvironmentError::with_source(
-                    EnvironmentErrorKind::Io,
-                    format!("Failed to relate {} to {}", path.display(), base.display()),
-                    error,
-                )
-            })?;
-            files.push(WalkedFile {
-                relative_path: relative_path.to_string_lossy().replace(MAIN_SEPARATOR, "/"),
-                path:          path.to_string_lossy().into_owned(),
-            });
-        } else if file_type.is_dir() {
-            let mut entries = match fs::read_dir(&path).await {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == ErrorKind::NotFound => continue,
-                Err(error) => {
-                    return Err(EnvironmentError::io(
-                        format!("Failed to read directory {}", path.display()),
+        let mut files = Vec::new();
+        let mut pending = vec![(root, root_metadata.file_type())];
+        while let Some((path, file_type)) = pending.pop() {
+            if file_type.is_file() {
+                let relative_path = path.strip_prefix(&base).map_err(|error| {
+                    EnvironmentError::with_source(
+                        EnvironmentErrorKind::Io,
+                        format!("Failed to relate {} to {}", path.display(), base.display()),
                         error,
-                    ));
+                    )
+                })?;
+                files.push(WalkedFile {
+                    relative_path: relative_path.to_string_lossy().replace(MAIN_SEPARATOR, "/"),
+                    path:          path.to_string_lossy().into_owned(),
+                });
+            } else if file_type.is_dir() {
+                let entries = match sync_fs::read_dir(&path) {
+                    Ok(entries) => entries,
+                    Err(error) if error.kind() == ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        return Err(EnvironmentError::io(
+                            format!("Failed to read directory {}", path.display()),
+                            error,
+                        ));
+                    }
+                };
+                for entry in entries {
+                    let entry = entry.map_err(|error| {
+                        EnvironmentError::io(
+                            format!("Failed to read directory {}", path.display()),
+                            error,
+                        )
+                    })?;
+                    // The type comes from the directory read itself; a stat
+                    // happens only where the filesystem left it unknown, and
+                    // it never follows a symlink.
+                    match entry.file_type() {
+                        Ok(file_type) => pending.push((entry.path(), file_type)),
+                        Err(error) if error.kind() == ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(EnvironmentError::io(
+                                format!("Failed to inspect {}", entry.path().display()),
+                                error,
+                            ));
+                        }
+                    }
                 }
-            };
-            while let Some(entry) = entries.next_entry().await.map_err(|error| {
-                EnvironmentError::io(
-                    format!("Failed to read directory {}", path.display()),
-                    error,
-                )
-            })? {
-                pending.push((entry.path(), None));
             }
         }
-    }
 
-    Ok(files)
+        Ok(files)
+    })
+    .await
+    .map_err(|error| {
+        EnvironmentError::with_source(
+            EnvironmentErrorKind::Io,
+            format!("Failed to walk {display}"),
+            error,
+        )
+    })?
 }
 
 /// Resolves where a walk starts, or `None` when the path is missing or
 /// crosses a symlink.
-async fn walk_root(
-    base: &Path,
-    relative_start: &str,
-) -> EnvResult<Option<(PathBuf, sync_fs::Metadata)>> {
+fn walk_root(base: &Path, relative_start: &str) -> EnvResult<Option<(PathBuf, sync_fs::Metadata)>> {
     fn missing(error: &io::Error) -> bool {
         matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory)
     }
 
     if relative_start.is_empty() {
-        return match fs::metadata(base).await {
+        return match sync_fs::metadata(base) {
             Ok(metadata) => Ok(Some((base.to_path_buf(), metadata))),
             Err(error) if missing(&error) => Ok(None),
             Err(error) => Err(EnvironmentError::io(
@@ -760,7 +766,7 @@ async fn walk_root(
     let mut metadata = None;
     for segment in relative_start.split('/') {
         root.push(segment);
-        let segment_metadata = match fs::symlink_metadata(&root).await {
+        let segment_metadata = match sync_fs::symlink_metadata(&root) {
             Ok(metadata) => metadata,
             Err(error) if missing(&error) => return Ok(None),
             Err(error) => {

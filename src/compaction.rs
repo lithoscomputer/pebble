@@ -15,6 +15,7 @@
 
 use std::fmt;
 use std::fmt::Write as _;
+use std::io::{Error as IoError, Result as IoResult, Write};
 
 use lithos_llm::client::Client;
 use lithos_llm::types::Request;
@@ -24,13 +25,11 @@ use crate::char_boundary::floor_char_boundary;
 use crate::error::{CompactionError, Result};
 use crate::event::Emitter;
 use crate::file_tracker::FileTracker;
-use crate::history::History;
+use crate::history::{APPROX_CHARS_PER_TOKEN, History};
 use crate::profile::ModelFacts;
 use crate::tool::result_text;
+use crate::truncation::serialized_json_bytes;
 use crate::types::{AgentEvent, Message};
-
-/// The characters-per-token ratio the local estimate assumes.
-const APPROX_CHARS_PER_TOKEN: usize = 4;
 
 /// The output budget for the summary text itself.
 const SUMMARY_MAX_TOKENS: u32 = 4_096;
@@ -366,7 +365,7 @@ fn single_turn_chars(turn: &Message) -> usize {
             let reasoning = turn.reasoning_text().map_or(0, str::len);
             let calls: usize = tool_calls
                 .iter()
-                .map(|call| call.name.len() + call.arguments.to_string().len())
+                .map(|call| call.name.len() + serialized_json_bytes(&call.arguments))
                 .sum();
             content.len() + reasoning + calls
         }
@@ -401,7 +400,7 @@ pub fn render_turns_for_summary(turns: &[Message]) -> String {
                         out,
                         "[Tool call: {}] {}",
                         call.name,
-                        clip(&call.arguments.to_string())
+                        clipped_arguments(&call.arguments)
                     );
                 }
             }
@@ -437,131 +436,93 @@ fn clip(text: &str) -> String {
     )
 }
 
+/// One tool call's arguments, serialized and cut to the transcript budget.
+///
+/// The arguments can hold an entire file, and the transcript keeps only
+/// [`TRANSCRIPT_FIELD_BYTES`] of them, so serialization runs into a capped
+/// buffer and stops at the cap rather than producing the whole value first.
+fn clipped_arguments(arguments: &serde_json::Value) -> String {
+    /// One byte past the budget, so a value that fills it exactly is
+    /// distinguishable from one the cap cut.
+    const CAPACITY: usize = TRANSCRIPT_FIELD_BYTES + 1;
+
+    struct CappedWriter(Vec<u8>);
+
+    impl Write for CappedWriter {
+        fn write(&mut self, bytes: &[u8]) -> IoResult<usize> {
+            let room = CAPACITY - self.0.len();
+            if room == 0 {
+                return Err(IoError::other("the transcript budget is spent"));
+            }
+            let taken = bytes.len().min(room);
+            self.0.extend_from_slice(&bytes[..taken]);
+            Ok(taken)
+        }
+
+        fn flush(&mut self) -> IoResult<()> {
+            Ok(())
+        }
+    }
+
+    let mut writer = CappedWriter(Vec::with_capacity(CAPACITY));
+    let complete = serde_json::to_writer(&mut writer, arguments).is_ok();
+    // The cap can land inside a multi-byte character; keep the valid prefix.
+    let text = match String::from_utf8(writer.0) {
+        Ok(text) => text,
+        Err(error) => {
+            let valid_up_to = error.utf8_error().valid_up_to();
+            let mut bytes = error.into_bytes();
+            bytes.truncate(valid_up_to);
+            String::from_utf8(bytes).expect("the bytes below the cut are valid UTF-8")
+        }
+    };
+    if complete {
+        clip(&text)
+    } else {
+        format!(
+            "{}...",
+            &text[..floor_char_boundary(&text, TRANSCRIPT_FIELD_BYTES)]
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::result::Result as StdResult;
-    use std::sync::{Arc, Mutex, PoisonError};
+    use std::sync::Arc;
     use std::time::SystemTime;
 
-    use async_trait::async_trait;
-    use lithos_llm::adapter::{ProviderAdapter, ResolvedCall};
-    use lithos_llm::catalog::{AdapterId, Catalog};
-    use lithos_llm::types::{
-        ContentPart, Error as LlmError, ErrorKind as LlmErrorKind, FinishReason,
-        Message as LlmMessage, Response, ResponseStream, ToolCall, ToolResult,
-    };
-    use lithos_llm::{Client, ClientBuild};
+    use lithos_llm::Client;
+    use lithos_llm::types::{ContentPart, ErrorKind as LlmErrorKind, ToolCall, ToolResult};
     use serde_json::json;
 
     use super::*;
     use crate::error::Error;
     use crate::event::{EventOptions, EventPump};
     use crate::record::StoredMessage;
+    use crate::session::testing::history_from;
+    use crate::test_support::{
+        ScriptedCompletion, ScriptedFailure, ScriptedProvider, client_from, message_text,
+        test_catalog, text_response,
+    };
     use crate::types::{SessionEvent, TokenUsage};
 
-    const TEST_CATALOG: &str = r#"
-schema_version = 1
-
-[providers.test]
-display_name = "Test"
-adapter = "test-adapter"
-codec = "test-codec"
-base_url = "http://127.0.0.1"
-default_model = "model"
-
-[providers.test.auth]
-type = "none"
-
-[providers.test.models.model]
-display_name = "Test model"
-api_model = "model"
-capabilities = { text = true }
-limits = { context_tokens = 200000, max_output_tokens = 32000 }
-
-[providers.test.models.on-request]
-display_name = "Reasons when asked"
-api_model = "on-request"
-capabilities = { text = true, reasoning = true }
-limits = { context_tokens = 200000, max_output_tokens = 32000 }
-
-[providers.test.models.always]
-display_name = "Reasons by default"
-api_model = "always"
-capabilities = { text = true, reasoning = true, reasoning_effort_levels = true }
-limits = { context_tokens = 200000, max_output_tokens = 32000 }
-"#;
-
-    /// What the fake provider answers a summarization call with.
-    #[derive(Clone)]
-    enum Script {
-        Summary(String),
-        Fails,
+    /// A summarization call that answers with `text`.
+    fn summary(text: &str) -> ScriptedCompletion {
+        ScriptedCompletion::response(text_response(text))
     }
 
-    struct ScriptedAdapter {
-        id:       AdapterId,
-        script:   Script,
-        requests: Arc<Mutex<Vec<Request>>>,
+    /// A summarization call that fails outright.
+    fn failure() -> ScriptedCompletion {
+        ScriptedCompletion::Failure(ScriptedFailure::terminal(
+            LlmErrorKind::Server,
+            "provider is down",
+        ))
     }
 
-    impl ScriptedAdapter {
-        fn new(script: Script) -> Self {
-            Self {
-                id: AdapterId::new("test-adapter"),
-                script,
-                requests: Arc::new(Mutex::new(Vec::new())),
-            }
-        }
-    }
-
-    #[async_trait]
-    impl ProviderAdapter for ScriptedAdapter {
-        fn id(&self) -> &AdapterId {
-            &self.id
-        }
-
-        async fn complete(&self, call: &ResolvedCall) -> StdResult<Response, LlmError> {
-            self.requests
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(call.request().clone());
-
-            match &self.script {
-                Script::Summary(text) => {
-                    let mut response = Response::new(
-                        call.route().provider().id().clone(),
-                        call.route().model().id().clone(),
-                        vec![ContentPart::Text { text: text.clone() }],
-                    );
-                    response.finish_reason = FinishReason::Stop;
-                    Ok(response)
-                }
-                Script::Fails => Err(LlmError::new(LlmErrorKind::Server, "provider is down")),
-            }
-        }
-
-        async fn stream(&self, _call: &ResolvedCall) -> StdResult<ResponseStream, LlmError> {
-            Err(LlmError::new(
-                LlmErrorKind::Middleware,
-                "compaction never streams",
-            ))
-        }
-    }
-
-    fn client(script: Script) -> (Client, Arc<Mutex<Vec<Request>>>) {
-        let adapter = ScriptedAdapter::new(script);
-        let requests = Arc::clone(&adapter.requests);
-        let catalog = Catalog::builder()
-            .overlay_toml(TEST_CATALOG)
-            .expect("the catalog layer parses")
-            .build()
-            .expect("the catalog validates");
-        let ClientBuild { client, .. } = Client::builder()
-            .catalog(catalog)
-            .adapter("test", adapter)
-            .build()
-            .expect("the client builds");
-        (client, requests)
+    /// A client whose non-streaming calls — compaction's — answer with
+    /// `completion`, and the provider handle the sent requests are read from.
+    fn client(completion: ScriptedCompletion) -> (Client, Arc<ScriptedProvider>) {
+        client_from(ScriptedProvider::new(Vec::new()).completing(vec![completion]))
     }
 
     fn now() -> SystemTime {
@@ -598,14 +559,6 @@ limits = { context_tokens = 200000, max_output_tokens = 32000 }
             }],
             timestamp: now(),
         }
-    }
-
-    fn history_from(turns: Vec<Message>) -> History {
-        let mut history = History::default();
-        for turn in turns {
-            history.push(turn);
-        }
-        history
     }
 
     /// An emitter whose pump is drained on demand, so a test sees exactly the
@@ -678,22 +631,19 @@ limits = { context_tokens = 200000, max_output_tokens = 32000 }
         );
     }
 
-    /// The facts the test catalog records about one of its models.
+    /// The facts the shared test catalog records about one of its models.
     fn catalog_facts(model: &str) -> ModelFacts {
-        let catalog = Catalog::builder()
-            .overlay_toml(TEST_CATALOG)
-            .expect("the catalog layer parses")
-            .build()
-            .expect("the catalog validates");
-        ModelFacts::from_catalog_model(catalog.model("test", model).expect("a known model"))
+        ModelFacts::from_catalog_model(test_catalog().model("test", model).expect("a known model"))
     }
 
     #[test]
-    fn a_model_that_reasons_only_when_asked_gets_no_headroom() {
+    fn a_reasoning_capability_alone_earns_no_headroom() {
         // The case a `reasoning` capability alone gets wrong: the model can
-        // reason, but a summarization call never asks it to, so the budget is
-        // the summary's own.
-        let facts = catalog_facts("on-request");
+        // reason, but nothing in its capabilities says it does so unasked, so
+        // the budget is the summary's own. The catalog's `always-thinking` row
+        // is that shape — the `reasoning_by_default` metadata that corrects it
+        // is applied at session build, not here.
+        let facts = catalog_facts("always-thinking");
 
         assert!(!facts.reasons_by_default);
         assert_eq!(
@@ -704,7 +654,9 @@ limits = { context_tokens = 200000, max_output_tokens = 32000 }
 
     #[test]
     fn a_model_that_always_reasons_gets_the_headroom_from_its_catalog_row() {
-        let facts = catalog_facts("always");
+        // A model with named effort levels reasons unless told not to, so its
+        // row alone earns the headroom.
+        let facts = catalog_facts("thinking");
 
         assert!(facts.reasons_by_default);
         assert_eq!(
@@ -768,6 +720,27 @@ limits = { context_tokens = 200000, max_output_tokens = 32000 }
 
         assert!(rendered.len() < 1_000);
         assert!(rendered.contains("..."));
+    }
+
+    #[test]
+    fn a_transcript_clips_long_tool_arguments_as_the_whole_serialization_would() {
+        // Multi-byte content, so the capped serialization has to cut at the
+        // same character boundary the uncapped form would.
+        let arguments = json!({ "content": "€".repeat(1_000) });
+        let rendered = render_turns_for_summary(&[Message::Assistant {
+            content:        String::new(),
+            tool_calls:     vec![ToolCall::function("c1", "write_file", arguments.clone())],
+            provider_parts: Vec::new(),
+            usage:          TokenUsage::default(),
+            response_id:    "resp_1".to_owned(),
+            timestamp:      now(),
+        }]);
+
+        assert!(rendered.len() < arguments.to_string().len());
+        assert!(rendered.contains(&format!(
+            "[Tool call: write_file] {}",
+            clip(&arguments.to_string())
+        )));
     }
 
     #[test]
@@ -944,15 +917,16 @@ limits = { context_tokens = 200000, max_output_tokens = 32000 }
         events:  Vec<AgentEvent>,
     }
 
-    /// Compacts a four-turn history against a provider that answers `script`.
-    async fn compact_with(script: Script) -> Compacted {
+    /// Compacts a four-turn history against a provider that answers
+    /// `completion`.
+    async fn compact_with(completion: ScriptedCompletion) -> Compacted {
         let mut history = history_from(
             (0..4)
                 .map(|index| user(&format!("message {index}")))
                 .collect(),
         );
         let before = history.to_stored_messages();
-        let (client, _) = client(script);
+        let (client, _) = client(completion);
         let events = Events::new();
 
         let result = compact_context(
@@ -986,7 +960,7 @@ limits = { context_tokens = 200000, max_output_tokens = 32000 }
 
     #[tokio::test]
     async fn a_summary_replaces_the_older_turns() {
-        let compacted = compact_with(Script::Summary("Brief handoff.".to_owned())).await;
+        let compacted = compact_with(summary("Brief handoff.")).await;
 
         compacted.result.expect("a summary compacts");
         let summary = summary_turn(&compacted.history);
@@ -1003,7 +977,7 @@ limits = { context_tokens = 200000, max_output_tokens = 32000 }
     #[tokio::test]
     async fn a_blank_summary_leaves_history_alone() {
         for blank in ["", "   \n\t  \n "] {
-            let compacted = compact_with(Script::Summary(blank.to_owned())).await;
+            let compacted = compact_with(summary(blank)).await;
 
             let error = compacted
                 .result
@@ -1037,7 +1011,7 @@ limits = { context_tokens = 200000, max_output_tokens = 32000 }
 
     #[tokio::test]
     async fn a_failed_summarization_call_leaves_history_alone() {
-        let compacted = compact_with(Script::Fails).await;
+        let compacted = compact_with(failure()).await;
 
         let error = compacted.result.expect_err("a failed call fails");
         assert!(
@@ -1052,7 +1026,7 @@ limits = { context_tokens = 200000, max_output_tokens = 32000 }
         let max_bytes = summary_max_approx_bytes();
         let overlong = format!("{}END", "€".repeat(max_bytes / 3 + 1));
 
-        let compacted = compact_with(Script::Summary(overlong)).await;
+        let compacted = compact_with(summary(&overlong)).await;
 
         compacted
             .result
@@ -1077,7 +1051,7 @@ limits = { context_tokens = 200000, max_output_tokens = 32000 }
             response_id:    "resp_1".to_owned(),
             timestamp:      now(),
         }]);
-        let (client, _) = client(Script::Summary("Brief handoff.".to_owned()));
+        let (client, _) = client(summary("Brief handoff."));
         let events = Events::new();
 
         compact_context(
@@ -1110,7 +1084,7 @@ limits = { context_tokens = 200000, max_output_tokens = 32000 }
     #[tokio::test]
     async fn compaction_with_nothing_to_summarize_makes_no_call() {
         let mut history = history_from(vec![user("only one turn")]);
-        let (client, requests) = client(Script::Summary("unused".to_owned()));
+        let (client, provider) = client(summary("unused"));
         let events = Events::new();
 
         compact_context(
@@ -1128,12 +1102,7 @@ limits = { context_tokens = 200000, max_output_tokens = 32000 }
         .expect("a no-op compaction succeeds");
 
         assert_eq!(history.len(), 1);
-        assert!(
-            requests
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .is_empty()
-        );
+        assert!(provider.completion_requests().is_empty());
         assert!(events.drain().await.is_empty());
     }
 
@@ -1147,7 +1116,7 @@ limits = { context_tokens = 200000, max_output_tokens = 32000 }
         ]);
         let mut file_tracker = FileTracker::default();
         file_tracker.record_edit("src/lib.rs");
-        let (client, requests) = client(Script::Summary("done".to_owned()));
+        let (client, provider) = client(summary("done"));
         let events = Events::new();
 
         compact_context(
@@ -1161,22 +1130,14 @@ limits = { context_tokens = 200000, max_output_tokens = 32000 }
         .await
         .expect("the summary compacts");
 
-        let sent = requests.lock().unwrap_or_else(PoisonError::into_inner);
+        let sent = provider.completion_requests();
         assert_eq!(sent.len(), 1);
         let request = &sent[0];
         assert_eq!(request.model(), "test/model");
         assert_eq!(request.max_output_tokens(), Some(SUMMARY_MAX_TOKENS));
         assert!(request.tools().is_empty());
 
-        let text: String = request
-            .messages()
-            .iter()
-            .flat_map(LlmMessage::content)
-            .filter_map(|part| match part {
-                ContentPart::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
+        let text: String = request.messages().iter().map(message_text).collect();
         assert!(text.contains("handoff document"));
         assert!(text.contains("COPY THIS SECTION VERBATIM"));
         assert!(text.contains("- src/lib.rs (edited)"));
@@ -1193,7 +1154,7 @@ limits = { context_tokens = 200000, max_output_tokens = 32000 }
                 .map(|index| user(&format!("message {index}")))
                 .collect(),
         );
-        let (client, requests) = client(Script::Summary("done".to_owned()));
+        let (client, provider) = client(summary("done"));
         let events = Events::new();
 
         compact_context(
@@ -1213,7 +1174,7 @@ limits = { context_tokens = 200000, max_output_tokens = 32000 }
         .await
         .expect("the summary compacts");
 
-        let sent = requests.lock().unwrap_or_else(PoisonError::into_inner);
+        let sent = provider.completion_requests();
         assert_eq!(
             sent[0].max_output_tokens(),
             Some(SUMMARY_MAX_TOKENS + REASONING_HEADROOM_TOKENS)
@@ -1227,7 +1188,7 @@ limits = { context_tokens = 200000, max_output_tokens = 32000 }
                 .map(|index| user(&format!("message {index}")))
                 .collect(),
         );
-        let (client, requests) = client(Script::Summary("unused".to_owned()));
+        let (client, provider) = client(summary("unused"));
         let events = Events::new();
 
         let error = compact_context(
@@ -1248,12 +1209,7 @@ limits = { context_tokens = 200000, max_output_tokens = 32000 }
             matches!(error, Error::Compaction(CompactionError::Request(_))),
             "unexpected error: {error}"
         );
-        assert!(
-            requests
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .is_empty()
-        );
+        assert!(provider.completion_requests().is_empty());
     }
 
     #[test]

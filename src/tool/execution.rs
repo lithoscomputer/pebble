@@ -40,7 +40,6 @@ use crate::environment::Environment;
 use crate::event::{Emitter, OutputCaptureStats, SessionBoundEmitter};
 use crate::human_input::{HumanInputProvider, is_question_tool};
 use crate::redact::Redactor;
-use crate::tools::WebFetchSummarizer;
 use crate::truncation::{
     OutputBudgets, ToolOutputLimits, preview_tool_output, serialized_json_bytes,
     truncate_tool_output,
@@ -68,16 +67,15 @@ const CANCELLED: &str = "Cancelled";
 /// optional seams with the `with_*` methods.
 #[derive(Clone, Copy)]
 pub struct ToolDispatch<'a> {
-    registry:             &'a ToolRegistry,
-    env:                  &'a Arc<dyn Environment>,
-    config:               &'a SessionOptions,
-    emitter:              &'a Emitter,
-    session_id:           &'a str,
-    root_session_id:      &'a str,
-    tool_env_provider:    Option<&'a Arc<dyn ToolEnvProvider>>,
-    human_input:          Option<&'a Arc<dyn HumanInputProvider>>,
-    redactor:             Option<&'a Arc<dyn Redactor>>,
-    web_fetch_summarizer: Option<&'a Arc<WebFetchSummarizer>>,
+    registry:          &'a ToolRegistry,
+    env:               &'a Arc<dyn Environment>,
+    config:            &'a SessionOptions,
+    emitter:           &'a Emitter,
+    session_id:        &'a str,
+    root_session_id:   &'a str,
+    tool_env_provider: Option<&'a Arc<dyn ToolEnvProvider>>,
+    human_input:       Option<&'a Arc<dyn HumanInputProvider>>,
+    redactor:          Option<&'a Arc<dyn Redactor>>,
 }
 
 impl<'a> ToolDispatch<'a> {
@@ -105,7 +103,6 @@ impl<'a> ToolDispatch<'a> {
             tool_env_provider: None,
             human_input: None,
             redactor: None,
-            web_fetch_summarizer: None,
         }
     }
 
@@ -136,13 +133,6 @@ impl<'a> ToolDispatch<'a> {
         self
     }
 
-    /// Sets which model answers a `web_fetch` prompt about a page.
-    #[must_use]
-    pub fn with_web_fetch_summarizer(mut self, summarizer: &'a Arc<WebFetchSummarizer>) -> Self {
-        self.web_fetch_summarizer = Some(summarizer);
-        self
-    }
-
     /// Answers every call in one round, in call order.
     ///
     /// `parallel` lets independent calls run together; a round holding a
@@ -169,14 +159,62 @@ impl<'a> ToolDispatch<'a> {
 
     /// Answers one call, publishing the same events a round would.
     pub async fn execute_one(&self, call: &ToolCall, cancel: CancellationToken) -> ToolResult {
-        let denial = self.config.tool_access_denial_reason(&call.name);
-        let registered = if denial.is_none() {
-            self.registry.get(&call.name)
-        } else {
-            None
-        };
-        self.execute_with_lookup(call, registered, denial, cancel)
-            .await
+        self.emit_started(call);
+
+        if let Some(reason) = self.config.tool_access_denial_reason(&call.name) {
+            return self.finish_error(call, &ToolError::denied(reason));
+        }
+
+        if let Some(hooks) = self.config.tool_hooks.as_ref() {
+            debug!(tool = %call.name, hook_event = "pre_tool_use", "Calling tool hook");
+            let started = Instant::now();
+            let decision = hooks.pre_tool_use(&call.name, &call.arguments).await;
+            let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            debug!(
+                tool = %call.name,
+                hook_event = "pre_tool_use",
+                ?decision,
+                duration_ms,
+                "Tool hook complete"
+            );
+
+            if let ToolHookDecision::Block { reason } = decision {
+                return self.finish_error(call, &ToolError::denied(reason));
+            }
+        }
+
+        let executed = self
+            .run_tool(call, self.registry.get(&call.name), cancel)
+            .await;
+        let error_kind = executed.error_kind;
+        let retained = self.retain(executed.result, executed.output_stats);
+        let result = retained.result;
+
+        self.emit_result(call, &result, retained.output_stats, error_kind);
+
+        if let Some(hooks) = self.config.tool_hooks.as_ref() {
+            let content = result_text(&result);
+            if result.is_error {
+                debug!(tool = %call.name, hook_event = "post_tool_use_failure", "Calling tool hook");
+                hooks
+                    .post_tool_use_failure(
+                        &call.name,
+                        &call.id,
+                        content.as_ref(),
+                        error_kind.unwrap_or(ToolErrorKind::Execution),
+                    )
+                    .await;
+                debug!(tool = %call.name, hook_event = "post_tool_use_failure", "Tool hook complete");
+            } else {
+                debug!(tool = %call.name, hook_event = "post_tool_use", "Calling tool hook");
+                hooks
+                    .post_tool_use(&call.name, &call.id, content.as_ref())
+                    .await;
+                debug!(tool = %call.name, hook_event = "post_tool_use", "Tool hook complete");
+            }
+        }
+
+        self.truncate_for_history(result, &call.name)
     }
 
     async fn execute_sequential(
@@ -200,23 +238,12 @@ impl<'a> ToolDispatch<'a> {
         calls: &[ToolCall],
         cancel: &CancellationToken,
     ) -> Vec<ToolResult> {
-        let pending: Vec<_> = calls
-            .iter()
-            .map(|call| {
-                let denial = self.config.tool_access_denial_reason(&call.name);
-                // Resolved before the call's future exists, so a tool the
-                // policy refuses is never looked up and its executor is never
-                // reached.
-                let registered = if denial.is_none() {
-                    self.registry.get(&call.name)
-                } else {
-                    None
-                };
-                self.execute_with_lookup(call, registered, denial, cancel.child_token())
-            })
-            .collect();
-
-        join_all(pending).await
+        join_all(
+            calls
+                .iter()
+                .map(|call| self.execute_one(call, cancel.child_token())),
+        )
+        .await
     }
 
     /// Runs the first human-question call and refuses the rest of the round.
@@ -249,69 +276,6 @@ impl<'a> ToolDispatch<'a> {
         }
 
         results
-    }
-
-    async fn execute_with_lookup(
-        &self,
-        call: &ToolCall,
-        registered: Option<&RegisteredTool>,
-        access_denial: Option<String>,
-        cancel: CancellationToken,
-    ) -> ToolResult {
-        self.emit_started(call);
-
-        if let Some(reason) = access_denial {
-            return self.finish_error(call, &ToolError::denied(reason));
-        }
-
-        if let Some(hooks) = self.config.tool_hooks.as_ref() {
-            debug!(tool = %call.name, hook_event = "pre_tool_use", "Calling tool hook");
-            let started = Instant::now();
-            let decision = hooks.pre_tool_use(&call.name, &call.arguments).await;
-            let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            debug!(
-                tool = %call.name,
-                hook_event = "pre_tool_use",
-                ?decision,
-                duration_ms,
-                "Tool hook complete"
-            );
-
-            if let ToolHookDecision::Block { reason } = decision {
-                return self.finish_error(call, &ToolError::denied(reason));
-            }
-        }
-
-        let executed = self.run_tool(call, registered, cancel).await;
-        let error_kind = executed.error_kind;
-        let retained = self.retain(executed.result, executed.output_stats);
-        let result = retained.result;
-
-        self.emit_result(call, &result, retained.output_stats, error_kind);
-
-        if let Some(hooks) = self.config.tool_hooks.as_ref() {
-            let content = result_text(&result);
-            if result.is_error {
-                debug!(tool = %call.name, hook_event = "post_tool_use_failure", "Calling tool hook");
-                hooks
-                    .post_tool_use_failure(
-                        &call.name,
-                        &call.id,
-                        content.as_ref(),
-                        error_kind.unwrap_or(ToolErrorKind::Execution),
-                    )
-                    .await;
-                debug!(tool = %call.name, hook_event = "post_tool_use_failure", "Tool hook complete");
-            } else {
-                debug!(tool = %call.name, hook_event = "post_tool_use", "Calling tool hook");
-                hooks
-                    .post_tool_use(&call.name, &call.id, content.as_ref())
-                    .await;
-                debug!(tool = %call.name, hook_event = "post_tool_use", "Tool hook complete");
-            }
-        }
-
-        self.truncate_for_history(&result, &call.name)
     }
 
     /// Validates the arguments and runs the tool.
@@ -355,9 +319,6 @@ impl<'a> ToolDispatch<'a> {
         if let Some(redactor) = self.redactor {
             context = context.with_redactor(Arc::clone(redactor));
         }
-        if let Some(summarizer) = self.web_fetch_summarizer {
-            context = context.with_web_fetch_summarizer(Arc::clone(summarizer));
-        }
 
         let (result, error_kind) = match (tool.executor)(call.arguments.clone(), context).await {
             Ok(output) => (text_result(call, output, false), None),
@@ -386,7 +347,7 @@ impl<'a> ToolDispatch<'a> {
             retained.output_stats,
             Some(error.kind()),
         );
-        self.truncate_for_history(&retained.result, &call.name)
+        self.truncate_for_history(retained.result, &call.name)
     }
 
     /// Cuts a tool's output down to what the session is willing to carry.
@@ -421,9 +382,8 @@ impl<'a> ToolDispatch<'a> {
     }
 
     /// Cuts the copy history keeps to the limits this tool deserves.
-    fn truncate_for_history(&self, result: &ToolResult, tool_name: &str) -> ToolResult {
-        let mut truncated = result.clone();
-        if let Some(text) = text_part_mut(&mut truncated) {
+    fn truncate_for_history(&self, mut result: ToolResult, tool_name: &str) -> ToolResult {
+        if let Some(text) = text_part_mut(&mut result) {
             let limits = ToolOutputLimits::resolve(
                 tool_name,
                 canonical_tool_name(tool_name),
@@ -432,7 +392,7 @@ impl<'a> ToolDispatch<'a> {
             );
             *text = truncate_tool_output(text, limits);
         }
-        truncated
+        result
     }
 
     fn emit_started(&self, call: &ToolCall) {

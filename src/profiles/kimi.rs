@@ -71,14 +71,14 @@ pub(crate) struct KimiProfile {
 
 impl KimiProfile {
     /// The harness for a session built from `deps`.
-    pub(crate) fn new(_deps: &ProfileDeps) -> Self {
+    pub(crate) fn new(deps: &ProfileDeps) -> Self {
         let options = NativeToolOptions::for_profile(AgentProfileKind::Kimi);
 
         // Finding files by name and reading one off the web have the same
         // contract in both vocabularies, so the rename is all they need. The
         // rest are adapters, reusing pebble's execution where the behavior
         // agrees.
-        let mut tools = discovery_and_web_tools();
+        let mut tools = discovery_and_web_tools(deps.web_fetch_summarizer.clone());
         for tool in &mut tools {
             if tool.definition.name == NativeTool::Glob.canonical_name() {
                 GLOB_DESCRIPTION.clone_into(&mut tool.definition.description);

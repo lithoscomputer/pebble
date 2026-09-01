@@ -67,7 +67,7 @@ mod tests {
             make_shell_tool_with_options(&NativeToolOptions::default()),
             make_grep_tool(),
             make_glob_tool(),
-            make_web_fetch_tool(),
+            make_web_fetch_tool(None),
         ]
     }
 

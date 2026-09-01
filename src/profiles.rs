@@ -46,7 +46,7 @@ use crate::skills::{Skill, format_skills_prompt_section};
 use crate::template::{TemplateContext, TemplateValue, render_named};
 use crate::tool::{NativeTool, RegisteredTool, ToolVocabulary};
 use crate::tools::{
-    make_apply_patch_tool, make_edit_file_tool, make_glob_tool, make_grep_tool,
+    WebFetchSummarizer, make_apply_patch_tool, make_edit_file_tool, make_glob_tool, make_grep_tool,
     make_read_file_tool, make_shell_tool_with_options, make_web_fetch_tool, make_write_file_tool,
 };
 
@@ -90,6 +90,13 @@ pub(crate) struct ProfileDeps {
     /// [`has_web_search`](Self::has_web_search) and lets the builder's
     /// canonical tool stand.
     pub(crate) search_provider:       Option<Arc<dyn SearchProvider>>,
+    /// The model that answers a `web_fetch` prompt about a page, when the
+    /// application named one.
+    ///
+    /// Carried here so a profile's fetch tool captures it at construction, the
+    /// way a search tool captures its engine — including by every child
+    /// session, which runs the same profile.
+    pub(crate) web_fetch_summarizer:  Option<Arc<WebFetchSummarizer>>,
     /// Whether the session may spawn child agents.
     pub(crate) has_subagents:         bool,
 }
@@ -103,6 +110,10 @@ impl fmt::Debug for ProfileDeps {
             .field(
                 "search_provider",
                 &self.search_provider.as_ref().map(|_| "<provider>"),
+            )
+            .field(
+                "web_fetch_summarizer",
+                &self.web_fetch_summarizer.as_ref().map(|_| "<summarizer>"),
             )
             .field("has_subagents", &self.has_subagents)
             .finish()
@@ -176,22 +187,27 @@ impl FileEditToolKind {
 /// is `web_search`: pebble's is registered by the session builder, because
 /// whether there is a search engine at all is the application's answer rather
 /// than the profile's.
-pub(crate) fn core_tools(options: &NativeToolOptions) -> Vec<RegisteredTool> {
+pub(crate) fn core_tools(
+    options: &NativeToolOptions,
+    web_fetch_summarizer: Option<Arc<WebFetchSummarizer>>,
+) -> Vec<RegisteredTool> {
     let mut tools = vec![
         make_read_file_tool(),
         make_write_file_tool(),
         make_shell_tool_with_options(options),
         make_grep_tool(),
     ];
-    tools.extend(discovery_and_web_tools());
+    tools.extend(discovery_and_web_tools(web_fetch_summarizer));
     tools
 }
 
 /// Finding things by name, and reading one off the web.
 ///
 /// Split out because the Kimi harness takes these and replaces the rest.
-pub(crate) fn discovery_and_web_tools() -> Vec<RegisteredTool> {
-    vec![make_glob_tool(), make_web_fetch_tool()]
+pub(crate) fn discovery_and_web_tools(
+    web_fetch_summarizer: Option<Arc<WebFetchSummarizer>>,
+) -> Vec<RegisteredTool> {
+    vec![make_glob_tool(), make_web_fetch_tool(web_fetch_summarizer)]
 }
 
 /// A tool definition under `tool`'s canonical name, which the registry renames
@@ -660,7 +676,7 @@ pub(crate) mod tests {
 
     #[test]
     fn the_core_tools_are_the_ones_no_coding_agent_works_without() {
-        let names: Vec<String> = core_tools(&NativeToolOptions::default())
+        let names: Vec<String> = core_tools(&NativeToolOptions::default(), None)
             .iter()
             .map(|tool| tool.definition.name.clone())
             .collect();

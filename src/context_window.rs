@@ -51,12 +51,13 @@ pub struct ContextWindowInput<'a> {
     pub tools: &'a [ToolDefinitionWithSource],
     /// The assembled system prompt, used to recognize the system message.
     pub system_prompt: &'a str,
-    /// The memory files the system prompt carries.
-    pub memory: &'a [MemoryDocument],
-    /// The skills the system prompt summarizes.
-    pub skills: &'a [Skill],
-    /// The vocabulary the skills section names the skill tool in.
-    pub tool_vocabulary: ToolVocabulary,
+    /// What the memory files contribute to the system prompt, from
+    /// [`memory_prompt_tokens`]. Computed once per session rather than here,
+    /// because the memory never changes after initialization.
+    pub memory_tokens: u64,
+    /// What the skills section contributes to the system prompt, from
+    /// [`skills_prompt_tokens`]. Fixed per session, like the memory.
+    pub skills_tokens: u64,
     /// Whether a skill has been expanded into the conversation this session.
     pub activated_skill_context_observed: bool,
     /// The provider the request will be routed to.
@@ -200,8 +201,6 @@ fn add_message_breakdown(
     warnings: &mut Vec<ContextWindowWarning>,
     input: &ContextWindowInput<'_>,
 ) {
-    let memory_tokens = text_tokens(&memory_prompt_suffix(input.memory));
-    let skills_tokens = text_tokens(&skills_prompt_suffix(input.skills, input.tool_vocabulary));
     let mut system_prompt_seen = false;
 
     for message in input.request.messages() {
@@ -210,16 +209,16 @@ fn add_message_breakdown(
 
         if !system_prompt_seen
             && message.role() == Role::System
-            && message_text(message) == input.system_prompt
+            && message_text_is(message, input.system_prompt)
         {
             system_prompt_seen = true;
-            let attributed = memory_tokens.saturating_add(skills_tokens);
+            let attributed = input.memory_tokens.saturating_add(input.skills_tokens);
             builder.add(
                 ContextWindowCategory::SystemPrompt,
                 estimate.tokens().saturating_sub(attributed),
             );
-            builder.add(ContextWindowCategory::Memory, memory_tokens);
-            builder.add(ContextWindowCategory::Skills, skills_tokens);
+            builder.add(ContextWindowCategory::Memory, input.memory_tokens);
+            builder.add(ContextWindowCategory::Skills, input.skills_tokens);
         } else {
             builder.add(ContextWindowCategory::Conversation, estimate.tokens());
         }
@@ -261,16 +260,39 @@ fn warnings_from_estimate(estimate: &TokenEstimate) -> Vec<ContextWindowWarning>
         .collect()
 }
 
-/// The text parts of a message, joined.
-fn message_text(message: &Message) -> String {
-    message
-        .content()
-        .iter()
-        .filter_map(|part| match part {
-            ContentPart::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect()
+/// Whether the message's text parts, joined, spell exactly `expected`.
+///
+/// Compared part by part rather than by joining into a fresh `String`,
+/// because this runs against the full system prompt on every snapshot.
+fn message_text_is(message: &Message, expected: &str) -> bool {
+    let mut rest = expected;
+    for part in message.content() {
+        if let ContentPart::Text { text } = part {
+            match rest.strip_prefix(text.as_str()) {
+                Some(remaining) => rest = remaining,
+                None => return false,
+            }
+        }
+    }
+    rest.is_empty()
+}
+
+/// The tokens the memory files contribute to the system prompt.
+///
+/// A session computes this once at initialization and carries the number into
+/// every [`ContextWindowInput`], because the memory is fixed for the session's
+/// life.
+#[must_use]
+pub fn memory_prompt_tokens(memory: &[MemoryDocument]) -> u64 {
+    text_tokens(&memory_prompt_suffix(memory))
+}
+
+/// The tokens the skills section contributes to the system prompt.
+///
+/// Fixed per session, like [`memory_prompt_tokens`].
+#[must_use]
+pub fn skills_prompt_tokens(skills: &[Skill], vocabulary: ToolVocabulary) -> u64 {
+    text_tokens(&skills_prompt_suffix(skills, vocabulary))
 }
 
 /// The memory text a profile appends to the system prompt.
@@ -528,9 +550,8 @@ mod tests {
             request: &built,
             tools: &tools,
             system_prompt: &system_prompt,
-            memory: &memory,
-            skills: &skills,
-            tool_vocabulary: ToolVocabulary::Canonical,
+            memory_tokens: memory_prompt_tokens(&memory),
+            skills_tokens: skills_prompt_tokens(&skills, ToolVocabulary::Canonical),
             activated_skill_context_observed: true,
             provider: "test",
             model: "model-a",
@@ -589,9 +610,8 @@ mod tests {
             request: &built,
             tools: &tools,
             system_prompt: &system_prompt,
-            memory: &memory,
-            skills: &skills,
-            tool_vocabulary: ToolVocabulary::Canonical,
+            memory_tokens: memory_prompt_tokens(&memory),
+            skills_tokens: skills_prompt_tokens(&skills, ToolVocabulary::Canonical),
             activated_skill_context_observed: false,
             provider: "test",
             model: "model-a",

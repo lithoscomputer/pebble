@@ -48,7 +48,7 @@ use crate::loop_detection::detect_loop;
 use crate::reasoning::ReasoningOutput;
 use crate::skills::{ExpandedInput, SkillExpansion, expand_skill};
 use crate::task_reminder::maybe_task_reminder;
-use crate::tool::{NativeTool, ToolDispatch, canonical_tool_name};
+use crate::tool::{NativeTool, ToolDefinitionWithSource, ToolDispatch, canonical_tool_name};
 use crate::types::{
     AgentEvent, ContextWindowSnapshot, CostSource, LlmOutputKind, LlmRetryPhase, Message,
     SessionState, SkillActivationSource, TokenUsage,
@@ -73,12 +73,6 @@ const TRUNCATED_STREAM: &str = "the stream ended without completing the response
 /// spent.
 const TRUNCATED_STREAM_EXHAUSTED: &str =
     "the stream ended without completing the response, after every replay";
-
-/// One request, and what it was measured to cost before it was sent.
-struct BuiltRequest {
-    request:        Request,
-    context_window: ContextWindowSnapshot,
-}
 
 /// An opened provider stream and the handle that cancels the call behind it.
 struct OpenStream {
@@ -263,14 +257,17 @@ impl Session {
                 compaction_failed = self.compact_if_needed().await;
             }
 
+            // The policy filter runs once per round; the request builder takes
+            // the only per-round copy of the definitions.
+            let tools = self.effective_tools();
+
             // Staged, not committed: an interrupted round must not leave a
             // system message behind for later steering to answer. It commits
             // only alongside the assistant turn that read it.
-            let pending_task_reminder = self.task_reminder_if_needed();
+            let pending_task_reminder = self.task_reminder_if_needed(&tools);
 
-            let built = self.build_request(pending_task_reminder.as_ref())?;
-            let local_context_window = built.context_window;
-            let request = built.request;
+            let request = self.build_request(&tools, pending_task_reminder.as_ref())?;
+            let local_context_window = self.measure_request(&request, &tools);
 
             // The last moment at which nothing is known about the response.
             // One per round, however many times the turn is replayed inside
@@ -280,7 +277,7 @@ impl Session {
             });
 
             let mut inference_start = Some(Instant::now());
-            let mut open = match self.open_stream(&request, &round_token).await {
+            let mut open = match self.open_stream(request, &round_token).await {
                 StreamOpen::Opened(open) => open,
                 StreamOpen::Failed(error) => {
                     record_elapsed(&mut inference_start, &mut totals.timing.inference);
@@ -468,7 +465,16 @@ impl Session {
                     }
                 }
 
-                open = match self.open_stream(&request, &round_token).await {
+                // Rebuilt rather than cloned: nothing the builder reads has
+                // changed inside this round, and a replay is the rare path.
+                let request = match self.build_request(&tools, pending_task_reminder.as_ref()) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        record_elapsed(&mut inference_start, &mut totals.timing.inference);
+                        return Err(error);
+                    }
+                };
+                open = match self.open_stream(request, &round_token).await {
                     StreamOpen::Opened(reopened) => reopened,
                     StreamOpen::Failed(error) => {
                         record_elapsed(&mut inference_start, &mut totals.timing.inference);
@@ -768,8 +774,7 @@ impl Session {
 
     /// The reminder to stage this round, where the model has drifted from the
     /// task.
-    fn task_reminder_if_needed(&self) -> Option<Message> {
-        let tools = self.effective_tools();
+    fn task_reminder_if_needed(&self, tools: &[ToolDefinitionWithSource]) -> Option<Message> {
         let names: Vec<&str> = tools
             .iter()
             .map(|tool| tool.definition.name.as_str())
@@ -780,12 +785,19 @@ impl Session {
         })
     }
 
-    /// Builds this round's request, and measures what it will cost to send.
+    /// Builds this round's request.
     ///
     /// A staged reminder goes last, through the same conversion durable turns
     /// use, so what the model reads now is what history will hold if the turn
-    /// commits.
-    fn build_request(&self, pending_task_reminder: Option<&Message>) -> Result<BuiltRequest> {
+    /// commits. Deterministic within a round — nothing it reads changes until
+    /// the turn commits — which is what lets a replay rebuild the request
+    /// instead of every round paying to clone one it will probably never
+    /// need again.
+    fn build_request(
+        &self,
+        tools: &[ToolDefinitionWithSource],
+        pending_task_reminder: Option<&Message>,
+    ) -> Result<Request> {
         let mut builder = Request::builder().model(self.model_selector.clone());
         if !self.system_prompt.trim().is_empty() {
             builder = builder.system(self.system_prompt.clone());
@@ -797,8 +809,7 @@ impl Session {
             builder = builder.message(reminder.to_llm_message());
         }
 
-        let tools = self.effective_tools();
-        for tool in &tools {
+        for tool in tools {
             builder = builder.tool(tool.definition.clone());
         }
         if !tools.is_empty() {
@@ -814,24 +825,27 @@ impl Session {
             builder = builder.speed(speed);
         }
 
-        let request = builder.build().map_err(|error| {
+        builder.build().map_err(|error| {
             Error::InvalidState(format!("this round's request could not be built: {error}"))
-        })?;
-        let context_window = build_local_snapshot(ContextWindowInput {
-            request: &request,
-            tools: &tools,
+        })
+    }
+
+    /// Measures what this round's request will cost to send.
+    fn measure_request(
+        &self,
+        request: &Request,
+        tools: &[ToolDefinitionWithSource],
+    ) -> ContextWindowSnapshot {
+        build_local_snapshot(ContextWindowInput {
+            request,
+            tools,
             system_prompt: &self.system_prompt,
-            memory: &self.memory,
-            skills: &self.skills,
-            tool_vocabulary: self.registry.vocabulary(),
+            memory_tokens: self.memory_tokens,
+            skills_tokens: self.skills_tokens,
             activated_skill_context_observed: self.activated_skill_context_observed,
             provider: &self.provider,
             model: &self.model,
             context_window_tokens: self.facts.context_window_tokens,
-        });
-        Ok(BuiltRequest {
-            request,
-            context_window,
         })
     }
 
@@ -862,7 +876,7 @@ impl Session {
     /// the session does.
     async fn open_stream(
         &mut self,
-        request: &Request,
+        request: Request,
         round_token: &CancellationToken,
     ) -> StreamOpen {
         // Fresh per call, including every replay: the client's attempt budget
@@ -878,7 +892,6 @@ impl Session {
         ));
 
         let client = self.client.clone();
-        let request = request.clone();
         let opening = client.stream_with_context(request, context);
         tokio::pin!(opening);
         let opened = tokio::select! {
@@ -1015,9 +1028,6 @@ impl Session {
             dispatch = dispatch.with_human_input(provider);
         }
         dispatch = dispatch.with_redactor(&self.redactor);
-        if let Some(summarizer) = self.web_fetch_summarizer.as_ref() {
-            dispatch = dispatch.with_web_fetch_summarizer(summarizer);
-        }
 
         let terminal = self.cancel_token.clone();
         let round = round_token.clone();

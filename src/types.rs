@@ -30,8 +30,8 @@ pub use self::context_window::{
 pub use self::llm::{CostSource, LlmOutputKind, LlmRetryPhase, TokenUsage};
 pub use self::process::{CommandTermination, ExecOutputTail, ExecOutputTailTrace};
 pub use self::todo::{
-    TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoListProjection, TodoPatch,
-    TodoProjection, TodoStatus, TodoUpdatedProps,
+    TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoListProjection, TodoProjection,
+    TodoStatus, TodoUpdatedProps,
 };
 pub use self::tool::{PermissionLevel, ToolCategory, ToolErrorKind, ToolSource, ToolSummary};
 use crate::error::ErrorData;

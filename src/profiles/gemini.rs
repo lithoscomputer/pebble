@@ -28,7 +28,7 @@ impl GeminiProfile {
     /// The harness for a session built from `deps`.
     pub(crate) fn new(deps: &ProfileDeps) -> Self {
         let options = NativeToolOptions::for_profile(AgentProfileKind::Gemini);
-        let mut tools = core_tools(&options);
+        let mut tools = core_tools(&options, deps.web_fetch_summarizer.clone());
         tools.push(make_edit_file_tool());
         tools.push(make_read_many_files_tool());
         tools.push(make_list_dir_tool());
