@@ -1,0 +1,82 @@
+---
+source: src/session/loop_tests/profiles.rs
+expression: rendered
+---
+nothing configured:
+  Bash
+  Edit
+  Read
+  TaskCreate
+  TaskGet
+  TaskList
+  TaskUpdate
+  WebFetch
+  Write
+search:
+  Bash
+  Edit
+  Read
+  TaskCreate
+  TaskGet
+  TaskList
+  TaskUpdate
+  WebFetch
+  WebSearch
+  Write
+subagents:
+  Agent
+  Bash
+  Edit
+  Read
+  SendMessage
+  TaskCreate
+  TaskGet
+  TaskList
+  TaskOutput
+  TaskStop
+  TaskUpdate
+  WebFetch
+  Write
+search + subagents (also what a child is shown):
+  Agent
+  Bash
+  Edit
+  Read
+  SendMessage
+  TaskCreate
+  TaskGet
+  TaskList
+  TaskOutput
+  TaskStop
+  TaskUpdate
+  WebFetch
+  WebSearch
+  Write
+a skill was discovered:
+  Bash
+  Edit
+  Read
+  Skill
+  TaskCreate
+  TaskGet
+  TaskList
+  TaskUpdate
+  WebFetch
+  Write
+everything, root only:
+  Agent
+  AskUserQuestion
+  Bash
+  Edit
+  Read
+  SendMessage
+  Skill
+  TaskCreate
+  TaskGet
+  TaskList
+  TaskOutput
+  TaskStop
+  TaskUpdate
+  WebFetch
+  WebSearch
+  Write

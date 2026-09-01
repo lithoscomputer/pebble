@@ -22,9 +22,13 @@ use std::sync::Arc;
 use lithos_llm::catalog::CatalogModel;
 
 use crate::environment::Environment;
+use crate::profiles::{
+    AnthropicProfile, Claude5Profile, GeminiProfile, Gpt56Profile, KimiProfile, OpenAiProfile,
+    ProfileDeps,
+};
 use crate::skills::Skill;
 use crate::subagent::{SubagentSupervisor, subagent_tools};
-use crate::tool::{RegisteredTool, ToolVocabulary};
+use crate::tool::{RegisteredTool, ToolRegistry, ToolVocabulary};
 use crate::types::AgentProfileKind;
 
 /// The context window pebble assumes for a model the catalog says nothing
@@ -273,12 +277,20 @@ pub trait AgentProfile: Send + Sync {
 
     /// The system prompt this profile's model starts a session with.
     ///
+    /// `registry` is the session's own, filled: what this session actually
+    /// holds, which is not always what this profile contributed. A profile is
+    /// shared — a child session runs its parent's — so a prompt section about a
+    /// tool a child does not inherit has to be conditioned on the registry
+    /// rather than on anything the profile was built with. Asking a person a
+    /// question is the one such tool today: a child has nobody to ask.
+    ///
     /// `memory` holds the files the application asked the session to load,
     /// already read; `user_instructions` is the application's own addition; and
     /// `skills` are the skills discovered for this session, which a profile
     /// normally summarizes rather than expands.
     fn build_system_prompt(
         &self,
+        registry: &ToolRegistry,
         env_context: &EnvContext,
         memory: &[String],
         user_instructions: Option<&str>,
@@ -296,20 +308,25 @@ pub trait AgentProfile: Send + Sync {
     }
 }
 
-/// The profile pebble ships for `kind`, or `None` where it ships none yet.
+/// The profile pebble ships for `kind`.
 ///
 /// This is the one place a session turns a catalog profile identifier into a
 /// profile. It is crate-internal on purpose: an application selects a profile
-/// by choosing a model, never by naming one, so widening this signature later
-/// — the built-in profiles will want the session's tool options and its
-/// subagent support — costs nothing outside the crate.
+/// by choosing a model, never by naming one, so `deps` could grow again — the
+/// harnesses read what the session is, and a later one may read more — without
+/// costing anything outside the crate.
 ///
-/// The six built-ins land with the profile port. Until then a session whose
-/// model resolves to a profile pebble has no implementation of is refused at
-/// build time rather than started without a harness.
-pub(crate) fn builtin_profile(kind: AgentProfileKind) -> Option<Arc<dyn AgentProfile>> {
-    let _ = kind;
-    None
+/// Every one of the six identifiers pebble knows is answered here; a catalog
+/// row naming something else is refused earlier, when the identifier is parsed.
+pub(crate) fn builtin_profile(kind: AgentProfileKind, deps: &ProfileDeps) -> Arc<dyn AgentProfile> {
+    match kind {
+        AgentProfileKind::Anthropic => Arc::new(AnthropicProfile::new(deps)),
+        AgentProfileKind::Claude5 => Arc::new(Claude5Profile::new(deps)),
+        AgentProfileKind::Gemini => Arc::new(GeminiProfile::new(deps)),
+        AgentProfileKind::Gpt56 => Arc::new(Gpt56Profile::new(deps)),
+        AgentProfileKind::Kimi => Arc::new(KimiProfile::new(deps)),
+        AgentProfileKind::OpenAi => Arc::new(OpenAiProfile::new(deps)),
+    }
 }
 
 #[cfg(test)]
@@ -353,6 +370,7 @@ mod tests {
 
         fn build_system_prompt(
             &self,
+            _registry: &ToolRegistry,
             env_context: &EnvContext,
             memory: &[String],
             user_instructions: Option<&str>,
@@ -428,7 +446,8 @@ mod tests {
             ..EnvContext::default()
         };
 
-        let prompt = profile.build_system_prompt(&env_context, &[], None, &[]);
+        let prompt =
+            profile.build_system_prompt(&ToolRegistry::new(), &env_context, &[], None, &[]);
 
         assert!(prompt.contains("test assistant"));
         assert!(prompt.contains("Working directory: /work"));
@@ -445,6 +464,7 @@ mod tests {
         }];
 
         let prompt = profile.build_system_prompt(
+            &ToolRegistry::new(),
             &EnvContext::default(),
             &["README.md contents".to_owned()],
             Some("Always use TDD"),
@@ -471,12 +491,56 @@ mod tests {
     }
 
     #[test]
-    fn pebble_ships_no_built_in_profiles_yet() {
+    fn every_harness_pebble_ships_answers_for_the_one_it_was_asked_for() {
         for kind in AgentProfileKind::ALL {
-            assert!(
-                builtin_profile(*kind).is_none(),
-                "{kind} has no implementation until the profiles are ported"
+            let profile = builtin_profile(*kind, &ProfileDeps::default());
+
+            assert_eq!(
+                profile.profile_kind(),
+                *kind,
+                "{kind} was answered with another harness"
             );
+        }
+    }
+
+    /// Every harness gives its model a shell, whatever else it withholds. The
+    /// GPT-5.6 one has nothing but a shell and a patch tool, and Claude 5
+    /// drives its own searches through one, so this is the only tool all
+    /// six share.
+    #[test]
+    fn every_harness_pebble_ships_gives_its_model_a_way_to_run_a_command() {
+        for kind in AgentProfileKind::ALL {
+            let profile = builtin_profile(*kind, &ProfileDeps::default());
+
+            assert!(
+                profile
+                    .base_tools()
+                    .iter()
+                    .any(|tool| tool.definition.name == "shell"),
+                "{kind} offers no shell"
+            );
+        }
+    }
+
+    /// A built-in harness contributes built-in tools, under their canonical
+    /// names. That is what lets the registry rename them into the harness's own
+    /// vocabulary, and what keeps an application's permission gate able to
+    /// categorize what it is being asked to approve.
+    #[test]
+    fn every_tool_a_built_in_harness_contributes_is_one_pebble_knows_by_name() {
+        use crate::tool::NativeTool;
+
+        for kind in AgentProfileKind::ALL {
+            let profile = builtin_profile(*kind, &ProfileDeps::default());
+
+            for tool in profile.base_tools() {
+                assert_eq!(tool.source, ToolSource::Native, "{kind}");
+                assert!(
+                    NativeTool::from_canonical_name(&tool.definition.name).is_some(),
+                    "{kind} contributes `{}`, which pebble cannot rename or categorize",
+                    tool.definition.name
+                );
+            }
         }
     }
 

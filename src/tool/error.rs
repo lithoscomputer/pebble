@@ -54,6 +54,25 @@ impl ToolError {
         }
     }
 
+    /// Builds an error that keeps an already boxed `source` as its cause.
+    ///
+    /// For a caller that takes another error apart rather than wrapping it: an
+    /// error whose message is copied into the tool error would otherwise say
+    /// the same thing twice in [`detail`](Self::detail), once as the message
+    /// and once as its own first cause.
+    #[must_use]
+    pub(crate) fn with_boxed_source(
+        kind: ToolErrorKind,
+        message: impl Into<String>,
+        source: Box<dyn StdError + Send + Sync + 'static>,
+    ) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            source: Some(source),
+        }
+    }
+
     /// The arguments did not match the tool's schema or were unusable.
     #[must_use]
     pub fn invalid_arguments(message: impl Into<String>) -> Self {
@@ -82,6 +101,16 @@ impl ToolError {
     #[must_use]
     pub fn execution(message: impl Into<String>) -> Self {
         Self::new(ToolErrorKind::Execution, message)
+    }
+
+    /// The same failure, said differently to the model.
+    ///
+    /// The kind and the cause are kept, so this is how a caller adds what only
+    /// it knows — which tool, which stage — to a message another layer wrote.
+    #[must_use]
+    pub(crate) fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = message.into();
+        self
     }
 
     /// The category of this failure.

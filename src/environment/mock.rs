@@ -40,6 +40,8 @@ pub struct MockEnvironment {
     pub grep_results:          Vec<String>,
     /// Returned by every [`glob`](Environment::glob) call.
     pub glob_results:          Vec<String>,
+    /// Returned by every [`list_directory`](Environment::list_directory) call.
+    pub dir_entries:           Vec<DirEntry>,
     /// Reported as the working directory.
     pub working_dir:           &'static str,
     /// Reported as the platform.
@@ -69,6 +71,8 @@ pub struct MockEnvironment {
     pub captured_working_dirs: Mutex<Vec<Option<String>>>,
     /// The environment variables of the last command.
     pub captured_env_vars:     Mutex<Option<HashMap<String, String>>>,
+    /// Every directory listing's `(path, depth)`, in call order.
+    pub captured_listings:     Mutex<Vec<(String, Option<usize>)>>,
     /// The retention cap of the last command.
     pub captured_output_cap:   Mutex<Option<usize>>,
 }
@@ -106,6 +110,7 @@ impl Default for MockEnvironment {
             },
             grep_results:          Vec::new(),
             glob_results:          Vec::new(),
+            dir_entries:           Vec::new(),
             working_dir:           "/work",
             platform_str:          "darwin",
             os_version_str:        "Darwin 24.0.0".to_owned(),
@@ -118,6 +123,7 @@ impl Default for MockEnvironment {
             captured_commands:     Mutex::new(Vec::new()),
             captured_working_dirs: Mutex::new(Vec::new()),
             captured_env_vars:     Mutex::new(None),
+            captured_listings:     Mutex::new(Vec::new()),
             captured_output_cap:   Mutex::new(None),
         }
     }
@@ -170,8 +176,12 @@ impl Environment for MockEnvironment {
         Ok(self.files.contains_key(path))
     }
 
-    async fn list_directory(&self, _path: &str, _depth: Option<usize>) -> EnvResult<Vec<DirEntry>> {
-        Ok(Vec::new())
+    async fn list_directory(&self, path: &str, depth: Option<usize>) -> EnvResult<Vec<DirEntry>> {
+        self.captured_listings
+            .lock()
+            .expect("captured_listings lock is not poisoned")
+            .push((path.to_owned(), depth));
+        Ok(self.dir_entries.clone())
     }
 
     async fn grep(

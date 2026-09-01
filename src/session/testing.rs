@@ -1,10 +1,14 @@
 //! What the session's own tests are built from.
 //!
-//! A session cannot be built without a profile, and pebble ships none yet, so
-//! every test here injects one through
-//! [`SessionBuilder::with_profile`](super::SessionBuilder::with_profile). The
-//! rest is assembly: a session on a scripted client, over a mock environment,
-//! with whatever tools and options the test needs.
+//! Every test here injects a profile through
+//! [`SessionBuilder::with_profile`](super::SessionBuilder::with_profile),
+//! rather than taking the built-in one its model resolves to: what these tests
+//! are about is the loop, and a harness that contributes nothing keeps a tool
+//! list or a prompt from a shipped profile out of every assertion. The tests
+//! that *are* about a harness live in
+//! [`loop_tests::profiles`](super::loop_tests::profiles) and let the catalog
+//! choose. The rest is assembly: a session on a scripted client, over a mock
+//! environment, with whatever tools and options the test needs.
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -23,13 +27,15 @@ use crate::config::SessionOptions;
 use crate::environment::Environment;
 use crate::human_input::HumanInputProvider;
 use crate::profile::{AgentProfile, EnvContext};
+use crate::redact::Redactor;
+use crate::search::SearchProvider;
 use crate::skills::{Skill, format_skills_prompt_section};
 use crate::subagent::{ChildSessionSpec, SessionFactory, SubagentLimits};
 use crate::test_support::{
     MockEnvironment, ScriptedCall, ScriptedCompletion, ScriptedProvider, client_from,
     scripted_client_builder,
 };
-use crate::tool::{RegisteredTool, ToolError, ToolVocabulary};
+use crate::tool::{RegisteredTool, ToolError, ToolRegistry, ToolVocabulary};
 use crate::types::{AgentEvent, AgentProfileKind, SessionEvent, ToolSource};
 
 /// A profile that names a harness and contributes only what it is given.
@@ -64,6 +70,7 @@ impl AgentProfile for TestProfile {
 
     fn build_system_prompt(
         &self,
+        _registry: &ToolRegistry,
         env_context: &EnvContext,
         memory: &[String],
         user_instructions: Option<&str>,
@@ -92,18 +99,21 @@ impl AgentProfile for TestProfile {
 /// is about: the script, and whichever of the tools, the options, the model, or
 /// the environment it depends on.
 pub(crate) struct TestSession {
-    calls:       Vec<ScriptedCall>,
-    delay:       Duration,
-    completions: Vec<ScriptedCompletion>,
-    tools:       Vec<RegisteredTool>,
-    options:     SessionOptions,
-    model:       String,
-    environment: Option<Arc<dyn Environment>>,
-    retries:     Option<RetryPolicy>,
-    concurrency: Option<NonZeroUsize>,
-    subagents:   Option<SessionFactory>,
-    limits:      SubagentLimits,
-    human_input: Option<Arc<dyn HumanInputProvider>>,
+    calls:           Vec<ScriptedCall>,
+    delay:           Duration,
+    completions:     Vec<ScriptedCompletion>,
+    tools:           Vec<RegisteredTool>,
+    options:         SessionOptions,
+    model:           String,
+    environment:     Option<Arc<dyn Environment>>,
+    retries:         Option<RetryPolicy>,
+    concurrency:     Option<NonZeroUsize>,
+    subagents:       Option<SessionFactory>,
+    limits:          SubagentLimits,
+    human_input:     Option<Arc<dyn HumanInputProvider>>,
+    redactor:        Option<Arc<dyn Redactor>>,
+    summarizer:      Option<String>,
+    search_provider: Option<Arc<dyn SearchProvider>>,
 }
 
 impl TestSession {
@@ -122,7 +132,28 @@ impl TestSession {
             subagents: None,
             limits: SubagentLimits::default(),
             human_input: None,
+            redactor: None,
+            summarizer: None,
+            search_provider: None,
         }
+    }
+
+    /// Strips secrets out of what the session publishes.
+    pub(crate) fn redacting(mut self, redactor: Arc<dyn Redactor>) -> Self {
+        self.redactor = Some(redactor);
+        self
+    }
+
+    /// Lets `web_fetch` answer a prompt by asking `model`.
+    pub(crate) fn summarizing_with(mut self, model: impl Into<String>) -> Self {
+        self.summarizer = Some(model.into());
+        self
+    }
+
+    /// Gives the session somewhere to send a web search.
+    pub(crate) fn searching_with(mut self, provider: Arc<dyn SearchProvider>) -> Self {
+        self.search_provider = Some(provider);
+        self
     }
 
     /// Lets the session spawn children, built the plain way.
@@ -243,6 +274,15 @@ impl TestSession {
         }
         if let Some(provider) = self.human_input {
             builder = builder.human_input(provider);
+        }
+        if let Some(redactor) = self.redactor {
+            builder = builder.redactor(redactor);
+        }
+        if let Some(model) = self.summarizer {
+            builder = builder.web_fetch_summarizer(model);
+        }
+        if let Some(provider) = self.search_provider {
+            builder = builder.search_provider(provider);
         }
         let session = builder.build().expect("the test session builds");
         (session, provider)

@@ -18,9 +18,9 @@ mod scripted;
 
 pub use self::scripted::{
     ScriptedCall, ScriptedCompletion, ScriptedFailure, ScriptedItem, ScriptedProvider,
-    TEST_CATALOG, client_from, events_for, message_text, multi_tool_call_response,
-    reasoning_delta_events, reasoning_response, scripted_client, scripted_client_builder,
-    test_catalog, text_delta_events, text_response, tool_call_events, tool_call_response,
-    with_cost, with_finish_reason, with_input_tokens, with_usage,
+    TEST_CATALOG, client_from, custom_tool_call_response, events_for, message_text,
+    multi_tool_call_response, reasoning_delta_events, reasoning_response, scripted_client,
+    scripted_client_builder, test_catalog, text_delta_events, text_response, tool_call_events,
+    tool_call_response, with_cost, with_finish_reason, with_input_tokens, with_usage,
 };
 pub use crate::environment::mock::{MockEnvironment, MutableMockEnvironment};

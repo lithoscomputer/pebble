@@ -55,8 +55,11 @@ use crate::environment::Environment;
 use crate::error::{Error, ErrorData, ErrorKind, InterruptReason, Result};
 use crate::event::EventCapacity;
 use crate::profile::AgentProfile;
+use crate::redact::Redactor;
+use crate::search::SearchProvider;
 use crate::session::{Session, SessionBuildError, ShutdownReason};
 use crate::tool::{RegisteredTool, ToolEnvProvider, ToolError};
+use crate::tools::WebFetchSummarizer;
 use crate::types::{
     AgentEvent, INITIAL_SUBAGENT_GENERATION, SessionEvent, SessionState, ToolErrorKind,
 };
@@ -322,6 +325,13 @@ impl ChildSessionSpec {
         if let Some(provider) = deps.tool_env_provider.as_ref() {
             builder = builder.tool_env_provider(Arc::clone(provider));
         }
+        builder = builder.redactor(Arc::clone(&deps.redactor));
+        if let Some(summarizer) = deps.web_fetch_summarizer.as_ref() {
+            builder = builder.web_fetch_summarizer(summarizer.model());
+        }
+        if let Some(provider) = deps.search_provider.as_ref() {
+            builder = builder.search_provider(Arc::clone(provider));
+        }
         builder.build()
     }
 }
@@ -333,19 +343,27 @@ impl ChildSessionSpec {
 /// human-input provider, which is why a child can never ask a person a
 /// question.
 pub(crate) struct ChildDeps {
-    pub(crate) client:            Client,
-    pub(crate) model_selector:    String,
-    pub(crate) profile:           Arc<dyn AgentProfile>,
-    pub(crate) environment:       Arc<dyn Environment>,
-    pub(crate) tools:             Vec<RegisteredTool>,
-    pub(crate) options:           SessionOptions,
-    pub(crate) tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
-    pub(crate) event_capacity:    EventCapacity,
-    pub(crate) factory:           SessionFactory,
-    pub(crate) open_sessions:     Arc<OpenSessions>,
+    pub(crate) client:               Client,
+    pub(crate) model_selector:       String,
+    pub(crate) profile:              Arc<dyn AgentProfile>,
+    pub(crate) environment:          Arc<dyn Environment>,
+    pub(crate) tools:                Vec<RegisteredTool>,
+    pub(crate) options:              SessionOptions,
+    pub(crate) tool_env_provider:    Option<Arc<dyn ToolEnvProvider>>,
+    /// What strips secrets out of what a child publishes. Inherited, because
+    /// a child's process output reaches the same stream its parent's does.
+    pub(crate) redactor:             Arc<dyn Redactor>,
+    /// Which model answers a child's `web_fetch` prompt about a page.
+    pub(crate) web_fetch_summarizer: Option<Arc<WebFetchSummarizer>>,
+    /// Where a child's web searches go. Inherited, because a child researches
+    /// the task its parent gave it.
+    pub(crate) search_provider:      Option<Arc<dyn SearchProvider>>,
+    pub(crate) event_capacity:       EventCapacity,
+    pub(crate) factory:              SessionFactory,
+    pub(crate) open_sessions:        Arc<OpenSessions>,
     /// The depth of the session these deps belong to. Its children sit one
     /// deeper.
-    pub(crate) depth:             usize,
+    pub(crate) depth:                usize,
 }
 
 /// Where a child sits in its tree, and which budget it spends.
@@ -452,8 +470,8 @@ pub(crate) enum SubagentStatus {
             not(test),
             allow(
                 dead_code,
-                reason = "the background-agent tool family reads it, and lands with the Claude 5 \
-                          profile"
+                reason = "only the crate's own tests read the result off a status: the tools that \
+                          report one answer from the wait cache instead"
             )
         )]
         result:   StdResult<SubagentResult, ErrorData>,
@@ -1069,13 +1087,6 @@ impl SubagentSupervisor {
 
     /// Starts a child whose terminal result should reach the parent by itself,
     /// at the next input boundary.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "the background-agent tool family lands with the Claude 5 profile"
-        )
-    )]
     pub(crate) fn spawn_with_parent_notification(
         &self,
         parent_session_id: &str,
@@ -1440,13 +1451,6 @@ impl SubagentSupervisor {
     ///
     /// The registration itself survives, so a later turn of the same child can
     /// register its own result.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "the background-agent tool family lands with the Claude 5 profile"
-        )
-    )]
     pub(crate) fn suppress_parent_notification(&self, agent_id: &str) {
         let cleared = {
             let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1777,13 +1781,6 @@ impl SubagentSupervisor {
     /// A closed agent keeps answering: its entry stays, so a model that asks
     /// about an agent it closed is told what happened rather than that it never
     /// existed.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "the background-agent tool family lands with the Claude 5 profile"
-        )
-    )]
     pub(crate) fn status(&self, agent_id: &str) -> Option<SubagentStatus> {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state

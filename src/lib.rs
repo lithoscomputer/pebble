@@ -61,11 +61,45 @@
 //! An [`AgentProfile`] decides which tools a session starts with, which
 //! vocabulary they are named in, and what the system prompt says, because a
 //! model trained inside a coding harness expects that harness back. Pebble
-//! selects one from the catalog metadata of the model a session resolved to.
+//! selects one from the catalog metadata of the model a session resolved to,
+//! from the six it ships — one per [`AgentProfileKind`], covering the Claude,
+//! Claude 5, Gemini CLI, OpenAI, Codex and Kimi Code families. An application
+//! picks a harness by picking a model; the built-in ones are not otherwise
+//! nameable, and one written outside the crate implements the same trait.
+//!
+//! Pebble's own are the ones a coding agent cannot work without: reading,
+//! writing and editing files ([`make_read_file_tool`],
+//! [`make_write_file_tool`], [`make_edit_file_tool`],
+//! [`make_read_many_files_tool`]), searching by content and by name
+//! ([`make_grep_tool`], [`make_glob_tool`], [`make_list_dir_tool`]), running
+//! commands ([`make_shell_tool`]), applying a patch
+//! ([`make_apply_patch_tool`]), and fetching a page
+//! ([`make_web_fetch_tool`]). Beside them are the tools a harness expects
+//! rather than needs: keeping a plan ([`TodoRuntime`] and the tools around
+//! it), asking a person a question ([`make_question_tool`]), loading a skill
+//! ([`make_use_skill_tool`]), and searching the web
+//! ([`make_web_search_tool`]). Every one of them acts through
+//! the [`Environment`], and what they answer with — schemas, descriptions,
+//! rendered output, failure messages — is part of pebble's contract, because a
+//! model reads all of it.
 //!
 //! A round of calls runs through [`ToolDispatch`], which answers every call it
 //! is given — including the ones it refuses — publishes what happened, and
 //! bounds what a tool produced before the model or an application sees it.
+//!
+//! Some of those tools are given something the session owns rather than the
+//! profile. A shell command's output tail reaches the event stream through the
+//! [`Redactor`] an application installed with
+//! [`SessionBuilder::redactor`] — pebble ships no secret detector, so without
+//! one the tail is what the process wrote. `web_fetch` answers a prompt
+//! about a page by asking the model named with
+//! [`SessionBuilder::web_fetch_summarizer`]; without one it returns the page
+//! and says the summary was unavailable. `web_search` goes to the
+//! [`SearchProvider`] installed with [`SessionBuilder::search_provider`], and
+//! is advertised only when there is one, because a search with no engine has
+//! no answer worth giving. A question goes to the [`HumanInputProvider`] the
+//! root session was given, and a child has none: a subagent reports back to
+//! its parent instead of interrupting a person.
 //!
 //! An application decides what may run. A [`ToolAccessPolicy`] answers by name
 //! and filters the tools a session even advertises; a [`ToolHookCallback`]
@@ -138,14 +172,18 @@ mod human_input;
 mod loop_detection;
 mod memory;
 mod profile;
+mod profiles;
 mod reasoning;
 mod record;
 mod redact;
+mod search;
 mod session;
 mod skills;
 mod subagent;
 mod task_reminder;
+mod template;
 mod tool;
+mod tools;
 mod truncation;
 mod types;
 
@@ -224,6 +262,7 @@ pub use self::profile::{
 pub use self::reasoning::ReasoningOutput;
 pub use self::record::{SESSION_RECORD_FORMAT_VERSION, SessionRecord, StoredMessage};
 pub use self::redact::{NoRedaction, Redactor};
+pub use self::search::{SearchError, SearchErrorKind, SearchProvider, SearchRequest, SearchResult};
 pub use self::session::{
     CompletionCoordinator, RetryEventObserver, RunOptions, RunTiming, Session, SessionBuildError,
     SessionBuilder, SessionControlHandle, ShutdownReason, SteeringItem, SteeringMessage,
@@ -238,6 +277,17 @@ pub use self::tool::{
     AgentEventEmitter, NativeTool, RegisteredTool, StaticEnvProvider, ToolContext,
     ToolDefinitionWithSource, ToolDispatch, ToolEnvProvider, ToolError, ToolExecutor, ToolRegistry,
     ToolVocabulary, canonical_tool_name, known_tool_category, tool_category, validate_tool_args,
+};
+pub use self::tools::{
+    Change, Hunk, PatchOperation, TodoRuntime, WebFetchSummarizer, apply_patch_operations,
+    grep_result_path, make_anthropic_question_tool, make_apply_patch_tool,
+    make_claude5_question_tool, make_edit_file_tool, make_glob_tool, make_grep_tool,
+    make_list_dir_tool, make_openai_question_tool, make_question_tool, make_read_file_tool,
+    make_read_many_files_tool, make_shell_tool, make_shell_tool_with_options,
+    make_task_create_tool, make_task_get_tool, make_task_list_tool, make_task_update_tool,
+    make_todo_list_tool, make_update_plan_tool, make_use_skill_tool,
+    make_use_skill_tool_for_vocabulary, make_web_fetch_tool, make_web_search_tool,
+    make_write_file_tool, parse_apply_patch,
 };
 pub use self::truncation::{
     DEFAULT_TOOL_OUTPUT_RETENTION_BYTES, DEFAULT_TOOL_OUTPUT_SERIALIZED_BYTES, OutputBudgets,

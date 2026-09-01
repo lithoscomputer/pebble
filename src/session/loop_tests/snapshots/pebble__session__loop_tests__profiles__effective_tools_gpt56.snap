@@ -1,0 +1,46 @@
+---
+source: src/session/loop_tests/profiles.rs
+expression: rendered
+---
+nothing configured:
+  apply_patch
+  shell_command
+  update_plan
+search:
+  apply_patch
+  shell_command
+  update_plan
+  web_search
+subagents:
+  apply_patch
+  close_agent
+  send_input
+  shell_command
+  spawn_agent
+  update_plan
+  wait
+search + subagents (also what a child is shown):
+  apply_patch
+  close_agent
+  send_input
+  shell_command
+  spawn_agent
+  update_plan
+  wait
+  web_search
+a skill was discovered:
+  apply_patch
+  shell_command
+  update_plan
+  use_skill
+everything, root only:
+  apply_patch
+  close_agent
+  request_user_input
+  send_input
+  shell_command
+  spawn_agent
+  update_plan
+  use_skill
+  wait
+  web_search

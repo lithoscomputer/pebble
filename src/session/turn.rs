@@ -1015,6 +1015,10 @@ impl Session {
         if let Some(provider) = human_input {
             dispatch = dispatch.with_human_input(provider);
         }
+        dispatch = dispatch.with_redactor(&self.redactor);
+        if let Some(summarizer) = self.web_fetch_summarizer.as_ref() {
+            dispatch = dispatch.with_web_fetch_summarizer(summarizer);
+        }
 
         let terminal = self.cancel_token.clone();
         let round = round_token.clone();

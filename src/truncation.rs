@@ -77,10 +77,6 @@ pub enum TruncationMode {
 }
 
 /// Output kept within a byte budget, with what that cost.
-#[allow(
-    dead_code,
-    reason = "the shell tool is the only caller and lands with the rest of the built-in tools"
-)]
 #[derive(Debug)]
 pub(crate) struct RetainedToolOutput {
     pub(crate) output: String,
@@ -114,10 +110,6 @@ fn split_head_tail(output: &str, max_bytes: usize) -> Option<(usize, usize)> {
 /// `previously_omitted_bytes` accounts for output an environment already
 /// dropped while draining the process, so the counts describe everything the
 /// tool produced rather than everything that reached this point.
-#[allow(
-    dead_code,
-    reason = "the shell tool is the only caller and lands with the rest of the built-in tools"
-)]
 #[must_use]
 pub(crate) fn retain_tool_output(
     output: String,

@@ -9,12 +9,13 @@
 //! ([`requests`]), what it does with a broken stream ([`replay`]), what happens
 //! when someone interrupts it ([`interrupts`]), what it does as the window
 //! fills ([`compaction`]), which harness a model resolves to ([`profiles`]),
-//! and what it does with the children it spawns ([`subagents`]).
+//! what it does with the children it spawns ([`subagents`]), and what it hands
+//! the built-in tools ([`tools`]).
 //!
-//! The subagent tests ([`subagents`]) arrived with the supervisor. Fabro's
-//! remaining deferred tests — the `use_skill` ones — are listed by name in
-//! `.ai/porting/11-deferred-tests.md`, so the phase that lands the subject
-//! ports them rather than rediscovering them.
+//! The subagent tests ([`subagents`]) arrived with the supervisor, and the
+//! `use_skill`, `web_search` and `apply_patch` ones ([`tools`]) with the tools
+//! they are about. `.ai/porting/11-deferred-tests.md` records where each of
+//! fabro's deferred tests landed.
 
 mod compaction;
 mod interrupts;
@@ -22,6 +23,7 @@ mod profiles;
 mod replay;
 mod requests;
 mod subagents;
+mod tools;
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};

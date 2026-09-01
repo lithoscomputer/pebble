@@ -21,7 +21,10 @@ use crate::tool::{NativeTool, ToolVocabulary};
 use crate::types::SkillSummary;
 
 /// The placeholder a template uses to say where the rest of the input goes.
-const USER_INPUT_PLACEHOLDER: &str = "{{user_input}}";
+///
+/// Read here for a typed `/name`, and by the skill tool for what a model sent
+/// with its call, so both put the input in the same place.
+pub(crate) const USER_INPUT_PLACEHOLDER: &str = "{{user_input}}";
 
 /// The file every skill directory holds.
 const SKILL_FILE_GLOB: &str = "*/SKILL.md";

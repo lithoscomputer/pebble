@@ -523,6 +523,26 @@ pub fn tool_call_response(tool_name: &str, tool_call_id: &str, arguments: Value)
     multi_tool_call_response(vec![(tool_name, tool_call_id, arguments)])
 }
 
+/// A response that asks for one custom tool, whose input is free-form text
+/// rather than JSON.
+///
+/// `apply_patch` is the one built-in tool shaped this way: the model writes a
+/// patch, not an object.
+#[must_use]
+pub fn custom_tool_call_response(tool_name: &str, tool_call_id: &str, input: &str) -> Response {
+    let content = vec![
+        ContentPart::Text {
+            text: "Let me use a tool.".to_owned(),
+        },
+        ContentPart::ToolCall(ToolCall::custom(tool_call_id, tool_name, input)),
+    ];
+    let mut response = Response::new(ProviderId::new("test"), ModelId::new("model"), content);
+    response.id = Some(format!("resp_{tool_call_id}"));
+    response.finish_reason = FinishReason::ToolCall;
+    response.usage = scripted_usage();
+    response
+}
+
 /// A response that asks for several tools at once.
 #[must_use]
 pub fn multi_tool_call_response(calls: Vec<(&str, &str, Value)>) -> Response {

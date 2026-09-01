@@ -1,0 +1,81 @@
+---
+source: src/session/loop_tests/profiles.rs
+expression: rendered
+---
+nothing configured:
+  edit_file
+  glob
+  grep
+  list_dir
+  read_file
+  read_many_files
+  shell
+  web_fetch
+  write_file
+search:
+  edit_file
+  glob
+  grep
+  list_dir
+  read_file
+  read_many_files
+  shell
+  web_fetch
+  web_search
+  write_file
+subagents:
+  close_agent
+  edit_file
+  glob
+  grep
+  list_dir
+  read_file
+  read_many_files
+  send_input
+  shell
+  spawn_agent
+  wait
+  web_fetch
+  write_file
+search + subagents (also what a child is shown):
+  close_agent
+  edit_file
+  glob
+  grep
+  list_dir
+  read_file
+  read_many_files
+  send_input
+  shell
+  spawn_agent
+  wait
+  web_fetch
+  web_search
+  write_file
+a skill was discovered:
+  edit_file
+  glob
+  grep
+  list_dir
+  read_file
+  read_many_files
+  shell
+  use_skill
+  web_fetch
+  write_file
+everything, root only:
+  close_agent
+  edit_file
+  glob
+  grep
+  list_dir
+  read_file
+  read_many_files
+  send_input
+  shell
+  spawn_agent
+  use_skill
+  wait
+  web_fetch
+  web_search
+  write_file

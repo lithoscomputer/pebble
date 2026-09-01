@@ -92,7 +92,10 @@ use crate::history::History;
 use crate::human_input::HumanInputProvider;
 use crate::memory::{MEMORY_BUDGET_BYTES, MemoryDocument, load_memory};
 use crate::profile::{AgentProfile, EnvContext, ModelFacts, SubagentSupport, builtin_profile};
+use crate::profiles::{FileEditToolKind, ProfileDeps};
 use crate::record::{SESSION_RECORD_FORMAT_VERSION, SessionRecord};
+use crate::redact::{NoRedaction, Redactor};
+use crate::search::SearchProvider;
 use crate::skills::{Skill, SkillExpansion, discover_skills};
 use crate::subagent::{
     ChildDeps, ChildIdentity, OpenSessions, SessionFactory, SubagentCallbackEvent,
@@ -100,6 +103,10 @@ use crate::subagent::{
 };
 use crate::tool::{
     RegisteredTool, StaticEnvProvider, ToolDefinitionWithSource, ToolEnvProvider, ToolRegistry,
+};
+use crate::tools::{
+    WebFetchSummarizer, make_question_tool, make_use_skill_tool_for_vocabulary,
+    make_web_search_tool,
 };
 use crate::types::{
     Actor, AgentEvent, AgentProfileKind, PermissionLevel, SessionEvent, SessionState, TokenUsage,
@@ -244,13 +251,6 @@ pub enum SessionBuildError {
         profile: String,
     },
 
-    /// The catalog names a harness pebble knows but does not ship yet.
-    #[error("pebble ships no built-in `{profile}` profile yet")]
-    ProfileUnavailable {
-        /// The harness the model expects.
-        profile: AgentProfileKind,
-    },
-
     /// The stored record was written by a newer pebble.
     #[error(
         "session record format version {version} is newer than this build reads (up to {supported})"
@@ -288,18 +288,21 @@ struct PebbleMetadata {
 /// session. Nothing mutates a registry afterwards.
 #[must_use = "a builder does nothing until `build` is called"]
 pub struct SessionBuilder {
-    client:            Client,
-    model:             Option<String>,
-    environment:       Option<Arc<dyn Environment>>,
-    tools:             Vec<RegisteredTool>,
-    human_input:       Option<Arc<dyn HumanInputProvider>>,
-    tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
-    options:           SessionOptions,
-    events:            EventOptions,
-    profile:           Option<Arc<dyn AgentProfile>>,
-    subagents:         Option<SessionFactory>,
-    subagent_limits:   SubagentLimits,
-    child:             Option<ChildIdentity>,
+    client:               Client,
+    model:                Option<String>,
+    environment:          Option<Arc<dyn Environment>>,
+    tools:                Vec<RegisteredTool>,
+    human_input:          Option<Arc<dyn HumanInputProvider>>,
+    tool_env_provider:    Option<Arc<dyn ToolEnvProvider>>,
+    redactor:             Arc<dyn Redactor>,
+    web_fetch_summarizer: Option<String>,
+    search_provider:      Option<Arc<dyn SearchProvider>>,
+    options:              SessionOptions,
+    events:               EventOptions,
+    profile:              Option<Arc<dyn AgentProfile>>,
+    subagents:            Option<SessionFactory>,
+    subagent_limits:      SubagentLimits,
+    child:                Option<ChildIdentity>,
 }
 
 impl SessionBuilder {
@@ -312,6 +315,9 @@ impl SessionBuilder {
             tools: Vec::new(),
             human_input: None,
             tool_env_provider: None,
+            redactor: Arc::new(NoRedaction),
+            web_fetch_summarizer: None,
+            search_provider: None,
             options: SessionOptions::default(),
             events: EventOptions::default(),
             profile: None,
@@ -368,6 +374,45 @@ impl SessionBuilder {
     /// Sets fixed extra environment variables for every tool call.
     pub fn tool_env(self, env: HashMap<String, String>) -> Self {
         self.tool_env_provider(Arc::new(StaticEnvProvider(env)))
+    }
+
+    /// Sets what strips secrets out of the process output the session
+    /// publishes.
+    ///
+    /// Pebble ships no secret detector, so without one the tail of a command's
+    /// output reaches the event stream exactly as the command wrote it. What
+    /// the model reads is never redacted: it is the same text the person at a
+    /// terminal would have seen.
+    pub fn redactor(mut self, redactor: Arc<dyn Redactor>) -> Self {
+        self.redactor = redactor;
+        self
+    }
+
+    /// Lets `web_fetch` answer a prompt about a page by asking `model`.
+    ///
+    /// The selector is resolved through this session's client, so the
+    /// summarizing model can be smaller and cheaper than the one running the
+    /// session. Without one, a `web_fetch` call carrying a prompt returns the
+    /// page and says the summary was unavailable.
+    pub fn web_fetch_summarizer(mut self, model: impl Into<String>) -> Self {
+        self.web_fetch_summarizer = Some(model.into());
+        self
+    }
+
+    /// Sets where the session's web searches go.
+    ///
+    /// Pebble talks to no search engine of its own: the application implements
+    /// [`SearchProvider`] over whatever it has. Registering one is the whole
+    /// switch — the session advertises `web_search`, built on pebble's schema
+    /// and answering in pebble's format whichever engine is underneath — and a
+    /// session without one advertises no search tool, so a model is never told
+    /// it can search and then refused. A child inherits its parent's provider.
+    ///
+    /// A profile whose model family expects a different search tool registers
+    /// its own, which replaces this one.
+    pub fn search_provider(mut self, provider: Arc<dyn SearchProvider>) -> Self {
+        self.search_provider = Some(provider);
+        self
     }
 
     /// Sets how the session behaves.
@@ -434,14 +479,8 @@ impl SessionBuilder {
     ///
     /// Crate-internal on purpose: an application picks a harness by picking a
     /// model, never by naming one, so this exists for pebble's own tests and
-    /// for the built-in profiles to be injected from.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "the injection hook is exercised by the crate's own tests"
-        )
-    )]
+    /// for a child session, which is built with the harness its parent already
+    /// resolved.
     pub(crate) fn with_profile(mut self, profile: Arc<dyn AgentProfile>) -> Self {
         self.profile = Some(profile);
         self
@@ -482,14 +521,38 @@ impl SessionBuilder {
         // an implementation was injected, so a model that names none is
         // refused the same way either way.
         let kind = profile_kind(&metadata, &handle)?;
-        let profile = match self.profile {
-            Some(profile) => profile,
-            None => builtin_profile(kind)
-                .ok_or(SessionBuildError::ProfileUnavailable { profile: kind })?,
+        // Built here rather than inside the profile: the tool is the
+        // application's answer — someone to ask — crossed with the harness's,
+        // and a harness with no question tool of its own, Gemini, answers
+        // `None` however the session was configured. The prompt reads it back
+        // out of the registry rather than being told, because a child session
+        // runs this same profile with nobody to ask.
+        let question_tool = self
+            .human_input
+            .as_ref()
+            .and_then(|_| make_question_tool(kind));
+        let deps = ProfileDeps {
+            provider_display_name: route.provider().display_name().to_owned(),
+            file_edit_tool:        FileEditToolKind::for_codec(route.provider().codec()),
+            search_provider:       self.search_provider.clone(),
+            has_subagents:         self.subagents.is_some(),
         };
+        let profile = self.profile.unwrap_or_else(|| builtin_profile(kind, &deps));
 
         let mut registry = ToolRegistry::with_vocabulary(profile.tool_vocabulary());
+        // Registered ahead of the profile's own tools, so a profile whose model
+        // expects a search tool of a different shape replaces this one by
+        // contributing it.
+        if let Some(provider) = &self.search_provider {
+            registry.register(make_web_search_tool(Arc::clone(provider)));
+        }
         for tool in profile.base_tools() {
+            registry.register(tool);
+        }
+        // Root-only, and only where the application named somewhere to ask: a
+        // child reports back to its parent rather than interrupting a person,
+        // and a spec carries no `HumanInputProvider` for exactly that reason.
+        if let Some(tool) = question_tool {
             registry.register(tool);
         }
         for tool in &self.tools {
@@ -516,6 +579,10 @@ impl SessionBuilder {
                 ),
             };
 
+        let web_fetch_summarizer = self
+            .web_fetch_summarizer
+            .map(|model| Arc::new(WebFetchSummarizer::new(self.client.clone(), model)));
+
         let supervisor = self.subagents.map(|factory| {
             SubagentSupervisor::new(Arc::new(ChildDeps {
                 client: self.client.clone(),
@@ -525,6 +592,9 @@ impl SessionBuilder {
                 tools: self.tools,
                 options: child_options(&self.options),
                 tool_env_provider: self.tool_env_provider.clone(),
+                redactor: Arc::clone(&self.redactor),
+                web_fetch_summarizer: web_fetch_summarizer.clone(),
+                search_provider: self.search_provider.clone(),
                 event_capacity: self.events.capacity,
                 factory,
                 open_sessions,
@@ -565,6 +635,8 @@ impl SessionBuilder {
             env: environment,
             human_input: self.human_input,
             tool_env_provider: self.tool_env_provider,
+            redactor: self.redactor,
+            web_fetch_summarizer,
             control_state: Arc::new(Mutex::new(ControlState::default())),
             control_notify: Arc::new(Notify::new()),
             followup_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -729,6 +801,11 @@ pub struct Session {
     env: Arc<dyn Environment>,
     human_input: Option<Arc<dyn HumanInputProvider>>,
     tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
+    /// What strips secrets out of the process output this session publishes.
+    redactor: Arc<dyn Redactor>,
+    /// Which model answers a `web_fetch` prompt about a page, when the
+    /// application named one.
+    web_fetch_summarizer: Option<Arc<WebFetchSummarizer>>,
     control_state: Arc<Mutex<ControlState>>,
     control_notify: Arc<Notify>,
     followup_queue: Arc<Mutex<VecDeque<String>>>,
@@ -839,6 +916,11 @@ impl Session {
     /// normal: pebble looks in no conventional location and guesses no
     /// filename.
     ///
+    /// Discovering any skill also registers the tool that loads one, in the
+    /// profile's own vocabulary. That is the only tool a session adds to
+    /// itself: what it loads is not known until the directories have been
+    /// read.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Interrupted`] when the session is cancelled while it is
@@ -877,6 +959,16 @@ impl Session {
             source_dirs: self.config.skill_dirs.clone(),
             skills: self.skills.iter().map(Skill::to_summary).collect(),
         });
+        // The one tool that cannot be built by the builder: what it loads is
+        // discovered here, and a session that discovered no skills advertises
+        // no way to load one.
+        if !self.skills.is_empty() {
+            let vocabulary = self.registry.vocabulary();
+            self.registry.register(make_use_skill_tool_for_vocabulary(
+                Arc::from(self.skills.clone()),
+                vocabulary,
+            ));
+        }
 
         self.env_context = self.build_env_context(&cancel).await?;
         debug!(
@@ -892,7 +984,11 @@ impl Session {
             .iter()
             .map(|document| document.content.clone())
             .collect();
+        // The registry is complete by now — the builder froze it and the skill
+        // tool above is the last addition — so a profile that gates a prompt
+        // section on a tool reads the session's real answer.
         self.system_prompt = self.profile.build_system_prompt(
+            &self.registry,
             &self.env_context,
             &memory,
             self.config.user_instructions.as_deref(),
@@ -1713,23 +1809,19 @@ mod tests {
 
     #[tokio::test]
     async fn a_models_profile_beats_its_providers() {
-        let model = Session::builder(client())
-            .model("test/model")
-            .environment(Arc::new(MockEnvironment::linux()))
-            .build()
-            .expect_err("pebble ships no profiles yet");
-        let inherited = Session::builder(client())
-            .model("test/inherited")
-            .environment(Arc::new(MockEnvironment::linux()))
-            .build()
-            .expect_err("pebble ships no profiles yet");
+        let resolved = |selector: &str| {
+            Session::builder(client())
+                .model(selector)
+                .environment(Arc::new(MockEnvironment::linux()))
+                .build()
+                .expect("the session builds")
+                .profile_kind()
+        };
 
-        assert!(matches!(model, SessionBuildError::ProfileUnavailable {
-            profile: AgentProfileKind::Anthropic,
-        }));
-        assert!(matches!(inherited, SessionBuildError::ProfileUnavailable {
-            profile: AgentProfileKind::OpenAi,
-        }));
+        // The model row names `anthropic`; its provider row names `openai`.
+        assert_eq!(resolved("test/model"), AgentProfileKind::Anthropic);
+        // This row names nothing, so the provider's answer stands.
+        assert_eq!(resolved("test/inherited"), AgentProfileKind::OpenAi);
     }
 
     #[tokio::test]

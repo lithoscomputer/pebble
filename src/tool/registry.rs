@@ -18,6 +18,8 @@ use crate::config::{ToolAccessPolicy, ToolExposureMode};
 use crate::environment::Environment;
 use crate::event::{OutputCaptureStats, SessionBoundEmitter};
 use crate::human_input::HumanInputProvider;
+use crate::redact::{NoRedaction, Redactor};
+use crate::tools::WebFetchSummarizer;
 use crate::types::{AgentEvent, ToolCategory, ToolSource, ToolSummary};
 
 /// The narrow handle a running tool publishes events through.
@@ -92,7 +94,7 @@ impl ToolEnvProvider for StaticEnvProvider {
 #[non_exhaustive]
 pub struct ToolContext {
     /// Where the tool's work lands.
-    pub env:                 Arc<dyn Environment>,
+    pub env:                  Arc<dyn Environment>,
     /// Fires when this call should stop. Composed from the session's terminal
     /// cancellation and the current round's interrupt, so a tool that watches
     /// it observes both.
@@ -102,22 +104,35 @@ pub struct ToolContext {
     /// with no result is a conversation the provider will refuse. A tool that
     /// ignores this token therefore holds its round — and the run ending it —
     /// open until it returns, so long work must watch it and answer.
-    pub cancel:              CancellationToken,
+    pub cancel:               CancellationToken,
     /// Extra environment variables for a command this call runs.
-    pub tool_env_provider:   Option<Arc<dyn ToolEnvProvider>>,
+    pub tool_env_provider:    Option<Arc<dyn ToolEnvProvider>>,
     /// The session that called the tool.
-    pub session_id:          Option<String>,
+    pub session_id:           Option<String>,
     /// The root of the session tree this call belongs to. Equal to
     /// [`session_id`](Self::session_id) in a root session; a child inherits
     /// its parent's root.
-    pub root_session_id:     Option<String>,
+    pub root_session_id:      Option<String>,
     /// The model-native identifier of this call.
-    pub tool_call_id:        Option<String>,
+    pub tool_call_id:         Option<String>,
     /// Where the tool publishes events.
-    pub agent_event_emitter: Option<Arc<dyn AgentEventEmitter>>,
+    pub agent_event_emitter:  Option<Arc<dyn AgentEventEmitter>>,
     /// Where the tool asks the person a question. Absent in child sessions and
     /// wherever the application installed no provider.
-    pub human_input:         Option<Arc<dyn HumanInputProvider>>,
+    pub human_input:          Option<Arc<dyn HumanInputProvider>>,
+    /// What strips secrets out of text the tool publishes.
+    ///
+    /// Only output leaving the session through an event goes through it — the
+    /// process tail a shell tool publishes — never what the model is shown,
+    /// which is the same text the model would have read from the terminal.
+    /// [`NoRedaction`](crate::NoRedaction) unless the application installed
+    /// one.
+    pub redactor:             Arc<dyn Redactor>,
+    /// Where `web_fetch` asks a model to answer a prompt about a page.
+    ///
+    /// Absent unless the application named a summarizing model, in which case
+    /// a prompt about a page is answered by returning the page.
+    pub web_fetch_summarizer: Option<Arc<WebFetchSummarizer>>,
 }
 
 impl ToolContext {
@@ -133,6 +148,8 @@ impl ToolContext {
             tool_call_id: None,
             agent_event_emitter: None,
             human_input: None,
+            redactor: Arc::new(NoRedaction),
+            web_fetch_summarizer: None,
         }
     }
 
@@ -180,6 +197,20 @@ impl ToolContext {
     #[must_use]
     pub fn with_human_input(mut self, provider: Arc<dyn HumanInputProvider>) -> Self {
         self.human_input = Some(provider);
+        self
+    }
+
+    /// Sets what strips secrets out of text the tool publishes.
+    #[must_use]
+    pub fn with_redactor(mut self, redactor: Arc<dyn Redactor>) -> Self {
+        self.redactor = redactor;
+        self
+    }
+
+    /// Sets which model answers a `web_fetch` prompt about a page.
+    #[must_use]
+    pub fn with_web_fetch_summarizer(mut self, summarizer: Arc<WebFetchSummarizer>) -> Self {
+        self.web_fetch_summarizer = Some(summarizer);
         self
     }
 
@@ -277,9 +308,11 @@ impl ToolDefinitionWithSource {
 
 /// The tools one session exposes.
 ///
-/// A session builder fills a registry, freezes it, and hands it to the
-/// session, which only reads it. Registration is therefore a build-time
-/// activity: nothing is added or removed while a run is in flight.
+/// A session builder fills a registry and hands it to the session, which adds
+/// one last tool while it initializes — the skill tool, whose skills are
+/// discovered rather than configured — and only reads it afterwards.
+/// Registration is therefore a setup activity: nothing is added or removed
+/// while a run is in flight.
 pub struct ToolRegistry {
     tools:      HashMap<String, RegisteredTool>,
     /// The naming scheme applied to built-in tools as they are registered.
@@ -475,8 +508,37 @@ pub(crate) fn required_str<'a>(arguments: &'a Value, key: &str) -> StdResult<&'a
         .ok_or_else(|| ToolError::invalid_arguments(format!("Missing required parameter: {key}")))
 }
 
+/// One optional counting argument, or the error the model is given instead.
+///
+/// An argument that is absent, negative, or not a number at all is `None`, so
+/// a tool falls back to its own default rather than refusing the call. A
+/// number too large for this machine is refused, because silently clamping a
+/// line offset would answer a question the model did not ask.
+///
+/// # Errors
+///
+/// Returns a [`ToolError`] of kind
+/// [`InvalidArguments`](crate::ToolErrorKind::InvalidArguments) when `key`
+/// holds a number this platform cannot hold.
+pub(crate) fn optional_usize_arg(
+    arguments: &Value,
+    key: &str,
+) -> StdResult<Option<usize>, ToolError> {
+    arguments
+        .get(key)
+        .and_then(Value::as_u64)
+        .map(|value| {
+            usize::try_from(value).map_err(|_| {
+                ToolError::invalid_arguments(format!("Parameter {key} is too large: {value}"))
+            })
+        })
+        .transpose()
+}
+
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+
     use serde_json::json;
 
     use super::*;
@@ -975,5 +1037,68 @@ mod tests {
 
         let context = context().with_human_input(Arc::new(Silent));
         assert!(context.human_input.is_some());
+    }
+
+    #[test]
+    fn a_context_redacts_nothing_until_it_is_given_a_redactor() {
+        struct MaskAll;
+
+        impl Redactor for MaskAll {
+            fn redact<'a>(&self, _text: &'a str) -> Cow<'a, str> {
+                Cow::Borrowed("[REDACTED]")
+            }
+        }
+
+        assert_eq!(context().redactor.redact("token abc"), "token abc");
+        assert_eq!(
+            context()
+                .with_redactor(Arc::new(MaskAll))
+                .redactor
+                .redact("token abc"),
+            "[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn a_required_string_argument_is_asked_for_by_name() {
+        let arguments = json!({"file_path": "/a.txt", "limit": 3});
+
+        assert_eq!(
+            required_str(&arguments, "file_path").expect("the argument is there"),
+            "/a.txt"
+        );
+        let missing = required_str(&arguments, "old_string").expect_err("the argument is absent");
+        assert_eq!(missing.kind(), ToolErrorKind::InvalidArguments);
+        assert_eq!(missing.message(), "Missing required parameter: old_string");
+        // A value of the wrong type is missing as far as the tool is
+        // concerned: it cannot use it either way.
+        assert_eq!(
+            required_str(&arguments, "limit")
+                .expect_err("the argument is not a string")
+                .message(),
+            "Missing required parameter: limit"
+        );
+    }
+
+    #[test]
+    fn an_optional_count_falls_back_rather_than_refusing_the_call() {
+        let arguments = json!({
+            "limit": 12,
+            "negative": -1,
+            "fractional": 1.5,
+            "text": "12",
+        });
+
+        assert_eq!(
+            optional_usize_arg(&arguments, "limit").expect("a whole number"),
+            Some(12)
+        );
+        for key in ["absent", "negative", "fractional", "text"] {
+            assert_eq!(
+                optional_usize_arg(&arguments, key).expect("nothing to refuse"),
+                None,
+                "{key} is not a count, so the tool uses its own default"
+            );
+        }
     }
 }

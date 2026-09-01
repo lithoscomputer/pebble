@@ -1,0 +1,76 @@
+---
+source: src/session/loop_tests/profiles.rs
+expression: rendered
+---
+nothing configured:
+  Bash
+  Edit
+  FetchURL
+  Glob
+  Grep
+  Read
+  TodoList
+  Write
+search:
+  Bash
+  Edit
+  FetchURL
+  Glob
+  Grep
+  Read
+  TodoList
+  WebSearch
+  Write
+subagents:
+  Bash
+  Edit
+  FetchURL
+  Glob
+  Grep
+  Read
+  TodoList
+  Write
+  close_agent
+  send_input
+  spawn_agent
+  wait
+search + subagents (also what a child is shown):
+  Bash
+  Edit
+  FetchURL
+  Glob
+  Grep
+  Read
+  TodoList
+  WebSearch
+  Write
+  close_agent
+  send_input
+  spawn_agent
+  wait
+a skill was discovered:
+  Bash
+  Edit
+  FetchURL
+  Glob
+  Grep
+  Read
+  Skill
+  TodoList
+  Write
+everything, root only:
+  AskUserQuestion
+  Bash
+  Edit
+  FetchURL
+  Glob
+  Grep
+  Read
+  Skill
+  TodoList
+  WebSearch
+  Write
+  close_agent
+  send_input
+  spawn_agent
+  wait

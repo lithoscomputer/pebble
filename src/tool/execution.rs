@@ -39,6 +39,8 @@ use crate::config::{SessionOptions, ToolHookDecision};
 use crate::environment::Environment;
 use crate::event::{Emitter, OutputCaptureStats, SessionBoundEmitter};
 use crate::human_input::{HumanInputProvider, is_question_tool};
+use crate::redact::Redactor;
+use crate::tools::WebFetchSummarizer;
 use crate::truncation::{
     OutputBudgets, ToolOutputLimits, preview_tool_output, serialized_json_bytes,
     truncate_tool_output,
@@ -66,14 +68,16 @@ const CANCELLED: &str = "Cancelled";
 /// optional seams with the `with_*` methods.
 #[derive(Clone, Copy)]
 pub struct ToolDispatch<'a> {
-    registry:          &'a ToolRegistry,
-    env:               &'a Arc<dyn Environment>,
-    config:            &'a SessionOptions,
-    emitter:           &'a Emitter,
-    session_id:        &'a str,
-    root_session_id:   &'a str,
-    tool_env_provider: Option<&'a Arc<dyn ToolEnvProvider>>,
-    human_input:       Option<&'a Arc<dyn HumanInputProvider>>,
+    registry:             &'a ToolRegistry,
+    env:                  &'a Arc<dyn Environment>,
+    config:               &'a SessionOptions,
+    emitter:              &'a Emitter,
+    session_id:           &'a str,
+    root_session_id:      &'a str,
+    tool_env_provider:    Option<&'a Arc<dyn ToolEnvProvider>>,
+    human_input:          Option<&'a Arc<dyn HumanInputProvider>>,
+    redactor:             Option<&'a Arc<dyn Redactor>>,
+    web_fetch_summarizer: Option<&'a Arc<WebFetchSummarizer>>,
 }
 
 impl<'a> ToolDispatch<'a> {
@@ -100,6 +104,8 @@ impl<'a> ToolDispatch<'a> {
             root_session_id,
             tool_env_provider: None,
             human_input: None,
+            redactor: None,
+            web_fetch_summarizer: None,
         }
     }
 
@@ -117,6 +123,23 @@ impl<'a> ToolDispatch<'a> {
     #[must_use]
     pub fn with_human_input(mut self, provider: &'a Arc<dyn HumanInputProvider>) -> Self {
         self.human_input = Some(provider);
+        self
+    }
+
+    /// Sets what strips secrets out of text a tool publishes.
+    ///
+    /// Without one, process output reaches the event stream exactly as the
+    /// process wrote it.
+    #[must_use]
+    pub fn with_redactor(mut self, redactor: &'a Arc<dyn Redactor>) -> Self {
+        self.redactor = Some(redactor);
+        self
+    }
+
+    /// Sets which model answers a `web_fetch` prompt about a page.
+    #[must_use]
+    pub fn with_web_fetch_summarizer(mut self, summarizer: &'a Arc<WebFetchSummarizer>) -> Self {
+        self.web_fetch_summarizer = Some(summarizer);
         self
     }
 
@@ -328,6 +351,12 @@ impl<'a> ToolDispatch<'a> {
         }
         if let Some(provider) = self.human_input {
             context = context.with_human_input(Arc::clone(provider));
+        }
+        if let Some(redactor) = self.redactor {
+            context = context.with_redactor(Arc::clone(redactor));
+        }
+        if let Some(summarizer) = self.web_fetch_summarizer {
+            context = context.with_web_fetch_summarizer(Arc::clone(summarizer));
         }
 
         let (result, error_kind) = match (tool.executor)(call.arguments.clone(), context).await {
