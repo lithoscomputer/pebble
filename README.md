@@ -105,7 +105,10 @@ behind the `test-util` feature.
 
 **Somewhere for the events to go, if they matter.** `Session::subscribe` hands
 out a bounded broadcast receiver, which is lossy for a reader that falls
-behind: right for a terminal, wrong for a ledger. An application that must see
+behind: right for a terminal, wrong for a ledger. The stream ends with the
+session rather than with the session value: once `Session::shutdown` has
+returned, a reader looping until `RecvError::Closed` finishes, so a renderer
+task can be joined before the session is dropped. An application that must see
 every event installs an `EventSink` instead — each event is recorded there, in
 sequence, before any subscriber sees it, and a sink that refuses one stops the
 run, because a session that cannot record what it did is worse than one that

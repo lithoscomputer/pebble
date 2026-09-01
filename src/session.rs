@@ -49,6 +49,11 @@
 //! the timer watching it. Both are joined — never abandoned — by
 //! [`Session::shutdown`] and by the end of a run, so a failure inside either is
 //! reported rather than lost. The application owns the Tokio runtime.
+//!
+//! Joining the pump is also what ends every stream [`Session::subscribe`]
+//! handed out. A reader looping until `RecvError::Closed` therefore finishes
+//! once `shutdown` returns, with the session still alive, so an application
+//! can join its renderer before letting the session go.
 
 mod control;
 #[cfg(test)]
@@ -1224,6 +1229,13 @@ impl Session {
     /// The stream is lossy for a subscriber that falls behind; an application
     /// that must see everything configures
     /// [`SessionBuilder::event_sink`] instead.
+    ///
+    /// The stream ends with the session, not with the value: once
+    /// [`Session::shutdown`] has returned, the receiver reads out whatever it
+    /// still holds and then observes `RecvError::Closed`, with the session
+    /// still alive. So a reader that loops until the stream closes can be
+    /// joined before the session is dropped, which is the order an application
+    /// wants — the renderer's summary is the last thing printed.
     pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
         self.emitter.subscribe()
     }
@@ -1539,6 +1551,11 @@ impl Session {
     /// closed before this session publishes its own end, so a reader sees a
     /// tree unwind from the leaves.
     ///
+    /// Every stream [`Session::subscribe`] handed out ends by the time this
+    /// returns: joining the pump is what closes them, so a reader looping
+    /// until `RecvError::Closed` finishes without the session having to be
+    /// dropped first.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::EventSink`] when the configured sink had refused an
@@ -1735,7 +1752,9 @@ mod tests {
     use std::result::Result as StdResult;
 
     use async_trait::async_trait;
+    use tokio::sync::broadcast::error::RecvError;
     use tokio::task::yield_now;
+    use tokio::time::timeout;
 
     use super::testing::{TestProfile, TestSession, builder, event_names, settled};
     use super::*;
@@ -2055,6 +2074,45 @@ mod tests {
             1
         );
         assert_eq!(session.state(), SessionState::Closed);
+    }
+
+    #[tokio::test]
+    async fn shutting_down_ends_the_streams_the_session_handed_out() {
+        let mut session = session();
+        // The renderer an application writes: read the stream until it ends,
+        // then report. Nothing tells it to stop except the stream itself.
+        let mut events = session.subscribe();
+        let renderer = tokio::spawn(async move {
+            let mut seen = 0_usize;
+            loop {
+                match events.recv().await {
+                    Ok(_) => seen += 1,
+                    Err(RecvError::Lagged(_)) => {}
+                    Err(RecvError::Closed) => break,
+                }
+            }
+            seen
+        });
+        session.run("do a thing").await.expect("the run succeeds");
+
+        session
+            .shutdown(ShutdownReason::Completed)
+            .await
+            .expect("the shutdown succeeds");
+
+        let seen = timeout(Duration::from_secs(5), renderer)
+            .await
+            .expect("the stream ends when the session is shut down, not when it is dropped")
+            .expect("the renderer finishes");
+        assert!(seen > 0, "the renderer read the run it was watching");
+        // Read after the join on purpose: the session is still alive here,
+        // which is the order an application works in — wait for the renderer,
+        // then let the session go.
+        assert_eq!(session.state(), SessionState::Closed);
+        assert!(
+            matches!(session.subscribe().recv().await, Err(RecvError::Closed)),
+            "subscribing to a closed session answers with a stream that has ended"
+        );
     }
 
     /// A sink that records nothing, so the pump stops on the first event.

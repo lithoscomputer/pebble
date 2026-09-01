@@ -18,6 +18,14 @@
 //! subscriber that falls behind observes `RecvError::Lagged` instead of
 //! stalling the session. An application that must see every event configures
 //! an [`EventSink`].
+//!
+//! The stream ends with the pipeline rather than with the last handle. The
+//! pump owns the only broadcast sender; an [`Emitter`] holds a weak one, which
+//! publishes and subscribes but keeps nothing open. So once the pump has
+//! stopped and been joined, every live receiver reads out whatever it still
+//! holds and then observes `RecvError::Closed`, however many emitter clones
+//! are still alive. That is what lets a reader loop until `Closed` and end,
+//! and it is the guarantee [`crate::Session::shutdown`] rests on.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -248,10 +256,20 @@ impl From<usize> for EventCapacity {
 /// Cloning is cheap and every clone feeds the same pipeline. Emitting is
 /// synchronous and never blocks: the event is queued and the owning
 /// [`EventPump`] publishes it.
+///
+/// An emitter holds no half of the pipeline open. Once the pump has stopped,
+/// emitting from a clone that outlived it is inert and the live stream is
+/// closed — a tool task unwinding long after a session shut down changes
+/// nothing either way.
 #[derive(Clone, Debug)]
 pub struct Emitter {
     outbox:    mpsc::UnboundedSender<Queued>,
-    published: broadcast::Sender<SessionEvent>,
+    /// A weak handle to the broadcast side, upgraded only for the moment
+    /// [`Emitter::subscribe`] takes to hand out a receiver.
+    ///
+    /// Weak on purpose: the pump holds the one sender, so the live stream ends
+    /// when the pump is joined rather than when the last emitter is dropped.
+    published: broadcast::WeakSender<SessionEvent>,
     sequence:  Arc<EventSequence>,
 }
 
@@ -303,9 +321,18 @@ impl Emitter {
     ///
     /// The receiver observes only events published after this call, and misses
     /// events if it falls more than the configured capacity behind.
+    ///
+    /// It ends when the pipeline does: once the pump has stopped and been
+    /// joined, the receiver reads out whatever it still holds and then
+    /// observes `RecvError::Closed`. Subscribing after that answers with a
+    /// receiver that is closed from its first read, which is what a stream
+    /// nothing will ever publish to looks like.
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<SessionEvent> {
-        self.published.subscribe()
+        match self.published.upgrade() {
+            Some(published) => published.subscribe(),
+            None => ended_stream(),
+        }
     }
 
     /// The highest sequence number this session has claimed for an event.
@@ -354,11 +381,27 @@ impl Emitter {
     }
 }
 
+/// A receiver on a stream that has already ended.
+///
+/// What [`Emitter::subscribe`] answers with once the pump is gone, so a late
+/// subscriber gets the ordinary end of a stream on its first read rather than
+/// a receiver that never speaks.
+fn ended_stream() -> broadcast::Receiver<SessionEvent> {
+    let (sender, receiver) = broadcast::channel(1);
+    drop(sender);
+    receiver
+}
+
 /// The publishing half of one session's event pipeline.
 ///
 /// The session owns the pump and decides where it runs, normally by spawning
 /// [`EventPump::run`] and joining the handle at shutdown so a sink failure is
 /// reported rather than lost.
+///
+/// The pump holds the only broadcast sender, which is what makes joining it
+/// the end of the live stream: when the pump is dropped — as it is the moment
+/// [`EventPump::run`] returns — every subscriber drains what it holds and then
+/// observes `RecvError::Closed`.
 #[must_use = "a pipeline publishes nothing until its pump runs"]
 pub struct EventPump {
     inbox:     mpsc::UnboundedReceiver<Queued>,
@@ -383,6 +426,8 @@ impl EventPump {
     /// Creates one session's pipeline.
     ///
     /// The [`Emitter`] is cloned to every producer; the pump is driven once.
+    /// The pump keeps the sender and the emitter takes a weak handle, so the
+    /// live stream lasts exactly as long as the pump does.
     pub fn new(options: EventOptions) -> (Emitter, Self) {
         let EventOptions {
             capacity,
@@ -394,7 +439,7 @@ impl EventPump {
         let sequence = Arc::new(EventSequence::resuming_after(resume_after_seq));
         let emitter = Emitter {
             outbox,
-            published: published.clone(),
+            published: published.downgrade(),
             sequence: Arc::clone(&sequence),
         };
         let pump = Self {
@@ -544,7 +589,7 @@ impl SessionBoundEmitter {
 mod tests {
     use std::io;
 
-    use tokio::sync::broadcast::error::TryRecvError;
+    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
     use tokio::task::{JoinHandle, yield_now};
 
     use super::*;
@@ -762,8 +807,9 @@ mod tests {
 
         assert_eq!(receiver.recv().await.unwrap().seq, 1);
         assert!(
-            matches!(receiver.try_recv(), Err(TryRecvError::Empty)),
-            "the refused event never reaches subscribers"
+            matches!(receiver.try_recv(), Err(TryRecvError::Closed)),
+            "the refused event never reaches subscribers, and the stream ends \
+             with the pump that stopped for it"
         );
     }
 
@@ -817,6 +863,31 @@ mod tests {
         assert!(
             emitter.is_closed(),
             "a stopped pump leaves its emitters closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_joined_pump_ends_the_stream_though_its_emitters_live_on() {
+        let (emitter, pump) = pipeline();
+        let mut receiver = emitter.subscribe();
+        let held = emitter.clone();
+
+        emitter.emit("ses_1", AgentEvent::LoopDetected);
+        emitter.close();
+        pump.await.unwrap().unwrap();
+
+        assert_eq!(
+            receiver.recv().await.unwrap().seq,
+            1,
+            "what was queued before the stop is still read out"
+        );
+        assert!(
+            matches!(receiver.recv().await, Err(RecvError::Closed)),
+            "two emitters are still alive and the stream has still ended"
+        );
+        assert!(
+            matches!(held.subscribe().recv().await, Err(RecvError::Closed)),
+            "subscribing after the pump has gone answers with an ended stream"
         );
     }
 

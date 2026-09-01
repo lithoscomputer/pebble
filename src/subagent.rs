@@ -1273,10 +1273,10 @@ impl SubagentSupervisor {
     ///
     /// It ends when its child's stream closes, or when `stop` says the child
     /// has been joined and everything it published is already in the buffer.
-    /// The token is what keeps a close cheap: the stream itself closes only
-    /// once every [`Emitter`](crate::Emitter) clone of the child is dropped,
-    /// and a shutdown that waited for that would pay the whole grace period
-    /// whenever anything still held one.
+    /// The token is what keeps a close cheap: a child's stream closes when the
+    /// child's own session is shut down, and a child that is merely finished
+    /// with this task is reused rather than closed, so a forwarder waiting for
+    /// the stream would sit out the whole grace period on every close.
     fn spawn_event_forwarder(
         &self,
         session: &Session,
@@ -4170,10 +4170,10 @@ mod tests {
     async fn closing_a_child_does_not_wait_out_the_grace_period() {
         let (parent, supervisor, children) = parent_over_recording_children(vec!["child result"]);
         let agent_id = spawn(&supervisor, &parent, "task");
-        // Anything holding a child's own supervisor holds the emitter behind
-        // it, so the child's stream stays open after the child is gone. The
-        // forwarder is told to stop rather than waited out, so a close costs
-        // nothing.
+        // The child's own supervisor is held here, so an emitter of the
+        // child's outlives the close. That holds nothing open — a stream ends
+        // with its pump — and the forwarder is told to stop rather than waited
+        // out, so a close costs nothing.
         let _child = first_child(&children);
         supervisor.wait(&agent_id).await.expect("the child answers");
 

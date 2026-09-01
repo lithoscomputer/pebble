@@ -13,6 +13,14 @@
 //! [`SessionControlHandle`] steers or interrupts a run already in progress, and
 //! [`Session::shutdown`] closes the session and joins everything it owns.
 //!
+//! [`Session::subscribe`] is how an application watches all of that happen. The
+//! stream it hands out is bounded and lossy for a reader that falls behind, and
+//! it ends when the session is shut down rather than when the session value is
+//! dropped: a reader looping until `RecvError::Closed` finishes once
+//! [`Session::shutdown`] has returned, so it can be joined before the session
+//! goes. An application that must see every event installs an [`EventSink`]
+//! instead.
+//!
 //! # Embedding pebble
 //!
 //! An application needs one dependency for all of this: `pebble`. What a

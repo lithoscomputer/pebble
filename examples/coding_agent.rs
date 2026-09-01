@@ -158,8 +158,11 @@ async fn run() -> Result<(), Box<dyn StdError>> {
     totals.add(&session);
     eprintln!("\nanswer: {}", answer.as_deref().unwrap_or("(no text)"));
 
-    // Closing publishes what is queued and joins everything the session owns,
-    // which is also what ends the renderer: the stream closes with the session.
+    // Closing publishes what is queued and joins everything the session owns.
+    // Joining the event pump is what ends the renderer: the stream closes when
+    // the session is shut down, not when the session value is dropped, so the
+    // renderer can be awaited here — while `session` is still alive — and its
+    // summary is the last thing printed.
     let turns = session.history().turns().len();
     session.shutdown(ShutdownReason::Completed).await?;
     let observed = renderer.await?;
@@ -365,12 +368,23 @@ struct Observed {
 /// The live stream is lossy for a subscriber that falls behind, which is what
 /// makes it right for a terminal and wrong for a ledger: an application that
 /// must see every event installs an `EventSink` instead.
+///
+/// Two things end this loop, and either one would do. `SessionEnded` is the
+/// session saying so on its own stream, and a closed stream is the same news
+/// from the pipeline: `Session::shutdown` joins the pump, and that is what
+/// closes every receiver `subscribe` handed out.
 async fn render_events(mut events: broadcast::Receiver<SessionEvent>) -> Observed {
     let mut observed = Observed::default();
     let mut streaming = false;
     loop {
         match events.recv().await {
-            Ok(event) => render(&event.event, &mut observed, &mut streaming),
+            Ok(event) => {
+                let ended = matches!(event.event, AgentEvent::SessionEnded);
+                render(&event.event, &mut observed, &mut streaming);
+                if ended {
+                    break;
+                }
+            }
             Err(RecvError::Lagged(dropped)) => {
                 observed.dropped += dropped;
                 eprintln!("[{dropped} events dropped: this reader fell behind]");
