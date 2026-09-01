@@ -60,7 +60,7 @@ const LOOP_WARNING: &str = "WARNING: Loop detected. You appear to be repeating t
                             calls. Please try a different approach or ask for clarification.";
 
 #[derive(Clone)]
-struct CodingAgentBridge {
+pub(super) struct CodingAgentBridge {
     state:                  Arc<Mutex<CodingAgentState>>,
     client:                 lithos_llm::Client,
     model_selector:         String,
@@ -72,7 +72,7 @@ struct CodingAgentBridge {
     registry:               ToolRegistry,
     env:                    Arc<dyn Environment>,
     human_input:            Option<Arc<dyn HumanInputProvider>>,
-    tool_env_provider:      Option<Arc<dyn ToolEnvProvider>>,
+    tool_env_provider:      Arc<Mutex<Option<Arc<dyn ToolEnvProvider>>>>,
     redactor:               Arc<dyn Redactor>,
     emitter:                Emitter,
     session_id:             String,
@@ -82,7 +82,7 @@ struct CodingAgentBridge {
     control_state:          Arc<Mutex<super::control::ControlState>>,
     control_notify:         Arc<Notify>,
     terminal_cancel:        CancellationToken,
-    completion_coordinator: Option<Arc<dyn super::CompletionCoordinator>>,
+    completion_coordinator: Arc<Mutex<Option<Arc<dyn super::CompletionCoordinator>>>>,
     followup_queue:         Arc<Mutex<VecDeque<String>>>,
     subagents:              Option<SubagentSupervisor>,
     skills:                 Vec<Skill>,
@@ -101,12 +101,12 @@ struct CodingAgentState {
 }
 
 impl CodingAgentBridge {
-    fn from_session(session: &mut Session, totals: &mut PromptTotals) -> Self {
+    fn from_session(session: &mut Session) -> Self {
         Self {
             state:                  Arc::new(Mutex::new(CodingAgentState {
                 history: mem::take(&mut session.history),
                 file_tracker: mem::take(&mut session.file_tracker),
-                totals: mem::take(totals),
+                totals: PromptTotals::default(),
                 activated_skill_context_observed: session.activated_skill_context_observed,
                 compaction_failed: false,
                 pending_task_reminder: None,
@@ -124,7 +124,7 @@ impl CodingAgentBridge {
             registry:               session.registry.clone(),
             env:                    Arc::clone(&session.env),
             human_input:            session.human_input.clone(),
-            tool_env_provider:      session.tool_env_provider.clone(),
+            tool_env_provider:      Arc::new(Mutex::new(session.tool_env_provider.clone())),
             redactor:               Arc::clone(&session.redactor),
             emitter:                session.emitter.clone(),
             session_id:             session.id.clone(),
@@ -134,20 +134,47 @@ impl CodingAgentBridge {
             control_state:          Arc::clone(&session.control_state),
             control_notify:         Arc::clone(&session.control_notify),
             terminal_cancel:        session.cancel_token.clone(),
-            completion_coordinator: session.completion_coordinator.clone(),
+            completion_coordinator: Arc::new(Mutex::new(session.completion_coordinator.clone())),
             followup_queue:         Arc::clone(&session.followup_queue),
             subagents:              session.subagents.clone(),
             skills:                 session.skills.clone(),
         }
     }
 
-    fn restore_session(&self, session: &mut Session, totals: &mut PromptTotals) {
+    fn begin_prompt(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.totals = PromptTotals::default();
+        state.compaction_failed = false;
+        state.pending_task_reminder = None;
+        state.local_context_window = None;
+        state.inference_start = None;
+        state.boundary_error = None;
+    }
+
+    fn restore_session(&self, session: &mut Session) {
         self.finish_inference();
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         session.history = state.history.clone();
         session.file_tracker = state.file_tracker.clone();
         session.activated_skill_context_observed = state.activated_skill_context_observed;
-        *totals = state.totals;
+        session.last_prompt = state.totals;
+    }
+
+    pub(super) fn set_tool_env_provider(&self, provider: Arc<dyn ToolEnvProvider>) {
+        *self
+            .tool_env_provider
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(provider);
+    }
+
+    pub(super) fn set_completion_coordinator(
+        &self,
+        coordinator: Arc<dyn super::CompletionCoordinator>,
+    ) {
+        *self
+            .completion_coordinator
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(coordinator);
     }
 
     fn take_boundary_error(&self) -> Option<Error> {
@@ -517,7 +544,12 @@ impl ToolRoundExecutor for CodingAgentBridge {
             &self.session_id,
             &self.root_session_id,
         );
-        if let Some(provider) = self.tool_env_provider.as_ref() {
+        let tool_env_provider = self
+            .tool_env_provider
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(provider) = tool_env_provider.as_ref() {
             dispatch = dispatch.with_tool_env_provider(provider);
         }
         if let Some(provider) = self.human_input.as_ref() {
@@ -611,8 +643,12 @@ impl TurnBoundaryHooks for CodingAgentBridge {
         _response: &Response,
         cancel: &CancellationToken,
     ) -> StdResult<TurnBoundaryAction, TurnBoundaryError> {
-        if self
+        let completion_coordinator = self
             .completion_coordinator
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if completion_coordinator
             .as_ref()
             .is_some_and(|coordinator| coordinator.on_natural_completion())
         {
@@ -698,7 +734,6 @@ impl Session {
         &mut self,
         input: &str,
         skill_expansion: SkillExpansion,
-        totals: &mut PromptTotals,
     ) -> Result<Option<String>> {
         if self.state == SessionState::Closed {
             return Err(Error::SessionClosed);
@@ -715,7 +750,50 @@ impl Session {
             });
         }
 
-        let bridge = CodingAgentBridge::from_session(self, totals);
+        self.ensure_coding_agent()?;
+        let bridge = self
+            .coding_bridge
+            .clone()
+            .ok_or_else(|| Error::InvalidState("the coding bridge was not built".to_owned()))?;
+        bridge.begin_prompt();
+        let mut agent = self
+            .coding_agent
+            .take()
+            .ok_or_else(|| Error::InvalidState("the coding agent was not built".to_owned()))?;
+
+        self.install_agent_control(agent.control_handle());
+        let result = agent
+            .prompt_with_cancellation(expanded.text, &self.cancel_token)
+            .await;
+        self.clear_agent_control();
+        self.coding_agent = Some(agent);
+        bridge.restore_session(self);
+        if let Some(error) = bridge.take_boundary_error() {
+            return Err(error);
+        }
+
+        match result {
+            Ok(outcome) => {
+                let text = outcome.text();
+                Ok((!text.trim().is_empty()).then_some(text))
+            }
+            Err(AgentError::Aborted) => Err(self.close_cancelled().await),
+            Err(AgentError::Model { source }) => Err(self.emit_llm_error(source)),
+            Err(error) => {
+                self.check_pump().await?;
+                Err(Error::InvalidState(format!(
+                    "the coding agent could not process the prompt: {error}"
+                )))
+            }
+        }
+    }
+
+    fn ensure_coding_agent(&mut self) -> Result<()> {
+        if self.coding_agent.is_some() {
+            return Ok(());
+        }
+
+        let bridge = CodingAgentBridge::from_session(self);
         let model_service = CodingModelService {
             client:     self.client.clone(),
             emitter:    self.emitter.clone(),
@@ -737,7 +815,7 @@ impl Session {
             max_turn_replays: STREAM_CONSUME_RETRIES,
             ..AgentConfig::default()
         };
-        let mut agent = Agent::builder(model_service, self.model_selector.clone())
+        let agent = Agent::builder(model_service, self.model_selector.clone())
             .system_prompt(self.system_prompt.clone())
             .messages(messages)
             .tool_provider(Arc::new(bridge.clone()))
@@ -748,30 +826,9 @@ impl Session {
             .build()
             .map_err(|error| Error::InvalidState(format!("building the coding agent: {error}")))?;
 
-        self.install_agent_control(agent.control_handle());
-        let result = agent
-            .prompt_with_cancellation(expanded.text, &self.cancel_token)
-            .await;
-        self.clear_agent_control();
-        bridge.restore_session(self, totals);
-        if let Some(error) = bridge.take_boundary_error() {
-            return Err(error);
-        }
-
-        match result {
-            Ok(outcome) => {
-                let text = outcome.text();
-                Ok((!text.trim().is_empty()).then_some(text))
-            }
-            Err(AgentError::Aborted) => Err(self.close_cancelled().await),
-            Err(AgentError::Model { source }) => Err(self.emit_llm_error(source)),
-            Err(error) => {
-                self.check_pump().await?;
-                Err(Error::InvalidState(format!(
-                    "the coding agent could not process the prompt: {error}"
-                )))
-            }
-        }
+        self.coding_bridge = Some(bridge);
+        self.coding_agent = Some(agent);
+        Ok(())
     }
 
     fn install_agent_control(&self, agent: pebble_agent::AgentControlHandle) {

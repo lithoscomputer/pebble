@@ -77,7 +77,7 @@ use lithos_llm::types::{
     Error as LlmError, ErrorKind as LlmErrorKind, ReasoningEffort, Request, RequestBuildError,
     Speed,
 };
-use pebble_agent::AgentControlHandle;
+use pebble_agent::{Agent, AgentControlHandle};
 use serde::Deserialize;
 use tokio::sync::{Notify, broadcast};
 use tokio::task::JoinHandle;
@@ -90,6 +90,7 @@ pub use self::control::{
     CompletionCoordinator, SessionControlHandle, SteeringItem, SteeringMessage,
 };
 pub use self::retry::RetryEventObserver;
+use self::turn::CodingAgentBridge;
 use crate::config::CodingSessionOptions;
 use crate::context_window::{memory_prompt_tokens, skills_prompt_tokens};
 use crate::environment::{Environment, ExecRequest};
@@ -639,6 +640,8 @@ impl SessionBuilder {
             subagents: supervisor,
             completion_coordinator: None,
             last_prompt: PromptTotals::default(),
+            coding_agent: None,
+            coding_bridge: None,
         };
 
         // Wired here rather than by the application: a supervisor with no
@@ -840,6 +843,11 @@ pub struct Session {
     subagents: Option<SubagentSupervisor>,
     completion_coordinator: Option<Arc<dyn CompletionCoordinator>>,
     last_prompt: PromptTotals,
+    /// The provider-neutral conversation loop, created after initialization on
+    /// the first prompt and retained for the rest of the session.
+    coding_agent: Option<Agent>,
+    /// Coding state and durable projection shared with `coding_agent`.
+    coding_bridge: Option<CodingAgentBridge>,
 }
 
 impl fmt::Debug for Session {
@@ -1247,7 +1255,10 @@ impl Session {
     /// Installs the coordinator that decides whether a finished turn really
     /// ends the prompt.
     pub fn set_completion_coordinator(&mut self, coordinator: Arc<dyn CompletionCoordinator>) {
-        self.completion_coordinator = Some(coordinator);
+        self.completion_coordinator = Some(Arc::clone(&coordinator));
+        if let Some(bridge) = &self.coding_bridge {
+            bridge.set_completion_coordinator(coordinator);
+        }
     }
 
     /// Queues more input to process once the current input is finished.
@@ -1337,17 +1348,26 @@ impl Session {
     /// Changes how hard the model is asked to think, from the next round on.
     pub fn set_reasoning_effort(&mut self, effort: Option<ReasoningEffort>) {
         self.config.reasoning_effort = effort;
+        if let Some(agent) = &mut self.coding_agent {
+            agent.set_reasoning_effort(effort);
+        }
     }
 
     /// Changes which latency or cost tier the session asks for, from the next
     /// round on.
     pub fn set_speed(&mut self, speed: Option<Speed>) {
         self.config.speed = speed;
+        if let Some(agent) = &mut self.coding_agent {
+            agent.set_speed(speed);
+        }
     }
 
     /// Changes where a tool call's extra environment variables come from.
     pub fn set_tool_env_provider(&mut self, provider: Arc<dyn ToolEnvProvider>) {
-        self.tool_env_provider = Some(provider);
+        self.tool_env_provider = Some(Arc::clone(&provider));
+        if let Some(bridge) = &self.coding_bridge {
+            bridge.set_tool_env_provider(provider);
+        }
     }
 
     /// Sets fixed extra environment variables for every tool call.
@@ -1373,11 +1393,7 @@ impl Session {
         }
 
         let timer = self.start_wall_clock_timer();
-        let mut totals = PromptTotals::default();
-
-        let result = self
-            .process_input(input, SkillExpansion::Apply, &mut totals)
-            .await;
+        let result = self.process_input(input, SkillExpansion::Apply).await;
 
         let mut task_failure = stop_wall_clock_timer(timer).await;
 
@@ -1399,8 +1415,6 @@ impl Session {
                 task_failure = task_failure.or(Some(error));
             }
         }
-
-        self.last_prompt = totals;
 
         match (result, task_failure) {
             // The prompt's own failure is the story; a task that also failed on
@@ -1466,6 +1480,9 @@ impl Session {
         self.transition(SessionState::Closed);
         if let Some(supervisor) = &self.subagents {
             supervisor.shutdown_all().await;
+        }
+        if let Some(agent) = &mut self.coding_agent {
+            let _ = agent.shutdown();
         }
         self.ended = true;
         self.emit(CodingEvent::SessionEnded);

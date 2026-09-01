@@ -441,6 +441,16 @@ impl Agent {
         }
     }
 
+    /// Changes the reasoning effort used by later model turns.
+    pub fn set_reasoning_effort(&mut self, effort: Option<ReasoningEffort>) {
+        self.config.reasoning_effort = effort;
+    }
+
+    /// Changes the latency or cost tier used by later model turns.
+    pub fn set_speed(&mut self, speed: Option<Speed>) {
+        self.config.speed = speed;
+    }
+
     /// Clears conversation history and queued input while the agent is idle.
     ///
     /// Returns `false` while a prompt is active or after shutdown.
