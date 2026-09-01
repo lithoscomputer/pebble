@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lithos_llm::types::{ContentPart, ToolCall, ToolDefinition, ToolResult};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -90,6 +91,48 @@ pub struct ToolCallContext<'a> {
     call: &'a ToolCall,
 }
 
+/// Why a tool call failed.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum ToolErrorKind {
+    /// The call arguments did not match the tool schema.
+    InvalidArguments,
+    /// The tool refused the call after the round allowed execution.
+    Denied,
+    /// The call was cancelled before it completed.
+    Cancelled,
+    /// No resolved tool matched the requested name.
+    Unavailable,
+    /// The tool ran and returned an error.
+    Execution,
+}
+
+/// The completed result supplied to an after-call hook.
+#[derive(Clone, Copy, Debug)]
+pub struct ToolCallOutcome<'a> {
+    result:     &'a ToolResult,
+    error_kind: Option<ToolErrorKind>,
+}
+
+impl<'a> ToolCallOutcome<'a> {
+    pub(crate) const fn new(result: &'a ToolResult, error_kind: Option<ToolErrorKind>) -> Self {
+        Self { result, error_kind }
+    }
+
+    /// The result committed to conversation history.
+    #[must_use]
+    pub const fn result(&self) -> &ToolResult {
+        self.result
+    }
+
+    /// Why the call failed, or `None` when it succeeded.
+    #[must_use]
+    pub const fn error_kind(&self) -> Option<ToolErrorKind> {
+        self.error_kind
+    }
+}
+
 impl<'a> ToolCallContext<'a> {
     pub(crate) const fn new(turn: usize, call: &'a ToolCall) -> Self {
         Self { turn, call }
@@ -142,18 +185,32 @@ pub trait ToolCallHooks: Send + Sync {
     async fn after_tool_call(
         &self,
         _context: ToolCallContext<'_>,
-        _result: &ToolResult,
+        _outcome: ToolCallOutcome<'_>,
         _cancel: &CancellationToken,
     ) {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ToolRoundAccess {
+    name:   String,
+    access: ToolAccess,
+}
+
+impl ToolRoundAccess {
+    pub(crate) fn new(name: String, access: ToolAccess) -> Self {
+        Self { name, access }
+    }
+}
+
 /// The input to a custom executor for one complete tool round.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy)]
 pub struct ToolRoundContext<'a> {
-    turn:  usize,
-    calls: &'a [ToolCall],
-    tools: &'a [ToolDefinition],
+    turn:       usize,
+    calls:      &'a [ToolCall],
+    tools:      &'a [ToolDefinition],
+    access:     &'a [ToolRoundAccess],
+    tool_hooks: Option<&'a dyn ToolCallHooks>,
 }
 
 impl<'a> ToolRoundContext<'a> {
@@ -161,8 +218,16 @@ impl<'a> ToolRoundContext<'a> {
         turn: usize,
         calls: &'a [ToolCall],
         tools: &'a [ToolDefinition],
+        access: &'a [ToolRoundAccess],
+        tool_hooks: Option<&'a dyn ToolCallHooks>,
     ) -> Self {
-        Self { turn, calls, tools }
+        Self {
+            turn,
+            calls,
+            tools,
+            access,
+            tool_hooks,
+        }
     }
 
     /// The zero-based model turn that requested these calls.
@@ -182,13 +247,74 @@ impl<'a> ToolRoundContext<'a> {
     pub const fn tools(&self) -> &[ToolDefinition] {
         self.tools
     }
+
+    /// Returns the access decision already made for a requested tool.
+    ///
+    /// A call for an unknown name is allowed through this gate so the round
+    /// executor can return its normal unavailable-tool result.
+    #[must_use]
+    pub fn access_for_call(&self, call: &ToolCall) -> ToolAccess {
+        self.access
+            .iter()
+            .find(|entry| entry.name == call.name)
+            .map_or_else(ToolAccess::default, |entry| entry.access.clone())
+    }
+
+    /// Runs the configured before-call hook for `call`.
+    pub async fn before_tool_call(
+        &self,
+        call: &ToolCall,
+        cancel: &CancellationToken,
+    ) -> BeforeToolCall {
+        match self.tool_hooks {
+            Some(hooks) => {
+                hooks
+                    .before_tool_call(ToolCallContext::new(self.turn, call), cancel)
+                    .await
+            }
+            None => BeforeToolCall::Proceed,
+        }
+    }
+
+    /// Runs the configured after-call hook for `call`.
+    pub async fn after_tool_call(
+        &self,
+        call: &ToolCall,
+        result: &ToolResult,
+        error_kind: Option<ToolErrorKind>,
+        cancel: &CancellationToken,
+    ) {
+        if let Some(hooks) = self.tool_hooks {
+            hooks
+                .after_tool_call(
+                    ToolCallContext::new(self.turn, call),
+                    ToolCallOutcome::new(result, error_kind),
+                    cancel,
+                )
+                .await;
+        }
+    }
+}
+
+impl fmt::Debug for ToolRoundContext<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolRoundContext")
+            .field("turn", &self.turn)
+            .field("calls", &self.calls)
+            .field("tools", &self.tools)
+            .field("has_tool_hooks", &self.tool_hooks.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Executes a complete tool round for a specialized agent layer.
 ///
 /// The executor returns exactly one result per call, in call order. It owns
-/// detailed tool events and any layer-specific output policy. The generic
-/// agent still commits the returned results before it observes cancellation.
+/// detailed tool events and any layer-specific output policy. It must apply
+/// [`ToolRoundContext::access_for_call`] and call the context's before and
+/// after hooks around every call it executes. The generic agent still commits
+/// the returned results before it observes cancellation.
 #[async_trait]
 pub trait ToolRoundExecutor: Send + Sync {
     /// Executes the round.

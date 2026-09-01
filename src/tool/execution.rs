@@ -27,7 +27,8 @@ use std::time::Instant;
 
 use futures_util::future::join_all;
 use lithos_llm::types::{ContentPart, ToolCall, ToolCallKind, ToolDefinitionKind, ToolResult};
-use pebble_agent::advanced::validate_tool_arguments;
+use pebble_agent as agent;
+use pebble_agent::advanced::{ToolRoundContext, validate_tool_arguments};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -148,26 +149,74 @@ impl<'a> ToolDispatch<'a> {
         parallel: bool,
         cancel: &CancellationToken,
     ) -> Vec<ToolResult> {
+        self.execute_with_agent_context(calls, parallel, cancel, None)
+            .await
+    }
+
+    /// Answers an agent-owned tool round through its resolved policy and
+    /// hooks.
+    pub(crate) async fn execute_agent_round(
+        &self,
+        context: ToolRoundContext<'_>,
+        cancel: &CancellationToken,
+    ) -> Vec<ToolResult> {
+        self.execute_with_agent_context(context.calls(), true, cancel, Some(context))
+            .await
+    }
+
+    async fn execute_with_agent_context(
+        &self,
+        calls: &[ToolCall],
+        parallel: bool,
+        cancel: &CancellationToken,
+        agent_context: Option<ToolRoundContext<'_>>,
+    ) -> Vec<ToolResult> {
         if calls.iter().any(|call| is_question_tool(&call.name)) {
-            return self.execute_question_round(calls, cancel).await;
+            return self
+                .execute_question_round(calls, cancel, agent_context)
+                .await;
         }
 
         if parallel && calls.len() > 1 {
-            self.execute_parallel(calls, cancel).await
+            self.execute_parallel(calls, cancel, agent_context).await
         } else {
-            self.execute_sequential(calls, cancel).await
+            self.execute_sequential(calls, cancel, agent_context).await
         }
     }
 
     /// Answers one call, publishing the same events a round would.
     pub async fn execute_one(&self, call: &ToolCall, cancel: CancellationToken) -> ToolResult {
+        self.execute_one_with_agent_context(call, cancel, None)
+            .await
+    }
+
+    async fn execute_one_with_agent_context(
+        &self,
+        call: &ToolCall,
+        cancel: CancellationToken,
+        agent_context: Option<ToolRoundContext<'_>>,
+    ) -> ToolResult {
         self.emit_started(call);
 
-        if let Some(reason) = self.config.tool_access_denial_reason(&call.name) {
+        let denial_reason = match agent_context {
+            Some(context) => match context.access_for_call(call) {
+                agent::ToolAccess::Allowed => None,
+                agent::ToolAccess::Denied { reason } => Some(reason),
+                _ => Some(format!("{} tool denied by agent access policy", call.name)),
+            },
+            None => self.config.tool_access_denial_reason(&call.name),
+        };
+        if let Some(reason) = denial_reason {
             return self.finish_error(call, &ToolError::denied(reason));
         }
 
-        if let Some(hooks) = self.config.tool_hooks.as_ref() {
+        if let Some(context) = agent_context {
+            if let agent::BeforeToolCall::Block { reason } =
+                context.before_tool_call(call, &cancel).await
+            {
+                return self.finish_error(call, &ToolError::denied(reason));
+            }
+        } else if let Some(hooks) = self.config.tool_hooks.as_ref() {
             debug!(tool = %call.name, hook_event = "pre_tool_use", "Calling tool hook");
             let started = Instant::now();
             let decision = hooks.pre_tool_use(&call.name, &call.arguments).await;
@@ -186,7 +235,7 @@ impl<'a> ToolDispatch<'a> {
         }
 
         let executed = self
-            .run_tool(call, self.registry.get(&call.name), cancel)
+            .run_tool(call, self.registry.get(&call.name), cancel.clone())
             .await;
         let error_kind = executed.error_kind;
         let retained = self.retain(executed.result, executed.output_stats);
@@ -194,7 +243,11 @@ impl<'a> ToolDispatch<'a> {
 
         self.emit_result(call, &result, retained.output_stats, error_kind);
 
-        if let Some(hooks) = self.config.tool_hooks.as_ref() {
+        if let Some(context) = agent_context {
+            context
+                .after_tool_call(call, &result, error_kind, &cancel)
+                .await;
+        } else if let Some(hooks) = self.config.tool_hooks.as_ref() {
             let content = result_text(&result);
             if result.is_error {
                 debug!(tool = %call.name, hook_event = "post_tool_use_failure", "Calling tool hook");
@@ -223,6 +276,7 @@ impl<'a> ToolDispatch<'a> {
         &self,
         calls: &[ToolCall],
         cancel: &CancellationToken,
+        agent_context: Option<ToolRoundContext<'_>>,
     ) -> Vec<ToolResult> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
@@ -230,7 +284,10 @@ impl<'a> ToolDispatch<'a> {
                 results.push(cancelled_result(call));
                 continue;
             }
-            results.push(self.execute_one(call, cancel.child_token()).await);
+            results.push(
+                self.execute_one_with_agent_context(call, cancel.child_token(), agent_context)
+                    .await,
+            );
         }
         results
     }
@@ -239,12 +296,11 @@ impl<'a> ToolDispatch<'a> {
         &self,
         calls: &[ToolCall],
         cancel: &CancellationToken,
+        agent_context: Option<ToolRoundContext<'_>>,
     ) -> Vec<ToolResult> {
-        join_all(
-            calls
-                .iter()
-                .map(|call| self.execute_one(call, cancel.child_token())),
-        )
+        join_all(calls.iter().map(|call| {
+            self.execute_one_with_agent_context(call, cancel.child_token(), agent_context)
+        }))
         .await
     }
 
@@ -257,6 +313,7 @@ impl<'a> ToolDispatch<'a> {
         &self,
         calls: &[ToolCall],
         cancel: &CancellationToken,
+        agent_context: Option<ToolRoundContext<'_>>,
     ) -> Vec<ToolResult> {
         let first_question = calls.iter().position(|call| is_question_tool(&call.name));
         let mut results = Vec::with_capacity(calls.len());
@@ -268,7 +325,8 @@ impl<'a> ToolDispatch<'a> {
             }
 
             let result = if Some(index) == first_question {
-                self.execute_one(call, cancel.child_token()).await
+                self.execute_one_with_agent_context(call, cancel.child_token(), agent_context)
+                    .await
             } else if is_question_tool(&call.name) {
                 self.refuse(call, &ToolError::denied(ONE_QUESTION_PER_ROUND))
             } else {

@@ -10,9 +10,13 @@ use serde_json::{Value, json};
 
 use super::super::testing::wait_for_event;
 use super::*;
-use crate::config::{ToolAccess, ToolAccessPolicy, ToolApprovalAdapter, ToolExposureMode};
+use crate::config::{
+    ToolAccess, ToolAccessPolicy, ToolApprovalAdapter, ToolExposureMode, ToolHookCallback,
+    ToolHookDecision,
+};
 use crate::task_reminder::TASK_REMINDER_TEXT;
 use crate::test_support::message_text;
+use crate::types::ToolErrorKind;
 
 /// A policy that answers from a table and denies whatever it does not know.
 struct NamedToolAccessPolicy {
@@ -329,6 +333,68 @@ async fn the_approval_hook_sees_the_call_the_model_asked_for() {
     let (name, arguments) = seen.as_ref().expect("the hook was called");
     assert_eq!(name, "echo");
     assert_eq!(arguments, &json!({"text": "world"}));
+}
+
+struct RecordingToolHooks {
+    entries: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait::async_trait]
+impl ToolHookCallback for RecordingToolHooks {
+    async fn pre_tool_use(&self, tool_name: &str, _tool_input: &Value) -> ToolHookDecision {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(format!("before {tool_name}"));
+        ToolHookDecision::Proceed
+    }
+
+    async fn post_tool_use(&self, tool_name: &str, tool_call_id: &str, tool_output: &str) {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(format!("after {tool_name} {tool_call_id} {tool_output}"));
+    }
+
+    async fn post_tool_use_failure(
+        &self,
+        tool_name: &str,
+        tool_call_id: &str,
+        error: &str,
+        error_kind: ToolErrorKind,
+    ) {
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(format!(
+                "failed {tool_name} {tool_call_id} {error_kind:?} {error}"
+            ));
+    }
+}
+
+#[tokio::test]
+async fn coding_tool_hooks_bracket_the_agent_owned_round() {
+    let entries = Arc::new(Mutex::new(Vec::new()));
+    let (mut session, _provider) = TestSession::new(approval_calls())
+        .tools([echo_tool()])
+        .options(CodingSessionOptions {
+            tool_hooks: Some(Arc::new(RecordingToolHooks {
+                entries: Arc::clone(&entries),
+            })),
+            ..CodingSessionOptions::default()
+        })
+        .build();
+
+    session
+        .prompt("Use echo")
+        .await
+        .expect("the prompt succeeds");
+
+    let recorded = entries.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(recorded.as_slice(), [
+        "before echo",
+        "after echo call_1 echo: hello"
+    ]);
 }
 
 #[tokio::test]

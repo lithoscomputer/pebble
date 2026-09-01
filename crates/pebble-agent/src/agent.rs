@@ -22,7 +22,8 @@ use crate::event::{AgentEvent, EventHub, EventProjection, FirstOutputKind};
 use crate::model::ModelService;
 use crate::tool::{
     BeforeToolCall, Tool, ToolAccess, ToolAccessContext, ToolAccessPolicy, ToolCallContext,
-    ToolCallHooks, ToolContext, ToolProvider, ToolRoundContext, ToolRoundExecutor,
+    ToolCallHooks, ToolCallOutcome, ToolContext, ToolErrorKind, ToolProvider, ToolRoundAccess,
+    ToolRoundContext, ToolRoundExecutor,
 };
 use crate::turn::{TurnBoundaryAction, TurnBoundaryContext, TurnBoundaryHooks, TurnContext};
 use crate::validation::validate_tool_arguments;
@@ -775,10 +776,25 @@ impl Agent {
             .filter(|tool| tool.is_allowed())
             .map(|tool| tool.tool.definition().clone())
             .collect::<Vec<_>>();
+        let access = tools
+            .iter()
+            .map(|tool| {
+                ToolRoundAccess::new(tool.tool.definition().name.clone(), tool.access.clone())
+            })
+            .collect::<Vec<_>>();
         let running = async {
             if let Some(executor) = &self.tool_round {
                 return executor
-                    .execute_round(ToolRoundContext::new(turn, calls, &advertised), &cancel)
+                    .execute_round(
+                        ToolRoundContext::new(
+                            turn,
+                            calls,
+                            &advertised,
+                            &access,
+                            self.tool_hooks.as_deref(),
+                        ),
+                        &cancel,
+                    )
                     .await;
             }
             match self.config.tool_execution {
@@ -834,8 +850,8 @@ impl Agent {
             ToolAccess::Allowed => None,
             ToolAccess::Denied { reason } => Some(reason.clone()),
         });
-        let (result, call_after_hook) = if let Some(reason) = denied {
-            (error_tool_result(call, reason), false)
+        let (result, error_kind, call_after_hook) = if let Some(reason) = denied {
+            (error_tool_result(call, reason), None, false)
         } else {
             let hook_context = ToolCallContext::new(turn, call);
             let decision = match &self.tool_hooks {
@@ -843,15 +859,18 @@ impl Agent {
                 None => BeforeToolCall::Proceed,
             };
             match decision {
-                BeforeToolCall::Block { reason } => (error_tool_result(call, reason), false),
+                BeforeToolCall::Block { reason } => (error_tool_result(call, reason), None, false),
                 BeforeToolCall::Proceed => {
-                    let result = match resolved {
+                    let (result, error_kind) = match resolved {
                         Some(resolved) => {
                             if let Err(error) = validate_tool_arguments(
                                 &resolved.tool.definition().kind,
                                 &call.arguments,
                             ) {
-                                error_tool_result(call, error.to_string())
+                                (
+                                    error_tool_result(call, error.to_string()),
+                                    Some(ToolErrorKind::InvalidArguments),
+                                )
                             } else {
                                 let context = ToolContext::new(
                                     call.id.clone(),
@@ -860,19 +879,28 @@ impl Agent {
                                     self.events.clone(),
                                 );
                                 match resolved.tool.execute(context, call.arguments.clone()).await {
-                                    Ok(output) => ToolResult {
-                                        tool_call_id: call.id.clone(),
-                                        name:         Some(call.name.clone()),
-                                        content:      nonempty_content(output.into_content()),
-                                        is_error:     false,
-                                    },
-                                    Err(error) => error_tool_result(call, error.to_string()),
+                                    Ok(output) => (
+                                        ToolResult {
+                                            tool_call_id: call.id.clone(),
+                                            name:         Some(call.name.clone()),
+                                            content:      nonempty_content(output.into_content()),
+                                            is_error:     false,
+                                        },
+                                        None,
+                                    ),
+                                    Err(error) => (
+                                        error_tool_result(call, error.to_string()),
+                                        Some(ToolErrorKind::Execution),
+                                    ),
                                 }
                             }
                         }
-                        None => error_tool_result(call, format!("unknown tool `{}`", call.name)),
+                        None => (
+                            error_tool_result(call, format!("unknown tool `{}`", call.name)),
+                            Some(ToolErrorKind::Unavailable),
+                        ),
                     };
-                    (result, true)
+                    (result, error_kind, true)
                 }
             }
         };
@@ -881,7 +909,11 @@ impl Agent {
         });
         if call_after_hook && let Some(hooks) = &self.tool_hooks {
             hooks
-                .after_tool_call(ToolCallContext::new(turn, call), &result, cancel)
+                .after_tool_call(
+                    ToolCallContext::new(turn, call),
+                    ToolCallOutcome::new(&result, error_kind),
+                    cancel,
+                )
                 .await;
         }
         result
@@ -1112,7 +1144,7 @@ mod tests {
         async fn after_tool_call(
             &self,
             _context: ToolCallContext<'_>,
-            _result: &ToolResult,
+            _outcome: ToolCallOutcome<'_>,
             _cancel: &CancellationToken,
         ) {
             self.trace
@@ -1147,6 +1179,42 @@ mod tests {
                     is_error:     false,
                 })
                 .collect()
+        }
+    }
+
+    struct GatedRoundExecutor;
+
+    #[async_trait]
+    impl ToolRoundExecutor for GatedRoundExecutor {
+        async fn execute_round(
+            &self,
+            context: ToolRoundContext<'_>,
+            cancel: &CancellationToken,
+        ) -> Vec<ToolResult> {
+            let mut results = Vec::with_capacity(context.calls().len());
+            for call in context.calls() {
+                if let ToolAccess::Denied { reason } = context.access_for_call(call) {
+                    results.push(error_tool_result(call, reason));
+                    continue;
+                }
+                if let BeforeToolCall::Block { reason } =
+                    context.before_tool_call(call, cancel).await
+                {
+                    results.push(error_tool_result(call, reason));
+                    continue;
+                }
+                let result = ToolResult {
+                    tool_call_id: call.id.clone(),
+                    name:         Some(call.name.clone()),
+                    content:      vec![ContentPart::Text {
+                        text: "specialized".to_owned(),
+                    }],
+                    is_error:     false,
+                };
+                context.after_tool_call(call, &result, None, cancel).await;
+                results.push(result);
+            }
+            results
         }
     }
 
@@ -1308,6 +1376,64 @@ mod tests {
         assert!(result.is_error);
         assert!(matches!(
             &result.content[0],
+            ContentPart::Text { text } if text == "hidden for this turn"
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_specialized_round_receives_access_and_tool_hooks() {
+        let calls_tools = response([
+            ContentPart::ToolCall(ToolCall::function("call_1", "inspect", json!({}))),
+            ContentPart::ToolCall(ToolCall::function("call_2", "hidden", json!({}))),
+        ]);
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let tool = |name: &'static str| {
+            Tool::function(name, name, json!({}), |_context, _arguments| async {
+                Err(crate::ToolError::new(
+                    "the specialized round owns execution",
+                ))
+            })
+        };
+        let policy = Arc::new(|context: ToolAccessContext<'_>| {
+            if context.definition().name == "hidden" {
+                ToolAccess::Denied {
+                    reason: "hidden for this turn".to_owned(),
+                }
+            } else {
+                ToolAccess::Allowed
+            }
+        });
+        let mut agent = Agent::builder(
+            ScriptedModel::new([calls_tools, text_response("finished")]),
+            "test/model",
+        )
+        .tools([tool("inspect"), tool("hidden")])
+        .tool_access_policy(policy)
+        .tool_call_hooks(Arc::new(RecordingToolHooks {
+            trace: Arc::clone(&trace),
+        }))
+        .tool_round_executor(Arc::new(GatedRoundExecutor))
+        .build()
+        .expect("the agent builds");
+
+        agent.prompt("work").await.expect("the prompt succeeds");
+
+        assert_eq!(
+            trace.lock().expect("the trace lock is healthy").as_slice(),
+            ["hook:before", "hook:after"]
+        );
+        let results = agent.messages()[2]
+            .content()
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!results[0].is_error);
+        assert!(results[1].is_error);
+        assert!(matches!(
+            &results[1].content[0],
             ContentPart::Text { text } if text == "hidden for this turn"
         ));
     }

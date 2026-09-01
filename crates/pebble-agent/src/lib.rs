@@ -64,7 +64,8 @@ pub use self::event::{AgentEvent, EventProjection, FirstOutputKind};
 pub use self::model::ModelService;
 pub use self::tool::{
     BeforeToolCall, Tool, ToolAccess, ToolAccessContext, ToolAccessPolicy, ToolCallContext,
-    ToolCallHooks, ToolContext, ToolError, ToolExecutor, ToolOutput, ToolProvider,
+    ToolCallHooks, ToolCallOutcome, ToolContext, ToolError, ToolErrorKind, ToolExecutor,
+    ToolOutput, ToolProvider,
 };
 pub use self::turn::{
     TurnBoundaryAction, TurnBoundaryContext, TurnBoundaryError, TurnBoundaryHooks, TurnContext,

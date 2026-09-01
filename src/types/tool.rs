@@ -3,6 +3,7 @@
 
 use std::fmt;
 
+pub use pebble_agent::ToolErrorKind;
 use serde::{Deserialize, Serialize};
 
 /// Where a registered tool came from.
@@ -84,27 +85,6 @@ pub struct ToolSummary {
     /// event stream flips it.
     #[serde(default)]
     pub invoked:     bool,
-}
-
-/// Why a tool call failed.
-///
-/// The execution layer renders a safe, model-facing message for the tool
-/// result and reports this kind alongside it, so hooks and event consumers can
-/// branch without parsing text.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum ToolErrorKind {
-    /// The arguments did not match the tool's schema or were unusable.
-    InvalidArguments,
-    /// A policy or an approval callback refused the call.
-    Denied,
-    /// The call was cancelled before it finished.
-    Cancelled,
-    /// The tool is not available in this session.
-    Unavailable,
-    /// The tool ran and failed.
-    Execution,
 }
 
 /// The permission ladder an embedder applies to a session's tools.

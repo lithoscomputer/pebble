@@ -12,13 +12,8 @@ use lithos_llm::types::{
     ContentPart, Error as LlmError, Message as LlmMessage, Request, Response, ResponseStream,
     ToolCall, ToolResult,
 };
+use pebble_agent as agent;
 use pebble_agent::advanced::{ToolRoundContext, ToolRoundExecutor};
-use pebble_agent::{
-    Agent, AgentConfig, AgentError, AgentEvent as GenericEvent, EventProjection, FirstOutputKind,
-    ModelService, Tool, ToolContext as GenericToolContext, ToolError as GenericToolError,
-    ToolExecutor as GenericToolExecutor, ToolOutput as GenericToolOutput, ToolProvider,
-    TurnBoundaryAction, TurnBoundaryContext, TurnBoundaryError, TurnBoundaryHooks, TurnContext,
-};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -26,7 +21,7 @@ use super::control::SteeringItem;
 use super::retry::RetryEventBridge;
 use super::{CodingRuntime, PromptTotals};
 use crate::compaction::{CompactionRequest, check_context_usage, compact_context};
-use crate::config::CodingSessionOptions;
+use crate::config::{CodingSessionOptions, ToolHookDecision};
 use crate::context_window::{
     ContextWindowInput, build_local_snapshot, context_window_from_response_usage,
 };
@@ -49,7 +44,7 @@ use crate::tool::{
 };
 use crate::types::{
     CodingEvent, ContextWindowSnapshot, CostSource, LlmOutputKind, LlmRetryPhase, Message,
-    SessionState, SkillActivationSource, TokenUsage,
+    SessionState, SkillActivationSource, TokenUsage, ToolErrorKind,
 };
 
 /// How many failed response streams Pebble replays after the first attempt.
@@ -311,7 +306,7 @@ impl CodingAgentBridge {
             });
     }
 
-    fn sync_messages(&self, context: &mut TurnBoundaryContext<'_>, include_reminder: bool) {
+    fn sync_messages(&self, context: &mut agent::TurnBoundaryContext<'_>, include_reminder: bool) {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         *context.messages_mut() = state.history.to_llm_messages();
         if include_reminder && let Some(reminder) = &state.pending_task_reminder {
@@ -436,12 +431,12 @@ impl CodingAgentBridge {
     }
 }
 
-impl EventProjection for CodingAgentBridge {
-    fn project(&self, event: &GenericEvent) {
+impl agent::EventProjection for CodingAgentBridge {
+    fn project(&self, event: &agent::AgentEvent) {
         match event {
-            GenericEvent::UserMessage { message } => self.commit_user_message(message),
-            GenericEvent::SteeringMessage { message } => self.commit_steering(message),
-            GenericEvent::ModelRequestStarted { request, .. } => {
+            agent::AgentEvent::UserMessage { message } => self.commit_user_message(message),
+            agent::AgentEvent::SteeringMessage { message } => self.commit_steering(message),
+            agent::AgentEvent::ModelRequestStarted { request, .. } => {
                 let local = self.measure_request(request);
                 let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
                 state.local_context_window = Some(local);
@@ -451,32 +446,32 @@ impl EventProjection for CodingAgentBridge {
                     requested_model: self.model.clone(),
                 });
             }
-            GenericEvent::FirstOutput { kind } => {
+            agent::AgentEvent::FirstOutput { kind } => {
                 let kind = match kind {
-                    FirstOutputKind::Text => LlmOutputKind::Text,
-                    FirstOutputKind::Reasoning => LlmOutputKind::Reasoning,
-                    FirstOutputKind::ToolCall => LlmOutputKind::ToolCall,
+                    agent::FirstOutputKind::Text => LlmOutputKind::Text,
+                    agent::FirstOutputKind::Reasoning => LlmOutputKind::Reasoning,
+                    agent::FirstOutputKind::ToolCall => LlmOutputKind::ToolCall,
                     _ => return,
                 };
                 self.emit(CodingEvent::LlmFirstOutput { kind });
             }
-            GenericEvent::TextDelta { delta } => {
+            agent::AgentEvent::TextDelta { delta } => {
                 self.emit(CodingEvent::TextDelta {
                     delta: delta.clone(),
                 });
             }
-            GenericEvent::ReasoningDelta { delta } => {
+            agent::AgentEvent::ReasoningDelta { delta } => {
                 self.emit(CodingEvent::ReasoningDelta {
                     delta: delta.clone(),
                 });
             }
-            GenericEvent::OutputReplaced => {
+            agent::AgentEvent::OutputReplaced => {
                 self.emit(CodingEvent::AssistantOutputReplace {
                     text:      String::new(),
                     reasoning: None,
                 });
             }
-            GenericEvent::TurnReplay {
+            agent::AgentEvent::TurnReplay {
                 failed_attempt,
                 delay_seconds,
                 error,
@@ -491,8 +486,8 @@ impl EventProjection for CodingAgentBridge {
                     phase:      LlmRetryPhase::Consume,
                 });
             }
-            GenericEvent::AssistantMessage { response } => self.commit_assistant(response),
-            GenericEvent::TurnInterrupted => {
+            agent::AgentEvent::AssistantMessage { response } => self.commit_assistant(response),
+            agent::AgentEvent::TurnInterrupted => {
                 self.finish_inference();
                 self.state
                     .lock()
@@ -505,25 +500,90 @@ impl EventProjection for CodingAgentBridge {
     }
 }
 
-impl ToolProvider for CodingAgentBridge {
-    fn tools_for_turn(&self, _context: TurnContext<'_>) -> Vec<Tool> {
-        self.effective_tools()
+impl agent::ToolProvider for CodingAgentBridge {
+    fn tools_for_turn(&self, _context: agent::TurnContext<'_>) -> Vec<agent::Tool> {
+        self.registry
+            .definitions_with_source()
             .into_iter()
-            .map(|tool| Tool::new(tool.definition, Arc::new(UnusedToolExecutor)))
+            .map(|tool| agent::Tool::new(tool.definition, Arc::new(UnusedToolExecutor)))
             .collect()
+    }
+}
+
+impl agent::ToolAccessPolicy for CodingAgentBridge {
+    fn access(&self, context: agent::ToolAccessContext<'_>) -> agent::ToolAccess {
+        self.config
+            .tool_access_denial_reason(&context.definition().name)
+            .map_or(agent::ToolAccess::Allowed, |reason| {
+                agent::ToolAccess::Denied { reason }
+            })
+    }
+}
+
+#[async_trait]
+impl agent::ToolCallHooks for CodingAgentBridge {
+    async fn before_tool_call(
+        &self,
+        context: agent::ToolCallContext<'_>,
+        _cancel: &CancellationToken,
+    ) -> agent::BeforeToolCall {
+        let Some(hooks) = self.config.tool_hooks.as_ref() else {
+            return agent::BeforeToolCall::Proceed;
+        };
+        match hooks
+            .pre_tool_use(&context.call().name, &context.call().arguments)
+            .await
+        {
+            ToolHookDecision::Proceed => agent::BeforeToolCall::Proceed,
+            ToolHookDecision::Block { reason } => agent::BeforeToolCall::Block { reason },
+        }
+    }
+
+    async fn after_tool_call(
+        &self,
+        context: agent::ToolCallContext<'_>,
+        outcome: agent::ToolCallOutcome<'_>,
+        _cancel: &CancellationToken,
+    ) {
+        let Some(hooks) = self.config.tool_hooks.as_ref() else {
+            return;
+        };
+        let result = outcome.result();
+        let content = result
+            .content
+            .iter()
+            .find_map(|part| match part {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        if result.is_error {
+            hooks
+                .post_tool_use_failure(
+                    &context.call().name,
+                    &context.call().id,
+                    content,
+                    outcome.error_kind().unwrap_or(ToolErrorKind::Execution),
+                )
+                .await;
+        } else {
+            hooks
+                .post_tool_use(&context.call().name, &context.call().id, content)
+                .await;
+        }
     }
 }
 
 struct UnusedToolExecutor;
 
 #[async_trait]
-impl GenericToolExecutor for UnusedToolExecutor {
+impl agent::ToolExecutor for UnusedToolExecutor {
     async fn execute(
         &self,
-        _context: GenericToolContext,
+        _context: agent::ToolContext,
         _arguments: serde_json::Value,
-    ) -> StdResult<GenericToolOutput, GenericToolError> {
-        Err(GenericToolError::new(
+    ) -> StdResult<agent::ToolOutput, agent::ToolError> {
+        Err(agent::ToolError::new(
             "coding tools must run through Pebble's round executor",
         ))
     }
@@ -558,7 +618,7 @@ impl ToolRoundExecutor for CodingAgentBridge {
         dispatch = dispatch.with_redactor(&self.redactor);
 
         let started = Instant::now();
-        let results = dispatch.execute(context.calls(), true, cancel).await;
+        let results = dispatch.execute_agent_round(context, cancel).await;
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.totals.timing.tool = state.totals.timing.tool.saturating_add(started.elapsed());
         if activated_a_skill(context.calls(), &results) {
@@ -588,12 +648,12 @@ impl ToolRoundExecutor for CodingAgentBridge {
 }
 
 #[async_trait]
-impl TurnBoundaryHooks for CodingAgentBridge {
+impl agent::TurnBoundaryHooks for CodingAgentBridge {
     async fn before_model(
         &self,
-        mut context: TurnBoundaryContext<'_>,
+        mut context: agent::TurnBoundaryContext<'_>,
         cancel: &CancellationToken,
-    ) -> StdResult<(), TurnBoundaryError> {
+    ) -> StdResult<(), agent::TurnBoundaryError> {
         self.settle_interrupts();
         self.wait_for_steer_if_needed(cancel).await;
         if cancel.is_cancelled() || self.terminal_cancel.is_cancelled() {
@@ -618,10 +678,10 @@ impl TurnBoundaryHooks for CodingAgentBridge {
 
     async fn after_model(
         &self,
-        mut context: TurnBoundaryContext<'_>,
+        mut context: agent::TurnBoundaryContext<'_>,
         _response: &Response,
         _cancel: &CancellationToken,
-    ) -> StdResult<(), TurnBoundaryError> {
+    ) -> StdResult<(), agent::TurnBoundaryError> {
         let compaction_failed = self
             .state
             .lock()
@@ -639,10 +699,10 @@ impl TurnBoundaryHooks for CodingAgentBridge {
 
     async fn after_answer(
         &self,
-        _context: TurnContext<'_>,
+        _context: agent::TurnContext<'_>,
         _response: &Response,
         cancel: &CancellationToken,
-    ) -> StdResult<TurnBoundaryAction, TurnBoundaryError> {
+    ) -> StdResult<agent::TurnBoundaryAction, agent::TurnBoundaryError> {
         let completion_coordinator = self
             .completion_coordinator
             .lock()
@@ -652,7 +712,7 @@ impl TurnBoundaryHooks for CodingAgentBridge {
             .as_ref()
             .is_some_and(|coordinator| coordinator.on_natural_completion())
         {
-            return Ok(TurnBoundaryAction::Continue);
+            return Ok(agent::TurnBoundaryAction::Continue);
         }
 
         let followup = self
@@ -668,7 +728,7 @@ impl TurnBoundaryHooks for CodingAgentBridge {
                 }
             } else {
                 expand_skill(&self.skills, &followup).map_err(|error| {
-                    TurnBoundaryError::new(format!("expanding follow-up input: {error}"))
+                    agent::TurnBoundaryError::new(format!("expanding follow-up input: {error}"))
                 })?
             };
             if let Some(name) = expanded.skill_name {
@@ -681,22 +741,24 @@ impl TurnBoundaryHooks for CodingAgentBridge {
                     source:     SkillActivationSource::Slash,
                 });
             }
-            return Ok(TurnBoundaryAction::ContinueWith(expanded.text.into()));
+            return Ok(agent::TurnBoundaryAction::ContinueWith(
+                expanded.text.into(),
+            ));
         }
 
         let Some(supervisor) = self.subagents.as_ref() else {
-            return Ok(TurnBoundaryAction::Complete);
+            return Ok(agent::TurnBoundaryAction::Complete);
         };
         match supervisor.next_parent_notification_turn(cancel).await {
-            Ok(Some(turn)) => Ok(TurnBoundaryAction::ContinueWith(turn.into())),
-            Ok(None) => Ok(TurnBoundaryAction::Complete),
+            Ok(Some(turn)) => Ok(agent::TurnBoundaryAction::ContinueWith(turn.into())),
+            Ok(None) => Ok(agent::TurnBoundaryAction::Complete),
             Err(error) => {
                 let message = error.to_string();
                 self.state
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .boundary_error = Some(error);
-                Err(TurnBoundaryError::new(message))
+                Err(agent::TurnBoundaryError::new(message))
             }
         }
     }
@@ -712,7 +774,7 @@ struct CodingModelService {
 }
 
 #[async_trait]
-impl ModelService for CodingModelService {
+impl agent::ModelService for CodingModelService {
     async fn stream(
         &self,
         request: Request,
@@ -777,8 +839,8 @@ impl CodingRuntime {
                 let text = outcome.text();
                 Ok((!text.trim().is_empty()).then_some(text))
             }
-            Err(AgentError::Aborted) => Err(self.close_cancelled().await),
-            Err(AgentError::Model { source }) => Err(self.emit_llm_error(source)),
+            Err(agent::AgentError::Aborted) => Err(self.close_cancelled().await),
+            Err(agent::AgentError::Model { source }) => Err(self.emit_llm_error(source)),
             Err(error) => {
                 self.check_pump().await?;
                 Err(Error::InvalidState(format!(
@@ -807,18 +869,20 @@ impl CodingRuntime {
             .unwrap_or_else(PoisonError::into_inner)
             .history
             .to_llm_messages();
-        let config = AgentConfig {
+        let config = agent::AgentConfig {
             max_output_tokens: self.max_output_tokens(),
             reasoning_effort: self.config.reasoning_effort,
             speed: self.config.speed,
             turn_replay: self.config.turn_replay,
             max_turn_replays: STREAM_CONSUME_RETRIES,
-            ..AgentConfig::default()
+            ..agent::AgentConfig::default()
         };
-        let agent = Agent::builder(model_service, self.model_selector.clone())
+        let agent = agent::Agent::builder(model_service, self.model_selector.clone())
             .system_prompt(self.system_prompt.clone())
             .messages(messages)
             .tool_provider(Arc::new(bridge.clone()))
+            .tool_access_policy(Arc::new(bridge.clone()))
+            .tool_call_hooks(Arc::new(bridge.clone()))
             .tool_round_executor(Arc::new(bridge.clone()))
             .turn_boundary_hooks(Arc::new(bridge.clone()))
             .event_projection(Arc::new(bridge.clone()))
