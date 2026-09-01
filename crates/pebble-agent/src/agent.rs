@@ -22,7 +22,7 @@ use crate::event::{AgentEvent, EventHub, EventProjection, FirstOutputKind};
 use crate::model::ModelService;
 use crate::tool::{
     BeforeToolCall, Tool, ToolAccess, ToolAccessContext, ToolAccessPolicy, ToolCallContext,
-    ToolCallHooks, ToolContext, ToolProvider,
+    ToolCallHooks, ToolContext, ToolProvider, ToolRoundContext, ToolRoundExecutor,
 };
 use crate::turn::{TurnBoundaryContext, TurnBoundaryHooks, TurnContext};
 use crate::validation::validate_tool_arguments;
@@ -126,6 +126,7 @@ pub struct AgentBuilder {
     tool_provider:     Option<Arc<dyn ToolProvider>>,
     tool_access:       Option<Arc<dyn ToolAccessPolicy>>,
     tool_hooks:        Option<Arc<dyn ToolCallHooks>>,
+    tool_round:        Option<Arc<dyn ToolRoundExecutor>>,
     context_transform: Option<Arc<dyn ContextTransform>>,
     turn_hooks:        Option<Arc<dyn TurnBoundaryHooks>>,
     event_projection:  Option<Arc<dyn EventProjection>>,
@@ -143,6 +144,7 @@ impl AgentBuilder {
             tool_provider:     None,
             tool_access:       None,
             tool_hooks:        None,
+            tool_round:        None,
             context_transform: None,
             turn_hooks:        None,
             event_projection:  None,
@@ -186,6 +188,12 @@ impl AgentBuilder {
     /// Sets the hooks called before and after every tool call.
     pub fn tool_call_hooks(mut self, hooks: Arc<dyn ToolCallHooks>) -> Self {
         self.tool_hooks = Some(hooks);
+        self
+    }
+
+    /// Replaces the default generic executor for complete tool rounds.
+    pub fn tool_round_executor(mut self, executor: Arc<dyn ToolRoundExecutor>) -> Self {
+        self.tool_round = Some(executor);
         self
     }
 
@@ -244,6 +252,7 @@ impl AgentBuilder {
             tool_provider: self.tool_provider,
             tool_access: self.tool_access,
             tool_hooks: self.tool_hooks,
+            tool_round: self.tool_round,
             context_transform: self.context_transform,
             turn_hooks: self.turn_hooks,
             config: self.config,
@@ -343,6 +352,7 @@ pub struct Agent {
     tool_provider:     Option<Arc<dyn ToolProvider>>,
     tool_access:       Option<Arc<dyn ToolAccessPolicy>>,
     tool_hooks:        Option<Arc<dyn ToolCallHooks>>,
+    tool_round:        Option<Arc<dyn ToolRoundExecutor>>,
     context_transform: Option<Arc<dyn ContextTransform>>,
     turn_hooks:        Option<Arc<dyn TurnBoundaryHooks>>,
     config:            AgentConfig,
@@ -383,6 +393,16 @@ impl Agent {
     /// Aborts the active prompt.
     pub fn abort(&self) -> bool {
         self.control_handle().abort()
+    }
+
+    /// Interrupts the current turn and waits for steering before another.
+    pub fn interrupt(&self) -> bool {
+        self.control_handle().interrupt()
+    }
+
+    /// Claims the next turn boundary for steering without interrupting now.
+    pub fn park_for_steer(&self) -> bool {
+        self.control_handle().park_for_steer()
     }
 
     /// Waits until no prompt is running.
@@ -492,12 +512,15 @@ impl Agent {
                     return Err(AgentError::Aborted);
                 }
 
-                for steering in self.control.drain_steering() {
+                if !self.control.wait_until_resumed(prompt_cancel).await {
+                    return Err(AgentError::Aborted);
+                }
+
+                let (round_cancel, steering) = self.control.begin_round();
+                for steering in steering {
                     self.messages.push(steering.clone());
                     self.emit(AgentEvent::SteeringMessage { message: steering });
                 }
-
-                let round_cancel = self.control.begin_round();
                 if let Some(hooks) = self.turn_hooks.clone() {
                     let context =
                         TurnBoundaryContext::new(&self.model, turn_count, &mut self.messages);
@@ -528,7 +551,8 @@ impl Agent {
                 self.emit(AgentEvent::TurnStarted { turn: turn_count });
                 let request = self.build_request(&tools)?;
                 self.emit(AgentEvent::ModelRequestStarted {
-                    model: self.model.clone(),
+                    model:   self.model.clone(),
+                    request: request.clone(),
                 });
 
                 let response = match self
@@ -563,8 +587,10 @@ impl Agent {
 
                 let calls = tool_calls(&response);
                 if calls.is_empty() {
-                    if round_cancel.is_cancelled() {
-                        self.emit(AgentEvent::TurnInterrupted);
+                    if round_cancel.is_cancelled() || self.control.is_paused() {
+                        if round_cancel.is_cancelled() {
+                            self.emit(AgentEvent::TurnInterrupted);
+                        }
                         continue;
                     }
                     if let Some(hooks) = self.turn_hooks.clone() {
@@ -704,7 +730,17 @@ impl Agent {
         round_cancel: &CancellationToken,
     ) -> Vec<ToolResult> {
         let cancel = CancellationToken::new();
+        let advertised = tools
+            .iter()
+            .filter(|tool| tool.is_allowed())
+            .map(|tool| tool.tool.definition().clone())
+            .collect::<Vec<_>>();
         let running = async {
+            if let Some(executor) = &self.tool_round {
+                return executor
+                    .execute_round(ToolRoundContext::new(turn, calls, &advertised), &cancel)
+                    .await;
+            }
             match self.config.tool_execution {
                 ToolExecution::Sequential => {
                     let mut results = Vec::with_capacity(calls.len());
@@ -738,7 +774,7 @@ impl Agent {
                     round_cancelled = true;
                     cancel.cancel();
                 }
-                results = &mut running => return results,
+                results = &mut running => return normalize_tool_results(calls, results),
             }
         }
     }
@@ -861,7 +897,7 @@ impl StreamObserver for AgentStreamObserver<'_> {
         self.emit(AgentEvent::TurnReplay {
             failed_attempt,
             delay_seconds: delay.as_secs_f64(),
-            error_kind: error.kind(),
+            error: error.data(),
         });
     }
 }
@@ -903,6 +939,24 @@ fn error_tool_result(call: &ToolCall, message: String) -> ToolResult {
         content:      vec![ContentPart::Text { text: message }],
         is_error:     true,
     }
+}
+
+fn normalize_tool_results(calls: &[ToolCall], results: Vec<ToolResult>) -> Vec<ToolResult> {
+    let mut results = results.into_iter();
+    calls
+        .iter()
+        .map(|call| match results.next() {
+            Some(result) if result.tool_call_id == call.id => result,
+            Some(_) => error_tool_result(
+                call,
+                "the tool-round executor returned a result for a different call".to_owned(),
+            ),
+            None => error_tool_result(
+                call,
+                "the tool-round executor returned no result for this call".to_owned(),
+            ),
+        })
+        .collect()
 }
 
 fn tool_calls(response: &Response) -> Vec<ToolCall> {
@@ -1030,6 +1084,30 @@ mod tests {
 
     struct BackgroundBoundary {
         trace: Arc<Mutex<Vec<String>>>,
+    }
+
+    struct FixedRoundExecutor;
+
+    #[async_trait]
+    impl ToolRoundExecutor for FixedRoundExecutor {
+        async fn execute_round(
+            &self,
+            context: ToolRoundContext<'_>,
+            _cancel: &CancellationToken,
+        ) -> Vec<ToolResult> {
+            context
+                .calls()
+                .iter()
+                .map(|call| ToolResult {
+                    tool_call_id: call.id.clone(),
+                    name:         Some(call.name.clone()),
+                    content:      vec![ContentPart::Text {
+                        text: "specialized".to_owned(),
+                    }],
+                    is_error:     false,
+                })
+                .collect()
+        }
     }
 
     #[async_trait]
@@ -1246,6 +1324,39 @@ mod tests {
             "event:complete",
             "hook:after"
         ]);
+    }
+
+    #[tokio::test]
+    async fn a_specialized_layer_can_execute_a_complete_tool_round() {
+        let calls_tool = response([ContentPart::ToolCall(ToolCall::function(
+            "call_1",
+            "inspect",
+            json!({}),
+        ))]);
+        let tool = Tool::function(
+            "inspect",
+            "inspect",
+            json!({}),
+            |_context, _arguments| async { panic!("the generic executor must not run") },
+        );
+        let mut agent = Agent::builder(
+            ScriptedModel::new([calls_tool, text_response("finished")]),
+            "test/model",
+        )
+        .tools([tool])
+        .tool_round_executor(Arc::new(FixedRoundExecutor))
+        .build()
+        .expect("the agent builds");
+
+        agent.prompt("work").await.expect("the prompt succeeds");
+
+        let ContentPart::ToolResult(result) = &agent.messages()[2].content()[0] else {
+            panic!("the call has a result");
+        };
+        assert!(matches!(
+            &result.content[0],
+            ContentPart::Text { text } if text == "specialized"
+        ));
     }
 
     #[tokio::test]

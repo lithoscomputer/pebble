@@ -71,6 +71,7 @@ pub use self::turn::{TurnBoundaryContext, TurnBoundaryError, TurnBoundaryHooks, 
 /// Lower-level turn primitives for specialized agent layers.
 pub mod advanced {
     pub use crate::stream::{StreamObserver, StreamOutcome, stream_response};
+    pub use crate::tool::{ToolRoundContext, ToolRoundExecutor};
     pub use crate::validation::{ToolArgumentsError, validate_tool_arguments};
 }
 

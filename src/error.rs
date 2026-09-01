@@ -12,7 +12,8 @@ use std::fmt;
 use std::result::Result as StdResult;
 
 use lithos_llm::types::{
-    Error as LlmError, ErrorKind as LlmErrorKind, RequestBuildError, RetryClassification,
+    Error as LlmError, ErrorData as LlmErrorData, ErrorKind as LlmErrorKind, RequestBuildError,
+    RetryClassification,
 };
 use serde::{Deserialize, Serialize};
 
@@ -298,6 +299,26 @@ impl From<&LlmError> for ErrorData {
         data.source_chain = source_chain(error);
         data.fill_from_llm(error);
         data
+    }
+}
+
+impl From<&LlmErrorData> for ErrorData {
+    fn from(error: &LlmErrorData) -> Self {
+        Self {
+            kind: ErrorKind::Llm,
+            message: error.message.clone(),
+            llm_kind: Some(error.kind),
+            retry: Some(error.retry),
+            provider: error
+                .provider
+                .as_ref()
+                .map(|provider| provider.as_str().to_owned()),
+            model: None,
+            status: error.status,
+            provider_code: error.provider_code.clone(),
+            provider_retry_after_millis: error.provider_retry_after_millis,
+            source_chain: error.source_message.iter().cloned().collect(),
+        }
     }
 }
 

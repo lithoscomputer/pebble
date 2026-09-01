@@ -11,13 +11,15 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::UserMessage;
 
 pub(crate) struct Control {
-    state: Mutex<ControlState>,
-    idle:  Notify,
+    state:  Mutex<ControlState>,
+    idle:   Notify,
+    resume: Notify,
 }
 
 struct ControlState {
     running:       bool,
     closed:        bool,
+    paused:        bool,
     steering:      VecDeque<Message>,
     follow_up:     VecDeque<Message>,
     prompt_cancel: CancellationToken,
@@ -27,15 +29,17 @@ struct ControlState {
 impl Control {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
-            state: Mutex::new(ControlState {
+            state:  Mutex::new(ControlState {
                 running:       false,
                 closed:        false,
+                paused:        false,
                 steering:      VecDeque::new(),
                 follow_up:     VecDeque::new(),
                 prompt_cancel: CancellationToken::new(),
                 round_cancel:  CancellationToken::new(),
             }),
-            idle:  Notify::new(),
+            idle:   Notify::new(),
+            resume: Notify::new(),
         })
     }
 
@@ -46,6 +50,7 @@ impl Control {
         }
         debug_assert!(!state.running, "a mutable agent cannot start two prompts");
         state.running = true;
+        state.paused = false;
         state.prompt_cancel = CancellationToken::new();
         state.round_cancel = CancellationToken::new();
         Some(state.prompt_cancel.clone())
@@ -54,24 +59,19 @@ impl Control {
     pub(crate) fn finish_prompt(&self) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.running = false;
+        state.paused = false;
         state.round_cancel = CancellationToken::new();
         drop(state);
         self.idle.notify_waiters();
+        self.resume.notify_waiters();
     }
 
-    pub(crate) fn begin_round(&self) -> CancellationToken {
+    pub(crate) fn begin_round(&self) -> (CancellationToken, Vec<Message>) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.round_cancel = CancellationToken::new();
-        state.round_cancel.clone()
-    }
-
-    pub(crate) fn drain_steering(&self) -> Vec<Message> {
-        self.state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .steering
-            .drain(..)
-            .collect()
+        let cancel = state.round_cancel.clone();
+        let steering = state.steering.drain(..).collect();
+        (cancel, steering)
     }
 
     pub(crate) fn pop_follow_up(&self) -> Option<Message> {
@@ -86,6 +86,7 @@ impl Control {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.steering.clear();
         state.follow_up.clear();
+        state.paused = false;
     }
 
     pub(crate) fn close(&self) -> bool {
@@ -98,6 +99,7 @@ impl Control {
         state.round_cancel.cancel();
         drop(state);
         self.idle.notify_waiters();
+        self.resume.notify_waiters();
         true
     }
 
@@ -113,6 +115,26 @@ impl Control {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .closed
+    }
+
+    pub(crate) fn is_paused(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .paused
+    }
+
+    pub(crate) async fn wait_until_resumed(&self, cancel: &CancellationToken) -> bool {
+        loop {
+            let notified = self.resume.notified();
+            if !self.is_paused() {
+                return true;
+            }
+            tokio::select! {
+                () = cancel.cancelled() => return false,
+                () = notified => {}
+            }
+        }
     }
 }
 
@@ -142,9 +164,12 @@ impl AgentControlHandle {
             return false;
         }
         state.steering.push_back(message.into().into_message());
+        state.paused = false;
         if state.running {
             state.round_cancel.cancel();
         }
+        drop(state);
+        self.control.resume.notify_waiters();
         true
     }
 
@@ -178,6 +203,41 @@ impl AgentControlHandle {
         }
         state.prompt_cancel.cancel();
         state.round_cancel.cancel();
+        drop(state);
+        self.control.resume.notify_waiters();
+        true
+    }
+
+    /// Interrupts the current turn and waits for steering before another.
+    ///
+    /// Returns whether a prompt was running.
+    pub fn interrupt(&self) -> bool {
+        let mut state = self
+            .control
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !state.running {
+            return false;
+        }
+        state.paused = true;
+        state.round_cancel.cancel();
+        true
+    }
+
+    /// Claims the next turn boundary for steering without interrupting now.
+    ///
+    /// Returns whether a prompt was running.
+    pub fn park_for_steer(&self) -> bool {
+        let mut state = self
+            .control
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !state.running {
+            return false;
+        }
+        state.paused = true;
         true
     }
 

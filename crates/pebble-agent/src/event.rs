@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use lithos_llm::types::{ErrorKind, Message, Response, ToolCall, ToolResult};
+use lithos_llm::types::{ErrorData, Message, Request, Response, ToolCall, ToolResult};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 
@@ -47,7 +47,9 @@ pub enum AgentEvent {
     /// A model request is about to open.
     ModelRequestStarted {
         /// The requested model selector.
-        model: String,
+        model:   String,
+        /// The complete provider-neutral request.
+        request: Request,
     },
     /// A stream attempt produced its first output.
     FirstOutput {
@@ -72,8 +74,8 @@ pub enum AgentEvent {
         failed_attempt: u32,
         /// The wait before the next attempt.
         delay_seconds:  f64,
-        /// The model-layer error category.
-        error_kind:     ErrorKind,
+        /// A cloneable projection of the model-layer failure.
+        error:          ErrorData,
     },
     /// A complete assistant response was committed.
     AssistantMessage {

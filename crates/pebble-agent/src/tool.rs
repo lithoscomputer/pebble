@@ -148,6 +148,57 @@ pub trait ToolCallHooks: Send + Sync {
     }
 }
 
+/// The input to a custom executor for one complete tool round.
+#[derive(Clone, Copy, Debug)]
+pub struct ToolRoundContext<'a> {
+    turn:  usize,
+    calls: &'a [ToolCall],
+    tools: &'a [ToolDefinition],
+}
+
+impl<'a> ToolRoundContext<'a> {
+    pub(crate) const fn new(
+        turn: usize,
+        calls: &'a [ToolCall],
+        tools: &'a [ToolDefinition],
+    ) -> Self {
+        Self { turn, calls, tools }
+    }
+
+    /// The zero-based model turn that requested these calls.
+    #[must_use]
+    pub const fn turn(&self) -> usize {
+        self.turn
+    }
+
+    /// The calls in model order.
+    #[must_use]
+    pub const fn calls(&self) -> &[ToolCall] {
+        self.calls
+    }
+
+    /// The definitions advertised for the turn.
+    #[must_use]
+    pub const fn tools(&self) -> &[ToolDefinition] {
+        self.tools
+    }
+}
+
+/// Executes a complete tool round for a specialized agent layer.
+///
+/// The executor returns exactly one result per call, in call order. It owns
+/// detailed tool events and any layer-specific output policy. The generic
+/// agent still commits the returned results before it observes cancellation.
+#[async_trait]
+pub trait ToolRoundExecutor: Send + Sync {
+    /// Executes the round.
+    async fn execute_round(
+        &self,
+        context: ToolRoundContext<'_>,
+        cancel: &CancellationToken,
+    ) -> Vec<ToolResult>;
+}
+
 /// The context supplied to one tool call.
 #[derive(Clone)]
 pub struct ToolContext {
