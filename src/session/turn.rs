@@ -1,348 +1,168 @@
-//! The turn loop: one input, however many rounds it takes.
-//!
-//! A round is one exchange with the model. The session drains whatever was
-//! steered in, builds a request, reads the response as it streams, commits the
-//! turn, runs the tools it asked for, and goes round again. It stops when the
-//! model answers with no tool calls, when something cancels the prompt, or when
-//! a model call fails for good.
-//!
-//! Three rules shape everything here, and each is a thing that goes wrong in a
-//! long-running agent if it is not held:
-//!
-//! - **Every tool call gets a result.** Tool results are committed whatever
-//!   interrupted the round, and a tool that was cancelled answers "Cancelled"
-//!   rather than being dropped mid-flight. A conversation carrying a call with
-//!   no result is one a provider will refuse for the rest of the session.
-//! - **A replayed turn withdraws what it showed.** Before any replay the
-//!   session publishes an empty
-//!   [`AssistantOutputReplace`](crate::AgentEvent::AssistantOutputReplace), so
-//!   a reader never sees the first half of a turn twice.
-//! - **An interrupt is announced exactly once.** Interrupt gestures are
-//!   counted, and the loop settles the count as it publishes one
-//!   [`RoundInterrupted`](crate::AgentEvent::RoundInterrupted) per gesture:
-//!   never two for one, never none.
+//! The coding layer that projects Pebble's durable behavior onto `Agent`.
 
-use std::sync::{Arc, PoisonError};
-use std::time::{Duration, Instant, SystemTime};
+use std::mem;
+use std::result::Result as StdResult;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Instant, SystemTime};
 
+use async_trait::async_trait;
 use lithos_llm::middleware::CallContext;
 use lithos_llm::types::{
-    ContentPart, Error as LlmError, Request, Response, ToolCall, ToolChoice, ToolResult,
+    ContentPart, Error as LlmError, Message as LlmMessage, Request, Response, ResponseStream,
+    ToolCall, ToolResult,
 };
-use pebble_agent::FirstOutputKind;
-use pebble_agent::advanced::{StreamObserver, StreamOutcome, stream_response};
+use pebble_agent::advanced::{ToolRoundContext, ToolRoundExecutor};
+use pebble_agent::{
+    Agent, AgentConfig, AgentError, AgentEvent as GenericEvent, EventProjection, FirstOutputKind,
+    ModelService, Tool, ToolContext as GenericToolContext, ToolError as GenericToolError,
+    ToolExecutor as GenericToolExecutor, ToolOutput as GenericToolOutput, ToolProvider,
+    TurnBoundaryAction, TurnBoundaryContext, TurnBoundaryError, TurnBoundaryHooks, TurnContext,
+};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use super::control::SteeringItem;
 use super::retry::RetryEventBridge;
 use super::{PromptTotals, Session};
 use crate::compaction::{CompactionRequest, check_context_usage, compact_context};
+use crate::config::SessionOptions;
 use crate::context_window::{
     ContextWindowInput, build_local_snapshot, context_window_from_response_usage,
 };
+use crate::environment::Environment;
 use crate::error::{Error, ErrorData, Result};
+use crate::event::Emitter;
+use crate::file_tracker::FileTracker;
+use crate::history::History;
 use crate::human_input::HumanInputProvider;
 use crate::loop_detection::detect_loop;
+use crate::profile::ModelFacts;
 use crate::reasoning::ReasoningOutput;
+use crate::redact::Redactor;
 use crate::skills::{ExpandedInput, SkillExpansion, expand_skill};
 use crate::task_reminder::maybe_task_reminder;
-use crate::tool::{NativeTool, ToolDefinitionWithSource, ToolDispatch, canonical_tool_name};
+use crate::tool::{
+    NativeTool, ToolDefinitionWithSource, ToolDispatch, ToolEnvProvider, ToolRegistry,
+    canonical_tool_name,
+};
 use crate::types::{
     AgentEvent, ContextWindowSnapshot, CostSource, LlmOutputKind, LlmRetryPhase, Message,
     SessionState, SkillActivationSource, TokenUsage,
 };
 
-/// How many times the session replays a turn whose stream broke after it had
-/// already shown output.
-///
-/// Three replays, so four attempts in all. Failures before any visible output
-/// never reach here: the client's retry middleware reconnects underneath the
-/// session, which is the only layer that can do it without a reader noticing.
-const STREAM_CONSUME_RETRIES: usize = 3;
+/// How many failed response streams Pebble replays after the first attempt.
+const STREAM_CONSUME_RETRIES: u32 = 3;
 
 /// What the model is told when it keeps making the same calls.
 const LOOP_WARNING: &str = "WARNING: Loop detected. You appear to be repeating the same tool \
                             calls. Please try a different approach or ask for clarification.";
 
-/// Takes the running span out of `start` and adds it to `total`.
-fn record_elapsed(start: &mut Option<Instant>, total: &mut Duration) {
-    if let Some(started) = start.take() {
-        *total = total.saturating_add(started.elapsed());
-    }
+#[derive(Clone)]
+struct CodingAgentBridge {
+    state:                  Arc<Mutex<CodingAgentState>>,
+    client:                 lithos_llm::Client,
+    model_selector:         String,
+    model:                  String,
+    provider:               String,
+    system_prompt:          String,
+    facts:                  ModelFacts,
+    config:                 SessionOptions,
+    registry:               ToolRegistry,
+    env:                    Arc<dyn Environment>,
+    human_input:            Option<Arc<dyn HumanInputProvider>>,
+    tool_env_provider:      Option<Arc<dyn ToolEnvProvider>>,
+    redactor:               Arc<dyn Redactor>,
+    emitter:                Emitter,
+    session_id:             String,
+    root_session_id:        String,
+    memory_tokens:          u64,
+    skills_tokens:          u64,
+    control_state:          Arc<Mutex<super::control::ControlState>>,
+    control_notify:         Arc<Notify>,
+    terminal_cancel:        CancellationToken,
+    completion_coordinator: Option<Arc<dyn super::CompletionCoordinator>>,
 }
 
-/// The tool calls a response asked for, in the order it asked.
-fn tool_calls_of(response: &Response) -> Vec<ToolCall> {
-    response
-        .content
-        .iter()
-        .filter_map(|part| match part {
-            ContentPart::ToolCall(call) => Some(call.clone()),
-            _ => None,
-        })
-        .collect()
+struct CodingAgentState {
+    history: History,
+    file_tracker: FileTracker,
+    totals: PromptTotals,
+    activated_skill_context_observed: bool,
+    compaction_failed: bool,
+    pending_task_reminder: Option<Message>,
+    local_context_window: Option<ContextWindowSnapshot>,
+    inference_start: Option<Instant>,
 }
 
-/// The parts of a response that only the provider understands.
-///
-/// Kept verbatim and replayed in place, because a reasoning block's signature
-/// and a provider's own opaque items are what make a multi-turn conversation
-/// valid on the next call.
-fn provider_parts_of(response: &Response) -> Vec<ContentPart> {
-    response
-        .content
-        .iter()
-        .filter(|part| matches!(part, ContentPart::Opaque { .. } | ContentPart::Reasoning(_)))
-        .cloned()
-        .collect()
-}
-
-impl Session {
-    /// Processes one input until the model stops asking for tools.
-    ///
-    /// Answers with the assistant's final text when it ended with any, and
-    /// `None` when it ended with nothing worth showing.
-    pub(super) async fn process_input(
-        &mut self,
-        input: &str,
-        skill_expansion: SkillExpansion,
-        human_input: Option<&Arc<dyn HumanInputProvider>>,
-        totals: &mut PromptTotals,
-    ) -> Result<Option<String>> {
-        if self.state == SessionState::Closed {
-            return Err(Error::SessionClosed);
-        }
-        self.transition(SessionState::Thinking);
-
-        let expanded = self.expand_input(input, skill_expansion)?;
-        if let Some(name) = &expanded.skill_name {
-            self.activated_skill_context_observed = true;
-            self.emit(AgentEvent::SkillActivated {
-                skill_name: name.clone(),
-                source:     SkillActivationSource::Slash,
-            });
-        }
-        self.history.push(Message::User {
-            content:   expanded.text.clone(),
-            timestamp: SystemTime::now(),
-        });
-        self.emit(AgentEvent::UserInput {
-            text: expanded.text,
-        });
-
-        // One failed summarization is unlikely to succeed again inside the
-        // same input, and both checkpoints would try. Suppressing further
-        // attempts stops a provider returning nothing from turning into a prompt
-        // of paid calls; the next input starts fresh.
-        let mut compaction_failed = false;
-
-        loop {
-            // A refusing sink has already stopped the pipeline, so the prompt
-            // ends here rather than working on with nothing recording it.
-            self.check_pump().await?;
-
-            self.refresh_round_token();
-
-            // Ending the prompt beats a park: a session waiting for a steer that
-            // was also cancelled is cancelled.
-            if self.cancel_token.is_cancelled() {
-                return Err(self.close_cancelled().await);
-            }
-
-            // Every round, whether or not this one looks interrupted: a
-            // gesture that raised its generation and then cancelled the token
-            // this loop was already replacing leaves an announcement owing on a
-            // round that ended normally, and it is owed now rather than at the
-            // next interrupt.
-            self.settle_interrupts();
-
-            // Steering pushed mid-round arrives as the first turn of the next
-            // one. Drain, park if a bare interrupt left nothing to say, then
-            // drain again — what woke the park is a steer that belongs to this
-            // round.
-            self.drain_steering();
-            self.wait_for_steer_if_needed().await?;
-            self.drain_steering();
-
-            // Stable for this round even when a control handle swaps a fresh
-            // token into the shared cell.
-            let round_token = self
-                .round_token
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
-
-            if !compaction_failed {
-                compaction_failed = self.compact_if_needed().await;
-            }
-
-            // The policy filter runs once per round; the request builder takes
-            // the only per-round copy of the definitions.
-            let tools = self.effective_tools();
-
-            // Staged, not committed: an interrupted round must not leave a
-            // system message behind for later steering to answer. It commits
-            // only alongside the assistant turn that read it.
-            let pending_task_reminder = self.task_reminder_if_needed(&tools);
-
-            let request = self.build_request(&tools, pending_task_reminder.as_ref())?;
-            let local_context_window = self.measure_request(&request, &tools);
-
-            // The last moment at which nothing is known about the response.
-            // One per round, however many times the turn is replayed inside
-            // it.
-            self.emit(AgentEvent::LlmRequestStarted {
-                requested_model: self.model.clone(),
-            });
-
-            let mut inference_start = Some(Instant::now());
-            let bridge_emitter = self.emitter.clone();
-            let bridge_session_id = self.id.clone();
-            let bridge_provider = self.provider.clone();
-            let bridge_model = self.model.clone();
-            let observer = SessionStreamObserver { session: self };
-            let outcome = stream_response(
-                &self.client,
-                request,
-                &self.cancel_token,
-                &round_token,
-                self.config.turn_replay,
-                u32::try_from(STREAM_CONSUME_RETRIES).unwrap_or(u32::MAX),
-                move || {
-                    let mut context = CallContext::new();
-                    context.extensions_mut().insert(RetryEventBridge::new(
-                        bridge_emitter.clone(),
-                        bridge_session_id.clone(),
-                        bridge_provider.clone(),
-                        bridge_model.clone(),
-                    ));
-                    context
-                },
-                &observer,
-            )
-            .await;
-            record_elapsed(&mut inference_start, &mut totals.timing.inference);
-
-            let response = match outcome {
-                StreamOutcome::Completed(response) => *response,
-                StreamOutcome::Aborted => return Err(self.close_cancelled().await),
-                StreamOutcome::Interrupted => continue,
-                StreamOutcome::Failed(error) => return Err(self.emit_llm_error(*error)),
-                _ => {
-                    return Err(Error::InvalidState(
-                        "the agent stream returned an unknown outcome".to_owned(),
-                    ));
-                }
-            };
-
-            let committed = self.commit_turn(
-                &response,
-                pending_task_reminder,
-                &local_context_window,
-                totals,
-            );
-
-            // The turn just grew the conversation, so measure it again before
-            // the next round is built on top of it.
-            if !compaction_failed {
-                compaction_failed = self.compact_if_needed().await;
-            }
-
-            let tool_calls = match committed {
-                Committed::Answered { text } => {
-                    if round_token.is_cancelled() {
-                        // A steer landed during the final response; deliver it
-                        // rather than ending the prompt on it.
-                        continue;
-                    }
-                    let coordinator_continues = self
-                        .completion_coordinator
-                        .as_ref()
-                        .is_some_and(|coordinator| coordinator.on_natural_completion());
-                    if coordinator_continues {
-                        continue;
-                    }
-                    return Ok((!text.trim().is_empty()).then_some(text));
-                }
-                Committed::CallsTools { tool_calls } => tool_calls,
-            };
-
-            // Tools watch one token covering both the end of the prompt and the
-            // end of the round, and answer "Cancelled" cooperatively rather
-            // than being dropped, which is what keeps every call paired with a
-            // result.
-            let composite = CancellationToken::new();
-            self.transition(SessionState::Executing);
-            let tool_start = Instant::now();
-            let results = self
-                .execute_tools(&tool_calls, &composite, &round_token, human_input)
-                .await;
-            totals.timing.tool = totals.timing.tool.saturating_add(tool_start.elapsed());
-
-            if activated_a_skill(&tool_calls, &results) {
-                self.activated_skill_context_observed = true;
-            }
-            self.file_tracker
-                .record_from_tool_calls(&tool_calls, &results);
-
-            // Committed whichever token fired, because a call without its
-            // result is a conversation no provider will take back.
-            self.history.push(Message::ToolResults {
-                results,
-                timestamp: SystemTime::now(),
-            });
-
-            if self.cancel_token.is_cancelled() {
-                return Err(self.close_cancelled().await);
-            }
-            self.transition(SessionState::Thinking);
-            if round_token.is_cancelled() {
-                continue;
-            }
-
-            if self.config.enable_loop_detection
-                && detect_loop(&self.history, self.config.loop_detection_window)
-            {
-                // Pushed straight into history rather than through the
-                // steering queue: this is the session talking to the model,
-                // not an operator, so it publishes no steering event.
-                self.history.push(Message::Steering {
-                    content:   LOOP_WARNING.to_owned(),
-                    timestamp: SystemTime::now(),
-                });
-                self.emit(AgentEvent::LoopDetected);
-            }
+impl CodingAgentBridge {
+    fn from_session(session: &mut Session, totals: &mut PromptTotals) -> Self {
+        Self {
+            state:                  Arc::new(Mutex::new(CodingAgentState {
+                history: mem::take(&mut session.history),
+                file_tracker: mem::take(&mut session.file_tracker),
+                totals: mem::take(totals),
+                activated_skill_context_observed: session.activated_skill_context_observed,
+                compaction_failed: false,
+                pending_task_reminder: None,
+                local_context_window: None,
+                inference_start: None,
+            })),
+            client:                 session.client.clone(),
+            model_selector:         session.model_selector.clone(),
+            model:                  session.model.clone(),
+            provider:               session.provider.clone(),
+            system_prompt:          session.system_prompt.clone(),
+            facts:                  session.facts,
+            config:                 session.config.clone(),
+            registry:               session.registry.clone(),
+            env:                    Arc::clone(&session.env),
+            human_input:            session.human_input.clone(),
+            tool_env_provider:      session.tool_env_provider.clone(),
+            redactor:               Arc::clone(&session.redactor),
+            emitter:                session.emitter.clone(),
+            session_id:             session.id.clone(),
+            root_session_id:        session.root_session_id.clone(),
+            memory_tokens:          session.memory_tokens,
+            skills_tokens:          session.skills_tokens,
+            control_state:          Arc::clone(&session.control_state),
+            control_notify:         Arc::clone(&session.control_notify),
+            terminal_cancel:        session.cancel_token.clone(),
+            completion_coordinator: session.completion_coordinator.clone(),
         }
     }
 
-    /// Expands a `/name` reference in the input, where one is allowed.
-    fn expand_input(&self, input: &str, expansion: SkillExpansion) -> Result<ExpandedInput> {
-        if self.skills.is_empty() || expansion == SkillExpansion::Skip {
-            return Ok(ExpandedInput {
-                text:       input.to_owned(),
-                skill_name: None,
-            });
-        }
-        expand_skill(&self.skills, input).map_err(|error| Error::InvalidState(error.to_string()))
+    fn restore_session(&self, session: &mut Session, totals: &mut PromptTotals) {
+        self.finish_inference();
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        session.history = state.history.clone();
+        session.file_tracker = state.file_tracker.clone();
+        session.activated_skill_context_observed = state.activated_skill_context_observed;
+        *totals = state.totals;
     }
 
-    /// Arms a fresh round token when the last round's was cancelled.
-    fn refresh_round_token(&self) {
-        let cancelled = self
-            .round_token
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_cancelled();
-        if cancelled {
-            *self
-                .round_token
-                .write()
-                .unwrap_or_else(PoisonError::into_inner) = CancellationToken::new();
+    fn emit(&self, event: AgentEvent) {
+        self.emitter.emit(self.session_id.clone(), event);
+    }
+
+    fn effective_tools(&self) -> Vec<ToolDefinitionWithSource> {
+        self.registry.definitions_with_source_for_policy(
+            self.config.tool_access_policy.as_deref(),
+            self.config.tool_exposure_mode,
+        )
+    }
+
+    fn finish_inference(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(started) = state.inference_start.take() {
+            state.totals.timing.inference = state
+                .totals
+                .timing
+                .inference
+                .saturating_add(started.elapsed());
         }
     }
 
-    /// Publishes one event per interrupt gesture that has not been announced.
-    fn settle_interrupts(&mut self) {
+    fn settle_interrupts(&self) {
         let generations = {
             let mut control = self
                 .control_state
@@ -362,93 +182,41 @@ impl Session {
         }
     }
 
-    /// Commits everything queued as real conversation turns.
-    fn drain_steering(&mut self) {
-        let items: Vec<SteeringItem> = {
-            let mut control = self
-                .control_state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            control.queue.drain(..).collect()
-        };
-        for item in items {
-            let timestamp = SystemTime::now();
-            match item {
-                SteeringItem::Steering { text, actor } => {
-                    self.history.push(Message::Steering {
-                        content: text.clone(),
-                        timestamp,
-                    });
-                    self.emitter
-                        .emit(self.id.clone(), AgentEvent::SteeringInjected {
-                            text,
-                            actor,
-                        });
-                }
-                SteeringItem::User { text } => self.history.push(Message::User {
-                    content: text,
-                    timestamp,
-                }),
-                SteeringItem::System { text } => self.history.push(Message::System {
-                    content: text,
-                    timestamp,
-                }),
-            }
-        }
-    }
-
-    /// Waits, where an interrupt parked the session, until someone says what to
-    /// do next.
-    ///
-    /// Only ending the prompt wakes this with a failure. The round token means
-    /// nothing here: the round it named is already over.
-    async fn wait_for_steer_if_needed(&mut self) -> Result<()> {
-        let notify = Arc::clone(&self.control_notify);
+    async fn wait_for_steer_if_needed(&self, cancel: &CancellationToken) {
         loop {
-            let cancelled = {
-                let notified = notify.notified();
-                tokio::pin!(notified);
-                // Registered before the queue is read, so a steer that lands
-                // in between still wakes this wait.
-                notified.as_mut().enable();
-
-                let should_wait = {
-                    let control = self
-                        .control_state
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    control.waiting_for_steer && control.queue.is_empty()
-                };
-                if !should_wait {
-                    return Ok(());
-                }
-
-                tokio::select! {
-                    biased;
-                    () = self.cancel_token.cancelled() => true,
-                    () = notified => false,
-                }
+            let notified = self.control_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let should_wait = {
+                let control = self
+                    .control_state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                control.waiting_for_steer && control.queue.is_empty()
             };
-            if cancelled {
-                return Err(self.close_cancelled().await);
+            if !should_wait {
+                return;
+            }
+            tokio::select! {
+                () = self.terminal_cancel.cancelled() => return,
+                () = cancel.cancelled() => return,
+                () = notified => {}
             }
         }
     }
 
-    /// Summarizes the older turns when the conversation is close to the
-    /// model's window.
-    ///
-    /// Answers whether an attempt failed, which suppresses the rest of this
-    /// input's attempts. The usage check runs even where compaction is turned
-    /// off, so an application still hears that the window is filling up.
-    async fn compact_if_needed(&mut self) -> bool {
+    async fn compact_if_needed(&self) -> bool {
+        let (mut history, file_tracker) = {
+            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            (state.history.clone(), state.file_tracker.clone())
+        };
         let Some(estimate) = check_context_usage(
             &self.system_prompt,
-            &self.history,
+            &history,
             self.facts.context_window_tokens,
             self.config.compaction_threshold_percent,
             &self.emitter,
-            &self.id,
+            &self.session_id,
         ) else {
             return false;
         };
@@ -463,106 +231,522 @@ impl Session {
             estimate,
         };
         if let Err(error) = compact_context(
-            &mut self.history,
+            &mut history,
             &self.client,
-            &self.file_tracker,
+            &file_tracker,
             request,
             &self.emitter,
-            &self.id,
+            &self.session_id,
         )
         .await
         {
-            // Not fatal: the conversation is intact, only larger than it
-            // should be.
-            self.emitter.emit(self.id.clone(), AgentEvent::Error {
+            self.emit(AgentEvent::Error {
                 error: ErrorData::from(&error),
             });
             return true;
         }
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .history = history;
         false
     }
 
-    /// The reminder to stage this round, where the model has drifted from the
-    /// task.
-    fn task_reminder_if_needed(&self, tools: &[ToolDefinitionWithSource]) -> Option<Message> {
-        let names: Vec<&str> = tools
+    fn stage_task_reminder(&self) {
+        let tools = self.effective_tools();
+        let names = tools
             .iter()
             .map(|tool| tool.definition.name.as_str())
-            .collect();
-        maybe_task_reminder(&self.history, &names).map(|content| Message::System {
-            content,
+            .collect::<Vec<_>>();
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.pending_task_reminder =
+            maybe_task_reminder(&state.history, &names).map(|content| Message::System {
+                content,
+                timestamp: SystemTime::now(),
+            });
+    }
+
+    fn sync_messages(&self, context: &mut TurnBoundaryContext<'_>, include_reminder: bool) {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        *context.messages_mut() = state.history.to_llm_messages();
+        if include_reminder && let Some(reminder) = &state.pending_task_reminder {
+            context.messages_mut().push(reminder.to_llm_message());
+        }
+    }
+
+    fn commit_user_message(&self, message: &LlmMessage) {
+        let text = message_text(message);
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .history
+            .push(Message::User {
+                content:   text.clone(),
+                timestamp: SystemTime::now(),
+            });
+        self.emit(AgentEvent::UserInput { text });
+    }
+
+    fn commit_steering(&self, message: &LlmMessage) {
+        self.settle_interrupts();
+        let queued = self
+            .control_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .queue
+            .pop_front();
+        let fallback = message_text(message);
+        let timestamp = SystemTime::now();
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match queued.unwrap_or_else(|| SteeringItem::steering(fallback)) {
+            SteeringItem::Steering { text, actor } => {
+                state.history.push(Message::Steering {
+                    content: text.clone(),
+                    timestamp,
+                });
+                drop(state);
+                self.emit(AgentEvent::SteeringInjected { text, actor });
+            }
+            SteeringItem::User { text } => state.history.push(Message::User {
+                content: text,
+                timestamp,
+            }),
+            SteeringItem::System { text } => state.history.push(Message::System {
+                content: text,
+                timestamp,
+            }),
+        }
+    }
+
+    fn commit_assistant(&self, response: &Response) {
+        self.finish_inference();
+        let text = response.text();
+        let tool_calls = tool_calls_of(response);
+        let reasoning = ReasoningOutput::from_content(&response.content);
+        let provider_parts = provider_parts_of(response);
+        let usage = TokenUsage::from(response.usage);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let context_window = state
+            .local_context_window
+            .take()
+            .map(|local| context_window_from_response_usage(&local, usage));
+
+        state.totals.usage = state.totals.usage.saturating_add(usage);
+        if let Some(cost) = response.cost {
+            state.totals.cost_usd_micros = Some(
+                state
+                    .totals
+                    .cost_usd_micros
+                    .unwrap_or(0)
+                    .saturating_add(cost.usd_micros),
+            );
+        }
+        if let Some(reminder) = state.pending_task_reminder.take() {
+            state.history.push(reminder);
+        }
+        state.history.push(Message::Assistant {
+            content: text.clone(),
+            tool_calls: tool_calls.clone(),
+            provider_parts,
+            usage,
+            response_id: response.id.clone().unwrap_or_default(),
             timestamp: SystemTime::now(),
-        })
+        });
+        drop(state);
+
+        let answering_model = response.model.model().as_str();
+        self.emit(AgentEvent::AssistantMessage {
+            text,
+            model: if answering_model.is_empty() {
+                self.model.clone()
+            } else {
+                answering_model.to_owned()
+            },
+            usage,
+            cost_usd_micros: response.cost.map(|cost| cost.usd_micros),
+            cost_source: response.cost.map(|cost| CostSource::from(cost.source)),
+            tool_call_count: tool_calls.len(),
+            context_window,
+            reasoning,
+        });
     }
 
-    /// Builds this round's request.
-    ///
-    /// A staged reminder goes last, through the same conversion durable turns
-    /// use, so what the model reads now is what history will hold if the turn
-    /// commits. Deterministic within a round — nothing it reads changes until
-    /// the turn commits — which is what lets a replay rebuild the request
-    /// instead of every round paying to clone one it will probably never
-    /// need again.
-    fn build_request(
-        &self,
-        tools: &[ToolDefinitionWithSource],
-        pending_task_reminder: Option<&Message>,
-    ) -> Result<Request> {
-        let mut builder = Request::builder().model(self.model_selector.clone());
-        if !self.system_prompt.trim().is_empty() {
-            builder = builder.system(self.system_prompt.clone());
-        }
-        for message in self.history.to_llm_messages() {
-            builder = builder.message(message);
-        }
-        if let Some(reminder) = pending_task_reminder {
-            builder = builder.message(reminder.to_llm_message());
-        }
-
-        for tool in tools {
-            builder = builder.tool(tool.definition.clone());
-        }
-        if !tools.is_empty() {
-            builder = builder.tool_choice(ToolChoice::Auto);
-        }
-        if let Some(max_output_tokens) = self.max_output_tokens() {
-            builder = builder.max_output_tokens(max_output_tokens);
-        }
-        if let Some(effort) = self.config.reasoning_effort {
-            builder = builder.reasoning_effort(effort);
-        }
-        if let Some(speed) = self.config.speed {
-            builder = builder.speed(speed);
-        }
-
-        builder.build().map_err(|error| {
-            Error::InvalidState(format!("this round's request could not be built: {error}"))
-        })
-    }
-
-    /// Measures what this round's request will cost to send.
-    fn measure_request(
-        &self,
-        request: &Request,
-        tools: &[ToolDefinitionWithSource],
-    ) -> ContextWindowSnapshot {
+    fn measure_request(&self, request: &Request) -> ContextWindowSnapshot {
+        let tools = self.effective_tools();
+        let activated = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .activated_skill_context_observed;
         build_local_snapshot(ContextWindowInput {
             request,
-            tools,
+            tools: &tools,
             system_prompt: &self.system_prompt,
             memory_tokens: self.memory_tokens,
             skills_tokens: self.skills_tokens,
-            activated_skill_context_observed: self.activated_skill_context_observed,
+            activated_skill_context_observed: activated,
             provider: &self.provider,
             model: &self.model,
             context_window_tokens: self.facts.context_window_tokens,
         })
     }
+}
+
+impl EventProjection for CodingAgentBridge {
+    fn project(&self, event: &GenericEvent) {
+        match event {
+            GenericEvent::UserMessage { message } => self.commit_user_message(message),
+            GenericEvent::SteeringMessage { message } => self.commit_steering(message),
+            GenericEvent::ModelRequestStarted { request, .. } => {
+                let local = self.measure_request(request);
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                state.local_context_window = Some(local);
+                state.inference_start = Some(Instant::now());
+                drop(state);
+                self.emit(AgentEvent::LlmRequestStarted {
+                    requested_model: self.model.clone(),
+                });
+            }
+            GenericEvent::FirstOutput { kind } => {
+                let kind = match kind {
+                    FirstOutputKind::Text => LlmOutputKind::Text,
+                    FirstOutputKind::Reasoning => LlmOutputKind::Reasoning,
+                    FirstOutputKind::ToolCall => LlmOutputKind::ToolCall,
+                    _ => return,
+                };
+                self.emit(AgentEvent::LlmFirstOutput { kind });
+            }
+            GenericEvent::TextDelta { delta } => {
+                self.emit(AgentEvent::TextDelta {
+                    delta: delta.clone(),
+                });
+            }
+            GenericEvent::ReasoningDelta { delta } => {
+                self.emit(AgentEvent::ReasoningDelta {
+                    delta: delta.clone(),
+                });
+            }
+            GenericEvent::OutputReplaced => {
+                self.emit(AgentEvent::AssistantOutputReplace {
+                    text:      String::new(),
+                    reasoning: None,
+                });
+            }
+            GenericEvent::TurnReplay {
+                failed_attempt,
+                delay_seconds,
+                error,
+            } => {
+                self.emit(AgentEvent::LlmRetry {
+                    provider:   self.provider.clone(),
+                    model:      self.model.clone(),
+                    attempt:    usize::try_from(failed_attempt.saturating_sub(1))
+                        .unwrap_or(usize::MAX),
+                    delay_secs: *delay_seconds,
+                    error:      ErrorData::from(error),
+                    phase:      LlmRetryPhase::Consume,
+                });
+            }
+            GenericEvent::AssistantMessage { response } => self.commit_assistant(response),
+            GenericEvent::TurnInterrupted => {
+                self.finish_inference();
+                self.state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .pending_task_reminder = None;
+                self.settle_interrupts();
+            }
+            _ => {}
+        }
+    }
+}
+
+impl ToolProvider for CodingAgentBridge {
+    fn tools_for_turn(&self, _context: TurnContext<'_>) -> Vec<Tool> {
+        self.effective_tools()
+            .into_iter()
+            .map(|tool| Tool::new(tool.definition, Arc::new(UnusedToolExecutor)))
+            .collect()
+    }
+}
+
+struct UnusedToolExecutor;
+
+#[async_trait]
+impl GenericToolExecutor for UnusedToolExecutor {
+    async fn execute(
+        &self,
+        _context: GenericToolContext,
+        _arguments: serde_json::Value,
+    ) -> StdResult<GenericToolOutput, GenericToolError> {
+        Err(GenericToolError::new(
+            "coding tools must run through Pebble's round executor",
+        ))
+    }
+}
+
+#[async_trait]
+impl ToolRoundExecutor for CodingAgentBridge {
+    async fn execute_round(
+        &self,
+        context: ToolRoundContext<'_>,
+        cancel: &CancellationToken,
+    ) -> Vec<ToolResult> {
+        let mut dispatch = ToolDispatch::new(
+            &self.registry,
+            &self.env,
+            &self.config,
+            &self.emitter,
+            &self.session_id,
+            &self.root_session_id,
+        );
+        if let Some(provider) = self.tool_env_provider.as_ref() {
+            dispatch = dispatch.with_tool_env_provider(provider);
+        }
+        if let Some(provider) = self.human_input.as_ref() {
+            dispatch = dispatch.with_human_input(provider);
+        }
+        dispatch = dispatch.with_redactor(&self.redactor);
+
+        let started = Instant::now();
+        let results = dispatch.execute(context.calls(), true, cancel).await;
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.totals.timing.tool = state.totals.timing.tool.saturating_add(started.elapsed());
+        if activated_a_skill(context.calls(), &results) {
+            state.activated_skill_context_observed = true;
+        }
+        state
+            .file_tracker
+            .record_from_tool_calls(context.calls(), &results);
+        state.history.push(Message::ToolResults {
+            results:   results.clone(),
+            timestamp: SystemTime::now(),
+        });
+        let loop_detected = self.config.enable_loop_detection
+            && detect_loop(&state.history, self.config.loop_detection_window);
+        if loop_detected {
+            state.history.push(Message::Steering {
+                content:   LOOP_WARNING.to_owned(),
+                timestamp: SystemTime::now(),
+            });
+        }
+        drop(state);
+        if loop_detected {
+            self.emit(AgentEvent::LoopDetected);
+        }
+        results
+    }
+}
+
+#[async_trait]
+impl TurnBoundaryHooks for CodingAgentBridge {
+    async fn before_model(
+        &self,
+        mut context: TurnBoundaryContext<'_>,
+        cancel: &CancellationToken,
+    ) -> StdResult<(), TurnBoundaryError> {
+        self.settle_interrupts();
+        self.wait_for_steer_if_needed(cancel).await;
+        if cancel.is_cancelled() || self.terminal_cancel.is_cancelled() {
+            return Ok(());
+        }
+
+        let compaction_failed = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .compaction_failed;
+        if !compaction_failed && self.compact_if_needed().await {
+            self.state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .compaction_failed = true;
+        }
+        self.stage_task_reminder();
+        self.sync_messages(&mut context, true);
+        Ok(())
+    }
+
+    async fn after_model(
+        &self,
+        mut context: TurnBoundaryContext<'_>,
+        _response: &Response,
+        _cancel: &CancellationToken,
+    ) -> StdResult<(), TurnBoundaryError> {
+        let compaction_failed = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .compaction_failed;
+        if !compaction_failed && self.compact_if_needed().await {
+            self.state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .compaction_failed = true;
+        }
+        self.sync_messages(&mut context, false);
+        Ok(())
+    }
+
+    async fn after_answer(
+        &self,
+        _context: TurnContext<'_>,
+        _response: &Response,
+        _cancel: &CancellationToken,
+    ) -> StdResult<TurnBoundaryAction, TurnBoundaryError> {
+        Ok(
+            if self
+                .completion_coordinator
+                .as_ref()
+                .is_some_and(|coordinator| coordinator.on_natural_completion())
+            {
+                TurnBoundaryAction::Continue
+            } else {
+                TurnBoundaryAction::Complete
+            },
+        )
+    }
+}
+
+#[derive(Clone)]
+struct CodingModelService {
+    client:     lithos_llm::Client,
+    emitter:    Emitter,
+    session_id: String,
+    provider:   String,
+    model:      String,
+}
+
+#[async_trait]
+impl ModelService for CodingModelService {
+    async fn stream(
+        &self,
+        request: Request,
+        mut context: CallContext,
+    ) -> StdResult<ResponseStream, LlmError> {
+        context.extensions_mut().insert(RetryEventBridge::new(
+            self.emitter.clone(),
+            self.session_id.clone(),
+            self.provider.clone(),
+            self.model.clone(),
+        ));
+        self.client.stream_with_context(request, context).await
+    }
+}
+
+impl Session {
+    /// Processes one input through the shared generic agent loop.
+    pub(super) async fn process_input(
+        &mut self,
+        input: &str,
+        skill_expansion: SkillExpansion,
+        _human_input: Option<&Arc<dyn HumanInputProvider>>,
+        totals: &mut PromptTotals,
+    ) -> Result<Option<String>> {
+        if self.state == SessionState::Closed {
+            return Err(Error::SessionClosed);
+        }
+        self.check_pump().await?;
+        self.transition(SessionState::Thinking);
+
+        let expanded = self.expand_input(input, skill_expansion)?;
+        if let Some(name) = &expanded.skill_name {
+            self.activated_skill_context_observed = true;
+            self.emit(AgentEvent::SkillActivated {
+                skill_name: name.clone(),
+                source:     SkillActivationSource::Slash,
+            });
+        }
+
+        let bridge = CodingAgentBridge::from_session(self, totals);
+        let model_service = CodingModelService {
+            client:     self.client.clone(),
+            emitter:    self.emitter.clone(),
+            session_id: self.id.clone(),
+            provider:   self.provider.clone(),
+            model:      self.model.clone(),
+        };
+        let messages = bridge
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .history
+            .to_llm_messages();
+        let config = AgentConfig {
+            max_output_tokens: self.max_output_tokens(),
+            reasoning_effort: self.config.reasoning_effort,
+            speed: self.config.speed,
+            turn_replay: self.config.turn_replay,
+            max_turn_replays: STREAM_CONSUME_RETRIES,
+            ..AgentConfig::default()
+        };
+        let mut agent = Agent::builder(model_service, self.model_selector.clone())
+            .system_prompt(self.system_prompt.clone())
+            .messages(messages)
+            .tool_provider(Arc::new(bridge.clone()))
+            .tool_round_executor(Arc::new(bridge.clone()))
+            .turn_boundary_hooks(Arc::new(bridge.clone()))
+            .event_projection(Arc::new(bridge.clone()))
+            .config(config)
+            .build()
+            .map_err(|error| Error::InvalidState(format!("building the coding agent: {error}")))?;
+
+        self.install_agent_control(agent.control_handle());
+        let result = agent
+            .prompt_with_cancellation(expanded.text, &self.cancel_token)
+            .await;
+        self.clear_agent_control();
+        bridge.restore_session(self, totals);
+
+        match result {
+            Ok(outcome) => {
+                let text = outcome.text();
+                Ok((!text.trim().is_empty()).then_some(text))
+            }
+            Err(AgentError::Aborted) => Err(self.close_cancelled().await),
+            Err(AgentError::Model { source }) => Err(self.emit_llm_error(source)),
+            Err(error) => {
+                self.check_pump().await?;
+                Err(Error::InvalidState(format!(
+                    "the coding agent could not process the prompt: {error}"
+                )))
+            }
+        }
+    }
+
+    fn install_agent_control(&self, agent: pebble_agent::AgentControlHandle) {
+        let control = self
+            .control_state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        for item in &control.queue {
+            agent.enqueue_steering(item.text().to_owned());
+        }
+        *self
+            .active_agent_control
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(agent);
+    }
+
+    fn clear_agent_control(&self) {
+        *self
+            .active_agent_control
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+    }
+
+    /// Expands a `/name` reference in the input, where one is allowed.
+    fn expand_input(&self, input: &str, expansion: SkillExpansion) -> Result<ExpandedInput> {
+        if self.skills.is_empty() || expansion == SkillExpansion::Skip {
+            return Ok(ExpandedInput {
+                text:       input.to_owned(),
+                skill_name: None,
+            });
+        }
+        expand_skill(&self.skills, input).map_err(|error| Error::InvalidState(error.to_string()))
+    }
 
     /// The most tokens the model may produce in one turn.
-    ///
-    /// The application's own budget where it set one, and the catalog's limit
-    /// otherwise, so a model is asked for what it can actually give.
     fn max_output_tokens(&self) -> Option<u32> {
         let configured = self
             .config
@@ -577,187 +761,39 @@ impl Session {
             .or_else(from_catalog)
             .filter(|tokens| *tokens > 0)
     }
-
-    /// Takes back everything the current turn has shown.
-    fn replace_visible_output(&self) {
-        self.emit(AgentEvent::AssistantOutputReplace {
-            text:      String::new(),
-            reasoning: None,
-        });
-    }
-
-    /// Records the assistant turn and publishes it.
-    fn commit_turn(
-        &mut self,
-        response: &Response,
-        pending_task_reminder: Option<Message>,
-        local_context_window: &ContextWindowSnapshot,
-        totals: &mut PromptTotals,
-    ) -> Committed {
-        let text = response.text();
-        let tool_calls = tool_calls_of(response);
-        // Normalized before the content moves into history.
-        let reasoning = ReasoningOutput::from_content(&response.content);
-        let provider_parts = provider_parts_of(response);
-        let usage = TokenUsage::from(response.usage);
-        let context_window = Some(context_window_from_response_usage(
-            local_context_window,
-            usage,
-        ));
-
-        totals.usage = totals.usage.saturating_add(usage);
-        if let Some(cost) = response.cost {
-            totals.cost_usd_micros = Some(
-                totals
-                    .cost_usd_micros
-                    .unwrap_or(0)
-                    .saturating_add(cost.usd_micros),
-            );
-        }
-
-        if let Some(reminder) = pending_task_reminder {
-            self.history.push(reminder);
-        }
-        self.history.push(Message::Assistant {
-            content: text.clone(),
-            tool_calls: tool_calls.clone(),
-            provider_parts,
-            usage,
-            response_id: response.id.clone().unwrap_or_default(),
-            timestamp: SystemTime::now(),
-        });
-
-        let answering_model = response.model.model().as_str();
-        self.emit(AgentEvent::AssistantMessage {
-            text: text.clone(),
-            model: if answering_model.is_empty() {
-                self.model.clone()
-            } else {
-                answering_model.to_owned()
-            },
-            usage,
-            cost_usd_micros: response.cost.map(|cost| cost.usd_micros),
-            cost_source: response.cost.map(|cost| CostSource::from(cost.source)),
-            tool_call_count: tool_calls.len(),
-            context_window,
-            reasoning,
-        });
-
-        if tool_calls.is_empty() {
-            Committed::Answered { text }
-        } else {
-            Committed::CallsTools { tool_calls }
-        }
-    }
-
-    /// Answers every tool call in one round, cancelling them together when
-    /// either the round or the prompt ends.
-    ///
-    /// The round is watched from here rather than from a task of its own, so
-    /// nothing outlives the round and the call to the tools is never dropped
-    /// half-finished. Cancellation is therefore only as prompt as the tools
-    /// are: a cancelled round waits for every call it made to answer, and a
-    /// tool that ignores its token holds the round open until it returns.
-    async fn execute_tools(
-        &self,
-        calls: &[ToolCall],
-        composite: &CancellationToken,
-        round_token: &CancellationToken,
-        human_input: Option<&Arc<dyn HumanInputProvider>>,
-    ) -> Vec<ToolResult> {
-        let mut dispatch = ToolDispatch::new(
-            &self.registry,
-            &self.env,
-            &self.config,
-            &self.emitter,
-            &self.id,
-            &self.root_session_id,
-        );
-        if let Some(provider) = self.tool_env_provider.as_ref() {
-            dispatch = dispatch.with_tool_env_provider(provider);
-        }
-        if let Some(provider) = human_input {
-            dispatch = dispatch.with_human_input(provider);
-        }
-        dispatch = dispatch.with_redactor(&self.redactor);
-
-        let terminal = self.cancel_token.clone();
-        let round = round_token.clone();
-        let mut terminal_seen = false;
-        let mut round_seen = false;
-
-        let running = dispatch.execute(calls, true, composite);
-        tokio::pin!(running);
-        loop {
-            tokio::select! {
-                biased;
-                () = terminal.cancelled(), if !terminal_seen => {
-                    terminal_seen = true;
-                    composite.cancel();
-                }
-                () = round.cancelled(), if !round_seen => {
-                    round_seen = true;
-                    composite.cancel();
-                }
-                results = &mut running => return results,
-            }
-        }
-    }
 }
 
-/// Projects the shared model-turn engine onto Pebble's durable coding events.
-struct SessionStreamObserver<'a> {
-    session: &'a Session,
+fn message_text(message: &LlmMessage) -> String {
+    message
+        .content()
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
-impl StreamObserver for SessionStreamObserver<'_> {
-    fn first_output(&self, kind: FirstOutputKind) {
-        let kind = match kind {
-            FirstOutputKind::Text => LlmOutputKind::Text,
-            FirstOutputKind::Reasoning => LlmOutputKind::Reasoning,
-            FirstOutputKind::ToolCall => LlmOutputKind::ToolCall,
-            _ => return,
-        };
-        self.session.emit(AgentEvent::LlmFirstOutput { kind });
-    }
-
-    fn text_delta(&self, delta: &str) {
-        self.session.emit(AgentEvent::TextDelta {
-            delta: delta.to_owned(),
-        });
-    }
-
-    fn reasoning_delta(&self, delta: &str) {
-        self.session.emit(AgentEvent::ReasoningDelta {
-            delta: delta.to_owned(),
-        });
-    }
-
-    fn output_replaced(&self) {
-        self.session.replace_visible_output();
-    }
-
-    fn replay(&self, failed_attempt: u32, delay: Duration, error: &LlmError) {
-        self.session.emit(AgentEvent::LlmRetry {
-            provider:   self.session.provider.clone(),
-            model:      self.session.model.clone(),
-            attempt:    usize::try_from(failed_attempt.saturating_sub(1)).unwrap_or(usize::MAX),
-            delay_secs: delay.as_secs_f64(),
-            error:      ErrorData::from(error),
-            phase:      LlmRetryPhase::Consume,
-        });
-    }
+fn tool_calls_of(response: &Response) -> Vec<ToolCall> {
+    response
+        .content
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::ToolCall(call) => Some(call.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
-/// What committing an assistant turn left the loop to do.
-enum Committed {
-    /// The model answered and asked for nothing.
-    Answered { text: String },
-    /// The model asked for tools.
-    CallsTools { tool_calls: Vec<ToolCall> },
+fn provider_parts_of(response: &Response) -> Vec<ContentPart> {
+    response
+        .content
+        .iter()
+        .filter(|part| matches!(part, ContentPart::Opaque { .. } | ContentPart::Reasoning(_)))
+        .cloned()
+        .collect()
 }
 
-/// Whether any call in this round successfully loaded a skill.
 fn activated_a_skill(calls: &[ToolCall], results: &[ToolResult]) -> bool {
     calls.iter().zip(results).any(|(call, result)| {
         !result.is_error && canonical_tool_name(&call.name) == NativeTool::UseSkill.canonical_name()
@@ -822,45 +858,6 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert!(matches!(parts[0], ContentPart::Reasoning(_)));
         assert!(matches!(parts[1], ContentPart::Opaque { .. }));
-    }
-
-    #[test]
-    fn usage_sums_across_a_prompt() {
-        let first = TokenUsage {
-            input:       10,
-            output:      5,
-            reasoning:   2,
-            cache_read:  1,
-            cache_write: 0,
-        };
-        let second = TokenUsage {
-            input:       3,
-            output:      7,
-            reasoning:   0,
-            cache_read:  0,
-            cache_write: 4,
-        };
-
-        assert_eq!(first.saturating_add(second), TokenUsage {
-            input:       13,
-            output:      12,
-            reasoning:   2,
-            cache_read:  1,
-            cache_write: 4,
-        });
-    }
-
-    #[test]
-    fn elapsed_time_is_taken_once() {
-        let mut start = Some(Instant::now());
-        let mut total = Duration::ZERO;
-
-        record_elapsed(&mut start, &mut total);
-        let after_first = total;
-        record_elapsed(&mut start, &mut total);
-
-        assert_eq!(total, after_first, "a taken span is not counted again");
-        assert!(start.is_none());
     }
 
     #[test]

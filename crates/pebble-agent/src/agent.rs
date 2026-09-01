@@ -24,7 +24,7 @@ use crate::tool::{
     BeforeToolCall, Tool, ToolAccess, ToolAccessContext, ToolAccessPolicy, ToolCallContext,
     ToolCallHooks, ToolContext, ToolProvider, ToolRoundContext, ToolRoundExecutor,
 };
-use crate::turn::{TurnBoundaryContext, TurnBoundaryHooks, TurnContext};
+use crate::turn::{TurnBoundaryAction, TurnBoundaryContext, TurnBoundaryHooks, TurnContext};
 use crate::validation::validate_tool_arguments;
 
 /// The default number of lifecycle events held for each subscriber.
@@ -96,6 +96,8 @@ pub struct AgentConfig {
     pub speed:             Option<Speed>,
     /// Replay policy for a response stream that fails after it opens.
     pub turn_replay:       RetryPolicy,
+    /// Hard limit on replays after the first response stream opens.
+    pub max_turn_replays:  u32,
     /// Whether independent tool calls run together.
     pub tool_execution:    ToolExecution,
     /// Events held for each live subscriber.
@@ -109,6 +111,7 @@ impl Default for AgentConfig {
             reasoning_effort:  None,
             speed:             None,
             turn_replay:       RetryPolicy::exponential().max_attempts(4),
+            max_turn_replays:  3,
             tool_execution:    ToolExecution::default(),
             event_capacity:    DEFAULT_EVENT_CAPACITY,
         }
@@ -458,11 +461,31 @@ impl Agent {
     /// prompt is aborted, context preparation fails, or the model call
     /// fails.
     pub async fn prompt(&mut self, message: impl Into<UserMessage>) -> Result<PromptOutcome> {
-        let message = message.into();
+        self.prompt_inner(message.into(), None).await
+    }
+
+    /// Processes one input until it completes or `cancel` is cancelled.
+    ///
+    /// The external signal is combined with cancellation from this agent's
+    /// control handle. A cancellation that is already set still commits the
+    /// input before the prompt aborts.
+    pub async fn prompt_with_cancellation(
+        &mut self,
+        message: impl Into<UserMessage>,
+        cancel: &CancellationToken,
+    ) -> Result<PromptOutcome> {
+        self.prompt_inner(message.into(), Some(cancel)).await
+    }
+
+    async fn prompt_inner(
+        &mut self,
+        message: UserMessage,
+        parent_cancel: Option<&CancellationToken>,
+    ) -> Result<PromptOutcome> {
         if message.content.is_empty() {
             return Err(AgentError::EmptyInput);
         }
-        let Some(prompt_cancel) = self.control.begin_prompt() else {
+        let Some(prompt_cancel) = self.control.begin_prompt(parent_cancel) else {
             return Err(AgentError::Closed);
         };
 
@@ -595,18 +618,22 @@ impl Agent {
                     }
                     if let Some(hooks) = self.turn_hooks.clone() {
                         let context = TurnContext::new(&self.model, turn, &self.messages);
-                        let boundary_message = hooks
+                        let boundary_action = hooks
                             .after_answer(context, &response, prompt_cancel)
                             .await
                             .map_err(|source| AgentError::TurnBoundary { source })?;
                         if prompt_cancel.is_cancelled() {
                             return Err(AgentError::Aborted);
                         }
-                        if let Some(message) = boundary_message {
-                            let message = message.into_message();
-                            self.messages.push(message.clone());
-                            self.emit(AgentEvent::UserMessage { message });
-                            continue;
+                        match boundary_action {
+                            TurnBoundaryAction::Complete => {}
+                            TurnBoundaryAction::Continue => continue,
+                            TurnBoundaryAction::ContinueWith(message) => {
+                                let message = message.into_message();
+                                self.messages.push(message.clone());
+                                self.emit(AgentEvent::UserMessage { message });
+                                continue;
+                            }
                         }
                         if round_cancel.is_cancelled() {
                             self.emit(AgentEvent::TurnInterrupted);
@@ -624,6 +651,9 @@ impl Agent {
 
                 if prompt_cancel.is_cancelled() {
                     return Err(AgentError::Aborted);
+                }
+                if round_cancel.is_cancelled() {
+                    self.emit(AgentEvent::TurnInterrupted);
                 }
             };
 
@@ -708,7 +738,7 @@ impl Agent {
             prompt_cancel,
             round_cancel,
             self.config.turn_replay,
-            u32::MAX,
+            self.config.max_turn_replays,
             CallContext::new,
             &observer,
         )
@@ -1142,12 +1172,16 @@ mod tests {
             context: TurnContext<'_>,
             _response: &Response,
             _cancel: &CancellationToken,
-        ) -> StdResult<Option<UserMessage>, crate::TurnBoundaryError> {
+        ) -> StdResult<TurnBoundaryAction, crate::TurnBoundaryError> {
             self.trace
                 .lock()
                 .expect("the trace lock is healthy")
                 .push(format!("answer:{}", context.turn()));
-            Ok((context.turn() == 0).then(|| UserMessage::text("background result")))
+            Ok(if context.turn() == 0 {
+                TurnBoundaryAction::ContinueWith(UserMessage::text("background result"))
+            } else {
+                TurnBoundaryAction::Complete
+            })
         }
     }
 

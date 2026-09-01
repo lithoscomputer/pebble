@@ -10,6 +10,19 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::UserMessage;
 
+/// What the agent does after a model turn answers without tool calls.
+#[derive(Clone, Debug, Default, PartialEq)]
+#[non_exhaustive]
+pub enum TurnBoundaryAction {
+    /// Finish the prompt with this answer.
+    #[default]
+    Complete,
+    /// Start another model turn without committing another message.
+    Continue,
+    /// Commit another user message and start another model turn.
+    ContinueWith(UserMessage),
+}
+
 /// An immutable view of the conversation at one model turn.
 #[derive(Clone, Copy, Debug)]
 pub struct TurnContext<'a> {
@@ -117,14 +130,14 @@ pub trait TurnBoundaryHooks: Send + Sync {
 
     /// Runs before a natural answer completes the prompt.
     ///
-    /// Returning `Some` commits that message and starts another model turn.
+    /// The returned action decides whether the answer completes the prompt.
     async fn after_answer(
         &self,
         _context: TurnContext<'_>,
         _response: &Response,
         _cancel: &CancellationToken,
-    ) -> StdResult<Option<UserMessage>, TurnBoundaryError> {
-        Ok(None)
+    ) -> StdResult<TurnBoundaryAction, TurnBoundaryError> {
+        Ok(TurnBoundaryAction::Complete)
     }
 }
 

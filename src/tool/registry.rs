@@ -323,6 +323,7 @@ impl ToolDefinitionWithSource {
 /// discovered rather than configured — and only reads it afterwards.
 /// Registration is therefore a setup activity: nothing is added or removed
 /// while a prompt is in flight.
+#[derive(Clone)]
 pub struct ToolRegistry {
     tools:      HashMap<String, RegisteredTool>,
     /// The naming scheme applied to built-in tools as they are registered.

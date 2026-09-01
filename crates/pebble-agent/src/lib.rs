@@ -66,7 +66,9 @@ pub use self::tool::{
     BeforeToolCall, Tool, ToolAccess, ToolAccessContext, ToolAccessPolicy, ToolCallContext,
     ToolCallHooks, ToolContext, ToolError, ToolExecutor, ToolOutput, ToolProvider,
 };
-pub use self::turn::{TurnBoundaryContext, TurnBoundaryError, TurnBoundaryHooks, TurnContext};
+pub use self::turn::{
+    TurnBoundaryAction, TurnBoundaryContext, TurnBoundaryError, TurnBoundaryHooks, TurnContext,
+};
 
 /// Lower-level turn primitives for specialized agent layers.
 pub mod advanced {

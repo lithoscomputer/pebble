@@ -43,7 +43,10 @@ impl Control {
         })
     }
 
-    pub(crate) fn begin_prompt(&self) -> Option<CancellationToken> {
+    pub(crate) fn begin_prompt(
+        &self,
+        parent_cancel: Option<&CancellationToken>,
+    ) -> Option<CancellationToken> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if state.closed {
             return None;
@@ -51,7 +54,8 @@ impl Control {
         debug_assert!(!state.running, "a mutable agent cannot start two prompts");
         state.running = true;
         state.paused = false;
-        state.prompt_cancel = CancellationToken::new();
+        state.prompt_cancel =
+            parent_cancel.map_or_else(CancellationToken::new, CancellationToken::child_token);
         state.round_cancel = CancellationToken::new();
         Some(state.prompt_cancel.clone())
     }
@@ -155,6 +159,17 @@ impl AgentControlHandle {
     /// Returns `false` when the agent is closed. Steering queued while idle is
     /// applied after the next prompt's user message.
     pub fn steer(&self, message: impl Into<UserMessage>) -> bool {
+        self.queue_steering(message.into(), true)
+    }
+
+    /// Queues steering for the next model turn without interrupting this one.
+    ///
+    /// Returns `false` when the agent is closed.
+    pub fn enqueue_steering(&self, message: impl Into<UserMessage>) -> bool {
+        self.queue_steering(message.into(), false)
+    }
+
+    fn queue_steering(&self, message: UserMessage, interrupt: bool) -> bool {
         let mut state = self
             .control
             .state
@@ -163,9 +178,9 @@ impl AgentControlHandle {
         if state.closed {
             return false;
         }
-        state.steering.push_back(message.into().into_message());
+        state.steering.push_back(message.into_message());
         state.paused = false;
-        if state.running {
+        if interrupt && state.running {
             state.round_cancel.cancel();
         }
         drop(state);

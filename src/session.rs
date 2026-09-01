@@ -76,6 +76,7 @@ use lithos_llm::types::{
     Error as LlmError, ErrorKind as LlmErrorKind, ReasoningEffort, Request, RequestBuildError,
     Speed,
 };
+use pebble_agent::AgentControlHandle;
 use serde::Deserialize;
 use tokio::sync::{Notify, broadcast};
 use tokio::task::JoinHandle;
@@ -151,7 +152,7 @@ pub struct PromptTiming {
 }
 
 /// What one prompt accumulated across every input it processed.
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 struct PromptTotals {
     timing:          PromptTiming,
     usage:           TokenUsage,
@@ -622,6 +623,7 @@ impl SessionBuilder {
             redactor: self.redactor,
             control_state: Arc::new(Mutex::new(ControlState::default())),
             control_notify: Arc::new(Notify::new()),
+            active_agent_control: Arc::new(Mutex::new(None)),
             followup_queue: Arc::new(Mutex::new(VecDeque::new())),
             cancel_token: CancellationToken::new(),
             round_token: Arc::new(RwLock::new(CancellationToken::new())),
@@ -818,6 +820,7 @@ pub struct Session {
     redactor: Arc<dyn Redactor>,
     control_state: Arc<Mutex<ControlState>>,
     control_notify: Arc<Notify>,
+    active_agent_control: Arc<Mutex<Option<AgentControlHandle>>>,
     followup_queue: Arc<Mutex<VecDeque<String>>>,
     /// Ends the whole prompt. Distinct from the round token, which ends one
     /// turn.
@@ -1224,6 +1227,7 @@ impl Session {
             Arc::clone(&self.control_state),
             Arc::clone(&self.round_token),
             Arc::clone(&self.control_notify),
+            Arc::clone(&self.active_agent_control),
         )
     }
 

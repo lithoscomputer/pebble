@@ -15,6 +15,7 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 
+use pebble_agent::AgentControlHandle;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -163,9 +164,10 @@ pub trait CompletionCoordinator: Send + Sync {
 /// session's next round boundary.
 #[derive(Clone, Debug)]
 pub struct SessionControlHandle {
-    control:     Arc<Mutex<ControlState>>,
-    round_token: Arc<RwLock<CancellationToken>>,
-    notify:      Arc<Notify>,
+    control:      Arc<Mutex<ControlState>>,
+    round_token:  Arc<RwLock<CancellationToken>>,
+    notify:       Arc<Notify>,
+    active_agent: Arc<Mutex<Option<AgentControlHandle>>>,
 }
 
 impl Default for SessionControlHandle {
@@ -179,9 +181,10 @@ impl SessionControlHandle {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            control:     Arc::new(Mutex::new(ControlState::default())),
-            round_token: Arc::new(RwLock::new(CancellationToken::new())),
-            notify:      Arc::new(Notify::new()),
+            control:      Arc::new(Mutex::new(ControlState::default())),
+            round_token:  Arc::new(RwLock::new(CancellationToken::new())),
+            notify:       Arc::new(Notify::new()),
+            active_agent: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -190,11 +193,13 @@ impl SessionControlHandle {
         control: Arc<Mutex<ControlState>>,
         round_token: Arc<RwLock<CancellationToken>>,
         notify: Arc<Notify>,
+        active_agent: Arc<Mutex<Option<AgentControlHandle>>>,
     ) -> Self {
         Self {
             control,
             round_token,
             notify,
+            active_agent,
         }
     }
 
@@ -229,7 +234,9 @@ impl SessionControlHandle {
                 control.waiting_for_steer = true;
             }
         }
-        self.cancel_round();
+        if !self.with_active_agent(AgentControlHandle::interrupt) {
+            self.cancel_round();
+        }
         self.notify.notify_waiters();
     }
 
@@ -251,15 +258,21 @@ impl SessionControlHandle {
         if control.queue.is_empty() {
             control.waiting_for_steer = true;
         }
+        drop(control);
+        let _ = self.with_active_agent(AgentControlHandle::park_for_steer);
     }
 
     /// Queues one item for the next round.
     pub fn enqueue(&self, item: SteeringItem) {
-        {
+        let text = item.text().to_owned();
+        let was_waiting = {
             let mut control = self.lock();
+            let was_waiting = control.waiting_for_steer;
             control.waiting_for_steer = false;
             control.queue.push_back(item);
-        }
+            was_waiting
+        };
+        self.deliver_to_active_agent(text, was_waiting);
         self.notify.notify_waiters();
     }
 
@@ -269,15 +282,18 @@ impl SessionControlHandle {
     /// session will never see.
     #[must_use]
     pub fn enqueue_bounded(&self, item: SteeringItem, cap: usize) -> Option<SteeringItem> {
-        let evicted = {
+        let text = item.text().to_owned();
+        let (evicted, was_waiting) = {
             let mut control = self.lock();
             let evicted = (control.queue.len() >= cap)
                 .then(|| control.queue.pop_front())
                 .flatten();
+            let was_waiting = control.waiting_for_steer;
             control.waiting_for_steer = false;
             control.queue.push_back(item);
-            evicted
+            (evicted, was_waiting)
         };
+        self.deliver_to_active_agent(text, was_waiting);
         self.notify.notify_waiters();
         evicted
     }
@@ -289,14 +305,18 @@ impl SessionControlHandle {
     /// is already queued is kept and the new item is refused.
     #[must_use]
     pub fn try_enqueue_bounded(&self, item: SteeringItem, cap: usize) -> bool {
-        {
+        let text = item.text().to_owned();
+        let was_waiting = {
             let mut control = self.lock();
             if control.queue.len() >= cap {
                 return false;
             }
             control.queue.push_back(item);
+            let was_waiting = control.waiting_for_steer;
             control.waiting_for_steer = false;
-        }
+            was_waiting
+        };
+        self.deliver_to_active_agent(text, was_waiting);
         self.notify.notify_waiters();
         true
     }
@@ -313,6 +333,7 @@ impl SessionControlHandle {
         item: SteeringItem,
         cap: usize,
     ) -> Option<SteeringItem> {
+        let text = item.text().to_owned();
         let evicted = {
             let mut control = self.lock();
             let evicted = (control.queue.len() >= cap)
@@ -323,7 +344,9 @@ impl SessionControlHandle {
             control.waiting_for_steer = false;
             evicted
         };
-        self.cancel_round();
+        if !self.with_active_agent(|agent| agent.steer(text)) {
+            self.cancel_round();
+        }
         self.notify.notify_waiters();
         evicted
     }
@@ -359,13 +382,16 @@ impl SessionControlHandle {
     }
 
     fn interrupt_then_enqueue(&self, item: SteeringItem) {
+        let text = item.text().to_owned();
         {
             let mut control = self.lock();
             control.interrupt_generation = control.interrupt_generation.saturating_add(1);
             control.queue.push_back(item);
             control.waiting_for_steer = false;
         }
-        self.cancel_round();
+        if !self.with_active_agent(|agent| agent.steer(text)) {
+            self.cancel_round();
+        }
         self.notify.notify_waiters();
     }
 
@@ -378,6 +404,24 @@ impl SessionControlHandle {
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .cancel();
+    }
+
+    fn deliver_to_active_agent(&self, text: String, interrupt: bool) {
+        let _ = self.with_active_agent(|agent| {
+            if interrupt {
+                agent.steer(text)
+            } else {
+                agent.enqueue_steering(text)
+            }
+        });
+    }
+
+    fn with_active_agent(&self, use_agent: impl FnOnce(&AgentControlHandle) -> bool) -> bool {
+        self.active_agent
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(use_agent)
     }
 
     fn lock(&self) -> MutexGuard<'_, ControlState> {
