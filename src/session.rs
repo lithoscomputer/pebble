@@ -1374,23 +1374,12 @@ impl Session {
             return Err(Error::SessionClosed);
         }
 
-        let human_input = self.human_input.clone();
         let timer = self.start_wall_clock_timer();
         let mut totals = PromptTotals::default();
 
-        let mut result = self
-            .process_input(
-                input,
-                SkillExpansion::Apply,
-                human_input.as_ref(),
-                &mut totals,
-            )
+        let result = self
+            .process_input(input, SkillExpansion::Apply, &mut totals)
             .await;
-
-        if result.is_ok() {
-            self.drain_boundary_queue(human_input.as_ref(), &mut totals, &mut result)
-                .await;
-        }
 
         let mut task_failure = stop_wall_clock_timer(timer).await;
 
@@ -1425,61 +1414,6 @@ impl Session {
             (Err(error), None) => Err(error),
             (Ok(_), Some(task)) => Err(task),
             (Ok(output), None) => Ok(output),
-        }
-    }
-
-    /// Runs whatever queued up while the last input was being answered.
-    ///
-    /// Follow-up input first, then one turn carrying every background result
-    /// that is ready. Background results never interrupt inference or a tool
-    /// call, and the ones ready at a boundary arrive together in one turn.
-    async fn drain_boundary_queue(
-        &mut self,
-        human_input: Option<&Arc<dyn HumanInputProvider>>,
-        totals: &mut PromptTotals,
-        result: &mut Result<Option<String>>,
-    ) {
-        loop {
-            let followup = self
-                .followup_queue
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .pop_front();
-
-            let next = if let Some(followup) = followup {
-                Some((followup, SkillExpansion::Apply))
-            } else if let Some(supervisor) = self.subagents.clone() {
-                match supervisor
-                    .next_parent_notification_turn(&self.cancel_token)
-                    .await
-                {
-                    Ok(Some(turn)) => Some((turn, SkillExpansion::Skip)),
-                    Ok(None) => None,
-                    // A cancelled wait may have a more specific reason
-                    // recorded than "cancelled", so ask the session.
-                    Err(Error::Interrupted(InterruptReason::Cancelled)) => {
-                        *result = Err(self.interrupted_error());
-                        return;
-                    }
-                    Err(error) => {
-                        *result = Err(error);
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
-
-            // Nothing queued: whatever the last input answered stands.
-            let Some((input, skill_expansion)) = next else {
-                return;
-            };
-            *result = self
-                .process_input(&input, skill_expansion, human_input, totals)
-                .await;
-            if result.is_err() {
-                return;
-            }
         }
     }
 

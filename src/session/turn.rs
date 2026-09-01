@@ -1,5 +1,6 @@
 //! The coding layer that projects Pebble's durable behavior onto `Agent`.
 
+use std::collections::VecDeque;
 use std::mem;
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -39,7 +40,8 @@ use crate::loop_detection::detect_loop;
 use crate::profile::ModelFacts;
 use crate::reasoning::ReasoningOutput;
 use crate::redact::Redactor;
-use crate::skills::{ExpandedInput, SkillExpansion, expand_skill};
+use crate::skills::{ExpandedInput, Skill, SkillExpansion, expand_skill};
+use crate::subagent::SubagentSupervisor;
 use crate::task_reminder::maybe_task_reminder;
 use crate::tool::{
     NativeTool, ToolDefinitionWithSource, ToolDispatch, ToolEnvProvider, ToolRegistry,
@@ -81,6 +83,9 @@ struct CodingAgentBridge {
     control_notify:         Arc<Notify>,
     terminal_cancel:        CancellationToken,
     completion_coordinator: Option<Arc<dyn super::CompletionCoordinator>>,
+    followup_queue:         Arc<Mutex<VecDeque<String>>>,
+    subagents:              Option<SubagentSupervisor>,
+    skills:                 Vec<Skill>,
 }
 
 struct CodingAgentState {
@@ -92,6 +97,7 @@ struct CodingAgentState {
     pending_task_reminder: Option<Message>,
     local_context_window: Option<ContextWindowSnapshot>,
     inference_start: Option<Instant>,
+    boundary_error: Option<Error>,
 }
 
 impl CodingAgentBridge {
@@ -106,6 +112,7 @@ impl CodingAgentBridge {
                 pending_task_reminder: None,
                 local_context_window: None,
                 inference_start: None,
+                boundary_error: None,
             })),
             client:                 session.client.clone(),
             model_selector:         session.model_selector.clone(),
@@ -128,6 +135,9 @@ impl CodingAgentBridge {
             control_notify:         Arc::clone(&session.control_notify),
             terminal_cancel:        session.cancel_token.clone(),
             completion_coordinator: session.completion_coordinator.clone(),
+            followup_queue:         Arc::clone(&session.followup_queue),
+            subagents:              session.subagents.clone(),
+            skills:                 session.skills.clone(),
         }
     }
 
@@ -138,6 +148,14 @@ impl CodingAgentBridge {
         session.file_tracker = state.file_tracker.clone();
         session.activated_skill_context_observed = state.activated_skill_context_observed;
         *totals = state.totals;
+    }
+
+    fn take_boundary_error(&self) -> Option<Error> {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .boundary_error
+            .take()
     }
 
     fn emit(&self, event: AgentEvent) {
@@ -276,14 +294,13 @@ impl CodingAgentBridge {
 
     fn commit_user_message(&self, message: &LlmMessage) {
         let text = message_text(message);
-        self.state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .history
-            .push(Message::User {
-                content:   text.clone(),
-                timestamp: SystemTime::now(),
-            });
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.compaction_failed = false;
+        state.history.push(Message::User {
+            content:   text.clone(),
+            timestamp: SystemTime::now(),
+        });
+        drop(state);
         self.emit(AgentEvent::UserInput { text });
     }
 
@@ -592,19 +609,60 @@ impl TurnBoundaryHooks for CodingAgentBridge {
         &self,
         _context: TurnContext<'_>,
         _response: &Response,
-        _cancel: &CancellationToken,
+        cancel: &CancellationToken,
     ) -> StdResult<TurnBoundaryAction, TurnBoundaryError> {
-        Ok(
-            if self
-                .completion_coordinator
-                .as_ref()
-                .is_some_and(|coordinator| coordinator.on_natural_completion())
-            {
-                TurnBoundaryAction::Continue
+        if self
+            .completion_coordinator
+            .as_ref()
+            .is_some_and(|coordinator| coordinator.on_natural_completion())
+        {
+            return Ok(TurnBoundaryAction::Continue);
+        }
+
+        let followup = self
+            .followup_queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front();
+        if let Some(followup) = followup {
+            let expanded = if self.skills.is_empty() {
+                ExpandedInput {
+                    text:       followup,
+                    skill_name: None,
+                }
             } else {
-                TurnBoundaryAction::Complete
-            },
-        )
+                expand_skill(&self.skills, &followup).map_err(|error| {
+                    TurnBoundaryError::new(format!("expanding follow-up input: {error}"))
+                })?
+            };
+            if let Some(name) = expanded.skill_name {
+                self.state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .activated_skill_context_observed = true;
+                self.emit(AgentEvent::SkillActivated {
+                    skill_name: name,
+                    source:     SkillActivationSource::Slash,
+                });
+            }
+            return Ok(TurnBoundaryAction::ContinueWith(expanded.text.into()));
+        }
+
+        let Some(supervisor) = self.subagents.as_ref() else {
+            return Ok(TurnBoundaryAction::Complete);
+        };
+        match supervisor.next_parent_notification_turn(cancel).await {
+            Ok(Some(turn)) => Ok(TurnBoundaryAction::ContinueWith(turn.into())),
+            Ok(None) => Ok(TurnBoundaryAction::Complete),
+            Err(error) => {
+                let message = error.to_string();
+                self.state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .boundary_error = Some(error);
+                Err(TurnBoundaryError::new(message))
+            }
+        }
     }
 }
 
@@ -640,7 +698,6 @@ impl Session {
         &mut self,
         input: &str,
         skill_expansion: SkillExpansion,
-        _human_input: Option<&Arc<dyn HumanInputProvider>>,
         totals: &mut PromptTotals,
     ) -> Result<Option<String>> {
         if self.state == SessionState::Closed {
@@ -697,6 +754,9 @@ impl Session {
             .await;
         self.clear_agent_control();
         bridge.restore_session(self, totals);
+        if let Some(error) = bridge.take_boundary_error() {
+            return Err(error);
+        }
 
         match result {
             Ok(outcome) => {
