@@ -10,6 +10,7 @@ use lithos_llm::types::{Message, ToolCall, ToolDefinition};
 use tokio_util::sync::CancellationToken;
 
 use super::{ToolErrorKind, ToolOutput};
+use crate::event::{AgentEvent, EventHub};
 
 /// A stable tool identity that does not depend on its model-visible name.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -106,14 +107,20 @@ impl ToolDescriptor {
     }
 }
 
-/// The tool catalog produced for one model turn.
+/// The complete tool catalog produced for one model turn.
 ///
-/// Middleware may filter this catalog before the model sees it. The kernel
-/// resolves each returned definition to its stable identity and sends the
-/// resolved descriptor through call middleware again.
+/// Middleware narrows the visible part of this catalog without discarding
+/// hidden descriptors. The kernel can therefore resolve an unadvertised call
+/// and send it through call middleware for a second policy check.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ToolCatalog {
-    tools: Vec<ToolDescriptor>,
+    entries: Vec<ToolCatalogEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ToolCatalogEntry {
+    descriptor: ToolDescriptor,
+    visible:    bool,
 }
 
 impl ToolCatalog {
@@ -121,25 +128,46 @@ impl ToolCatalog {
     #[must_use]
     pub fn new(tools: impl IntoIterator<Item = ToolDescriptor>) -> Self {
         Self {
-            tools: tools.into_iter().collect(),
+            entries: tools
+                .into_iter()
+                .map(|descriptor| ToolCatalogEntry {
+                    descriptor,
+                    visible: true,
+                })
+                .collect(),
         }
     }
 
-    /// The tools in catalog order.
-    #[must_use]
-    pub fn tools(&self) -> &[ToolDescriptor] {
-        &self.tools
+    /// All tools in catalog order, including hidden tools.
+    pub fn tools(&self) -> impl ExactSizeIterator<Item = &ToolDescriptor> {
+        self.entries.iter().map(|entry| &entry.descriptor)
     }
 
-    /// Keeps only the tools accepted by `predicate`.
-    pub fn retain(&mut self, predicate: impl FnMut(&ToolDescriptor) -> bool) {
-        self.tools.retain(predicate);
+    /// The tools that middleware left visible to the model.
+    pub fn visible_tools(&self) -> impl Iterator<Item = &ToolDescriptor> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.visible)
+            .map(|entry| &entry.descriptor)
     }
 
-    /// Consumes the catalog and returns its descriptors.
+    /// Keeps accepted tools visible and hides rejected tools.
+    ///
+    /// A tool hidden by an inner middleware stays hidden. This makes several
+    /// policy layers compose by narrowing access.
+    pub fn retain(&mut self, mut predicate: impl FnMut(&ToolDescriptor) -> bool) {
+        for entry in &mut self.entries {
+            entry.visible &= predicate(&entry.descriptor);
+        }
+    }
+
+    /// Finds a tool by its model-visible name, whether visible or hidden.
     #[must_use]
-    pub fn into_tools(self) -> Vec<ToolDescriptor> {
-        self.tools
+    pub fn find_by_name(&self, name: &str) -> Option<&ToolDescriptor> {
+        self.entries
+            .iter()
+            .find(|entry| entry.descriptor.definition().name == name)
+            .map(|entry| &entry.descriptor)
     }
 }
 
@@ -182,12 +210,13 @@ impl<'a> ToolDiscoveryContext<'a> {
 }
 
 /// One resolved tool invocation passed through middleware.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ToolCallRequest {
     turn:         usize,
     call:         ToolCall,
     descriptor:   ToolDescriptor,
     cancellation: CancellationToken,
+    events:       Option<EventHub>,
 }
 
 impl ToolCallRequest {
@@ -204,6 +233,7 @@ impl ToolCallRequest {
             call,
             descriptor,
             cancellation,
+            events: None,
         }
     }
 
@@ -229,6 +259,35 @@ impl ToolCallRequest {
     #[must_use]
     pub const fn cancellation(&self) -> &CancellationToken {
         &self.cancellation
+    }
+
+    /// Publishes incremental output for observers.
+    ///
+    /// This does not add the fragment to the result returned to the model.
+    pub fn emit_output_delta(&self, delta: impl Into<String>) {
+        if let Some(events) = &self.events {
+            events.emit(AgentEvent::ToolOutputDelta {
+                tool_call_id: self.call.id.clone(),
+                delta:        delta.into(),
+            });
+        }
+    }
+
+    pub(crate) fn with_events(mut self, events: EventHub) -> Self {
+        self.events = Some(events);
+        self
+    }
+}
+
+impl fmt::Debug for ToolCallRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ToolCallRequest")
+            .field("turn", &self.turn)
+            .field("call", &self.call)
+            .field("descriptor", &self.descriptor)
+            .field("cancelled", &self.cancellation.is_cancelled())
+            .finish_non_exhaustive()
     }
 }
 
@@ -674,8 +733,18 @@ mod tests {
 
         catalog.retain(|tool| tool.id().as_str() == "read");
 
-        assert_eq!(catalog.tools().len(), 1);
-        assert_eq!(catalog.tools()[0].id().as_str(), "read");
+        assert_eq!(catalog.tools().len(), 2);
+        let visible = catalog.visible_tools().collect::<Vec<_>>();
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].id().as_str(), "read");
+        assert_eq!(
+            catalog
+                .find_by_name("write")
+                .expect("the hidden tool remains resolvable")
+                .id()
+                .as_str(),
+            "write"
+        );
         assert!(matches!(
             ToolOutcome::success(ToolOutput::new([ContentPart::Text {
                 text: "ok".to_owned(),

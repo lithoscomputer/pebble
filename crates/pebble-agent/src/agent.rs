@@ -21,9 +21,8 @@ use crate::event::{AgentEvent, EventHub, EventProjection, FirstOutputKind};
 use crate::integration::{StreamObserver, StreamOutcome, stream_response};
 use crate::model::ModelService;
 use crate::tool::{
-    BeforeToolCall, Tool, ToolAccess, ToolAccessContext, ToolAccessPolicy, ToolCallContext,
-    ToolCallHooks, ToolCallOutcome, ToolContext, ToolErrorKind, ToolProvider, ToolRoundAccess,
-    ToolRoundContext, ToolRoundExecutor,
+    StaticToolService, Tool, ToolCallRequest, ToolCatalog, ToolDiscoveryContext, ToolErrorKind,
+    ToolMiddleware, ToolOutcome, ToolScheduling, ToolService, ToolSystem,
 };
 use crate::turn::{TurnBoundaryAction, TurnBoundaryContext, TurnBoundaryHooks, TurnContext};
 use crate::validation::validate_tool_arguments;
@@ -121,17 +120,6 @@ impl From<&str> for UserMessage {
     }
 }
 
-/// Whether independent tool calls in one model response run together.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum ToolExecution {
-    /// Run calls in model order.
-    Sequential,
-    /// Run calls concurrently and commit their results in model order.
-    #[default]
-    Parallel,
-}
-
 /// Turn-loop policy for an [`Agent`].
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
@@ -154,8 +142,6 @@ pub struct AgentConfig {
     pub turn_replay:       RetryPolicy,
     /// Hard limit on replays after the first response stream opens.
     pub max_turn_replays:  u32,
-    /// Whether independent tool calls run together.
-    pub tool_execution:    ToolExecution,
     /// Events held for each live subscriber.
     pub event_capacity:    usize,
 }
@@ -172,7 +158,6 @@ impl Default for AgentConfig {
                 .jitter(true)
                 .max_attempts(DEFAULT_REPLAY_ATTEMPTS),
             max_turn_replays:  3,
-            tool_execution:    ToolExecution::default(),
             event_capacity:    DEFAULT_EVENT_CAPACITY,
         }
     }
@@ -186,10 +171,8 @@ pub struct AgentBuilder {
     system_prompt:    String,
     messages:         Vec<Message>,
     tools:            Vec<Tool>,
-    tool_provider:    Option<Arc<dyn ToolProvider>>,
-    tool_access:      Option<Arc<dyn ToolAccessPolicy>>,
-    tool_hooks:       Option<Arc<dyn ToolCallHooks>>,
-    tool_round:       Option<Arc<dyn ToolRoundExecutor>>,
+    tool_service:     Option<Arc<dyn ToolService>>,
+    tool_middleware:  Vec<Arc<dyn ToolMiddleware>>,
     turn_hooks:       Option<Arc<dyn TurnBoundaryHooks>>,
     event_projection: Option<Arc<dyn EventProjection>>,
     config:           AgentConfig,
@@ -204,10 +187,8 @@ impl AgentBuilder {
             system_prompt:    String::new(),
             messages:         Vec::new(),
             tools:            Vec::new(),
-            tool_provider:    None,
-            tool_access:      None,
-            tool_hooks:       None,
-            tool_round:       None,
+            tool_service:     None,
+            tool_middleware:  Vec::new(),
             turn_hooks:       None,
             event_projection: None,
             config:           AgentConfig::default(),
@@ -243,30 +224,20 @@ impl AgentBuilder {
         self
     }
 
-    /// Adds tools resolved from conversation state before each model turn.
+    /// Sets the terminal service for dynamic tool discovery and invocation.
     ///
-    /// Resolved tools are combined with tools added through
+    /// A custom service cannot be combined with tools added through
     /// [`tools`](Self::tools).
-    pub fn tool_provider(mut self, provider: Arc<dyn ToolProvider>) -> Self {
-        self.tool_provider = Some(provider);
+    pub fn tool_service(mut self, service: Arc<dyn ToolService>) -> Self {
+        self.tool_service = Some(service);
         self
     }
 
-    /// Sets the access policy evaluated for every resolved tool in every turn.
-    pub fn tool_access_policy(mut self, policy: Arc<dyn ToolAccessPolicy>) -> Self {
-        self.tool_access = Some(policy);
-        self
-    }
-
-    /// Sets the hooks called before and after every tool call.
-    pub fn tool_call_hooks(mut self, hooks: Arc<dyn ToolCallHooks>) -> Self {
-        self.tool_hooks = Some(hooks);
-        self
-    }
-
-    /// Replaces the default generic executor for complete tool rounds.
-    pub fn tool_round_executor(mut self, executor: Arc<dyn ToolRoundExecutor>) -> Self {
-        self.tool_round = Some(executor);
+    /// Adds one tool middleware inside every middleware already installed.
+    ///
+    /// The first installed middleware is outermost.
+    pub fn tool_middleware(mut self, middleware: Arc<dyn ToolMiddleware>) -> Self {
+        self.tool_middleware.push(middleware);
         self
     }
 
@@ -292,8 +263,7 @@ impl AgentBuilder {
     ///
     /// # Errors
     ///
-    /// Returns an error for a blank model, a zero event capacity, or duplicate
-    /// tool names.
+    /// Returns an error for invalid configuration or duplicate static tools.
     pub fn build(self) -> StdResult<Agent, AgentBuildError> {
         if self.model.trim().is_empty() {
             return Err(AgentBuildError::EmptyModel);
@@ -301,25 +271,36 @@ impl AgentBuilder {
         if self.config.event_capacity == 0 {
             return Err(AgentBuildError::ZeroEventCapacity);
         }
+        if self.tool_service.is_some() && !self.tools.is_empty() {
+            return Err(AgentBuildError::ConflictingToolSources);
+        }
         let mut names = HashSet::new();
+        let mut ids = HashSet::new();
         for tool in &self.tools {
             let name = tool.definition().name.clone();
             if !names.insert(name.clone()) {
                 return Err(AgentBuildError::DuplicateTool { name });
             }
+            let id = tool.descriptor().id().clone();
+            if !ids.insert(id.clone()) {
+                return Err(AgentBuildError::DuplicateToolId { id });
+            }
         }
 
         let events = EventHub::new(self.config.event_capacity, self.event_projection);
+        let terminal = self.tool_service.unwrap_or_else(|| {
+            Arc::new(StaticToolService::new(self.tools)) as Arc<dyn ToolService>
+        });
+        let mut tool_system = ToolSystem::new(terminal);
+        for middleware in self.tool_middleware {
+            tool_system = tool_system.middleware(middleware);
+        }
         Ok(Agent {
             model_service: self.model_service,
             model: self.model,
             system_prompt: self.system_prompt,
             messages: self.messages,
-            tools: self.tools,
-            tool_provider: self.tool_provider,
-            tool_access: self.tool_access,
-            tool_hooks: self.tool_hooks,
-            tool_round: self.tool_round,
+            tool_system,
             turn_hooks: self.turn_hooks,
             config: self.config,
             events,
@@ -416,11 +397,7 @@ pub struct Agent {
     model:         String,
     system_prompt: String,
     messages:      Vec<Message>,
-    tools:         Vec<Tool>,
-    tool_provider: Option<Arc<dyn ToolProvider>>,
-    tool_access:   Option<Arc<dyn ToolAccessPolicy>>,
-    tool_hooks:    Option<Arc<dyn ToolCallHooks>>,
-    tool_round:    Option<Arc<dyn ToolRoundExecutor>>,
+    tool_system:   ToolSystem,
     turn_hooks:    Option<Arc<dyn TurnBoundaryHooks>>,
     config:        AgentConfig,
     events:        EventHub,
@@ -654,7 +631,7 @@ impl Agent {
                     prepared.map_err(|source| AgentError::TurnBoundary { source })?;
                 }
 
-                let tools = self.resolve_tools(turn_count)?;
+                let tools = self.discover_tools(turn_count).await?;
                 self.emit(AgentEvent::TurnStarted { turn: turn_count });
                 let request = self.build_request(&tools)?;
                 self.emit(AgentEvent::ModelRequestStarted {
@@ -744,10 +721,14 @@ impl Agent {
                 }
                 tool_call_count += calls.len();
 
-                let results = self
+                let execution = self
                     .execute_tools(turn, &calls, &tools, prompt_cancel, &round_cancel)
                     .await;
-                self.messages.push(tool_results_message(&results));
+                self.messages.push(tool_results_message(&execution.results));
+
+                if let Some(source) = execution.system_error {
+                    return Err(AgentError::ToolSystem { source });
+                }
 
                 if prompt_cancel.is_cancelled() {
                     return Err(AgentError::Aborted);
@@ -770,32 +751,28 @@ impl Agent {
         }
     }
 
-    fn resolve_tools(&self, turn: usize) -> Result<Vec<ResolvedTool>> {
-        let context = TurnContext::new(&self.model, turn, &self.messages);
-        let mut tools = self.tools.clone();
-        if let Some(provider) = &self.tool_provider {
-            tools.extend(provider.tools_for_turn(context));
-        }
-
+    async fn discover_tools(&self, turn: usize) -> Result<ToolCatalog> {
+        let tools = self
+            .tool_system
+            .discover(ToolDiscoveryContext::new(&self.model, turn, &self.messages))
+            .await
+            .map_err(|source| AgentError::ToolSystem { source })?;
         let mut names = HashSet::new();
-        let mut resolved = Vec::with_capacity(tools.len());
-        for tool in tools {
+        let mut ids = HashSet::new();
+        for tool in tools.tools() {
             let name = tool.definition().name.clone();
             if !names.insert(name.clone()) {
                 return Err(AgentError::DuplicateTool { name });
             }
-            let access = self
-                .tool_access
-                .as_ref()
-                .map_or_else(ToolAccess::default, |policy| {
-                    policy.access(ToolAccessContext::new(context, tool.definition()))
-                });
-            resolved.push(ResolvedTool { tool, access });
+            let id = tool.id().clone();
+            if !ids.insert(id.clone()) {
+                return Err(AgentError::DuplicateToolId { id });
+            }
         }
-        Ok(resolved)
+        Ok(tools)
     }
 
-    fn build_request(&self, tools: &[ResolvedTool]) -> Result<Request> {
+    fn build_request(&self, tools: &ToolCatalog) -> Result<Request> {
         let mut builder = Request::builder().model(self.model.clone());
         if !self.system_prompt.trim().is_empty() {
             builder = builder.system(self.system_prompt.clone());
@@ -803,10 +780,10 @@ impl Agent {
         for message in &self.messages {
             builder = builder.message(message.clone());
         }
-        for tool in tools.iter().filter(|tool| tool.is_allowed()) {
-            builder = builder.tool(tool.tool.definition().clone());
+        for tool in tools.visible_tools() {
+            builder = builder.tool(tool.definition().clone());
         }
-        if tools.iter().any(ResolvedTool::is_allowed) {
+        if tools.visible_tools().next().is_some() {
             builder = builder.tool_choice(ToolChoice::Auto);
         }
         if let Some(tokens) = self.config.max_output_tokens {
@@ -852,80 +829,34 @@ impl Agent {
     }
 
     /// Answers every call as `Cancelled` without running one.
-    ///
-    /// The round still goes through the normal path with a token that has
-    /// already fired, so a specialized round executor records the results
-    /// where it keeps them.
     async fn answer_calls_as_cancelled(
         &self,
         turn: usize,
         calls: &[ToolCall],
-        tools: &[ResolvedTool],
+        tools: &ToolCatalog,
     ) -> Vec<ToolResult> {
         let fired = CancellationToken::new();
         fired.cancel();
-        self.execute_tools(turn, calls, tools, &fired, &fired).await
+        self.execute_tools(turn, calls, tools, &fired, &fired)
+            .await
+            .results
     }
 
     async fn execute_tools(
         &self,
         turn: usize,
         calls: &[ToolCall],
-        tools: &[ResolvedTool],
+        tools: &ToolCatalog,
         prompt_cancel: &CancellationToken,
         round_cancel: &CancellationToken,
-    ) -> Vec<ToolResult> {
+    ) -> ToolRoundExecution {
         // A round that opens after either token fired runs already cancelled:
-        // each layer's dispatch then answers calls it has not started as
-        // `Cancelled`, and the results still get recorded.
+        // each call is answered as `Cancelled`, and every call stays paired.
         let cancel = CancellationToken::new();
         if prompt_cancel.is_cancelled() || round_cancel.is_cancelled() {
             cancel.cancel();
         }
-        let advertised = tools
-            .iter()
-            .filter(|tool| tool.is_allowed())
-            .map(|tool| tool.tool.definition().clone())
-            .collect::<Vec<_>>();
-        let access = tools
-            .iter()
-            .map(|tool| {
-                ToolRoundAccess::new(tool.tool.definition().name.clone(), tool.access.clone())
-            })
-            .collect::<Vec<_>>();
-        let running = async {
-            if let Some(executor) = &self.tool_round {
-                return executor
-                    .execute_round(
-                        ToolRoundContext::new(
-                            turn,
-                            calls,
-                            &advertised,
-                            &access,
-                            self.tool_hooks.as_deref(),
-                        ),
-                        &cancel,
-                    )
-                    .await;
-            }
-            match self.config.tool_execution {
-                ToolExecution::Sequential => {
-                    let mut results = Vec::with_capacity(calls.len());
-                    for call in calls {
-                        results.push(self.execute_tool(turn, call, tools, &cancel).await);
-                    }
-                    results
-                }
-                ToolExecution::Parallel => {
-                    join_all(
-                        calls
-                            .iter()
-                            .map(|call| self.execute_tool(turn, call, tools, &cancel)),
-                    )
-                    .await
-                }
-            }
-        };
+        let running = self.schedule_tools(turn, calls, tools, &cancel);
         tokio::pin!(running);
 
         let mut prompt_cancelled = false;
@@ -941,8 +872,55 @@ impl Agent {
                     round_cancelled = true;
                     cancel.cancel();
                 }
-                results = &mut running => return normalize_tool_results(calls, results),
+                results = &mut running => return ToolRoundExecution::from_calls(results),
             }
+        }
+    }
+
+    async fn schedule_tools(
+        &self,
+        turn: usize,
+        calls: &[ToolCall],
+        tools: &ToolCatalog,
+        cancel: &CancellationToken,
+    ) -> Vec<ExecutedCall> {
+        let exclusive = calls.iter().position(|call| {
+            tools
+                .find_by_name(&call.name)
+                .is_some_and(|tool| tool.scheduling() == ToolScheduling::ExclusiveRound)
+        });
+        if let Some(exclusive) = exclusive {
+            let mut results = Vec::with_capacity(calls.len());
+            for (index, call) in calls.iter().enumerate() {
+                if cancel.is_cancelled() {
+                    results.push(ExecutedCall::completed(cancelled_tool_result(call)));
+                } else if index == exclusive {
+                    results.push(self.execute_tool(turn, call, tools, cancel).await);
+                } else {
+                    results.push(self.refuse_exclusive_peer(call));
+                }
+            }
+            return results;
+        }
+
+        let sequential = calls.iter().any(|call| {
+            tools
+                .find_by_name(&call.name)
+                .is_some_and(|tool| tool.scheduling() == ToolScheduling::Sequential)
+        });
+        if sequential {
+            let mut results = Vec::with_capacity(calls.len());
+            for call in calls {
+                results.push(self.execute_tool(turn, call, tools, cancel).await);
+            }
+            results
+        } else {
+            join_all(
+                calls
+                    .iter()
+                    .map(|call| self.execute_tool(turn, call, tools, cancel)),
+            )
+            .await
         }
     }
 
@@ -955,104 +933,83 @@ impl Agent {
         &self,
         turn: usize,
         call: &ToolCall,
-        tools: &[ResolvedTool],
+        tools: &ToolCatalog,
         cancel: &CancellationToken,
-    ) -> ToolResult {
+    ) -> ExecutedCall {
         // A call that finds its round already cancelled is answered without
         // starting, and publishes nothing: there was no execution to report.
         if cancel.is_cancelled() {
-            return cancelled_tool_result(call);
+            return ExecutedCall::completed(cancelled_tool_result(call));
         }
         self.emit(AgentEvent::ToolStarted { call: call.clone() });
-        let resolved = tools
-            .iter()
-            .find(|tool| tool.tool.definition().name == call.name);
-        let (result, error_kind, call_after_hook) =
-            self.run_tool_call(turn, call, resolved, cancel).await;
+        let Some(descriptor) = tools.find_by_name(&call.name) else {
+            return self.complete_tool(
+                call,
+                ToolOutcome::failure(
+                    ToolErrorKind::Unavailable,
+                    format!("unknown tool `{}`", call.name),
+                ),
+                None,
+            );
+        };
+        if let Err(error) = validate_tool_arguments(&descriptor.definition().kind, &call.arguments)
+        {
+            return self.complete_tool(
+                call,
+                ToolOutcome::failure(ToolErrorKind::InvalidArguments, error.to_string()),
+                None,
+            );
+        }
+
+        let request =
+            ToolCallRequest::new(turn, call.clone(), descriptor.clone(), cancel.child_token())
+                .with_events(self.events.clone());
+        let called = self.tool_system.call(request).await;
+        if cancel.is_cancelled() {
+            return self.complete_tool(
+                call,
+                ToolOutcome::failure(ToolErrorKind::Cancelled, CANCELLED),
+                None,
+            );
+        }
+        match called {
+            Ok(outcome) => self.complete_tool(call, outcome, None),
+            Err(error) => {
+                let message = error.message().to_owned();
+                self.complete_tool(
+                    call,
+                    ToolOutcome::failure(ToolErrorKind::Execution, message),
+                    Some(error),
+                )
+            }
+        }
+    }
+
+    fn refuse_exclusive_peer(&self, call: &ToolCall) -> ExecutedCall {
+        self.emit(AgentEvent::ToolStarted { call: call.clone() });
+        self.complete_tool(
+            call,
+            ToolOutcome::failure(
+                ToolErrorKind::Denied,
+                "this tool did not run because an exclusive tool must run alone in its round",
+            ),
+            None,
+        )
+    }
+
+    fn complete_tool(
+        &self,
+        call: &ToolCall,
+        outcome: ToolOutcome,
+        system_error: Option<crate::ToolSystemError>,
+    ) -> ExecutedCall {
+        let result = tool_result(call, outcome);
         self.emit(AgentEvent::ToolCompleted {
             result: result.clone(),
         });
-        if call_after_hook && let Some(hooks) = &self.tool_hooks {
-            hooks
-                .after_tool_call(
-                    ToolCallContext::new(turn, call),
-                    ToolCallOutcome::new(&result, error_kind),
-                    cancel,
-                )
-                .await;
-        }
-        result
-    }
-
-    /// Produces the tool result and whether the after-call hook should run.
-    ///
-    /// Returns `call_after_hook = false` when access was denied or a
-    /// before-call hook blocked the call, so the after-call hook only sees
-    /// calls that were allowed to proceed.
-    async fn run_tool_call(
-        &self,
-        turn: usize,
-        call: &ToolCall,
-        resolved: Option<&ResolvedTool>,
-        cancel: &CancellationToken,
-    ) -> (ToolResult, Option<ToolErrorKind>, bool) {
-        if let Some(resolved) = resolved
-            && let ToolAccess::Denied { reason } = &resolved.access
-        {
-            return (error_tool_result(call, reason.clone()), None, false);
-        }
-
-        let decision = match &self.tool_hooks {
-            Some(hooks) => {
-                hooks
-                    .before_tool_call(ToolCallContext::new(turn, call), cancel)
-                    .await
-            }
-            None => BeforeToolCall::Proceed,
-        };
-        if let BeforeToolCall::Block { reason } = decision {
-            return (error_tool_result(call, reason), None, false);
-        }
-
-        let Some(resolved) = resolved else {
-            return (
-                error_tool_result(call, format!("unknown tool `{}`", call.name)),
-                Some(ToolErrorKind::Unavailable),
-                true,
-            );
-        };
-        if let Err(error) =
-            validate_tool_arguments(&resolved.tool.definition().kind, &call.arguments)
-        {
-            return (
-                error_tool_result(call, error.to_string()),
-                Some(ToolErrorKind::InvalidArguments),
-                true,
-            );
-        }
-
-        let context = ToolContext::new(
-            call.id.clone(),
-            call.name.clone(),
-            cancel.clone(),
-            self.events.clone(),
-        );
-        match resolved.tool.execute(context, call.arguments.clone()).await {
-            Ok(output) => (
-                ToolResult {
-                    tool_call_id: call.id.clone(),
-                    name:         Some(call.name.clone()),
-                    content:      nonempty_content(output.into_content()),
-                    is_error:     false,
-                },
-                None,
-                true,
-            ),
-            Err(error) => (
-                error_tool_result(call, error.to_string()),
-                Some(ToolErrorKind::Execution),
-                true,
-            ),
+        ExecutedCall {
+            result,
+            system_error,
         }
     }
 
@@ -1061,14 +1018,39 @@ impl Agent {
     }
 }
 
-struct ResolvedTool {
-    tool:   Tool,
-    access: ToolAccess,
+struct ExecutedCall {
+    result:       ToolResult,
+    system_error: Option<crate::ToolSystemError>,
 }
 
-impl ResolvedTool {
-    const fn is_allowed(&self) -> bool {
-        matches!(&self.access, ToolAccess::Allowed)
+impl ExecutedCall {
+    const fn completed(result: ToolResult) -> Self {
+        Self {
+            result,
+            system_error: None,
+        }
+    }
+}
+
+struct ToolRoundExecution {
+    results:      Vec<ToolResult>,
+    system_error: Option<crate::ToolSystemError>,
+}
+
+impl ToolRoundExecution {
+    fn from_calls(calls: Vec<ExecutedCall>) -> Self {
+        let mut results = Vec::with_capacity(calls.len());
+        let mut system_error = None;
+        for call in calls {
+            results.push(call.result);
+            if system_error.is_none() {
+                system_error = call.system_error;
+            }
+        }
+        Self {
+            results,
+            system_error,
+        }
     }
 }
 
@@ -1150,30 +1132,24 @@ fn error_tool_result(call: &ToolCall, message: String) -> ToolResult {
     }
 }
 
+fn tool_result(call: &ToolCall, outcome: ToolOutcome) -> ToolResult {
+    match outcome {
+        ToolOutcome::Success(output) => ToolResult {
+            tool_call_id: call.id.clone(),
+            name:         Some(call.name.clone()),
+            content:      nonempty_content(output.into_content()),
+            is_error:     false,
+        },
+        ToolOutcome::Failure { message, .. } => error_tool_result(call, message),
+    }
+}
+
 /// What a call that never started is told.
 const CANCELLED: &str = "Cancelled";
 
 /// The result of a call that was cancelled before it started.
 fn cancelled_tool_result(call: &ToolCall) -> ToolResult {
     error_tool_result(call, CANCELLED.to_owned())
-}
-
-fn normalize_tool_results(calls: &[ToolCall], results: Vec<ToolResult>) -> Vec<ToolResult> {
-    let mut results = results.into_iter();
-    calls
-        .iter()
-        .map(|call| match results.next() {
-            Some(result) if result.tool_call_id == call.id => result,
-            Some(_) => error_tool_result(
-                call,
-                "the tool-round executor returned a result for a different call".to_owned(),
-            ),
-            None => error_tool_result(
-                call,
-                "the tool-round executor returned no result for this call".to_owned(),
-            ),
-        })
-        .collect()
 }
 
 fn tool_calls(response: &Response) -> Vec<ToolCall> {
@@ -1197,13 +1173,16 @@ mod tests {
     use futures_util::stream;
     use lithos_llm::catalog::{ModelId, ProviderId};
     use lithos_llm::middleware::CallContext;
-    use lithos_llm::types::{ErrorKind, ResponseStream, RetryClassification, StreamEvent};
+    use lithos_llm::types::{
+        ErrorKind, ResponseStream, RetryClassification, StreamEvent, ToolDefinition,
+    };
     use serde_json::json;
     use tokio::sync::Notify;
     use tokio::time::timeout;
 
     use super::*;
     use crate::tool::ToolError;
+    use crate::{ToolDescriptor, ToolId};
 
     /// How long a test waits for a prompt another task has to unblock.
     const PATIENCE: Duration = Duration::from_secs(5);
@@ -1300,6 +1279,7 @@ mod tests {
                 }
             },
         )
+        .expect("the parking tool is valid")
     }
 
     /// An agent whose first turn calls the parking tool and whose second
@@ -1336,99 +1316,96 @@ mod tests {
         events.iter().position(matcher)
     }
 
-    struct RecordingToolHooks {
+    struct DynamicTools {
+        hidden_executions: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ToolService for DynamicTools {
+        async fn discover(
+            &self,
+            context: ToolDiscoveryContext<'_>,
+        ) -> StdResult<ToolCatalog, crate::ToolSystemError> {
+            let names = if context.turn() == 0 {
+                ["allowed", "hidden"].as_slice()
+            } else {
+                ["later"].as_slice()
+            };
+            Ok(ToolCatalog::new(names.iter().map(|name| {
+                ToolDescriptor::new(
+                    ToolId::try_new(*name).expect("the test identity is valid"),
+                    ToolDefinition::function(*name, *name, json!({})),
+                )
+            })))
+        }
+
+        async fn call(
+            &self,
+            request: ToolCallRequest,
+        ) -> StdResult<ToolOutcome, crate::ToolSystemError> {
+            if request.descriptor().id().as_str() == "hidden" {
+                self.hidden_executions.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(ToolOutcome::success(request.call().name.clone().into()))
+        }
+    }
+
+    struct HideTool;
+
+    #[async_trait]
+    impl ToolMiddleware for HideTool {
+        async fn discover(
+            &self,
+            context: ToolDiscoveryContext<'_>,
+            next: crate::ToolDiscoveryNext<'_>,
+        ) -> StdResult<ToolCatalog, crate::ToolSystemError> {
+            let mut catalog = next.run(context).await?;
+            catalog.retain(|tool| tool.id().as_str() != "hidden");
+            Ok(catalog)
+        }
+
+        async fn call(
+            &self,
+            request: ToolCallRequest,
+            next: crate::ToolCallNext<'_>,
+        ) -> StdResult<ToolOutcome, crate::ToolSystemError> {
+            if request.descriptor().id().as_str() == "hidden" {
+                Ok(ToolOutcome::failure(
+                    ToolErrorKind::Denied,
+                    "hidden for this turn",
+                ))
+            } else {
+                next.run(request).await
+            }
+        }
+    }
+
+    struct RecordingToolMiddleware {
         trace: Arc<Mutex<Vec<&'static str>>>,
     }
 
     #[async_trait]
-    impl ToolCallHooks for RecordingToolHooks {
-        async fn before_tool_call(
+    impl ToolMiddleware for RecordingToolMiddleware {
+        async fn call(
             &self,
-            _context: ToolCallContext<'_>,
-            _cancel: &CancellationToken,
-        ) -> BeforeToolCall {
+            request: ToolCallRequest,
+            next: crate::ToolCallNext<'_>,
+        ) -> StdResult<ToolOutcome, crate::ToolSystemError> {
             self.trace
                 .lock()
                 .expect("the trace lock is healthy")
-                .push("hook:before");
-            BeforeToolCall::Proceed
-        }
-
-        async fn after_tool_call(
-            &self,
-            _context: ToolCallContext<'_>,
-            _outcome: ToolCallOutcome<'_>,
-            _cancel: &CancellationToken,
-        ) {
+                .push("middleware:before");
+            let outcome = next.run(request).await;
             self.trace
                 .lock()
                 .expect("the trace lock is healthy")
-                .push("hook:after");
+                .push("middleware:after");
+            outcome
         }
     }
 
     struct BackgroundBoundary {
         trace: Arc<Mutex<Vec<String>>>,
-    }
-
-    struct FixedRoundExecutor;
-
-    #[async_trait]
-    impl ToolRoundExecutor for FixedRoundExecutor {
-        async fn execute_round(
-            &self,
-            context: ToolRoundContext<'_>,
-            _cancel: &CancellationToken,
-        ) -> Vec<ToolResult> {
-            context
-                .calls()
-                .iter()
-                .map(|call| ToolResult {
-                    tool_call_id: call.id.clone(),
-                    name:         Some(call.name.clone()),
-                    content:      vec![ContentPart::Text {
-                        text: "specialized".to_owned(),
-                    }],
-                    is_error:     false,
-                })
-                .collect()
-        }
-    }
-
-    struct GatedRoundExecutor;
-
-    #[async_trait]
-    impl ToolRoundExecutor for GatedRoundExecutor {
-        async fn execute_round(
-            &self,
-            context: ToolRoundContext<'_>,
-            cancel: &CancellationToken,
-        ) -> Vec<ToolResult> {
-            let mut results = Vec::with_capacity(context.calls().len());
-            for call in context.calls() {
-                if let ToolAccess::Denied { reason } = context.access_for_call(call) {
-                    results.push(error_tool_result(call, reason));
-                    continue;
-                }
-                if let BeforeToolCall::Block { reason } =
-                    context.before_tool_call(call, cancel).await
-                {
-                    results.push(error_tool_result(call, reason));
-                    continue;
-                }
-                let result = ToolResult {
-                    tool_call_id: call.id.clone(),
-                    name:         Some(call.name.clone()),
-                    content:      vec![ContentPart::Text {
-                        text: "specialized".to_owned(),
-                    }],
-                    is_error:     false,
-                };
-                context.after_tool_call(call, &result, None, cancel).await;
-                results.push(result);
-            }
-            results
-        }
     }
 
     #[async_trait]
@@ -1498,12 +1475,16 @@ mod tests {
             "inspect",
             json!({"name": "parser"}),
         ))]);
-        let tool = Tool::function(
-            "inspect",
-            "Inspect a value",
-            json!({"type": "object"}),
-            |_context, arguments| async move { Ok(format!("inspected {}", arguments["name"]).into()) },
-        );
+        let tool =
+            Tool::function(
+                "inspect",
+                "Inspect a value",
+                json!({"type": "object"}),
+                |_context, arguments| async move {
+                    Ok(format!("inspected {}", arguments["name"]).into())
+                },
+            )
+            .expect("the inspect tool is valid");
         let mut agent = Agent::builder(
             ScriptedModel::new([calls_tool, text_response("finished")]),
             "test/model",
@@ -1527,7 +1508,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_and_access_are_resolved_for_each_turn() {
+    async fn tool_discovery_and_policy_run_for_each_turn() {
         let calls_hidden = response([ContentPart::ToolCall(ToolCall::function(
             "call_1",
             "hidden",
@@ -1535,38 +1516,11 @@ mod tests {
         ))]);
         let (model, requests) = ScriptedModel::recording([calls_hidden, text_response("finished")]);
         let hidden_executions = Arc::new(AtomicUsize::new(0));
-        let observed = Arc::clone(&hidden_executions);
-        let provider = Arc::new(move |context: TurnContext<'_>| {
-            let tool = |name: &'static str| {
-                let observed = Arc::clone(&observed);
-                Tool::function(name, name, json!({}), move |_context, _arguments| {
-                    let observed = Arc::clone(&observed);
-                    async move {
-                        if name == "hidden" {
-                            observed.fetch_add(1, Ordering::SeqCst);
-                        }
-                        Ok(name.into())
-                    }
-                })
-            };
-            if context.turn() == 0 {
-                vec![tool("allowed"), tool("hidden")]
-            } else {
-                vec![tool("later")]
-            }
-        });
-        let policy = Arc::new(|context: ToolAccessContext<'_>| {
-            if context.definition().name == "hidden" {
-                ToolAccess::Denied {
-                    reason: "hidden for this turn".to_owned(),
-                }
-            } else {
-                ToolAccess::Allowed
-            }
-        });
         let mut agent = Agent::builder(model, "test/model")
-            .tool_provider(provider)
-            .tool_access_policy(policy)
+            .tool_service(Arc::new(DynamicTools {
+                hidden_executions: Arc::clone(&hidden_executions),
+            }))
+            .tool_middleware(Arc::new(HideTool))
             .build()
             .expect("the agent builds");
 
@@ -1594,65 +1548,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_specialized_round_receives_access_and_tool_hooks() {
-        let calls_tools = response([
-            ContentPart::ToolCall(ToolCall::function("call_1", "inspect", json!({}))),
-            ContentPart::ToolCall(ToolCall::function("call_2", "hidden", json!({}))),
-        ]);
-        let trace = Arc::new(Mutex::new(Vec::new()));
-        let tool = |name: &'static str| {
-            Tool::function(name, name, json!({}), |_context, _arguments| async {
-                Err(crate::ToolError::new(
-                    "the specialized round owns execution",
-                ))
-            })
-        };
-        let policy = Arc::new(|context: ToolAccessContext<'_>| {
-            if context.definition().name == "hidden" {
-                ToolAccess::Denied {
-                    reason: "hidden for this turn".to_owned(),
-                }
-            } else {
-                ToolAccess::Allowed
-            }
-        });
-        let mut agent = Agent::builder(
-            ScriptedModel::new([calls_tools, text_response("finished")]),
-            "test/model",
-        )
-        .tools([tool("inspect"), tool("hidden")])
-        .tool_access_policy(policy)
-        .tool_call_hooks(Arc::new(RecordingToolHooks {
-            trace: Arc::clone(&trace),
-        }))
-        .tool_round_executor(Arc::new(GatedRoundExecutor))
-        .build()
-        .expect("the agent builds");
-
-        agent.prompt("work").await.expect("the prompt succeeds");
-
-        assert_eq!(
-            trace.lock().expect("the trace lock is healthy").as_slice(),
-            ["hook:before", "hook:after"]
-        );
-        let results = agent.messages()[2]
-            .content()
-            .iter()
-            .filter_map(|part| match part {
-                ContentPart::ToolResult(result) => Some(result),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert!(!results[0].is_error);
-        assert!(results[1].is_error);
-        assert!(matches!(
-            &results[1].content[0],
-            ContentPart::Text { text } if text == "hidden for this turn"
-        ));
-    }
-
-    #[tokio::test]
-    async fn tool_hooks_and_event_projection_keep_call_order() {
+    async fn tool_middleware_is_inside_kernel_events() {
         let calls_tool = response([ContentPart::ToolCall(ToolCall::function(
             "call_1",
             "inspect",
@@ -1685,13 +1581,14 @@ mod tests {
                     .push("tool");
                 async { Ok("done".into()) }
             },
-        );
+        )
+        .expect("the test tool is valid");
         let mut agent = Agent::builder(
             ScriptedModel::new([calls_tool, text_response("finished")]),
             "test/model",
         )
         .tools([tool])
-        .tool_call_hooks(Arc::new(RecordingToolHooks {
+        .tool_middleware(Arc::new(RecordingToolMiddleware {
             trace: Arc::clone(&trace),
         }))
         .event_projection(projection)
@@ -1702,43 +1599,65 @@ mod tests {
 
         assert_eq!(*trace.lock().expect("the trace lock is healthy"), [
             "event:start",
-            "hook:before",
+            "middleware:before",
             "tool",
+            "middleware:after",
             "event:complete",
-            "hook:after"
         ]);
     }
 
     #[tokio::test]
-    async fn a_specialized_layer_can_execute_a_complete_tool_round() {
-        let calls_tool = response([ContentPart::ToolCall(ToolCall::function(
-            "call_1",
-            "inspect",
+    async fn an_exclusive_tool_runs_alone() {
+        let calls_tool = response([
+            ContentPart::ToolCall(ToolCall::function("call_1", "question", json!({}))),
+            ContentPart::ToolCall(ToolCall::function("call_2", "peer", json!({}))),
+        ]);
+        let executions = Arc::new(Mutex::new(Vec::new()));
+        let question_executions = Arc::clone(&executions);
+        let question = Tool::function(
+            "question",
+            "question",
             json!({}),
-        ))]);
-        let tool = Tool::function(
-            "inspect",
-            "inspect",
-            json!({}),
-            |_context, _arguments| async { panic!("the generic executor must not run") },
-        );
+            move |_context, _arguments| {
+                question_executions
+                    .lock()
+                    .expect("the execution lock is healthy")
+                    .push("question");
+                async { Ok("answered".into()) }
+            },
+        )
+        .expect("the question tool is valid")
+        .with_scheduling(ToolScheduling::ExclusiveRound);
+        let peer_executions = Arc::clone(&executions);
+        let peer = Tool::function("peer", "peer", json!({}), move |_context, _arguments| {
+            peer_executions
+                .lock()
+                .expect("the execution lock is healthy")
+                .push("peer");
+            async { Ok("unexpected".into()) }
+        })
+        .expect("the peer tool is valid");
         let mut agent = Agent::builder(
             ScriptedModel::new([calls_tool, text_response("finished")]),
             "test/model",
         )
-        .tools([tool])
-        .tool_round_executor(Arc::new(FixedRoundExecutor))
+        .tools([question, peer])
         .build()
         .expect("the agent builds");
 
         agent.prompt("work").await.expect("the prompt succeeds");
 
-        let ContentPart::ToolResult(result) = &agent.messages()[2].content()[0] else {
-            panic!("the call has a result");
+        assert_eq!(
+            *executions.lock().expect("the execution lock is healthy"),
+            ["question"]
+        );
+        let ContentPart::ToolResult(result) = &agent.messages()[2].content()[1] else {
+            panic!("the peer call has a result");
         };
+        assert!(result.is_error);
         assert!(matches!(
             &result.content[0],
-            ContentPart::Text { text } if text == "specialized"
+            ContentPart::Text { text } if text.contains("exclusive tool")
         ));
     }
 
@@ -1807,7 +1726,8 @@ mod tests {
                     Ok("ran".into())
                 }
             },
-        );
+        )
+        .expect("the count tool is valid");
         let control = AgentControlHandle::detached();
         let mut agent = Agent::builder(model, "test/model")
             .control_handle(control.clone())
@@ -1920,7 +1840,8 @@ mod tests {
                     Ok("ran".into())
                 }
             },
-        );
+        )
+        .expect("the count tool is valid");
         let mut agent = Agent::builder(ScriptedModel::new([calls_tool]), "test/model")
             .tools([counting_tool])
             .turn_boundary_hooks(Arc::new(FailingBoundary))
@@ -1990,7 +1911,8 @@ mod tests {
                 observed.fetch_add(1, Ordering::SeqCst);
                 async { Ok("unexpected".into()) }
             },
-        );
+        )
+        .expect("the inspect tool is valid");
         let mut agent = Agent::builder(
             ScriptedModel::new([calls_tool, text_response("corrected")]),
             "test/model",
@@ -2062,6 +1984,7 @@ mod tests {
             Tool::function("same", "same", json!({}), |_context, _arguments| async {
                 Ok("ok".into())
             })
+            .expect("the test tool is valid")
         };
         let result = Agent::builder(ScriptedModel::new([]), "test/model")
             .tools([make_tool(), make_tool()])

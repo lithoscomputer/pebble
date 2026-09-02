@@ -5,6 +5,7 @@ use std::result::Result as StdResult;
 use lithos_llm::types::{Error as LlmError, RequestBuildError};
 use thiserror::Error;
 
+use crate::tool::{ToolId, ToolSystemError};
 use crate::turn::TurnBoundaryError;
 
 /// A result returned while an agent processes a prompt.
@@ -20,11 +21,20 @@ pub enum AgentBuildError {
     /// The event buffer cannot hold an event.
     #[error("the event capacity must be greater than zero")]
     ZeroEventCapacity,
+    /// Static tools and a dynamic terminal service were both configured.
+    #[error("static tools cannot be combined with a custom tool service")]
+    ConflictingToolSources,
     /// Two tools use the same model-visible name.
     #[error("tool `{name}` was registered more than once")]
     DuplicateTool {
         /// The duplicated name.
         name: String,
+    },
+    /// Two tools use the same stable identity.
+    #[error("tool identity `{id}` was registered more than once")]
+    DuplicateToolId {
+        /// The duplicated identity.
+        id: ToolId,
     },
 }
 
@@ -44,6 +54,12 @@ pub enum AgentError {
         /// The duplicated name.
         name: String,
     },
+    /// Two tools resolved to the same stable identity for one turn.
+    #[error("tool identity `{id}` was resolved more than once for one turn")]
+    DuplicateToolId {
+        /// The duplicated identity.
+        id: ToolId,
+    },
     /// The current prompt was aborted.
     #[error("the agent prompt was aborted")]
     Aborted,
@@ -60,6 +76,13 @@ pub enum AgentError {
         /// The model-layer failure.
         #[source]
         source: LlmError,
+    },
+    /// Tool discovery or middleware failed.
+    #[error("running the tool system")]
+    ToolSystem {
+        /// The tool-system failure.
+        #[source]
+        source: ToolSystemError,
     },
     /// A configured turn-boundary hook failed.
     #[error("processing a model-turn boundary")]

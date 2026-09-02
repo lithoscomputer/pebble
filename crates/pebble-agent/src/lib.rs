@@ -5,11 +5,10 @@
 //! does not know about files, shells, coding profiles, memory, skills,
 //! subagents, persistence, credentials, or provider construction.
 //!
-//! Specialized layers can resolve and filter tools for each turn with
-//! [`ToolProvider`] and [`ToolAccessPolicy`]. [`ToolCallHooks`] surround tool
-//! execution, [`TurnBoundaryHooks`] own compaction and background-result
-//! boundaries, and [`EventProjection`] maps the generic lifecycle into a
-//! durable application event model.
+//! Specialized layers supply a [`ToolService`] and compose policy through
+//! [`ToolMiddleware`]. [`TurnBoundaryHooks`] own compaction and
+//! background-result boundaries, and [`EventProjection`] maps the generic
+//! lifecycle into a durable application event model.
 //!
 //! # One agent
 //!
@@ -29,7 +28,7 @@
 //!     |_context, arguments| async move {
 //!         Ok(format!("inspected {}", arguments["name"]).into())
 //!     },
-//! );
+//! )?;
 //!
 //! let mut agent = Agent::builder(client, "provider/model")
 //!     .system_prompt("Use tools when they help.")
@@ -53,19 +52,17 @@ mod turn;
 mod validation;
 
 pub use self::agent::{
-    Agent, AgentBuilder, AgentConfig, AgentSnapshot, AgentState, PromptOutcome, ToolExecution,
-    UserMessage,
+    Agent, AgentBuilder, AgentConfig, AgentSnapshot, AgentState, PromptOutcome, UserMessage,
 };
 pub use self::control::{AgentControlHandle, QueueOutcome};
 pub use self::error::{AgentBuildError, AgentError, Result};
 pub use self::event::{AgentEvent, EventProjection, FirstOutputKind};
 pub use self::model::ModelService;
 pub use self::tool::{
-    BeforeToolCall, Tool, ToolAccess, ToolAccessContext, ToolAccessPolicy, ToolCallContext,
-    ToolCallHooks, ToolCallNext, ToolCallOutcome, ToolCallRequest, ToolCatalog, ToolContext,
-    ToolDescriptor, ToolDiscoveryContext, ToolDiscoveryNext, ToolError, ToolErrorKind,
-    ToolExecutor, ToolId, ToolIdError, ToolMiddleware, ToolOutcome, ToolOutput, ToolProvider,
-    ToolScheduling, ToolService, ToolSystem, ToolSystemError,
+    Tool, ToolCallNext, ToolCallRequest, ToolCatalog, ToolContext, ToolDescriptor,
+    ToolDiscoveryContext, ToolDiscoveryNext, ToolError, ToolErrorKind, ToolExecutor, ToolId,
+    ToolIdError, ToolMiddleware, ToolOutcome, ToolOutput, ToolScheduling, ToolService, ToolSystem,
+    ToolSystemError,
 };
 pub use self::turn::{
     TurnBoundaryAction, TurnBoundaryContext, TurnBoundaryError, TurnBoundaryHooks, TurnContext,
@@ -74,12 +71,9 @@ pub use self::turn::{
 /// The small specialization interface a layer built on this crate uses.
 ///
 /// `pebble-coding-agent` is that layer. It observes the response stream as it
-/// arrives, executes complete tool rounds with its own policy and events, and
-/// validates tool arguments the way the generic loop does. Nothing here is
-/// needed to run an [`Agent`] directly, and the surface stays this small on
-/// purpose: it is the contract between the two crates, not a second API.
+/// arrives and validates tool arguments the way the generic loop does.
+/// Nothing here is needed to run an [`Agent`] directly.
 pub mod integration {
     pub use crate::stream::{StreamObserver, StreamOutcome, stream_response};
-    pub use crate::tool::{ToolRoundContext, ToolRoundExecutor};
     pub use crate::validation::{ToolArgumentsError, validate_tool_arguments};
 }
