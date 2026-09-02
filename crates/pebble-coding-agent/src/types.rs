@@ -951,8 +951,8 @@ impl CodingEvent {
 
     /// Records this event on the tracing subscriber.
     ///
-    /// Streaming noise logs nothing, and process output is reported by size
-    /// rather than content.
+    /// Streaming noise logs nothing. Process output and subagent task prompts
+    /// are reported by size rather than content.
     pub fn trace(&self, session_id: &str) {
         use tracing::{debug, error, info, warn};
 
@@ -1141,7 +1141,11 @@ impl CodingEvent {
             } => {
                 debug!(
                     session_id,
-                    agent_id, depth, generation, task, "Subagent spawned"
+                    agent_id,
+                    depth,
+                    generation,
+                    task_len = task.len(),
+                    "Subagent spawned"
                 );
             }
             Self::SubAgentTurnStarted {
@@ -1152,7 +1156,11 @@ impl CodingEvent {
             } => {
                 debug!(
                     session_id,
-                    agent_id, depth, generation, task, "Subagent turn started"
+                    agent_id,
+                    depth,
+                    generation,
+                    task_len = task.len(),
+                    "Subagent turn started"
                 );
             }
             Self::SubAgentCompleted {
