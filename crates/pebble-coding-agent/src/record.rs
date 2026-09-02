@@ -112,6 +112,58 @@ impl SessionRecord {
     pub const fn is_supported(&self) -> bool {
         self.format_version <= SESSION_RECORD_FORMAT_VERSION
     }
+
+    /// The exact route the session last ran on, as a `provider/model` selector
+    /// the client's resolver restores without guessing.
+    ///
+    /// `None` when the record names no provider or no model, which a resume
+    /// on the recorded model refuses rather than reinterpreting.
+    #[must_use]
+    pub fn recorded_route(&self) -> Option<String> {
+        match (&self.provider, &self.model) {
+            (Some(provider), Some(model)) => Some(format!("{provider}/{model}")),
+            _ => None,
+        }
+    }
+
+    /// Brings a record written by an older pebble up to the format this build
+    /// writes.
+    ///
+    /// Every supported version is migrated explicitly here and keeps a frozen
+    /// fixture under `tests/fixtures`. A version this build does not know —
+    /// newer than it writes, or older than pebble ever wrote — is refused with
+    /// a typed error rather than read on a guess.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RecordMigrationError::UnsupportedVersion`] for a format
+    /// version this build cannot read.
+    pub fn migrate(self) -> Result<Self, RecordMigrationError> {
+        match self.format_version {
+            SESSION_RECORD_FORMAT_VERSION => Ok(self),
+            version => Err(RecordMigrationError::UnsupportedVersion {
+                version,
+                supported: SESSION_RECORD_FORMAT_VERSION,
+            }),
+        }
+    }
+}
+
+/// A stored record could not be brought up to this build's format.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RecordMigrationError {
+    /// The record's format version is one this build does not read.
+    #[error(
+        "session record format version {version} is not one this build reads (it reads up to \
+         {supported})"
+    )]
+    UnsupportedVersion {
+        /// The version the record declares.
+        version:   u32,
+        /// The newest version this build reads.
+        supported: u32,
+    },
 }
 
 /// One stored conversation turn.

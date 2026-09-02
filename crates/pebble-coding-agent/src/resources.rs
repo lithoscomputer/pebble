@@ -17,7 +17,9 @@ pub use crate::memory::{MEMORY_BUDGET_BYTES, MemoryDocument, load_memory};
 pub use crate::profile::{
     AgentProfile, DEFAULT_CONTEXT_WINDOW_TOKENS, EnvContext, ModelFacts, SubagentSupport,
 };
-pub use crate::record::{SESSION_RECORD_FORMAT_VERSION, SessionRecord, StoredMessage};
+pub use crate::record::{
+    RecordMigrationError, SESSION_RECORD_FORMAT_VERSION, SessionRecord, StoredMessage,
+};
 pub use crate::skills::{
     ExpandedInput, Skill, SkillExpansion, SkillExpansionError, SkillParseError, discover_skills,
     expand_skill, format_skills_prompt_section, parse_skill,

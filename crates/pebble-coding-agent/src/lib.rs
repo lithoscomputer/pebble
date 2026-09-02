@@ -58,7 +58,8 @@ mod readme {}
 
 pub use self::coding_agent::{
     CodingAgent, CodingAgentBuildError, CodingAgentBuilder, CodingAgentControlHandle,
-    ControlSnapshot, PromptOutcome, PromptTiming, ShutdownReason, SteeringMessage, SteeringOutcome,
+    CodingAgentExport, ControlSnapshot, PromptOutcome, PromptTiming, ResumeMode, ShutdownReason,
+    SteeringMessage, SteeringOutcome,
 };
 pub use self::config::CodingAgentOptions;
 pub use self::environment::{

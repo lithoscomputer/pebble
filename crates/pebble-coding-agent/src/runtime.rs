@@ -37,7 +37,9 @@ pub use self::control::SteeringLease;
 pub(crate) use self::control::{SessionControlHandle, SteeringItem};
 pub use self::retry::RetryEventObserver;
 use self::turn::CodingAgentBridge;
-pub(crate) use crate::coding_agent::{CodingAgentBuildError, PromptTiming, ShutdownReason};
+pub(crate) use crate::coding_agent::{
+    CodingAgentBuildError, PromptTiming, ResumeMode, ShutdownReason,
+};
 use crate::config::CodingAgentOptions;
 use crate::context_window::{memory_prompt_tokens, skills_prompt_tokens};
 use crate::environment::{Environment, ExecRequest};
@@ -49,7 +51,7 @@ use crate::human_input::HumanInputProvider;
 use crate::memory::{MEMORY_BUDGET_BYTES, MemoryDocument, load_memory};
 use crate::profile::{AgentProfile, EnvContext, ModelFacts, SubagentSupport, builtin_profile};
 use crate::profiles::{FileEditToolKind, ProfileDeps};
-use crate::record::{SESSION_RECORD_FORMAT_VERSION, SessionRecord};
+use crate::record::{RecordMigrationError, SessionRecord};
 use crate::redact::{NoRedaction, Redactor};
 use crate::search::SearchProvider;
 use crate::skills::{Skill, SkillExpansion, discover_skills};
@@ -75,6 +77,22 @@ const METADATA_NAMESPACE: &str = "pebble";
 
 /// How long a probe run inside the environment may take.
 const PROBE_TIMEOUT_MS: u64 = 5_000;
+
+/// A live session's state, warm, for a successor in the same process.
+///
+/// The record is the durable part. The rest is what
+/// [`CodingRuntime::initialize`] derives from the environment and the options,
+/// carried so the successor does not derive it again.
+#[derive(Clone, Debug)]
+pub(crate) struct WarmState {
+    pub(crate) record: SessionRecord,
+    pub(crate) system_prompt: String,
+    pub(crate) skills: Vec<Skill>,
+    pub(crate) memory_tokens: u64,
+    pub(crate) skills_tokens: u64,
+    pub(crate) file_tracker: FileTracker,
+    pub(crate) activated_skill_context_observed: bool,
+}
 
 /// What one prompt accumulated across every input it processed.
 #[derive(Clone, Copy, Debug, Default)]
@@ -162,6 +180,11 @@ impl CodingRuntimeBuilder {
     pub(crate) fn environment(mut self, environment: Arc<dyn Environment>) -> Self {
         self.environment = Some(environment);
         self
+    }
+
+    /// Whether a model has been named on this builder.
+    pub(crate) const fn has_model(&self) -> bool {
+        self.model.is_some()
     }
 
     /// Adds tools on top of the ones the profile contributes.
@@ -721,42 +744,145 @@ impl CodingRuntime {
     ///
     /// The record supplies the identity, the conversation, and where the event
     /// stream had got to; `deps` supplies everything a record cannot hold — the
-    /// client, the environment, the tools, the options. Event numbering
-    /// continues from the record, so one session's events stay uniquely
-    /// numbered across restarts.
+    /// client, the environment, the tools, the options. `mode` decides the
+    /// model: the exact route the record names, restored without guessing, or
+    /// a selector the caller chose for failover. Event numbering continues from
+    /// the record, so one session's events stay uniquely numbered across
+    /// restarts.
     ///
     /// # Errors
     ///
     /// Returns [`CodingAgentBuildError`] for the same reasons
-    /// [`CodingRuntimeBuilder::build`] does, and
+    /// [`CodingRuntimeBuilder::build`] does;
     /// [`UnsupportedRecord`](CodingAgentBuildError::UnsupportedRecord) for a
-    /// record this build is too old to read.
+    /// format version this build does not read; and, when the recorded model is
+    /// asked for,
+    /// [`RecordedRouteMissing`](CodingAgentBuildError::RecordedRouteMissing)
+    /// for a record that names no route,
+    /// [`RecordedRouteUnavailable`](CodingAgentBuildError::RecordedRouteUnavailable)
+    /// for one the client cannot reach, and
+    /// [`RecordedRouteMismatch`](CodingAgentBuildError::RecordedRouteMismatch)
+    /// if the resolver answered with a different model.
     pub(crate) fn from_record(
-        record: &SessionRecord,
+        record: SessionRecord,
+        mode: &ResumeMode,
         deps: CodingRuntimeBuilder,
     ) -> StdResult<Self, CodingAgentBuildError> {
-        if !record.is_supported() {
-            return Err(CodingAgentBuildError::UnsupportedRecord {
-                version:   record.format_version,
-                supported: SESSION_RECORD_FORMAT_VERSION,
-            });
-        }
+        let record = record.migrate().map_err(|error| match error {
+            RecordMigrationError::UnsupportedVersion { version, supported } => {
+                CodingAgentBuildError::UnsupportedRecord { version, supported }
+            }
+        })?;
+
+        let recorded = match mode {
+            ResumeMode::RecordedModel => {
+                let route = record.recorded_route().ok_or_else(|| {
+                    CodingAgentBuildError::RecordedRouteMissing {
+                        session_id: record.session_id.clone(),
+                    }
+                })?;
+                Some(route)
+            }
+            ResumeMode::UseModel(_) => None,
+        };
+        let selector = match mode {
+            ResumeMode::RecordedModel => recorded.clone().unwrap_or_default(),
+            ResumeMode::UseModel(selector) => selector.clone(),
+        };
 
         let mut deps = deps;
-        if let Some(model) = &record.model {
-            deps.model = Some(model.clone());
-        }
+        deps.model = Some(selector);
         deps.events.resume_after_seq = record.last_event_seq;
-        let mut session = deps.build_with_id(record.session_id.clone(), record.created_at)?;
+        let built = deps.build_with_id(record.session_id.clone(), record.created_at);
+        let mut session = match (built, &recorded) {
+            // An exact route the client cannot reach is its own failure, and
+            // never a reason to run the conversation somewhere else.
+            (Err(CodingAgentBuildError::ModelSelection { source, .. }), Some(_)) => {
+                return Err(CodingAgentBuildError::RecordedRouteUnavailable {
+                    provider: record.provider.clone().unwrap_or_default(),
+                    model: record.model.clone().unwrap_or_default(),
+                    source,
+                });
+            }
+            (built, _) => built?,
+        };
+        if let Some(recorded) = recorded {
+            let resolved = format!("{}/{}", session.provider, session.model);
+            if resolved != recorded {
+                return Err(CodingAgentBuildError::RecordedRouteMismatch { recorded, resolved });
+            }
+        }
+
         session.history = History::from_stored_messages(&record.messages);
         // The parentage the record carries is restored, so storing a resumed
         // child again says the same thing. The tree itself is not: a resumed
         // child has no supervisor above it, and rebuilding one is the
         // application's to do.
-        session
-            .parent_session_id
-            .clone_from(&record.parent_session_id);
+        session.parent_session_id = record.parent_session_id;
         Ok(session)
+    }
+
+    /// Rebuilds a live session's successor from its warm state, on the same
+    /// route, without initializing again.
+    ///
+    /// Everything [`initialize`](Self::initialize) would compute is taken from
+    /// the state instead: the system prompt, the discovered skills and the tool
+    /// that loads one, the token counts the context snapshot reads, and the
+    /// files the session touched. Call
+    /// [`start_from_warm_state`](Self::start_from_warm_state) afterwards in
+    /// place of `initialize`.
+    ///
+    /// # Errors
+    ///
+    /// As [`from_record`](Self::from_record) on the recorded model.
+    pub(crate) fn from_warm_state(
+        state: WarmState,
+        deps: CodingRuntimeBuilder,
+    ) -> StdResult<Self, CodingAgentBuildError> {
+        let mut session = Self::from_record(state.record, &ResumeMode::RecordedModel, deps)?;
+        if !state.skills.is_empty() {
+            let vocabulary = session.registry.vocabulary();
+            session
+                .registry
+                .register(make_use_skill_tool_for_vocabulary(
+                    Arc::from(state.skills.clone()),
+                    vocabulary,
+                ));
+        }
+        session.skills = state.skills;
+        session.system_prompt = state.system_prompt;
+        session.memory_tokens = state.memory_tokens;
+        session.skills_tokens = state.skills_tokens;
+        session.file_tracker = state.file_tracker;
+        session.activated_skill_context_observed = state.activated_skill_context_observed;
+        Ok(session)
+    }
+
+    /// Opens the event stream of a session built from warm state.
+    ///
+    /// Publishes [`SessionStarted`](CodingEvent::SessionStarted) and nothing
+    /// else: no memory was loaded and no skills were discovered, because the
+    /// warm state already carried what they produce.
+    pub(crate) fn start_from_warm_state(&mut self) {
+        self.emit(CodingEvent::SessionStarted {
+            provider: Some(self.provider.clone()),
+            model:    Some(self.model.clone()),
+        });
+    }
+
+    /// Everything a successor in this process needs to carry on without
+    /// initializing again: the durable record plus the state initialization
+    /// derived from it.
+    pub(crate) fn warm_state(&self) -> WarmState {
+        WarmState {
+            record: self.to_record(),
+            system_prompt: self.system_prompt.clone(),
+            skills: self.skills.clone(),
+            memory_tokens: self.memory_tokens,
+            skills_tokens: self.skills_tokens,
+            file_tracker: self.file_tracker.clone(),
+            activated_skill_context_observed: self.activated_skill_context_observed,
+        }
     }
 
     /// The session as it should be stored.
@@ -1572,6 +1698,7 @@ mod tests {
     use super::*;
     use crate::error::ErrorKind;
     use crate::event::EventSinkError;
+    use crate::record::SESSION_RECORD_FORMAT_VERSION;
     use crate::test_support::{
         MockEnvironment, ScriptedCall, ScriptedFailure, scripted_client, text_response,
     };
@@ -2037,8 +2164,12 @@ mod tests {
             .expect("the shutdown succeeds");
         let record = session.to_record();
 
-        let resumed =
-            CodingRuntime::from_record(&record, builder(client())).expect("the record restores");
+        let resumed = CodingRuntime::from_record(
+            record.clone(),
+            &ResumeMode::RecordedModel,
+            builder(client()),
+        )
+        .expect("the record restores");
 
         assert_eq!(resumed.id(), session.id());
         assert_eq!(resumed.root_session_id(), session.id());
@@ -2067,8 +2198,12 @@ mod tests {
         let record = session.to_record();
         let last_seq = record.last_event_seq;
 
-        let resumed =
-            CodingRuntime::from_record(&record, builder(client())).expect("the record restores");
+        let resumed = CodingRuntime::from_record(
+            record.clone(),
+            &ResumeMode::RecordedModel,
+            builder(client()),
+        )
+        .expect("the record restores");
         let mut events = resumed.subscribe();
         resumed.emit(CodingEvent::LoopDetected);
 
@@ -2120,8 +2255,12 @@ mod tests {
         let mut record = SessionRecord::new("ses_1");
         record.format_version = SESSION_RECORD_FORMAT_VERSION + 1;
 
-        let error = CodingRuntime::from_record(&record, builder(client()))
-            .expect_err("this build is too old for the record");
+        let error = CodingRuntime::from_record(
+            record.clone(),
+            &ResumeMode::RecordedModel,
+            builder(client()),
+        )
+        .expect_err("this build is too old for the record");
 
         assert!(matches!(
             error,

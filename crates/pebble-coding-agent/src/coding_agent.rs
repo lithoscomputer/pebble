@@ -22,7 +22,7 @@ use crate::record::SessionRecord;
 use crate::redact::Redactor;
 use crate::runtime::{
     CodingRuntime, CodingRuntimeBuilder, InterruptReasonHandle, SessionControlHandle, SteeringItem,
-    SteeringLease,
+    SteeringLease, WarmState,
 };
 use crate::search::SearchProvider;
 use crate::subagent::{ChildAgentFactory, SubagentLimits};
@@ -127,9 +127,10 @@ pub enum CodingAgentBuildError {
         profile: String,
     },
 
-    /// The stored record was written by a newer pebble.
+    /// The stored record's format version is one this build does not read.
     #[error(
-        "session record format version {version} is newer than this build reads (up to {supported})"
+        "session record format version {version} is not one this build reads (it reads up to \
+         {supported})"
     )]
     UnsupportedRecord {
         /// The version the record declares.
@@ -137,6 +138,84 @@ pub enum CodingAgentBuildError {
         /// The newest version this build reads.
         supported: u32,
     },
+
+    /// Resume was asked to restore the recorded model, and the record names
+    /// no provider or no model to restore.
+    #[error("session record {session_id} names no provider and model to resume on")]
+    RecordedRouteMissing {
+        /// The session the record describes.
+        session_id: String,
+    },
+
+    /// The exact route the record names is not one this client can reach, so
+    /// the session is not resumed on a different one.
+    #[error("the recorded route {provider}/{model} is not available to this client: {source}")]
+    RecordedRouteUnavailable {
+        /// The provider the record names.
+        provider: String,
+        /// The model the record names.
+        model:    String,
+        /// What the client's resolver said.
+        #[source]
+        source:   ModelSelectionError,
+    },
+
+    /// The recorded route resolved to a different provider or model, which a
+    /// resume on the recorded model never accepts.
+    #[error("the recorded route {recorded} resolved to {resolved}, which is a different model")]
+    RecordedRouteMismatch {
+        /// The `provider/model` pair the record names.
+        recorded: String,
+        /// The `provider/model` pair the client resolved.
+        resolved: String,
+    },
+
+    /// A model was set on a builder that resumes a session, and the resume
+    /// mode already decides the model.
+    #[error("a resumed agent takes its model from the resume mode, not from the builder")]
+    ModelConflictsWithResume,
+}
+
+/// Which model a resumed session runs on.
+///
+/// Resume never infers this from how the builder was called. The recorded
+/// route is restored exactly or the caller names a replacement, and the choice
+/// is visible where the agent is resumed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResumeMode {
+    /// Restore the exact `provider/model` route the record names. A record
+    /// that names none, or names a route this client cannot reach, is refused
+    /// rather than resumed on a different model.
+    RecordedModel,
+    /// Keep the conversation but run it on `selector`, which the client's
+    /// catalog resolves. This is the failover path, and the new route is what
+    /// the next record stores.
+    UseModel(String),
+}
+
+/// A warm, in-memory handoff from one live coding agent to its successor.
+///
+/// Where a [`SessionRecord`] is the minimal durable form and a session
+/// resumed from one re-initializes — probing the environment, loading memory
+/// and skills, rebuilding the system prompt — an export also carries that
+/// derived state, so the successor skips initialization. The successor is
+/// built on the exported route: the system prompt names the model, so a
+/// change of model goes through [`CodingAgent::resume`] instead.
+///
+/// Taking an export does not consume or close the agent it came from. The
+/// application shuts the predecessor down when it is done with it.
+#[derive(Clone, Debug)]
+pub struct CodingAgentExport {
+    inner: WarmState,
+}
+
+impl CodingAgentExport {
+    /// The durable record inside the export, for storing beside it.
+    #[must_use]
+    pub const fn record(&self) -> &SessionRecord {
+        &self.inner.record
+    }
 }
 
 /// The completed result of one coding-agent prompt.
@@ -181,34 +260,33 @@ impl PromptOutcome {
     }
 }
 
+/// What a builder resumes from, when it resumes at all.
+enum ResumeSource {
+    Record(SessionRecord, ResumeMode),
+    Export(WarmState),
+}
+
 /// Builds an initialized [`CodingAgent`].
 #[must_use = "a builder does nothing until `build().await` is called"]
 pub struct CodingAgentBuilder {
-    inner:       CodingRuntimeBuilder,
-    resume_from: Option<SessionRecord>,
+    inner:  CodingRuntimeBuilder,
+    resume: Option<ResumeSource>,
 }
 
 impl CodingAgentBuilder {
     fn new(client: Client, environment: Arc<dyn Environment>) -> Self {
         Self {
-            inner:       CodingRuntime::builder(client).environment(environment),
-            resume_from: None,
+            inner:  CodingRuntime::builder(client).environment(environment),
+            resume: None,
         }
     }
 
     /// Names the model through the client's catalog.
+    ///
+    /// A builder that resumes a session takes its model from the resume mode
+    /// instead, and refuses one set here.
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.inner = self.inner.model(model);
-        self
-    }
-
-    /// Restores identity and conversation history from a durable record.
-    ///
-    /// A model stored in the record takes precedence over one set with
-    /// [`model`](Self::model). Other dependencies and options come from this
-    /// builder.
-    pub fn resume_from(mut self, record: SessionRecord) -> Self {
-        self.resume_from = Some(record);
         self
     }
 
@@ -292,16 +370,36 @@ impl CodingAgentBuilder {
     /// does not select a supported coding profile, or resource initialization
     /// fails.
     pub async fn build(self) -> Result<CodingAgent, CodingAgentBuildError> {
-        let mut inner = match self.resume_from {
-            Some(record) => CodingRuntime::from_record(&record, self.inner)?,
-            None => self.inner.build()?,
-        };
-        if let Err(source) = inner.initialize().await {
-            let _ = inner.shutdown(ShutdownReason::Error).await;
-            return Err(CodingAgentBuildError::Initialization {
-                source: Box::new(source),
-            });
+        if self.resume.is_some() && self.inner.has_model() {
+            return Err(CodingAgentBuildError::ModelConflictsWithResume);
         }
+        let inner = match self.resume {
+            Some(ResumeSource::Record(record, mode)) => {
+                let mut inner = CodingRuntime::from_record(record, &mode, self.inner)?;
+                if let Err(source) = inner.initialize().await {
+                    let _ = inner.shutdown(ShutdownReason::Error).await;
+                    return Err(CodingAgentBuildError::Initialization {
+                        source: Box::new(source),
+                    });
+                }
+                inner
+            }
+            Some(ResumeSource::Export(state)) => {
+                let mut inner = CodingRuntime::from_warm_state(state, self.inner)?;
+                inner.start_from_warm_state();
+                inner
+            }
+            None => {
+                let mut inner = self.inner.build()?;
+                if let Err(source) = inner.initialize().await {
+                    let _ = inner.shutdown(ShutdownReason::Error).await;
+                    return Err(CodingAgentBuildError::Initialization {
+                        source: Box::new(source),
+                    });
+                }
+                inner
+            }
+        };
         let control = CodingControl::new(&inner);
         Ok(CodingAgent { inner, control })
     }
@@ -712,6 +810,76 @@ impl CodingAgent {
         CodingAgentBuilder::new(client, environment)
     }
 
+    /// Starts a builder that resumes a stored session on the model `mode`
+    /// names.
+    ///
+    /// The record supplies the identity, the conversation, and where the event
+    /// stream had got to; the builder supplies everything a record cannot hold
+    /// and must not also name a model. The resumed agent initializes again —
+    /// probing the environment and rebuilding its system prompt — so a
+    /// [`ResumeMode::UseModel`] failover gets a prompt written for the model it
+    /// runs on.
+    ///
+    /// ```no_run
+    /// use pebble_coding_agent::{CodingAgent, ResumeMode};
+    /// # use std::sync::Arc;
+    /// # async fn example(
+    /// #     client: lithos_llm::Client,
+    /// #     environment: Arc<dyn pebble_coding_agent::Environment>,
+    /// #     record: pebble_coding_agent::resources::SessionRecord,
+    /// # ) -> Result<(), Box<dyn std::error::Error>> {
+    /// let same = CodingAgent::resume(
+    ///     client.clone(),
+    ///     Arc::clone(&environment),
+    ///     record.clone(),
+    ///     ResumeMode::RecordedModel,
+    /// )
+    /// .build()
+    /// .await?;
+    ///
+    /// let fallback = CodingAgent::resume(
+    ///     client,
+    ///     environment,
+    ///     record,
+    ///     ResumeMode::UseModel("openai/gpt-fallback".into()),
+    /// )
+    /// .build()
+    /// .await?;
+    /// # let _ = (same, fallback);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn resume(
+        client: Client,
+        environment: Arc<dyn Environment>,
+        record: SessionRecord,
+        mode: ResumeMode,
+    ) -> CodingAgentBuilder {
+        let mut builder = CodingAgentBuilder::new(client, environment);
+        builder.resume = Some(ResumeSource::Record(record, mode));
+        builder
+    }
+
+    /// Starts a builder that continues a live agent from its
+    /// [`export`](Self::export), without initializing again.
+    ///
+    /// This is the handoff between two agents in one process: the successor
+    /// keeps the identity, the conversation, the system prompt, and the
+    /// discovered skills, and binds whatever services the builder gives it —
+    /// a different human-input provider, different tool hooks — for its own
+    /// life. It runs on the exported route; a change of model goes through
+    /// [`resume`](Self::resume). Event numbering continues from the export, on
+    /// a fresh event stream.
+    pub fn resume_from_export(
+        client: Client,
+        environment: Arc<dyn Environment>,
+        export: CodingAgentExport,
+    ) -> CodingAgentBuilder {
+        let mut builder = CodingAgentBuilder::new(client, environment);
+        builder.resume = Some(ResumeSource::Export(export.inner));
+        builder
+    }
+
     /// Processes one user prompt and every queued follow-up to completion.
     ///
     /// # Errors
@@ -845,10 +1013,22 @@ impl CodingAgent {
     /// Captures the durable session state.
     ///
     /// The record can be taken between prompts or during a prompt as a crash
-    /// checkpoint. Restore it with [`CodingAgentBuilder::resume_from`].
+    /// checkpoint. Restore it with [`CodingAgent::resume`].
     #[must_use]
     pub fn to_record(&self) -> SessionRecord {
         self.inner.to_record()
+    }
+
+    /// Captures everything a successor in the same process needs to carry on
+    /// without initializing again.
+    ///
+    /// Taking an export leaves this agent as it was. Continue from it with
+    /// [`CodingAgent::resume_from_export`].
+    #[must_use]
+    pub fn export(&self) -> CodingAgentExport {
+        CodingAgentExport {
+            inner: self.inner.warm_state(),
+        }
     }
 
     /// Closes the agent and joins its owned tasks.
@@ -997,11 +1177,11 @@ mod tests {
         let (client, _provider) =
             scripted_client(vec![ScriptedCall::response(text_response("second"))]);
         let environment = Arc::new(MockEnvironment::linux());
-        let mut resumed = CodingAgent::builder(client, environment)
-            .resume_from(record)
-            .build()
-            .await
-            .expect("the durable record resumes");
+        let mut resumed =
+            CodingAgent::resume(client, environment, record, ResumeMode::RecordedModel)
+                .build()
+                .await
+                .expect("the durable record resumes");
 
         assert_eq!(resumed.id(), original_id);
         assert!(!resumed.history().is_empty());

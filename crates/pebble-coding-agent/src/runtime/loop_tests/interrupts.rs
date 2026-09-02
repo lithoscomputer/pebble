@@ -842,7 +842,8 @@ async fn a_resumed_session_carries_on_the_conversation_and_the_numbering() {
 
     let (client, provider) = scripted_client(answers("second answer"));
     let mut resumed =
-        CodingRuntime::from_record(&record, builder(client)).expect("the record restores");
+        CodingRuntime::from_record(record.clone(), &ResumeMode::RecordedModel, builder(client))
+            .expect("the record restores");
     let mut events = resumed.subscribe();
 
     let answer = resumed

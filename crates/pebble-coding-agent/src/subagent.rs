@@ -1991,8 +1991,8 @@ mod tests {
     use crate::error::ErrorKind;
     use crate::human_input::{Answer, HumanInputError, HumanInputProvider, Question};
     use crate::record::SessionRecord;
-    use crate::runtime::testing;
     use crate::runtime::testing::{TestSession, noop_tool};
+    use crate::runtime::{ResumeMode, testing};
     use crate::test_support::{
         MockEnvironment, ScriptedCall, message_text, scripted_client, text_response,
     };
@@ -3577,8 +3577,12 @@ mod tests {
         // though the tree above it is the application's to rebuild.
         let (client, _resumed_provider) =
             scripted_client(vec![ScriptedCall::response(text_response("resumed"))]);
-        let mut resumed = CodingRuntime::from_record(&record, testing::builder(client))
-            .expect("the child's record resumes");
+        let mut resumed = CodingRuntime::from_record(
+            record.clone(),
+            &ResumeMode::RecordedModel,
+            testing::builder(client),
+        )
+        .expect("the child's record resumes");
         assert_eq!(
             resumed.to_record().parent_session_id.as_deref(),
             Some(session.id())
