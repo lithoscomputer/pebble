@@ -25,6 +25,7 @@ mod requests;
 mod subagents;
 mod tools;
 
+use std::collections::VecDeque;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -207,7 +208,7 @@ async fn a_session_is_executing_while_its_tools_run_and_thinking_between_rounds(
             .get()
             .expect("the probe was handed its session")
             .current();
-        control.interrupt_then_steer("carry on", None);
+        control.steer("carry on");
         between_rounds
     });
 
@@ -650,7 +651,7 @@ async fn a_round_the_user_interrupted_is_not_a_loop() {
                 && starts.fetch_add(1, Ordering::SeqCst) == 1
         })
         .await;
-        control.interrupt_then_steer("try something else", None);
+        control.steer("try something else");
     });
 
     let answer = timeout(Duration::from_secs(1), session.prompt("Keep repeating"))
@@ -1100,7 +1101,7 @@ async fn a_blocking_tool_answers_the_round_that_was_interrupted() {
             matches!(event, CodingEvent::RoundInterrupted { generation: 1 })
         })
         .await;
-        control.steer("resume after tool", None);
+        control.enqueue_steering("resume after tool");
     });
 
     session

@@ -103,7 +103,10 @@ pub enum AgentEvent {
         result: ToolResult,
     },
     /// A round was interrupted so queued steering can be applied.
-    TurnInterrupted,
+    TurnInterrupted {
+        /// The session-wide interrupt generation, counted from one.
+        generation: u64,
+    },
     /// The prompt and all queued follow-up input completed.
     PromptCompleted {
         /// The final response.

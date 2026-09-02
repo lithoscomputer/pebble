@@ -1,6 +1,5 @@
 //! The coding layer that projects Pebble's durable behavior onto `Agent`.
 
-use std::collections::VecDeque;
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Instant, SystemTime};
@@ -15,7 +14,7 @@ use pebble_agent as agent;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use super::control::{SessionControlHandle, actor_from_attribution};
+use super::control::actor_from_attribution;
 use super::retry::RetryEventBridge;
 use super::{CodingRuntime, PromptTotals, StateMachine};
 use crate::compaction::{CompactionRequest, check_context_usage, compact_context};
@@ -66,7 +65,6 @@ pub(super) struct CodingAgentBridge {
     session_id:     String,
     memory_tokens:  u64,
     skills_tokens:  u64,
-    control:        SessionControlHandle,
     /// The session's state, moved to `Executing` for the length of a tool
     /// round and back to `Thinking` after it.
     state_machine:  StateMachine,
@@ -74,7 +72,6 @@ pub(super) struct CodingAgentBridge {
     /// terminal token, so it also fires when the session is shut down, and set
     /// afresh by [`begin_prompt`](Self::begin_prompt) for every prompt.
     prompt_cancel:  Arc<Mutex<CancellationToken>>,
-    followup_queue: Arc<Mutex<VecDeque<String>>>,
     subagents:      Option<SubagentSupervisor>,
     skills:         Vec<Skill>,
 }
@@ -148,10 +145,8 @@ impl CodingAgentBridge {
             session_id:     runtime.id.clone(),
             memory_tokens:  runtime.memory_tokens,
             skills_tokens:  runtime.skills_tokens,
-            control:        runtime.control_handle(),
             state_machine:  runtime.state.clone(),
             prompt_cancel:  Arc::new(Mutex::new(runtime.cancel_token.clone())),
-            followup_queue: Arc::clone(&runtime.followup_queue),
             subagents:      runtime.subagents.clone(),
             skills:         runtime.skills.clone(),
         }
@@ -230,12 +225,6 @@ impl CodingAgentBridge {
                 .timing
                 .inference
                 .saturating_add(started.elapsed());
-        }
-    }
-
-    fn settle_interrupts(&self) {
-        for generation in self.control.settle_interrupts() {
-            self.emit(CodingEvent::RoundInterrupted { generation });
         }
     }
 
@@ -341,7 +330,6 @@ impl CodingAgentBridge {
     }
 
     fn commit_steering(&self, message: &LlmMessage, attribution: Option<&Value>) {
-        self.settle_interrupts();
         let text = message_text(message);
         let actor = actor_from_attribution(attribution);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -567,13 +555,15 @@ impl agent::EventProjection for CodingAgentBridge {
                     Some(result.tool_call_id.clone()),
                 );
             }
-            agent::AgentEvent::TurnInterrupted => {
+            agent::AgentEvent::TurnInterrupted { generation } => {
                 self.finish_inference();
                 self.state
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .pending_task_reminder = None;
-                self.settle_interrupts();
+                self.emit(CodingEvent::RoundInterrupted {
+                    generation: *generation,
+                });
             }
             _ => {}
         }
@@ -587,7 +577,6 @@ impl agent::AgentLifecycle for CodingAgentBridge {
         _context: agent::TurnContext<'_>,
         cancel: &CancellationToken,
     ) -> StdResult<agent::ConversationUpdate, agent::LifecycleError> {
-        self.settle_interrupts();
         if cancel.is_cancelled() || self.prompt_cancel().is_cancelled() {
             return Ok(agent::ConversationUpdate::unchanged());
         }
@@ -616,66 +605,41 @@ impl agent::AgentLifecycle for CodingAgentBridge {
         Ok(update)
     }
 
+    async fn prepare_follow_up(
+        &self,
+        _context: agent::TurnContext<'_>,
+        message: agent::UserMessage,
+        _cancel: &CancellationToken,
+    ) -> StdResult<agent::UserMessage, agent::LifecycleError> {
+        let text = message.text_content();
+        let expanded = if self.skills.is_empty() {
+            ExpandedInput {
+                text,
+                skill_name: None,
+            }
+        } else {
+            expand_skill(&self.skills, &text)
+                .map_err(|source| self.record_boundary_error(Error::SkillExpansion(source)))?
+        };
+        if let Some(name) = expanded.skill_name {
+            self.state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .activated_skill_context_observed = true;
+            self.emit(CodingEvent::SkillActivated {
+                skill_name: name,
+                source:     SkillActivationSource::Slash,
+            });
+        }
+        Ok(agent::UserMessage::text(expanded.text))
+    }
+
     async fn after_answer(
         &self,
         _context: agent::TurnContext<'_>,
         _response: &Response,
         cancel: &CancellationToken,
     ) -> StdResult<agent::AfterAnswerAction, agent::LifecycleError> {
-        // The completion close-door race. A steer may be queued right now, or a
-        // steering lease may be held by an external source that is about to
-        // send one. Anything queued sends the loop around again to drain it; an
-        // open lease parks the prompt until the last lease drops. The wake-up
-        // is registered before either is read, so a steer or a release that
-        // lands mid-decision is never lost between the two.
-        let prompt_cancel = self.prompt_cancel();
-        loop {
-            let notified = self.control.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-
-            if self.control.pending_steering() > 0 {
-                return Ok(agent::AfterAnswerAction::Continue);
-            }
-            let parked = self.control.steering_lease_count() > 0;
-            if !parked || cancel.is_cancelled() || prompt_cancel.is_cancelled() {
-                break;
-            }
-            tokio::select! {
-                () = prompt_cancel.cancelled() => break,
-                () = cancel.cancelled() => break,
-                () = notified => {}
-            }
-        }
-
-        let followup = self
-            .followup_queue
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .pop_front();
-        if let Some(followup) = followup {
-            let expanded = if self.skills.is_empty() {
-                ExpandedInput {
-                    text:       followup,
-                    skill_name: None,
-                }
-            } else {
-                expand_skill(&self.skills, &followup)
-                    .map_err(|source| self.record_boundary_error(Error::SkillExpansion(source)))?
-            };
-            if let Some(name) = expanded.skill_name {
-                self.state
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .activated_skill_context_observed = true;
-                self.emit(CodingEvent::SkillActivated {
-                    skill_name: name,
-                    source:     SkillActivationSource::Slash,
-                });
-            }
-            return Ok(agent::AfterAnswerAction::ContinueWith(expanded.text.into()));
-        }
-
         let Some(supervisor) = self.subagents.as_ref() else {
             return Ok(agent::AfterAnswerAction::Complete);
         };

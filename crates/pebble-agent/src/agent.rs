@@ -15,7 +15,7 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::control::{AgentControlHandle, Control};
+use crate::control::{AgentControlHandle, CompletionReadiness, Control};
 use crate::conversation::ConversationProjection;
 use crate::error::{AgentBuildError, AgentError, Result};
 use crate::event::{AgentEvent, EventHub, EventProjection, FirstOutputKind};
@@ -600,7 +600,7 @@ impl Agent {
         let mut turn_count = 0;
         let mut tool_call_count = 0;
 
-        loop {
+        'prompt: loop {
             self.commit_user_message(next_message);
 
             let final_response = loop {
@@ -611,6 +611,7 @@ impl Agent {
                 if !self.control.wait_until_resumed(prompt_cancel).await {
                     return Err(AgentError::Aborted);
                 }
+                self.emit_pending_interrupts();
 
                 let (round_cancel, steering) = self.control.begin_round();
                 for steering in steering {
@@ -628,7 +629,7 @@ impl Agent {
                         return Err(AgentError::Aborted);
                     }
                     if round_cancel.is_cancelled() {
-                        self.emit(AgentEvent::TurnInterrupted);
+                        self.emit_pending_interrupts();
                         continue;
                     }
                     let update = prepared.map_err(|source| AgentError::Lifecycle { source })?;
@@ -649,7 +650,7 @@ impl Agent {
                 {
                     StreamResult::Completed(response) => *response,
                     StreamResult::Interrupted => {
-                        self.emit(AgentEvent::TurnInterrupted);
+                        self.emit_pending_interrupts();
                         continue;
                     }
                 };
@@ -693,9 +694,30 @@ impl Agent {
                     }
                     if round_cancel.is_cancelled() || self.control.is_paused() {
                         if round_cancel.is_cancelled() {
-                            self.emit(AgentEvent::TurnInterrupted);
+                            self.emit_pending_interrupts();
                         }
                         continue;
+                    }
+
+                    if matches!(
+                        self.control.wait_for_completion(prompt_cancel).await,
+                        CompletionReadiness::SteeringQueued
+                    ) {
+                        self.emit_pending_interrupts();
+                        continue;
+                    }
+                    if prompt_cancel.is_cancelled() {
+                        return Err(AgentError::Aborted);
+                    }
+                    if round_cancel.is_cancelled() {
+                        self.emit_pending_interrupts();
+                        continue;
+                    }
+                    if let Some(follow_up) = self.control.pop_follow_up() {
+                        next_message = self
+                            .prepare_follow_up(follow_up, turn, prompt_cancel)
+                            .await?;
+                        continue 'prompt;
                     }
                     if let Some(lifecycle) = self.lifecycle.clone() {
                         let context = TurnContext::new(&self.model, turn, &self.messages);
@@ -707,6 +729,10 @@ impl Agent {
                         if prompt_cancel.is_cancelled() {
                             return Err(AgentError::Aborted);
                         }
+                        if round_cancel.is_cancelled() {
+                            self.emit_pending_interrupts();
+                            continue;
+                        }
                         match boundary_action {
                             AfterAnswerAction::Complete => {}
                             AfterAnswerAction::Continue => continue,
@@ -715,10 +741,6 @@ impl Agent {
                                 self.commit_user_message(message);
                                 continue;
                             }
-                        }
-                        if round_cancel.is_cancelled() {
-                            self.emit(AgentEvent::TurnInterrupted);
-                            continue;
                         }
                     }
                     break response;
@@ -739,13 +761,15 @@ impl Agent {
                     return Err(AgentError::Aborted);
                 }
                 if round_cancel.is_cancelled() {
-                    self.emit(AgentEvent::TurnInterrupted);
+                    self.emit_pending_interrupts();
                 }
             };
 
             if let Some(follow_up) = self.control.pop_follow_up() {
-                next_message = follow_up;
-                continue;
+                next_message = self
+                    .prepare_follow_up(follow_up, turn_count.saturating_sub(1), prompt_cancel)
+                    .await?;
+                continue 'prompt;
             }
 
             return Ok(PromptOutcome {
@@ -775,6 +799,23 @@ impl Agent {
             }
         }
         Ok(tools)
+    }
+
+    async fn prepare_follow_up(
+        &self,
+        message: UserMessage,
+        turn: usize,
+        cancel: &CancellationToken,
+    ) -> Result<Message> {
+        let Some(lifecycle) = self.lifecycle.clone() else {
+            return Ok(message.into_message());
+        };
+        let context = TurnContext::new(&self.model, turn, &self.messages);
+        lifecycle
+            .prepare_follow_up(context, message, cancel)
+            .await
+            .map(UserMessage::into_message)
+            .map_err(|source| AgentError::Lifecycle { source })
     }
 
     fn build_request(&self, tools: &ToolCatalog) -> Result<Request> {
@@ -853,6 +894,12 @@ impl Agent {
             projection.user_message_committed(&message);
         }
         self.emit(AgentEvent::UserMessage { message });
+    }
+
+    fn emit_pending_interrupts(&self) {
+        for generation in self.control.settle_interrupts() {
+            self.emit(AgentEvent::TurnInterrupted { generation });
+        }
     }
 
     fn apply_conversation_update(&mut self, update: ConversationUpdate) {
@@ -1945,7 +1992,7 @@ mod tests {
         assert!(
             position(&events, |event| matches!(
                 event,
-                AgentEvent::TurnInterrupted
+                AgentEvent::TurnInterrupted { .. }
             ))
             .is_none(),
             "an abort is not a round interrupt"
@@ -2046,7 +2093,7 @@ mod tests {
         assert!(
             position(&events, |event| matches!(
                 event,
-                AgentEvent::ToolStarted { .. } | AgentEvent::TurnInterrupted
+                AgentEvent::ToolStarted { .. } | AgentEvent::TurnInterrupted { .. }
             ))
             .is_none(),
             "nothing started and nothing was interrupted"
@@ -2190,7 +2237,7 @@ mod tests {
         assert_eq!(outcome.turn_count(), 2);
         let events = drained(&mut events);
         let interrupted = position(&events, |event| {
-            matches!(event, AgentEvent::TurnInterrupted)
+            matches!(event, AgentEvent::TurnInterrupted { .. })
         })
         .expect("the round was interrupted");
         let steered = position(&events, |event| {
@@ -2236,7 +2283,7 @@ mod tests {
         assert!(
             position(&events, |event| matches!(
                 event,
-                AgentEvent::TurnInterrupted
+                AgentEvent::TurnInterrupted { .. }
             ))
             .is_none(),
             "a park interrupts nothing"
@@ -2280,7 +2327,7 @@ mod tests {
         assert_eq!(outcome.text(), "steered");
         let events = drained(&mut events);
         let interrupted = position(&events, |event| {
-            matches!(event, AgentEvent::TurnInterrupted)
+            matches!(event, AgentEvent::TurnInterrupted { .. })
         })
         .expect("the round was interrupted");
         let steered = position(&events, |event| {
@@ -2314,7 +2361,7 @@ mod tests {
         assert_eq!(outcome.turn_count(), 2);
         let events = drained(&mut events);
         let interrupted = position(&events, |event| {
-            matches!(event, AgentEvent::TurnInterrupted)
+            matches!(event, AgentEvent::TurnInterrupted { .. })
         })
         .expect("the round was interrupted");
         let steered = position(&events, |event| {

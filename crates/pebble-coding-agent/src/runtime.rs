@@ -12,7 +12,7 @@ mod retry;
 pub(crate) mod testing;
 mod turn;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fmt;
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -26,15 +26,14 @@ use lithos_llm::types::{
 };
 use pebble_agent::{Agent, AgentControlHandle, ToolMiddleware};
 use serde::Deserialize;
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use self::control::InterruptLedger;
 pub use self::control::SteeringLease;
-pub(crate) use self::control::{SessionControlHandle, actor_from_attribution};
+pub(crate) use self::control::{actor_from_attribution, steering_message};
 pub use self::retry::RetryEventObserver;
 use self::turn::{CodingAgentBridge, ConversationState};
 pub(crate) use crate::coding_agent::{
@@ -534,9 +533,6 @@ impl CodingRuntimeBuilder {
             tool_env_provider: self.tool_env_provider,
             redactor: self.redactor,
             agent_control: AgentControlHandle::detached(),
-            ledger: Arc::new(Mutex::new(InterruptLedger::default())),
-            control_notify: Arc::new(Notify::new()),
-            followup_queue: Arc::new(Mutex::new(VecDeque::new())),
             cancel_token: CancellationToken::new(),
             interrupt_reason: Arc::new(Mutex::new(None)),
             skills: Vec::new(),
@@ -735,10 +731,6 @@ pub(crate) struct CodingRuntime {
     /// The control the generic agent is bound to when it is built, so a
     /// handle can be given out before the first prompt creates the agent.
     agent_control:     AgentControlHandle,
-    /// The exactly-once interrupt ledger and the completion leases.
-    ledger:            Arc<Mutex<InterruptLedger>>,
-    control_notify:    Arc<Notify>,
-    followup_queue:    Arc<Mutex<VecDeque<String>>>,
     /// Ends the whole prompt. Distinct from the round token, which ends one
     /// turn.
     cancel_token:      CancellationToken,
@@ -1286,46 +1278,39 @@ impl CodingRuntime {
     }
 
     /// A handle that steers and interrupts this session from elsewhere.
-    pub(crate) fn control_handle(&self) -> SessionControlHandle {
-        SessionControlHandle::attached(
-            self.agent_control.clone(),
-            Arc::clone(&self.ledger),
-            Arc::clone(&self.control_notify),
-        )
+    pub(crate) fn control_handle(&self) -> AgentControlHandle {
+        self.agent_control.clone()
     }
 
     /// Queues guidance for the next round.
     #[cfg(test)]
     pub(crate) fn steer(&self, text: impl Into<String>) {
-        self.control_handle().steer(text, None);
+        let _ = self.agent_control.enqueue_steering(text.into());
     }
 
     /// Hands out a steering lease that parks natural completion while an
     /// external steering source is attached.
     #[cfg(test)]
     pub(crate) fn steering_lease(&self) -> SteeringLease {
-        SteeringLease::acquire(self.control_handle())
+        SteeringLease::acquire(&self.agent_control)
     }
 
     /// Queues more input to process once the current input is finished.
     #[cfg(test)]
     pub(crate) fn follow_up(&self, message: impl Into<String>) {
-        self.followup_queue
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push_back(message.into());
+        let _ = self.agent_control.follow_up(message.into());
     }
 
-    /// The follow-up queue, for a producer outside the session.
-    pub(crate) fn followup_queue_handle(&self) -> Arc<Mutex<VecDeque<String>>> {
-        Arc::clone(&self.followup_queue)
+    /// The generic control handle, for a producer outside the session.
+    pub(crate) fn agent_control_handle(&self) -> AgentControlHandle {
+        self.agent_control.clone()
     }
 
     /// Ends the prompt.
     ///
     /// The loop unwinds through its own checkpoints — every tool call still
     /// gets its result recorded — and then closes the session. This is the
-    /// terminal gesture; [`SessionControlHandle::interrupt`] is the one that
+    /// terminal gesture; [`AgentControlHandle::interrupt`] is the one that
     /// only abandons a round.
     #[cfg(test)]
     pub(crate) fn interrupt(&self) {
@@ -2140,7 +2125,7 @@ mod tests {
         let controller = tokio::spawn(async move {
             provider.wait_for_call().await;
             assert!(handle.interrupt());
-            handle.interrupt_then_steer("do this instead", None);
+            handle.steer("do this instead");
         });
 
         timeout(Duration::from_secs(5), session.prompt("do a thing"))

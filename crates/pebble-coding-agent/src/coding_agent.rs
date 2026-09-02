@@ -1,15 +1,15 @@
 //! The ready-to-run coding-agent facade.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::Duration;
 
 use lithos_llm::Client;
 use lithos_llm::catalog::MetadataError;
 use lithos_llm::resolver::ModelSelectionError;
 use lithos_llm::types::{ReasoningEffort, RequestBuildError, Speed};
-use pebble_agent::{QueueOutcome, ToolMiddleware, UserMessage};
+use pebble_agent::{AgentControlHandle, QueueOutcome, ToolMiddleware, UserMessage};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -23,8 +23,8 @@ use crate::prompt_transform::SystemPromptTransform;
 use crate::record::SessionRecord;
 use crate::redact::Redactor;
 use crate::runtime::{
-    CodingRuntime, CodingRuntimeBuilder, InterruptReasonHandle, SessionControlHandle,
-    SteeringLease, WarmState, actor_from_attribution,
+    CodingRuntime, CodingRuntimeBuilder, InterruptReasonHandle, SteeringLease, WarmState,
+    actor_from_attribution, steering_message,
 };
 use crate::search::SearchProvider;
 use crate::subagent::SubagentOptions;
@@ -449,16 +449,15 @@ impl CodingAgentBuilder {
     }
 }
 
-/// What a control handle reaches: the session's control, its follow-up queue,
-/// and the terminal cancellation an abort fires.
+/// What a control handle reaches: generic agent control and the terminal
+/// cancellation an abort fires.
 ///
 /// Whether a prompt is running and whether the agent is closed are read from
 /// the session's own control rather than tracked again here. An abort counts
 /// as closed from the moment its cancellation fires, before the shutdown it
 /// causes has finished.
 struct CodingControl {
-    session:          SessionControlHandle,
-    follow_up:        Arc<Mutex<VecDeque<String>>>,
+    session:          AgentControlHandle,
     cancel:           CancellationToken,
     interrupt_reason: InterruptReasonHandle,
 }
@@ -467,7 +466,6 @@ impl CodingControl {
     fn new(session: &CodingRuntime) -> Arc<Self> {
         Arc::new(Self {
             session:          session.control_handle(),
-            follow_up:        session.followup_queue_handle(),
             cancel:           session.cancel_token(),
             interrupt_reason: session.interrupt_reason_handle(),
         })
@@ -620,9 +618,8 @@ impl ControlSnapshot {
 ///
 /// Cloning is cheap. Every clone steers, follows up, aborts, and observes the
 /// same agent. Every operation is safe to call from any task at any time,
-/// including from several handles at once: the queue and the interrupt ledger
-/// are updated under one lock, so two steers sent together both land and an
-/// interrupt is announced exactly once.
+/// including from several handles at once. The generic control state updates
+/// each queue and interrupt generation under one lock.
 #[derive(Clone)]
 pub struct CodingAgentControlHandle {
     control: Arc<CodingControl>,
@@ -638,9 +635,12 @@ impl CodingAgentControlHandle {
     ///
     /// Pebble owns the bound and the rule: a full queue evicts its oldest
     /// message, and the outcome carries what was evicted so the application
-    /// can report it. Follow-ups are not bounded; they run one at a time after
-    /// each answer and never race a round boundary.
+    /// can report it.
     pub const STEERING_QUEUE_CAPACITY: usize = 64;
+
+    /// How many follow-up messages wait for a natural answer before the oldest
+    /// is dropped.
+    pub const FOLLOW_UP_QUEUE_CAPACITY: usize = 64;
 
     /// Queues steering for the next round boundary without interrupting the
     /// round in progress.
@@ -652,10 +652,9 @@ impl CodingAgentControlHandle {
             return SteeringOutcome::Closed;
         }
         let message = message.into();
-        SteeringOutcome::from_queue(self.control.session.queue_steering(
-            message.text,
-            message.actor,
-            Some(Self::STEERING_QUEUE_CAPACITY),
+        SteeringOutcome::from_queue(self.control.session.enqueue_steering_bounded(
+            steering_message(message.text, message.actor),
+            Self::STEERING_QUEUE_CAPACITY,
         ))
     }
 
@@ -671,17 +670,10 @@ impl CodingAgentControlHandle {
             return SteeringOutcome::Closed;
         }
         let message = message.into();
-        let capacity = Some(Self::STEERING_QUEUE_CAPACITY);
-        let outcome = if self.is_running() {
-            self.control
-                .session
-                .steer_now(message.text, message.actor, capacity)
-        } else {
-            self.control
-                .session
-                .queue_steering(message.text, message.actor, capacity)
-        };
-        SteeringOutcome::from_queue(outcome)
+        SteeringOutcome::from_queue(self.control.session.steer_bounded(
+            steering_message(message.text, message.actor),
+            Self::STEERING_QUEUE_CAPACITY,
+        ))
     }
 
     /// Interrupts the round in progress without saying what comes next.
@@ -710,25 +702,24 @@ impl CodingAgentControlHandle {
     /// supported replacement for reaching into the drain, park, and generation
     /// protocol directly.
     pub fn hold_open_for_steering(&self) -> SteeringLease {
-        SteeringLease::acquire(self.control.session.clone())
+        SteeringLease::acquire(&self.control.session)
     }
 
     /// Queues input to run as its own user turn once the current prompt
     /// reaches an answer.
     ///
-    /// A follow-up is ordinary input, not steering: it does not interrupt
-    /// anything and is not bounded. The author is not recorded on the turn it
-    /// becomes.
+    /// A follow-up is ordinary input, not steering, and does not interrupt.
+    /// The author is not recorded on the turn it becomes. A full queue evicts
+    /// its oldest message and returns it.
     pub fn queue_follow_up(&self, message: impl Into<SteeringMessage>) -> SteeringOutcome {
         if self.is_closed() {
             return SteeringOutcome::Closed;
         }
-        self.control
-            .follow_up
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push_back(message.into().text);
-        SteeringOutcome::Accepted
+        let message = message.into();
+        SteeringOutcome::from_queue(self.control.session.follow_up_bounded(
+            UserMessage::text(message.text),
+            Self::FOLLOW_UP_QUEUE_CAPACITY,
+        ))
     }
 
     /// Aborts the active prompt and closes the agent for good.
@@ -768,17 +759,13 @@ impl CodingAgentControlHandle {
     /// A read-only view of the agent's state and queued input.
     #[must_use]
     pub fn snapshot(&self) -> ControlSnapshot {
+        let snapshot = self.control.session.snapshot();
         ControlSnapshot {
-            running:            self.is_running(),
+            running:            snapshot.is_running(),
             closed:             self.is_closed(),
-            parked:             self.control.session.is_parked(),
-            pending_steering:   self.control.session.pending_steering(),
-            pending_follow_ups: self
-                .control
-                .follow_up
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .len(),
+            parked:             snapshot.is_paused(),
+            pending_steering:   snapshot.pending_steering(),
+            pending_follow_ups: snapshot.pending_follow_ups(),
         }
     }
 }
@@ -1333,6 +1320,31 @@ mod tests {
         assert_eq!(snapshot.pending_steering(), capacity);
         assert!(!snapshot.is_running());
         assert!(!snapshot.is_parked());
+        agent
+            .shutdown(ShutdownReason::Completed)
+            .await
+            .expect("the agent shuts down");
+    }
+
+    #[tokio::test]
+    async fn a_full_follow_up_queue_evicts_the_oldest_and_reports_it() {
+        let mut agent = agent_with(vec![ScriptedCall::response(text_response("done"))], []).await;
+        let control = agent.control_handle();
+        let capacity = CodingAgentControlHandle::FOLLOW_UP_QUEUE_CAPACITY;
+        for index in 0..capacity {
+            assert_eq!(
+                control.queue_follow_up(format!("follow up {index}")),
+                SteeringOutcome::Accepted
+            );
+        }
+
+        let outcome = control.queue_follow_up("one too many");
+
+        assert_eq!(
+            outcome,
+            SteeringOutcome::Evicted(SteeringMessage::new("follow up 0"))
+        );
+        assert_eq!(control.snapshot().pending_follow_ups(), capacity);
         agent
             .shutdown(ShutdownReason::Completed)
             .await

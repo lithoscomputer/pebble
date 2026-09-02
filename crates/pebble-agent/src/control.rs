@@ -4,7 +4,6 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use lithos_llm::types::Message;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -17,13 +16,16 @@ pub(crate) struct Control {
 }
 
 struct ControlState {
-    running:       bool,
-    closed:        bool,
-    paused:        bool,
-    steering:      VecDeque<UserMessage>,
-    follow_up:     VecDeque<Message>,
+    running: bool,
+    closed: bool,
+    paused: bool,
+    steering: VecDeque<UserMessage>,
+    follow_up: VecDeque<UserMessage>,
     prompt_cancel: CancellationToken,
-    round_cancel:  CancellationToken,
+    round_cancel: CancellationToken,
+    interrupt_generation: u64,
+    settled_interrupt_generation: u64,
+    completion_holds: usize,
 }
 
 impl ControlState {
@@ -43,13 +45,16 @@ impl Control {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             state:  Mutex::new(ControlState {
-                running:       false,
-                closed:        false,
-                paused:        false,
-                steering:      VecDeque::new(),
-                follow_up:     VecDeque::new(),
+                running: false,
+                closed: false,
+                paused: false,
+                steering: VecDeque::new(),
+                follow_up: VecDeque::new(),
                 prompt_cancel: CancellationToken::new(),
-                round_cancel:  CancellationToken::new(),
+                round_cancel: CancellationToken::new(),
+                interrupt_generation: 0,
+                settled_interrupt_generation: 0,
+                completion_holds: 0,
             }),
             idle:   Notify::new(),
             resume: Notify::new(),
@@ -78,6 +83,7 @@ impl Control {
         state.running = false;
         state.paused = false;
         state.round_cancel = CancellationToken::new();
+        state.settled_interrupt_generation = state.interrupt_generation;
         drop(state);
         self.idle.notify_waiters();
         self.resume.notify_waiters();
@@ -91,7 +97,7 @@ impl Control {
         (cancel, steering)
     }
 
-    pub(crate) fn pop_follow_up(&self) -> Option<Message> {
+    pub(crate) fn pop_follow_up(&self) -> Option<UserMessage> {
         self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -141,6 +147,47 @@ impl Control {
             .is_parked()
     }
 
+    pub(crate) fn settle_interrupts(&self) -> Vec<u64> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let first = state.settled_interrupt_generation.saturating_add(1);
+        let last = state.interrupt_generation;
+        state.settled_interrupt_generation = last;
+        if first <= last {
+            (first..=last).collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub(crate) async fn wait_for_completion(
+        &self,
+        cancel: &CancellationToken,
+    ) -> CompletionReadiness {
+        loop {
+            let notified = self.resume.notified();
+            let readiness = {
+                let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                if !state.steering.is_empty() {
+                    CompletionReadiness::SteeringQueued
+                } else if state.completion_holds == 0 {
+                    CompletionReadiness::Ready
+                } else {
+                    CompletionReadiness::Waiting
+                }
+            };
+            match readiness {
+                CompletionReadiness::Ready | CompletionReadiness::SteeringQueued => {
+                    return readiness;
+                }
+                CompletionReadiness::Waiting => {}
+            }
+            tokio::select! {
+                () = cancel.cancelled() => return CompletionReadiness::Ready,
+                () = notified => {}
+            }
+        }
+    }
+
     pub(crate) async fn wait_until_resumed(&self, cancel: &CancellationToken) -> bool {
         loop {
             let notified = self.resume.notified();
@@ -155,6 +202,13 @@ impl Control {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CompletionReadiness {
+    Ready,
+    SteeringQueued,
+    Waiting,
+}
+
 /// What the control did with a message it was asked to queue.
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
@@ -166,6 +220,83 @@ pub enum QueueOutcome {
     Evicted(UserMessage),
     /// The agent is closed and nothing was queued.
     Closed,
+}
+
+/// A hold on natural prompt completion.
+///
+/// While a hold exists, a prompt that reaches a natural answer waits for
+/// steering. Dropping the final hold wakes the prompt. This closes the race
+/// between an external input source deciding to steer and the prompt ending.
+#[must_use = "completion is held only while this value exists"]
+pub struct CompletionLease {
+    control: Arc<Control>,
+}
+
+impl fmt::Debug for CompletionLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompletionLease")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for CompletionLease {
+    fn drop(&mut self) {
+        let wake = {
+            let mut state = self
+                .control
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            state.completion_holds = state.completion_holds.saturating_sub(1);
+            state.completion_holds == 0
+        };
+        if wake {
+            self.control.resume.notify_waiters();
+        }
+    }
+}
+
+/// A read-only snapshot of an agent's control state.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AgentControlSnapshot {
+    running:            bool,
+    closed:             bool,
+    paused:             bool,
+    pending_steering:   usize,
+    pending_follow_ups: usize,
+}
+
+impl AgentControlSnapshot {
+    /// Whether a prompt is running.
+    #[must_use]
+    pub const fn is_running(&self) -> bool {
+        self.running
+    }
+
+    /// Whether the agent is closed.
+    #[must_use]
+    pub const fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Whether the prompt is parked waiting for steering.
+    #[must_use]
+    pub const fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// How many steering messages are queued.
+    #[must_use]
+    pub const fn pending_steering(&self) -> usize {
+        self.pending_steering
+    }
+
+    /// How many follow-up messages are queued.
+    #[must_use]
+    pub const fn pending_follow_ups(&self) -> usize {
+        self.pending_follow_ups
+    }
 }
 
 impl QueueOutcome {
@@ -261,6 +392,7 @@ impl AgentControlHandle {
         state.steering.push_back(message);
         state.paused = false;
         if interrupt && state.running {
+            state.interrupt_generation = state.interrupt_generation.saturating_add(1);
             state.round_cancel.cancel();
         }
         drop(state);
@@ -272,16 +404,34 @@ impl AgentControlHandle {
     ///
     /// Returns `false` when the agent is closed.
     pub fn follow_up(&self, message: impl Into<UserMessage>) -> bool {
+        self.queue_follow_up(message.into(), None).is_queued()
+    }
+
+    /// Queues follow-up input, keeping at most `capacity` messages queued.
+    ///
+    /// A full queue drops its oldest message to make room and returns it.
+    pub fn follow_up_bounded(
+        &self,
+        message: impl Into<UserMessage>,
+        capacity: usize,
+    ) -> QueueOutcome {
+        self.queue_follow_up(message.into(), Some(capacity))
+    }
+
+    fn queue_follow_up(&self, message: UserMessage, capacity: Option<usize>) -> QueueOutcome {
         let mut state = self
             .control
             .state
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if state.closed {
-            return false;
+            return QueueOutcome::Closed;
         }
-        state.follow_up.push_back(message.into().into_message());
-        true
+        let evicted = capacity
+            .filter(|capacity| state.follow_up.len() >= *capacity)
+            .and_then(|_| state.follow_up.pop_front());
+        state.follow_up.push_back(message);
+        evicted.map_or(QueueOutcome::Queued, QueueOutcome::Evicted)
     }
 
     /// Aborts the active prompt.
@@ -324,6 +474,7 @@ impl AgentControlHandle {
         if state.steering.is_empty() {
             state.paused = true;
         }
+        state.interrupt_generation = state.interrupt_generation.saturating_add(1);
         state.round_cancel.cancel();
         true
     }
@@ -358,6 +509,19 @@ impl AgentControlHandle {
     /// handle only where no agent was ever built.
     pub fn close(&self) -> bool {
         self.control.close()
+    }
+
+    /// Holds natural completion open for an external steering source.
+    pub fn hold_completion(&self) -> CompletionLease {
+        let mut state = self
+            .control
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        state.completion_holds = state.completion_holds.saturating_add(1);
+        CompletionLease {
+            control: Arc::clone(&self.control),
+        }
     }
 
     /// Waits until no prompt is running.
@@ -402,6 +566,43 @@ impl AgentControlHandle {
             .steering
             .len()
     }
+
+    /// How many follow-up messages wait for a natural answer.
+    #[must_use]
+    pub fn pending_follow_ups(&self) -> usize {
+        self.control
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .follow_up
+            .len()
+    }
+
+    /// Removes and returns the oldest queued follow-up.
+    ///
+    /// Embedding layers that supervise prompts can use this after a prompt
+    /// returns to close their own completion race. A normal
+    /// [`Agent`](crate::Agent) consumes follow-ups itself.
+    pub fn take_follow_up(&self) -> Option<UserMessage> {
+        self.control.pop_follow_up()
+    }
+
+    /// Returns one consistent view of the control state.
+    #[must_use]
+    pub fn snapshot(&self) -> AgentControlSnapshot {
+        let state = self
+            .control
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        AgentControlSnapshot {
+            running:            state.running,
+            closed:             state.closed,
+            paused:             state.is_parked(),
+            pending_steering:   state.steering.len(),
+            pending_follow_ups: state.follow_up.len(),
+        }
+    }
 }
 
 impl fmt::Debug for AgentControlHandle {
@@ -412,6 +613,7 @@ impl fmt::Debug for AgentControlHandle {
             .field("closed", &self.is_closed())
             .field("paused", &self.is_paused())
             .field("pending_steering", &self.pending_steering())
+            .field("pending_follow_ups", &self.pending_follow_ups())
             .finish()
     }
 }
@@ -437,6 +639,54 @@ mod tests {
         assert_eq!(outcome, QueueOutcome::Evicted(UserMessage::text("first")));
         assert!(outcome.is_queued());
         assert_eq!(handle.pending_steering(), 2);
+    }
+
+    #[test]
+    fn bounded_follow_ups_share_the_control_snapshot() {
+        let handle = AgentControlHandle::detached();
+        assert_eq!(handle.follow_up_bounded("first", 1), QueueOutcome::Queued);
+
+        let outcome = handle.follow_up_bounded("second", 1);
+
+        assert_eq!(outcome, QueueOutcome::Evicted(UserMessage::text("first")));
+        assert_eq!(handle.snapshot().pending_follow_ups(), 1);
+        assert_eq!(handle.take_follow_up(), Some(UserMessage::text("second")));
+    }
+
+    #[test]
+    fn interrupt_generations_settle_once_in_order() {
+        let handle = AgentControlHandle::detached();
+        let _prompt_cancel = handle
+            .control
+            .begin_prompt(None)
+            .expect("an open control starts a prompt");
+
+        assert!(handle.interrupt());
+        assert!(handle.steer("continue"));
+
+        assert_eq!(handle.control.settle_interrupts(), [1, 2]);
+        assert!(handle.control.settle_interrupts().is_empty());
+    }
+
+    #[test]
+    fn completion_holds_are_counted_until_the_last_drop() {
+        let handle = AgentControlHandle::detached();
+        let first = handle.hold_completion();
+        let second = handle.hold_completion();
+        let hold_count = || {
+            handle
+                .control
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .completion_holds
+        };
+
+        assert_eq!(hold_count(), 2);
+        drop(first);
+        assert_eq!(hold_count(), 1);
+        drop(second);
+        assert_eq!(hold_count(), 0);
     }
 
     #[test]

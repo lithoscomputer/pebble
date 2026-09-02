@@ -123,6 +123,16 @@ pub trait AgentLifecycle: Send + Sync {
         Ok(ConversationUpdate::unchanged())
     }
 
+    /// Prepares queued follow-up input before the agent commits it.
+    async fn prepare_follow_up(
+        &self,
+        _context: TurnContext<'_>,
+        message: UserMessage,
+        _cancel: &CancellationToken,
+    ) -> StdResult<UserMessage, LifecycleError> {
+        Ok(message)
+    }
+
     /// Runs before a natural answer completes the prompt.
     ///
     /// The returned action decides whether the answer completes the prompt.

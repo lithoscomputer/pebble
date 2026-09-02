@@ -43,6 +43,7 @@ use std::time::Duration;
 
 use futures_util::future::join_all;
 use lithos_llm::Client;
+use pebble_agent::AgentControlHandle;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{Instant, timeout_at};
@@ -464,7 +465,7 @@ struct SubAgent {
     monitor_task:        Option<JoinHandle<()>>,
     cleanup_task:        Option<JoinHandle<()>>,
     child_abort_handle:  AbortHandle,
-    followup_queue:      Arc<Mutex<VecDeque<String>>>,
+    control:             AgentControlHandle,
     cancel_token:        CancellationToken,
     depth:               usize,
     /// Registration for generations whose results should be delivered to the
@@ -791,10 +792,9 @@ impl SubagentHandle {
 
             if reusable {
                 let next_prompt = agent
-                    .followup_queue
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .pop_front();
+                    .control
+                    .take_follow_up()
+                    .map(|message| message.text_content());
                 if let Some(next_prompt) = next_prompt {
                     return TurnCommit::Continue(next_prompt);
                 }
@@ -1130,7 +1130,7 @@ impl SubagentSupervisor {
         slot: SessionSlot,
     ) -> String {
         let agent_id = format!("{:08x}", uuid::Uuid::new_v4().as_fields().0);
-        let followup_queue = session.followup_queue_handle();
+        let control = session.agent_control_handle();
         let cancel_token = session.cancel_token();
 
         let (start_tx, start_rx) = oneshot::channel();
@@ -1169,7 +1169,7 @@ impl SubagentSupervisor {
                 monitor_task: Some(monitor_task),
                 cleanup_task: None,
                 child_abort_handle,
-                followup_queue,
+                control,
                 cancel_token,
                 depth: child_depth,
                 parent_notification,
@@ -1208,11 +1208,11 @@ impl SubagentSupervisor {
             let status = agent.status.borrow().clone();
             match status {
                 SubagentStatus::Running => {
-                    agent
-                        .followup_queue
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .push_back(message.to_owned());
+                    if !agent.control.follow_up(message) {
+                        return Err(ToolError::execution(format!(
+                            "Agent {agent_id} cannot accept more input because its session ended"
+                        )));
+                    }
                     None
                 }
                 SubagentStatus::Finished { reusable, .. } => {
@@ -1741,7 +1741,7 @@ impl SubagentSupervisor {
                 monitor_task: Some(monitor_task),
                 cleanup_task: None,
                 child_abort_handle,
-                followup_queue: Arc::new(Mutex::new(VecDeque::new())),
+                control: AgentControlHandle::detached(),
                 cancel_token,
                 depth,
                 parent_notification: None,

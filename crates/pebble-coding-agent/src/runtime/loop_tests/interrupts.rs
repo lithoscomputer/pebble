@@ -88,7 +88,7 @@ async fn an_interrupt_with_nothing_running_does_nothing() {
     session.prompt("start").await.expect("the prompt succeeds");
 
     assert_eq!(session.history().turns().len(), 2, "input and answer");
-    assert!(!handle.is_parked());
+    assert!(!handle.is_paused());
     let published = settled(&mut session, &mut events).await;
     assert_eq!(
         count(&published, |event| matches!(
@@ -120,9 +120,9 @@ async fn an_interrupt_that_lands_while_the_session_is_parked_is_announced_too() 
             matches!(event, CodingEvent::RoundInterrupted { generation: 1 })
         })
         .await;
-        assert!(control.is_parked());
+        assert!(control.is_paused());
         assert!(control.interrupt(), "a parked prompt is still running");
-        control.steer("carry on", None);
+        control.enqueue_steering("carry on");
     });
 
     timeout(PATIENCE, session.prompt("start"))
@@ -156,30 +156,6 @@ async fn an_interrupt_that_lands_while_the_session_is_parked_is_announced_too() 
 }
 
 #[tokio::test]
-async fn a_gesture_whose_round_cancel_was_lost_is_still_announced() {
-    // What a race between two gestures can leave behind: the generation is
-    // raised, but the cancel landed on the token the loop was already
-    // replacing, so the round that follows ends normally. The announcement is
-    // owed all the same, and waiting for the next interrupt to pay it would
-    // break the exactly-once promise.
-    let (mut session, _provider) = TestSession::answering(answers("OK"));
-    let mut events = session.subscribe();
-    session.control_handle().record_interrupt_without_a_round();
-
-    session.prompt("start").await.expect("the prompt succeeds");
-
-    let published = settled(&mut session, &mut events).await;
-    let generations: Vec<u64> = published
-        .iter()
-        .filter_map(|event| match event {
-            CodingEvent::RoundInterrupted { generation } => Some(*generation),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(generations, [1], "the raised generation is announced once");
-}
-
-#[tokio::test]
 async fn an_interrupt_settles_before_the_steer_that_replaces_it() {
     let (mut session, provider) = TestSession::answering(vec![
         ScriptedCall::PendingOpen,
@@ -190,7 +166,7 @@ async fn an_interrupt_settles_before_the_steer_that_replaces_it() {
     let steerer = handle.clone();
     let controller = tokio::spawn(async move {
         provider.wait_for_call().await;
-        steerer.interrupt_then_steer("stop now", None);
+        steerer.steer("stop now");
     });
 
     timeout(PATIENCE, session.prompt("start"))
@@ -199,7 +175,7 @@ async fn an_interrupt_settles_before_the_steer_that_replaces_it() {
         .expect("the prompt succeeds");
     controller.await.expect("the controller finishes");
 
-    assert!(!handle.is_parked());
+    assert!(!handle.is_paused());
     let published = settled(&mut session, &mut events).await;
     let settled_at = position(&published, |event| {
         matches!(event, CodingEvent::RoundInterrupted { generation: 1 })
@@ -230,8 +206,8 @@ async fn an_interrupt_while_the_model_is_thinking_settles_once() {
             matches!(event, CodingEvent::RoundInterrupted { generation: 1 })
         })
         .await;
-        assert!(control.is_parked());
-        control.steer("resume inference", None);
+        assert!(control.is_paused());
+        control.enqueue_steering("resume inference");
         control
     });
 
@@ -242,7 +218,7 @@ async fn an_interrupt_while_the_model_is_thinking_settles_once() {
     let control = controller.await.expect("the controller finishes");
 
     assert_eq!(provider.call_count(), 2, "the round was asked again");
-    assert!(!control.is_parked());
+    assert!(!control.is_paused());
     let published = settled(&mut session, &mut recorded).await;
     assert_eq!(
         count(&published, |event| matches!(
@@ -301,7 +277,7 @@ async fn an_interrupted_round_leaves_no_task_reminder_behind() {
             matches!(event, CodingEvent::RoundInterrupted { generation: 1 })
         })
         .await;
-        control.steer("wrap up now", None);
+        control.enqueue_steering("wrap up now");
     });
 
     timeout(PATIENCE, session.prompt("continue"))
@@ -360,7 +336,7 @@ async fn an_interrupt_mid_stream_withdraws_what_the_turn_showed_and_commits_noth
             |event| matches!(event, CodingEvent::TextDelta { delta } if delta == "half an answer"),
         )
         .await;
-        control.interrupt_then_steer("say it differently", None);
+        control.steer("say it differently");
     });
 
     let answer = timeout(PATIENCE, session.prompt("say something"))
@@ -469,7 +445,7 @@ async fn an_interrupted_parallel_round_answers_every_call_it_made() {
             matches!(event, CodingEvent::ToolCallStarted { .. })
         })
         .await;
-        control.interrupt_then_steer("stop all of that", None);
+        control.steer("stop all of that");
     });
 
     timeout(PATIENCE, session.prompt("run three tools"))
@@ -566,7 +542,7 @@ async fn a_steering_lease_lets_a_late_steer_drive_another_round() {
         .await;
         // Queue the steer, then drop the lease. The queued item makes the
         // parked prompt run another round rather than complete.
-        handle.steer("after-completion steer", None);
+        handle.enqueue_steering("after-completion steer");
         drop(lease);
     });
 
@@ -1104,7 +1080,7 @@ async fn a_tool_that_ends_the_round_is_still_answered_before_the_next_one() {
             matches!(event, CodingEvent::ToolCallStarted { .. })
         })
         .await;
-        control.interrupt_then_steer("stop that", None);
+        control.steer("stop that");
     });
 
     let answer = timeout(PATIENCE, session.prompt("watch something"))

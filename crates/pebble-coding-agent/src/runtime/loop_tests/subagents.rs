@@ -310,8 +310,8 @@ async fn control_interrupt_during_subagent_wait_closes_child_and_resumes_after_s
             matches!(event, CodingEvent::RoundInterrupted { generation: 1 })
         })
         .await;
-        assert!(controller.is_parked());
-        controller.steer("resume after interrupt", None);
+        assert!(controller.is_paused());
+        controller.enqueue_steering("resume after interrupt");
     });
 
     let output = timeout(Duration::from_secs(5), session.prompt("wait for the child"))
@@ -327,7 +327,7 @@ async fn control_interrupt_during_subagent_wait_closes_child_and_resumes_after_s
         supervisor.status(BLOCKED_AGENT),
         Some(SubagentStatus::Closed)
     ));
-    assert!(!control.is_parked());
+    assert!(!control.is_paused());
 
     let published = drained(&mut recorded).await;
     assert_eq!(
