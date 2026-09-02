@@ -31,8 +31,8 @@ use lithos_llm::catalog::{AdapterId, Catalog, ModelId, ProviderId};
 use lithos_llm::client::{ClientBuild, ClientBuilder};
 use lithos_llm::types::{
     ContentBlockId, ContentBlockKind, ContentPart, Cost, CostSource, Error as LlmError,
-    ErrorKind as LlmErrorKind, FinishReason, Message, Request, Response, ResponseStream,
-    RetryClassification, StreamEvent, TokenCounts, ToolCall, ToolCallKind,
+    ErrorKind as LlmErrorKind, FinishReason, Message, ReasoningContent, Request, Response,
+    ResponseStream, RetryClassification, StreamEvent, TokenCounts, ToolCall, ToolCallKind,
 };
 use serde_json::{Value, json};
 use tokio::sync::Notify;
@@ -579,6 +579,31 @@ pub fn reasoning_response(text: &str, summary: &str, trace: &str) -> Response {
             {"type": "reasoning.text", "text": trace},
         ]),
     )];
+    content.extend(response.content);
+    response.content = content;
+    response
+}
+
+/// A response carrying an OpenAI Responses `reasoning` item the way the
+/// lithos codec decodes one: a readable `Reasoning` part holding `trace` when
+/// there is one, then the whole item as the opaque `openai.reasoning` part.
+///
+/// The codec derives `trace` from the item, so a test names it explicitly to
+/// pin what the normalizer does with a given pairing rather than to mirror
+/// the codec's join rule.
+#[must_use]
+pub fn responses_reasoning_response(text: &str, trace: Option<&str>, item: Value) -> Response {
+    let mut response = text_response(text);
+    let mut content = Vec::new();
+    if let Some(trace) = trace {
+        content.push(ContentPart::Reasoning(ReasoningContent {
+            text:             trace.to_owned(),
+            signature:        None,
+            signature_origin: None,
+            redacted:         false,
+        }));
+    }
+    content.push(ContentPart::opaque("openai.reasoning", item));
     content.extend(response.content);
     response.content = content;
     response

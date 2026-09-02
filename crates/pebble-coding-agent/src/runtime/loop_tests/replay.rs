@@ -10,17 +10,14 @@
 use std::time::Duration;
 
 use lithos_llm::middleware::RetryPolicy;
-use lithos_llm::types::{
-    ContentPart, FinishReason, ReasoningContent, Response, RetryClassification, StreamEvent,
-    ToolCall,
-};
+use lithos_llm::types::{ContentPart, FinishReason, RetryClassification, StreamEvent, ToolCall};
 use tokio::time::timeout;
 
 use super::*;
 use crate::reasoning::ReasoningOutput;
 use crate::test_support::{
-    reasoning_delta_events, reasoning_response, text_delta_events, tool_call_events,
-    with_finish_reason,
+    reasoning_delta_events, reasoning_response, responses_reasoning_response, text_delta_events,
+    tool_call_events, with_finish_reason,
 };
 use crate::types::LlmRetryPhase;
 
@@ -790,53 +787,32 @@ async fn only_the_replayed_turn_contributes_reasoning() {
     ))]);
 }
 
-/// A response shaped the way the lithos OpenAI Responses codec now decodes a
-/// `reasoning` output item: the whole item stays in the opaque
-/// `openai.reasoning` part, and a `Reasoning` part exists only when the item
-/// carries `content[]` text.
-fn responses_reasoning_response(text: &str, item: serde_json::Value) -> Response {
-    let mut response = text_response(text);
-    let mut content = Vec::new();
-    if let Some(trace) = item
-        .get("content")
-        .and_then(serde_json::Value::as_array)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|entry| entry.get("text").and_then(serde_json::Value::as_str))
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        })
-        .filter(|trace| !trace.is_empty())
-    {
-        content.push(ContentPart::Reasoning(ReasoningContent {
-            text:             trace,
-            signature:        None,
-            signature_origin: None,
-            redacted:         false,
-        }));
-    }
-    content.push(ContentPart::opaque("openai.reasoning", item));
-    content.extend(response.content);
-    response.content = content;
-    response
+// The lithos OpenAI Responses codec decodes a `reasoning` item into a readable
+// `Reasoning` part plus the whole item as an opaque `openai.reasoning` part.
+// The readable text is the item's `reasoning_text` entries or, when it has
+// none, its `summary_text` entries, either way joined by a blank line. Pebble's
+// normalizer keeps that fallback out of `trace` only because the codec's
+// separator matches its own, so these tests pin both the shape and the
+// dependency.
+
+/// The `reasoning` item a summary-only response carries.
+fn two_summary_item() -> serde_json::Value {
+    json!({
+        "type": "reasoning",
+        "id": "rs_1",
+        "encrypted_content": "gAAAAA",
+        "summary": [
+            {"type": "summary_text", "text": "A"},
+            {"type": "summary_text", "text": "B"},
+        ],
+    })
 }
 
 #[tokio::test]
 async fn a_responses_item_with_only_summary_blocks_reports_a_summary_and_no_trace() {
-    let (mut session, _provider) =
-        TestSession::answering(vec![ScriptedCall::response(responses_reasoning_response(
-            "4.",
-            json!({
-                "type": "reasoning",
-                "id": "rs_1",
-                "encrypted_content": "gAAAAA",
-                "summary": [
-                    {"type": "summary_text", "text": "A"},
-                    {"type": "summary_text", "text": "B"},
-                ],
-            }),
-        ))]);
+    let (mut session, _provider) = TestSession::answering(vec![ScriptedCall::response(
+        responses_reasoning_response("4.", Some("A\n\nB"), two_summary_item()),
+    )]);
     let mut events = session.subscribe();
 
     session
@@ -852,10 +828,33 @@ async fn a_responses_item_with_only_summary_blocks_reports_a_summary_and_no_trac
 }
 
 #[tokio::test]
+async fn a_fallback_trace_joined_differently_from_the_summary_survives_as_a_trace() {
+    // The normalizer drops the codec's summary fallback by equality alone. A
+    // codec that joined the summaries with "" instead of a blank line would
+    // hand a reader this bogus trace, which is the regression lithos-llm PR #2
+    // fixed; this pins that pebble relies on the codec's separator.
+    let (mut session, _provider) = TestSession::answering(vec![ScriptedCall::response(
+        responses_reasoning_response("4.", Some("AB"), two_summary_item()),
+    )]);
+    let mut events = session.subscribe();
+
+    session
+        .prompt("What is 2+2?")
+        .await
+        .expect("the prompt succeeds");
+
+    let published = settled(&mut session, &mut events).await;
+    assert_eq!(reasoning_of(&published), [Some(ReasoningOutput::new(
+        "A\n\nB", "AB",
+    ))]);
+}
+
+#[tokio::test]
 async fn a_responses_item_with_reasoning_text_reports_it_once_as_the_trace() {
     let (mut session, _provider) =
         TestSession::answering(vec![ScriptedCall::response(responses_reasoning_response(
             "4.",
+            Some("step one"),
             json!({
                 "type": "reasoning",
                 "id": "rs_1",

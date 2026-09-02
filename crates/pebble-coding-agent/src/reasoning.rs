@@ -351,25 +351,47 @@ mod tests {
     }
 
     #[test]
-    fn responses_item_with_only_summary_blocks_produces_no_trace() {
+    fn responses_summary_fallback_part_is_deduplicated_against_the_summary() {
         // What the lithos OpenAI Responses codec decodes for a `reasoning`
-        // item with two `summary_text` blocks and no `content[]`: the opaque
-        // item alone, with no `Reasoning` part built from the summaries.
-        let output = ReasoningOutput::from_content(&[openai_reasoning(json!({
-            "type": "reasoning",
-            "id": "rs_1",
-            "encrypted_content": "gAAAAA",
-            "summary": [
-                {"type": "summary_text", "text": "A"},
-                {"type": "summary_text", "text": "B"},
-            ],
-        }))])
+        // item with two `summary_text` blocks and no `content[]`: a
+        // `Reasoning` part holding the summaries joined by a blank line, then
+        // the opaque item. The fallback matches the joined summary exactly and
+        // so never becomes a trace.
+        let output = ReasoningOutput::from_content(&[
+            reasoning("A\n\nB"),
+            openai_reasoning(json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "gAAAAA",
+                "summary": [
+                    {"type": "summary_text", "text": "A"},
+                    {"type": "summary_text", "text": "B"},
+                ],
+            })),
+        ])
         .expect("readable reasoning");
         assert_eq!(output, ReasoningOutput::from_summary("A\n\nB"));
         assert_eq!(
             serde_json::to_value(&output).expect("serializes"),
             json!({"summary": "A\n\nB"})
         );
+    }
+
+    #[test]
+    fn responses_summary_fallback_joined_differently_survives_as_a_trace() {
+        // Deduplication is by equality alone: a fallback joined with "" (the
+        // codec behavior lithos-llm PR #2 replaced) is reported as a trace.
+        let output = ReasoningOutput::from_content(&[
+            reasoning("AB"),
+            openai_reasoning(json!({
+                "summary": [
+                    {"type": "summary_text", "text": "A"},
+                    {"type": "summary_text", "text": "B"},
+                ],
+            })),
+        ])
+        .expect("readable reasoning");
+        assert_eq!(output, ReasoningOutput::new("A\n\nB", "AB"));
     }
 
     #[test]
