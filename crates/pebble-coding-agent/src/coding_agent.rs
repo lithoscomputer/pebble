@@ -1029,9 +1029,9 @@ impl CodingAgent {
         self.inner.state()
     }
 
-    /// The committed coding-agent conversation.
+    /// A snapshot of the committed coding-agent conversation.
     #[must_use]
-    pub const fn history(&self) -> &History {
+    pub fn history(&self) -> History {
         self.inner.history()
     }
 
@@ -1115,13 +1115,13 @@ mod tests {
             .expect("the coding agent builds and initializes")
     }
 
-    fn steering_texts(agent: &CodingAgent) -> Vec<&str> {
+    fn steering_texts(agent: &CodingAgent) -> Vec<String> {
         agent
             .history()
             .turns()
             .iter()
             .filter_map(|turn| match turn {
-                Message::Steering { content, .. } => Some(content.as_str()),
+                Message::Steering { content, .. } => Some(content.clone()),
                 _ => None,
             })
             .collect()

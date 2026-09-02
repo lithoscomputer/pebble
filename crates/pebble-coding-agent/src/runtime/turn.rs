@@ -1,7 +1,6 @@
 //! The coding layer that projects Pebble's durable behavior onto `Agent`.
 
 use std::collections::VecDeque;
-use std::mem;
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Instant, SystemTime};
@@ -56,7 +55,7 @@ const LOOP_WARNING: &str = "WARNING: Loop detected. You appear to be repeating t
 
 #[derive(Clone)]
 pub(super) struct CodingAgentBridge {
-    state:             Arc<Mutex<BridgeState>>,
+    state:             Arc<Mutex<ConversationState>>,
     client:            lithos_llm::Client,
     model_selector:    String,
     model:             String,
@@ -84,11 +83,17 @@ pub(super) struct CodingAgentBridge {
     skills:            Vec<Skill>,
 }
 
-struct BridgeState {
-    history: History,
-    file_tracker: FileTracker,
-    totals: PromptTotals,
-    activated_skill_context_observed: bool,
+/// The conversation and what one prompt accumulates around it.
+///
+/// One copy, shared by the runtime and the bridge: the runtime reads it for
+/// records, exports, and the public history, and the bridge writes it as the
+/// loop commits turns. The first four members outlive a prompt; the rest are
+/// reset by [`CodingAgentBridge::begin_prompt`].
+pub(super) struct ConversationState {
+    pub(super) history: History,
+    pub(super) file_tracker: FileTracker,
+    pub(super) totals: PromptTotals,
+    pub(super) activated_skill_context_observed: bool,
     compaction_failed: bool,
     pending_task_reminder: Option<Message>,
     local_context_window: Option<ContextWindowSnapshot>,
@@ -96,20 +101,27 @@ struct BridgeState {
     boundary_error: Option<Error>,
 }
 
-impl CodingAgentBridge {
-    fn from_runtime(runtime: &mut CodingRuntime) -> Self {
+impl ConversationState {
+    /// A conversation that starts from `history`, with nothing accumulated.
+    pub(super) fn new(history: History) -> Self {
         Self {
-            state:             Arc::new(Mutex::new(BridgeState {
-                history: mem::take(&mut runtime.history),
-                file_tracker: mem::take(&mut runtime.file_tracker),
-                totals: PromptTotals::default(),
-                activated_skill_context_observed: runtime.activated_skill_context_observed,
-                compaction_failed: false,
-                pending_task_reminder: None,
-                local_context_window: None,
-                inference_start: None,
-                boundary_error: None,
-            })),
+            history,
+            file_tracker: FileTracker::default(),
+            totals: PromptTotals::default(),
+            activated_skill_context_observed: false,
+            compaction_failed: false,
+            pending_task_reminder: None,
+            local_context_window: None,
+            inference_start: None,
+            boundary_error: None,
+        }
+    }
+}
+
+impl CodingAgentBridge {
+    fn from_runtime(runtime: &CodingRuntime) -> Self {
+        Self {
+            state:             Arc::clone(&runtime.conversation),
             client:            runtime.client.clone(),
             model_selector:    runtime.model_selector.clone(),
             model:             runtime.model.clone(),
@@ -149,15 +161,6 @@ impl CodingAgentBridge {
         state.boundary_error = None;
     }
 
-    fn restore_runtime(&self, runtime: &mut CodingRuntime) {
-        self.finish_inference();
-        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        runtime.history = state.history.clone();
-        runtime.file_tracker = state.file_tracker.clone();
-        runtime.activated_skill_context_observed = state.activated_skill_context_observed;
-        runtime.last_prompt = state.totals;
-    }
-
     #[cfg(test)]
     pub(super) fn set_tool_env_provider(&self, provider: Arc<dyn ToolEnvProvider>) {
         *self
@@ -193,7 +196,7 @@ impl CodingAgentBridge {
         )
     }
 
-    fn finish_inference(&self) {
+    pub(super) fn finish_inference(&self) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(started) = state.inference_start.take() {
             state.totals.timing.inference = state
@@ -773,7 +776,7 @@ impl CodingRuntime {
 
         let expanded = self.expand_input(input, skill_expansion)?;
         if let Some(name) = &expanded.skill_name {
-            self.activated_skill_context_observed = true;
+            self.conversation().activated_skill_context_observed = true;
             self.emit(CodingEvent::SkillActivated {
                 skill_name: name.clone(),
                 source:     SkillActivationSource::Slash,
@@ -795,7 +798,7 @@ impl CodingRuntime {
             .prompt_with_cancellation(expanded.text, prompt_cancel)
             .await;
         self.coding_agent = Some(agent);
-        bridge.restore_runtime(self);
+        bridge.finish_inference();
         if let Some(error) = bridge.take_boundary_error() {
             return Err(error);
         }

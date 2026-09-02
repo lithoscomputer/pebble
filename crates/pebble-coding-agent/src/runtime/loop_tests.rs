@@ -74,7 +74,7 @@ async fn a_text_only_response_completes_the_prompt() {
 
     assert_eq!(output.as_deref(), Some("Hello there!"));
     assert_eq!(session.state(), CodingAgentState::Idle);
-    let turns = session.history().turns();
+    let turns = session.history().turns().to_vec();
     assert_eq!(turns.len(), 2, "the input and the answer");
     assert!(matches!(&turns[0], Message::User { content, .. } if content == "Hi"));
     assert!(matches!(&turns[1], Message::Assistant { content, .. } if content == "Hello there!"));
@@ -107,7 +107,7 @@ async fn inputs_are_processed_one_after_another() {
         .expect("the second prompt succeeds");
     assert_eq!(session.state(), CodingAgentState::Idle);
 
-    let turns = session.history().turns();
+    let turns = session.history().turns().to_vec();
     assert_eq!(turns.len(), 4);
     assert!(matches!(&turns[0], Message::User { content, .. } if content == "one"));
     assert!(matches!(&turns[1], Message::Assistant { content, .. } if content == "First"));
@@ -128,7 +128,7 @@ async fn a_follow_up_starts_another_cycle() {
         .await
         .expect("the prompt succeeds");
 
-    let turns = session.history().turns();
+    let turns = session.history().turns().to_vec();
     assert_eq!(turns.len(), 4);
     assert!(matches!(&turns[0], Message::User { content, .. } if content == "initial message"));
     assert!(matches!(&turns[1], Message::Assistant { content, .. } if content == "First response"));
@@ -159,7 +159,7 @@ async fn a_tool_round_pairs_the_call_with_its_result() {
         .expect("the prompt succeeds");
 
     assert_eq!(session.state(), CodingAgentState::Idle);
-    let turns = session.history().turns();
+    let turns = session.history().turns().to_vec();
     assert_eq!(turns.len(), 4, "input, call, result, answer");
     assert!(matches!(&turns[0], Message::User { .. }));
     assert!(matches!(&turns[1], Message::Assistant { tool_calls, .. } if tool_calls.len() == 1));
@@ -190,7 +190,7 @@ async fn every_call_of_a_parallel_round_comes_back() {
         .await
         .expect("the prompt succeeds");
 
-    let turns = session.history().turns();
+    let turns = session.history().turns().to_vec();
     assert_eq!(turns.len(), 4);
     let results = tool_results(&session, 2);
     assert_eq!(
@@ -396,7 +396,7 @@ async fn a_tool_that_ends_the_prompt_still_has_its_result_committed() {
 
     assert!(matches!(error, Error::Interrupted(_)));
     assert_eq!(session.state(), CodingAgentState::Closed);
-    let turns = session.history().turns();
+    let turns = session.history().turns().to_vec();
     assert_eq!(turns.len(), 3, "input, call, and the call's result");
     assert!(matches!(&turns[1], Message::Assistant { tool_calls, .. } if tool_calls.len() == 1));
     assert!(matches!(&turns[2], Message::ToolResults { .. }));
@@ -621,7 +621,7 @@ async fn a_cancelled_session_never_calls_the_model() {
     assert!(matches!(error, Error::Interrupted(_)));
     assert_eq!(session.state(), CodingAgentState::Closed);
     assert_eq!(provider.call_count(), 0);
-    let turns = session.history().turns();
+    let turns = session.history().turns().to_vec();
     assert_eq!(turns.len(), 1, "only the input was recorded");
     assert!(matches!(&turns[0], Message::User { .. }));
 }

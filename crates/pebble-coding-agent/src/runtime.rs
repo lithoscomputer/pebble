@@ -15,7 +15,7 @@ mod turn;
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::result::Result as StdResult;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::SystemTime;
 
 use lithos_llm::Client;
@@ -36,7 +36,7 @@ use self::control::InterruptLedger;
 pub use self::control::SteeringLease;
 pub(crate) use self::control::{SessionControlHandle, actor_from_attribution};
 pub use self::retry::RetryEventObserver;
-use self::turn::CodingAgentBridge;
+use self::turn::{CodingAgentBridge, ConversationState};
 pub(crate) use crate::coding_agent::{
     CodingAgentBuildError, PromptTiming, ResumeMode, ShutdownReason,
 };
@@ -491,7 +491,7 @@ impl CodingRuntimeBuilder {
             id,
             created_at,
             config: self.options,
-            history: History::default(),
+            conversation: Arc::new(Mutex::new(ConversationState::new(History::default()))),
             emitter,
             pump: Some(pump),
             state: CodingAgentState::Idle,
@@ -518,11 +518,8 @@ impl CodingRuntimeBuilder {
             memory_tokens: 0,
             skills_tokens: 0,
             system_prompt: String::new(),
-            activated_skill_context_observed: false,
-            file_tracker: FileTracker::default(),
             subagents: supervisor,
             prompt_transform: self.prompt_transform,
-            last_prompt: PromptTotals::default(),
             coding_agent: None,
             coding_bridge: None,
         };
@@ -674,70 +671,69 @@ impl InterruptReasonHandle {
 /// from a handle taken before the prompt starts.
 #[must_use = "call `shutdown` to stop the session and join what it owns"]
 pub(crate) struct CodingRuntime {
-    id: String,
+    id:                String,
     /// The root of this session's tree. A root session names itself; a child
     /// inherits its parent's root, which is how root-scoped tools — one shared
     /// todo list across a tree of agents — know where they belong.
-    root_session_id: String,
+    root_session_id:   String,
     /// The session that spawned this one, for a child. A root has none.
     parent_session_id: Option<String>,
     /// What this child was built from, for the supervisor to recognize its own
     /// specification in the session a factory answered with. A root has none.
-    built_from: Option<Arc<ChildDeps>>,
-    created_at: SystemTime,
-    config: CodingAgentOptions,
-    history: History,
-    emitter: Emitter,
+    built_from:        Option<Arc<ChildDeps>>,
+    created_at:        SystemTime,
+    config:            CodingAgentOptions,
+    /// The conversation and what the current prompt has accumulated, shared
+    /// with the bridge that writes it.
+    conversation:      Arc<Mutex<ConversationState>>,
+    emitter:           Emitter,
     /// The event pump, until [`CodingRuntime::shutdown`] joins it.
-    pump: Option<JoinHandle<Result<()>>>,
-    state: CodingAgentState,
-    ended: bool,
-    client: Client,
-    profile: Arc<dyn AgentProfile>,
-    provider: String,
-    model: String,
+    pump:              Option<JoinHandle<Result<()>>>,
+    state:             CodingAgentState,
+    ended:             bool,
+    client:            Client,
+    profile:           Arc<dyn AgentProfile>,
+    provider:          String,
+    model:             String,
     /// What every request names, which is the resolved `provider/model` pair
     /// rather than the selector the application gave, so no round can drift to
     /// a different model than the one whose harness the session is running.
-    model_selector: String,
-    facts: ModelFacts,
-    knowledge_cutoff: String,
-    registry: ToolRegistry,
-    env: Arc<dyn Environment>,
-    human_input: Option<Arc<dyn HumanInputProvider>>,
+    model_selector:    String,
+    facts:             ModelFacts,
+    knowledge_cutoff:  String,
+    registry:          ToolRegistry,
+    env:               Arc<dyn Environment>,
+    human_input:       Option<Arc<dyn HumanInputProvider>>,
     tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
     /// What strips secrets out of the process output this session publishes.
-    redactor: Arc<dyn Redactor>,
+    redactor:          Arc<dyn Redactor>,
     /// The control the generic agent is bound to when it is built, so a
     /// handle can be given out before the first prompt creates the agent.
-    agent_control: AgentControlHandle,
+    agent_control:     AgentControlHandle,
     /// The exactly-once interrupt ledger and the completion leases.
-    ledger: Arc<Mutex<InterruptLedger>>,
-    control_notify: Arc<Notify>,
-    followup_queue: Arc<Mutex<VecDeque<String>>>,
+    ledger:            Arc<Mutex<InterruptLedger>>,
+    control_notify:    Arc<Notify>,
+    followup_queue:    Arc<Mutex<VecDeque<String>>>,
     /// Ends the whole prompt. Distinct from the round token, which ends one
     /// turn.
-    cancel_token: CancellationToken,
-    interrupt_reason: Arc<Mutex<Option<InterruptReason>>>,
-    skills: Vec<Skill>,
+    cancel_token:      CancellationToken,
+    interrupt_reason:  Arc<Mutex<Option<InterruptReason>>>,
+    skills:            Vec<Skill>,
     /// What the memory files and the skills section contribute to the system
     /// prompt, measured once at initialization: both are fixed for the
     /// session's life, and every round's context snapshot reads them.
-    memory_tokens: u64,
-    skills_tokens: u64,
-    system_prompt: String,
-    activated_skill_context_observed: bool,
-    file_tracker: FileTracker,
-    subagents: Option<SubagentSupervisor>,
+    memory_tokens:     u64,
+    skills_tokens:     u64,
+    system_prompt:     String,
+    subagents:         Option<SubagentSupervisor>,
     /// The application's adjustment to the system prompt, applied once when
     /// the session initializes.
-    prompt_transform: Option<Arc<dyn SystemPromptTransform>>,
-    last_prompt: PromptTotals,
+    prompt_transform:  Option<Arc<dyn SystemPromptTransform>>,
     /// The provider-neutral conversation loop, created after initialization on
     /// the first prompt and retained for the rest of the session.
-    coding_agent: Option<Agent>,
+    coding_agent:      Option<Agent>,
     /// Coding state and durable projection shared with `coding_agent`.
-    coding_bridge: Option<Arc<CodingAgentBridge>>,
+    coding_bridge:     Option<Arc<CodingAgentBridge>>,
 }
 
 impl fmt::Debug for CodingRuntime {
@@ -751,7 +747,7 @@ impl fmt::Debug for CodingRuntime {
             .field("profile", &self.profile.profile_kind())
             .field("state", &self.state)
             .field("ended", &self.ended)
-            .field("turns", &self.history.len())
+            .field("turns", &self.conversation().history.len())
             .finish_non_exhaustive()
     }
 }
@@ -835,7 +831,7 @@ impl CodingRuntime {
             }
         }
 
-        session.history = History::from_stored_messages(&record.messages);
+        session.conversation().history = History::from_stored_messages(&record.messages);
         // The parentage the record carries is restored, so storing a resumed
         // child again says the same thing. The tree itself is not: a resumed
         // child has no supervisor above it, and rebuilding one is the
@@ -875,8 +871,11 @@ impl CodingRuntime {
         session.system_prompt = state.system_prompt;
         session.memory_tokens = state.memory_tokens;
         session.skills_tokens = state.skills_tokens;
-        session.file_tracker = state.file_tracker;
-        session.activated_skill_context_observed = state.activated_skill_context_observed;
+        {
+            let mut conversation = session.conversation();
+            conversation.file_tracker = state.file_tracker;
+            conversation.activated_skill_context_observed = state.activated_skill_context_observed;
+        }
         Ok(session)
     }
 
@@ -896,14 +895,16 @@ impl CodingRuntime {
     /// initializing again: the durable record plus the state initialization
     /// derived from it.
     pub(crate) fn warm_state(&self) -> WarmState {
+        let record = self.to_record();
+        let conversation = self.conversation();
         WarmState {
-            record: self.to_record(),
+            record,
             system_prompt: self.system_prompt.clone(),
             skills: self.skills.clone(),
             memory_tokens: self.memory_tokens,
             skills_tokens: self.skills_tokens,
-            file_tracker: self.file_tracker.clone(),
-            activated_skill_context_observed: self.activated_skill_context_observed,
+            file_tracker: conversation.file_tracker.clone(),
+            activated_skill_context_observed: conversation.activated_skill_context_observed,
         }
     }
 
@@ -925,7 +926,7 @@ impl CodingRuntime {
         record.model = Some(self.model.clone());
         record.created_at = self.created_at;
         record.last_event_seq = self.emitter.last_seq();
-        record.messages = self.history.to_stored_messages();
+        record.messages = self.conversation().history.to_stored_messages();
         record
     }
 
@@ -1179,31 +1180,38 @@ impl CodingRuntime {
         self.state
     }
 
-    /// The conversation so far.
-    pub(crate) const fn history(&self) -> &History {
-        &self.history
+    /// A snapshot of the conversation so far.
+    pub(crate) fn history(&self) -> History {
+        self.conversation().history.clone()
     }
 
-    /// The files this session has read and changed.
+    /// A snapshot of the files this session has read and changed.
     #[cfg(test)]
-    pub(crate) const fn file_tracker(&self) -> &FileTracker {
-        &self.file_tracker
+    pub(crate) fn file_tracker(&self) -> FileTracker {
+        self.conversation().file_tracker.clone()
     }
 
     /// Where the last prompt spent its time.
-    pub(crate) const fn last_prompt_timing(&self) -> PromptTiming {
-        self.last_prompt.timing
+    pub(crate) fn last_prompt_timing(&self) -> PromptTiming {
+        self.conversation().totals.timing
     }
 
     /// What the last prompt cost in tokens, summed over every response.
-    pub(crate) const fn last_prompt_usage(&self) -> TokenUsage {
-        self.last_prompt.usage
+    pub(crate) fn last_prompt_usage(&self) -> TokenUsage {
+        self.conversation().totals.usage
     }
 
     /// What the last prompt cost in USD micros, where the catalog or the
     /// provider priced it.
-    pub(crate) const fn last_prompt_cost_usd_micros(&self) -> Option<u64> {
-        self.last_prompt.cost_usd_micros
+    pub(crate) fn last_prompt_cost_usd_micros(&self) -> Option<u64> {
+        self.conversation().totals.cost_usd_micros
+    }
+
+    /// The shared conversation, locked.
+    fn conversation(&self) -> MutexGuard<'_, ConversationState> {
+        self.conversation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The tools the model is actually shown, after the access policy.
@@ -1405,7 +1413,7 @@ impl CodingRuntime {
         input: &str,
         cancel: Option<&CancellationToken>,
     ) -> Result<Option<String>> {
-        self.last_prompt = PromptTotals::default();
+        self.conversation().totals = PromptTotals::default();
         if self.state == CodingAgentState::Closed {
             return Err(Error::SessionClosed);
         }

@@ -213,7 +213,7 @@ async fn background_agent_notifications_are_batched_into_one_parent_turn() {
         .expect("the prompt succeeds");
 
     assert_eq!(output.as_deref(), Some("Synthesized both results"));
-    let turns = parent.history().turns();
+    let turns = parent.history().turns().to_vec();
     assert_eq!(turns.len(), 4, "one extra turn carries both results");
     let Some(Message::User {
         content: notification,
@@ -283,7 +283,7 @@ async fn background_agent_output_is_not_parsed_for_skill_references() {
         .expect("the prompt succeeds");
 
     assert_eq!(output.as_deref(), Some("Acknowledged"));
-    let turns = parent.history().turns();
+    let turns = parent.history().turns().to_vec();
     let Some(Message::User {
         content: notification,
         ..

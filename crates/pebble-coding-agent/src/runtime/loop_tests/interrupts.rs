@@ -46,7 +46,7 @@ async fn a_steer_lands_as_its_own_turn() {
         .await
         .expect("the prompt succeeds");
 
-    let turns = session.history().turns();
+    let turns = session.history().turns().to_vec();
     assert_eq!(turns.len(), 3, "input, steer, answer");
     assert!(matches!(&turns[0], Message::User { .. }));
     assert!(
@@ -328,13 +328,14 @@ async fn an_interrupted_round_leaves_no_task_reminder_behind() {
     assert_eq!(reminder.role(), Role::System);
     assert_eq!(message_text(reminder), TASK_REMINDER_TEXT);
 
+    let history = session.history();
     let [
         ..,
         Message::System {
             content: committed, ..
         },
         Message::Assistant { content, .. },
-    ] = session.history().turns()
+    ] = history.turns()
     else {
         panic!("the reminder commits with the assistant turn that read it");
     };
@@ -368,7 +369,7 @@ async fn an_interrupt_mid_stream_withdraws_what_the_turn_showed_and_commits_noth
 
     assert_eq!(answer.as_deref(), Some("the answer after the steer"));
     assert_eq!(provider.call_count(), 2);
-    let turns = session.history().turns();
+    let turns = session.history().turns().to_vec();
     assert_eq!(turns.len(), 3, "input, steer, answer");
     assert!(matches!(&turns[1], Message::Steering { .. }));
     assert!(
@@ -570,7 +571,7 @@ async fn a_steering_lease_lets_a_late_steer_drive_another_round() {
     session.prompt("hi").await.expect("the prompt succeeds");
     steering.await.expect("the steering task finishes");
 
-    let turns = session.history().turns();
+    let turns = session.history().turns().to_vec();
     assert_eq!(turns.len(), 4, "input, answer, steer, answer");
     assert!(matches!(&turns[1], Message::Assistant { content, .. } if content == "First reply"));
     assert!(
@@ -691,7 +692,7 @@ async fn a_prompt_inside_its_budget_is_untouched() {
     session.prompt("Hello").await.expect("the prompt succeeds");
 
     assert_eq!(session.state(), CodingAgentState::Idle);
-    let turns = session.history().turns();
+    let turns = session.history().turns().to_vec();
     assert_eq!(turns.len(), 2);
     assert!(matches!(&turns[1], Message::Assistant { content, .. } if content == "Fast response"));
 }
