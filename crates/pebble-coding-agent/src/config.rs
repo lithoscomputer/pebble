@@ -293,6 +293,14 @@ pub struct CodingAgentOptions {
     /// default of four allows the three replays Pebble is willing to spend on
     /// one turn.
     ///
+    /// The default schedule waits one second before the first replay, doubles
+    /// the wait for each replay after that, and caps a wait at sixty seconds.
+    /// Each wait is jittered: it lands between half of the computed wait and
+    /// the whole of it, so the three replays together take between about 3.5
+    /// and 7 seconds. That outlasts a provider blip of a few seconds, which the
+    /// 100 millisecond schedule of [`RetryPolicy::exponential`] does not. A
+    /// `Retry-After` from the provider replaces the computed wait.
+    ///
     /// The type is reexported as
     /// [`lithos_llm::middleware::RetryPolicy`].
     pub(crate) turn_replay: RetryPolicy,
@@ -369,7 +377,11 @@ impl Default for CodingAgentOptions {
             compaction_threshold_percent: 80,
             compaction_preserve_turns: 6,
             wall_clock_timeout: None,
-            turn_replay: RetryPolicy::exponential().max_attempts(DEFAULT_RETRY_ATTEMPTS),
+            turn_replay: RetryPolicy::exponential()
+                .initial_delay(DEFAULT_REPLAY_INITIAL_DELAY)
+                .max_delay(DEFAULT_REPLAY_MAX_DELAY)
+                .jitter(true)
+                .max_attempts(DEFAULT_RETRY_ATTEMPTS),
         }
     }
 }
@@ -379,6 +391,14 @@ impl Default for CodingAgentOptions {
 /// One opening attempt plus the three replays a session will spend on a turn
 /// whose stream broke after it had already shown output.
 const DEFAULT_RETRY_ATTEMPTS: u32 = 4;
+
+/// The wait before the first replay under the default
+/// [`CodingAgentOptions::turn_replay`]. Each later wait doubles the one before.
+const DEFAULT_REPLAY_INITIAL_DELAY: Duration = Duration::from_secs(1);
+
+/// The longest computed wait between replays under the default
+/// [`CodingAgentOptions::turn_replay`].
+const DEFAULT_REPLAY_MAX_DELAY: Duration = Duration::from_secs(60);
 
 impl CodingAgentOptions {
     /// Sets how hard the model should think, where the provider offers a
@@ -692,6 +712,51 @@ mod tests {
                 .next_delay(DEFAULT_RETRY_ATTEMPTS, &error)
                 .is_none(),
             "the fourth failure spends the budget"
+        );
+    }
+
+    #[test]
+    fn the_default_turn_replay_waits_seconds_not_milliseconds() {
+        // Fabro's schedule: one second, doubling, jittered. Jitter lands each
+        // wait between half of the computed delay and the whole of it, so the
+        // three replays together outlast a provider blip of a few seconds.
+        let config = CodingAgentOptions::default();
+        let error = LlmError::new(LlmErrorKind::Network, "connection reset")
+            .with_retry(RetryClassification::Safe);
+        let expected = [
+            (1, Duration::from_millis(500), Duration::from_secs(1)),
+            (2, Duration::from_secs(1), Duration::from_secs(2)),
+            (3, Duration::from_secs(2), Duration::from_secs(4)),
+        ];
+
+        for (attempt, floor, ceiling) in expected {
+            let delay = config
+                .turn_replay
+                .next_delay(attempt, &error)
+                .unwrap_or_else(|| panic!("attempt {attempt} is replayed"));
+            assert!(
+                (floor..=ceiling).contains(&delay),
+                "attempt {attempt} waited {delay:?}, outside {floor:?}..={ceiling:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_default_turn_replay_caps_its_wait_at_a_minute() {
+        // The default budget is spent long before the doubling reaches the
+        // cap, so a wider budget on the same schedule shows it.
+        let policy = CodingAgentOptions::default()
+            .turn_replay
+            .max_attempts(u32::MAX);
+        let error = LlmError::new(LlmErrorKind::Network, "connection reset")
+            .with_retry(RetryClassification::Safe);
+
+        let delay = policy
+            .next_delay(20, &error)
+            .expect("a replay is still allowed");
+        assert!(
+            (Duration::from_secs(30)..=Duration::from_secs(60)).contains(&delay),
+            "attempt 20 waited {delay:?}, outside the jittered sixty second cap"
         );
     }
 

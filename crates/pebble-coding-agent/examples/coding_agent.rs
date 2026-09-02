@@ -123,7 +123,9 @@ async fn run() -> Result<(), Box<dyn StdError>> {
             CodingAgentOptions::default()
                 .with_wall_clock_timeout(PROMPT_BUDGET)
                 // This example chooses the same spacing for request retry and
-                // turn replay. Applications can configure them independently.
+                // turn replay, in place of the default one second, doubling,
+                // jittered schedule. Applications can configure them
+                // independently.
                 .with_turn_replay(policy),
         )
         .build()

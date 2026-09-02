@@ -110,8 +110,10 @@ middleware when it builds the client, with Pebble's `RetryEventObserver` on it.
 The observer is what puts the client's own retries onto the agent's event
 stream. Without it, an agent still runs correctly and does not report retries.
 `CodingAgentOptions::turn_replay` controls the separate replay that happens
-after a response stream opens. The two policies can share settings, but they
-have different ownership and do not have to match.
+after a response stream opens. Its default waits one second before the first
+replay, doubles the wait each time, caps a wait at sixty seconds, and jitters
+each wait. The two policies can share settings, but they have different
+ownership and do not have to match.
 
 Applications use `lithos-llm` directly to build clients and use its public
 model types. The Pebble packages do not re-export their dependencies.
