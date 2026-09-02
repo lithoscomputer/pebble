@@ -234,6 +234,23 @@ impl SessionControlHandle {
         self.agent.is_paused()
     }
 
+    /// Whether a prompt is running.
+    #[must_use]
+    pub(crate) fn is_running(&self) -> bool {
+        self.agent.is_running()
+    }
+
+    /// Whether the agent is closed.
+    #[must_use]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.agent.is_closed()
+    }
+
+    /// Waits until no prompt is running.
+    pub(crate) async fn wait_for_idle(&self) {
+        self.agent.wait_for_idle().await;
+    }
+
     /// A wake-up that fires when steering is queued or the last lease drops.
     ///
     /// Register it before reading the queue or the lease count, the way the

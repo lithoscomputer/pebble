@@ -10,7 +10,7 @@ use lithos_llm::catalog::MetadataError;
 use lithos_llm::resolver::ModelSelectionError;
 use lithos_llm::types::{ReasoningEffort, RequestBuildError, Speed};
 use pebble_agent::{QueueOutcome, UserMessage};
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::CodingAgentOptions;
@@ -426,19 +426,18 @@ impl CodingAgentBuilder {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct CodingPromptState {
-    running: bool,
-    closed:  bool,
-}
-
+/// What a control handle reaches: the session's control, its follow-up queue,
+/// and the terminal cancellation an abort fires.
+///
+/// Whether a prompt is running and whether the agent is closed are read from
+/// the session's own control rather than tracked again here. An abort counts
+/// as closed from the moment its cancellation fires, before the shutdown it
+/// causes has finished.
 struct CodingControl {
     session:          SessionControlHandle,
     follow_up:        Arc<Mutex<VecDeque<String>>>,
     cancel:           CancellationToken,
     interrupt_reason: InterruptReasonHandle,
-    prompt_state:     Mutex<CodingPromptState>,
-    idle:             Notify,
 }
 
 impl CodingControl {
@@ -448,44 +447,7 @@ impl CodingControl {
             follow_up:        session.followup_queue_handle(),
             cancel:           session.cancel_token(),
             interrupt_reason: session.interrupt_reason_handle(),
-            prompt_state:     Mutex::new(CodingPromptState::default()),
-            idle:             Notify::new(),
         })
-    }
-
-    fn begin_prompt(&self) {
-        let mut state = self
-            .prompt_state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        debug_assert!(!state.running, "a mutable session cannot start two prompts");
-        state.running = true;
-    }
-
-    fn finish_prompt(&self, closed: bool) {
-        let mut state = self
-            .prompt_state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        state.running = false;
-        state.closed |= closed;
-        drop(state);
-        self.idle.notify_waiters();
-    }
-
-    fn mark_closed(&self) {
-        let mut state = self
-            .prompt_state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        state.closed = true;
-    }
-
-    fn state(&self) -> CodingPromptState {
-        *self
-            .prompt_state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -679,13 +641,12 @@ impl CodingAgentControlHandle {
     /// was already on its way. While no prompt is running this only queues, and
     /// the message opens the next prompt.
     pub fn steer_now(&self, message: impl Into<SteeringMessage>) -> SteeringOutcome {
-        let state = self.control.state();
-        if state.closed {
+        if self.is_closed() {
             return SteeringOutcome::Closed;
         }
         let message = message.into();
         let capacity = Some(Self::STEERING_QUEUE_CAPACITY);
-        let outcome = if state.running {
+        let outcome = if self.is_running() {
             self.control
                 .session
                 .steer_now(message.text, message.actor, capacity)
@@ -704,8 +665,7 @@ impl CodingAgentControlHandle {
     /// parks at the next boundary until a steer arrives or the prompt is
     /// cancelled. Returns whether a prompt was running to interrupt.
     pub fn interrupt(&self) -> bool {
-        let state = self.control.state();
-        if !state.running || state.closed {
+        if !self.is_running() || self.is_closed() {
             return false;
         }
         self.control.session.interrupt()
@@ -749,16 +709,8 @@ impl CodingAgentControlHandle {
     /// [`CodingAgent::prompt_with_cancellation`] instead. Returns whether a
     /// prompt was running.
     pub fn abort(&self) -> bool {
-        {
-            let mut state = self
-                .control
-                .prompt_state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if !state.running || state.closed {
-                return false;
-            }
-            state.closed = true;
+        if !self.is_running() || self.is_closed() {
+            return false;
         }
         self.control
             .interrupt_reason
@@ -769,34 +721,27 @@ impl CodingAgentControlHandle {
 
     /// Waits until no prompt is running.
     pub async fn wait_for_idle(&self) {
-        loop {
-            let notified = self.control.idle.notified();
-            if !self.is_running() {
-                return;
-            }
-            notified.await;
-        }
+        self.control.session.wait_for_idle().await;
     }
 
     /// Whether a prompt is running.
     #[must_use]
     pub fn is_running(&self) -> bool {
-        self.control.state().running
+        self.control.session.is_running()
     }
 
     /// Whether the agent is closed or is finishing an abort.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.control.state().closed
+        self.control.session.is_closed() || self.control.cancel.is_cancelled()
     }
 
     /// A read-only view of the agent's state and queued input.
     #[must_use]
     pub fn snapshot(&self) -> ControlSnapshot {
-        let state = self.control.state();
         ControlSnapshot {
-            running:            state.running,
-            closed:             state.closed,
+            running:            self.is_running(),
+            closed:             self.is_closed(),
             parked:             self.control.session.is_parked(),
             pending_steering:   self.control.session.pending_steering(),
             pending_follow_ups: self
@@ -941,11 +886,7 @@ impl CodingAgent {
         input: &str,
         cancel: Option<&CancellationToken>,
     ) -> Result<PromptOutcome, Error> {
-        self.control.begin_prompt();
-        let result = self.inner.prompt_with_cancellation(input, cancel).await;
-        self.control
-            .finish_prompt(self.inner.state() == CodingAgentState::Closed);
-        let text = result?;
+        let text = self.inner.prompt_with_cancellation(input, cancel).await?;
         let final_message = self
             .inner
             .history()
@@ -1058,9 +999,7 @@ impl CodingAgent {
 
     /// Closes the agent and joins its owned tasks.
     pub async fn shutdown(&mut self, reason: ShutdownReason) -> Result<bool, Error> {
-        let result = self.inner.shutdown(reason).await;
-        self.control.mark_closed();
-        result
+        self.inner.shutdown(reason).await
     }
 }
 
@@ -1068,6 +1007,7 @@ impl CodingAgent {
 mod tests {
     use lithos_llm::types::ToolDefinition;
     use serde_json::json;
+    use tokio::sync::Notify;
     use tokio::time::timeout;
 
     use super::*;

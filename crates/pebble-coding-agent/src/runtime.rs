@@ -1531,6 +1531,9 @@ impl CodingRuntime {
         if let Some(agent) = &mut self.coding_agent {
             let _ = agent.shutdown();
         }
+        // A session shut down before its first prompt never built its agent,
+        // so the control it handed out is closed here for it to read.
+        let _ = self.agent_control.close();
         self.ended = true;
         self.emit(CodingEvent::SessionEnded);
         self.join_pump().await?;

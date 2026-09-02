@@ -323,6 +323,17 @@ impl AgentControlHandle {
         true
     }
 
+    /// Closes the agent from a handle: the active prompt aborts and no further
+    /// prompt runs.
+    ///
+    /// Returns whether this call performed the transition. Closing through the
+    /// handle publishes no event; [`Agent::shutdown`](crate::Agent::shutdown)
+    /// does, so a layer that owns the agent shuts it down and closes the
+    /// handle only where no agent was ever built.
+    pub fn close(&self) -> bool {
+        self.control.close()
+    }
+
     /// Waits until no prompt is running.
     pub async fn wait_for_idle(&self) {
         loop {
