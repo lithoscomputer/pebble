@@ -613,6 +613,13 @@ impl ToolRoundExecutor for CodingAgentBridge {
             results:   results.clone(),
             timestamp: SystemTime::now(),
         });
+        // A round somebody ended is not the model repeating itself. Its
+        // results are committed all the same, but a loop warning here would
+        // land in the conversation ahead of the steer that replaces the round,
+        // or in a prompt that is already over.
+        if cancel.is_cancelled() || self.prompt_cancel().is_cancelled() {
+            return results;
+        }
         let loop_detected = self.config.enable_loop_detection
             && detect_loop(&state.history, self.config.loop_detection_window);
         if loop_detected {

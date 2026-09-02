@@ -565,6 +565,132 @@ async fn repeating_the_same_call_warns_the_model() {
     );
 }
 
+/// A tool that answers its first `answered` calls at once and then waits to be
+/// cancelled, so a test can interrupt a round that repeats an earlier one.
+fn parking_after(answered: usize) -> RegisteredTool {
+    let calls = Arc::new(AtomicUsize::new(0));
+    RegisteredTool::new(
+        ToolDefinition::function("repeat", "Repeats itself", json!({"type": "object"})),
+        Arc::new(move |_arguments, context| {
+            let calls = Arc::clone(&calls);
+            Box::pin(async move {
+                if calls.fetch_add(1, Ordering::SeqCst) < answered {
+                    return Ok("ok".to_owned());
+                }
+                context.cancel.cancelled().await;
+                Err(ToolError::cancelled("Cancelled"))
+            })
+        }),
+    )
+    .with_source(ToolSource::Native)
+}
+
+/// Two rounds that make the same call, then an answer.
+fn two_identical_rounds() -> Vec<ScriptedCall> {
+    vec![
+        ScriptedCall::response(tool_call_response("repeat", "call_1", json!({}))),
+        ScriptedCall::response(tool_call_response("repeat", "call_2", json!({}))),
+        ScriptedCall::response(text_response("Done")),
+    ]
+}
+
+/// Loop detection tight enough for two identical rounds to count.
+fn two_round_loop_detection() -> CodingAgentOptions {
+    CodingAgentOptions {
+        enable_loop_detection: true,
+        loop_detection_window: 2,
+        ..CodingAgentOptions::default()
+    }
+}
+
+#[tokio::test]
+async fn two_identical_rounds_left_to_finish_are_a_loop() {
+    // The control for the interrupted case below: the same two rounds, with
+    // nobody stepping in, are flagged.
+    let (mut session, _provider) = TestSession::new(two_identical_rounds())
+        .tools([noop_tool("repeat")])
+        .options(two_round_loop_detection())
+        .build();
+    let mut events = session.subscribe();
+
+    session
+        .prompt("Keep repeating")
+        .await
+        .expect("the prompt succeeds");
+
+    assert!(session.history().turns().iter().any(|turn| {
+        matches!(turn, Message::Steering { content, .. } if content.contains("Loop detected"))
+    }));
+    let published = settled(&mut session, &mut events).await;
+    assert_eq!(
+        count(&published, |event| matches!(
+            event,
+            CodingEvent::LoopDetected
+        )),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_round_the_user_interrupted_is_not_a_loop() {
+    // The second round repeats the first, but it is the user who ends it, so
+    // its results are committed without a warning: the steer that replaces
+    // the round is the next thing the model reads.
+    let (mut session, _provider) = TestSession::new(two_identical_rounds())
+        .tools([parking_after(1)])
+        .options(two_round_loop_detection())
+        .build();
+    let control = session.control_handle();
+    let mut events = session.subscribe();
+    let mut recorded = session.subscribe();
+    let controller = tokio::spawn(async move {
+        let starts = AtomicUsize::new(0);
+        wait_for_event(&mut events, |event| {
+            matches!(event, CodingEvent::ToolCallStarted { .. })
+                && starts.fetch_add(1, Ordering::SeqCst) == 1
+        })
+        .await;
+        control.interrupt_then_steer("try something else", None);
+    });
+
+    let answer = timeout(Duration::from_secs(1), session.prompt("Keep repeating"))
+        .await
+        .expect("the interrupt unblocks the tool")
+        .expect("the prompt succeeds");
+    controller.await.expect("the controller finishes");
+
+    assert_eq!(answer.as_deref(), Some("Done"));
+    let turns = session.history().turns().to_vec();
+    assert!(
+        !turns.iter().any(|turn| {
+            matches!(turn, Message::Steering { content, .. } if content.contains("Loop detected"))
+        }),
+        "no loop warning was written: {turns:?}"
+    );
+    let results = tool_results(&session, 4);
+    assert_eq!(
+        results.len(),
+        1,
+        "the interrupted call still has its result"
+    );
+    assert!(
+        matches!(
+            turns.get(5),
+            Some(Message::Steering { content, .. }) if content == "try something else"
+        ),
+        "the steer follows the interrupted round directly: {turns:?}"
+    );
+    let published = settled(&mut session, &mut recorded).await;
+    assert_eq!(
+        count(&published, |event| matches!(
+            event,
+            CodingEvent::LoopDetected
+        )),
+        0,
+        "the interrupted round was not announced as a loop"
+    );
+}
+
 // --- Accounting ---
 
 #[tokio::test]
