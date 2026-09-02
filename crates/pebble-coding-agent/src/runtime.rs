@@ -1263,15 +1263,9 @@ impl CodingRuntime {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The tools the model is actually shown, after the access policy.
-    ///
-    /// The same filter the session builds its requests with, so what an
-    /// application reads here is what the model was told.
+    /// The tools registered for this session before middleware filters them.
     pub(crate) fn effective_tools(&self) -> Vec<ToolDefinitionWithSource> {
-        self.registry.definitions_with_source_for_policy(
-            self.config.tool_access_policy.as_deref(),
-            self.config.tool_exposure_mode,
-        )
+        self.registry.definitions_with_source()
     }
 
     /// Watches the session's events from here on.

@@ -815,21 +815,25 @@ async fn a_childs_events_reach_the_parents_durable_stream() {
 // --- What a child is given ---
 
 /// An application tool is root-only unless marked, a marked tool that needs a
-/// person is withheld all the same, and the parent's access policy binds the
+/// person is withheld all the same, and the parent's middleware binds the
 /// child: the child can never be shown more than its parent was.
 #[tokio::test]
-async fn a_child_inherits_only_the_tools_marked_for_it_under_its_parents_policy() {
-    use crate::config::{CodingAgentOptions, ToolAccess, ToolAccessPolicy, ToolExposureMode};
+async fn a_child_inherits_only_marked_tools_and_its_parents_middleware() {
+    use pebble_agent::ToolDescriptor;
+
+    use crate::tool::{PermissionMiddleware, ToolPermission, ToolPermissionPolicy};
 
     /// Denies the shell to the whole tree.
     struct NoShell;
 
-    impl ToolAccessPolicy for NoShell {
-        fn access_for_tool(&self, tool_name: &str) -> ToolAccess {
-            if tool_name == "shell" {
-                ToolAccess::Denied
+    impl ToolPermissionPolicy for NoShell {
+        fn permission(&self, tool: &ToolDescriptor) -> ToolPermission {
+            if tool.id().as_str() == "shell" {
+                ToolPermission::Deny {
+                    reason: "shell is disabled".to_owned(),
+                }
             } else {
-                ToolAccess::Allowed
+                ToolPermission::Allow
             }
         }
     }
@@ -860,7 +864,7 @@ async fn a_child_inherits_only_the_tools_marked_for_it_under_its_parents_policy(
 
     // Registered on the builder as an application would register them, not
     // through the test profile, which would make them the harness's own.
-    let (client, _provider) = scripted_client(answers("done"));
+    let (client, provider) = scripted_client(answers("done"));
     let mut parent = CodingRuntime::builder(client)
         .model("test/model")
         .environment(Arc::new(MockEnvironment::linux()))
@@ -871,11 +875,7 @@ async fn a_child_inherits_only_the_tools_marked_for_it_under_its_parents_policy(
                 .allow_in_subagents()
                 .requires_human_input(),
         ])
-        .options(CodingAgentOptions {
-            tool_access_policy: Some(Arc::new(NoShell)),
-            tool_exposure_mode: ToolExposureMode::IncludeRequiresApproval,
-            ..CodingAgentOptions::default()
-        })
+        .tool_middleware(Arc::new(PermissionMiddleware::new(Arc::new(NoShell))))
         .observe_children(observer)
         .build()
         .expect("the parent builds");
@@ -901,10 +901,6 @@ async fn a_child_inherits_only_the_tools_marked_for_it_under_its_parents_policy(
     for name in ["audit", "lint", "ask_ops"] {
         assert!(parent_tools.contains(&name.to_owned()), "{parent_tools:?}");
     }
-    assert!(
-        !parent_tools.contains(&"shell".to_owned()),
-        "the policy binds the parent too: {parent_tools:?}"
-    );
 
     let child = child_tools
         .lock()
@@ -921,13 +917,20 @@ async fn a_child_inherits_only_the_tools_marked_for_it_under_its_parents_policy(
         !child.contains(&"ask_ops".to_owned()),
         "a tool that needs a person never reaches a child: {child:?}"
     );
-    assert!(
-        !child.contains(&"shell".to_owned()),
-        "a child cannot widen its parent's policy: {child:?}"
-    );
+    assert!(child.contains(&"shell".to_owned()), "{child:?}");
     assert!(
         child.contains(&"read_file".to_owned()),
         "built-in tools are inherited: {child:?}"
+    );
+    let requests = provider.requests();
+    let child_request = requests.first().expect("the child asked its model");
+    assert!(
+        child_request
+            .tools()
+            .iter()
+            .all(|tool| tool.name != "shell"),
+        "the inherited middleware filters the child request: {:?}",
+        child_request.tools()
     );
 
     parent

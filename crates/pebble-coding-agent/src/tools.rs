@@ -48,10 +48,7 @@ pub use self::todo::{
 };
 pub use self::web::{WebFetchSummarizer, make_web_fetch_tool};
 pub use self::web_search::make_web_search_tool;
-pub use crate::config::{
-    NativeToolOptions, ToolAccess, ToolAccessPolicy, ToolApprovalAdapter, ToolApprovalFn,
-    ToolExposureMode, ToolHookCallback, ToolHookDecision,
-};
+pub use crate::config::NativeToolOptions;
 pub use crate::event::OutputCaptureStats;
 pub use crate::tool::{
     ApprovalDecision, CodingEventEmitter, CodingToolSet, PermissionLevelPolicy,

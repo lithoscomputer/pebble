@@ -1,6 +1,6 @@
 //! The coding layer that projects Pebble's durable behavior onto `Agent`.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Instant, SystemTime};
@@ -23,22 +23,20 @@ use crate::config::CodingAgentOptions;
 use crate::context_window::{
     ContextWindowInput, build_local_snapshot, context_window_from_response_usage,
 };
-use crate::environment::Environment;
 use crate::error::{Error, ErrorData, InterruptReason, Result};
 use crate::event::{Emitter, OutputCaptureStats};
 use crate::file_tracker::FileTracker;
 use crate::history::History;
-use crate::human_input::{HumanInputProvider, is_question_tool};
 use crate::loop_detection::detect_loop;
 use crate::profile::ModelFacts;
 use crate::reasoning::ReasoningOutput;
-use crate::redact::Redactor;
 use crate::skills::{ExpandedInput, Skill, SkillExpansion, expand_skill};
 use crate::subagent::SubagentSupervisor;
 use crate::task_reminder::maybe_task_reminder;
+#[cfg(test)]
+use crate::tool::ToolEnvProvider;
 use crate::tool::{
-    NativeTool, ToolDefinitionWithSource, ToolDispatch, ToolEnvProvider, ToolRegistry,
-    canonical_tool_name,
+    CodingToolService, NativeTool, ToolDefinitionWithSource, ToolRegistry, canonical_tool_name,
 };
 use crate::types::{
     CodingAgentState, CodingEvent, ContextWindowSnapshot, CostSource, LlmOutputKind, LlmRetryPhase,
@@ -54,36 +52,31 @@ const LOOP_WARNING: &str = "WARNING: Loop detected. You appear to be repeating t
 
 #[derive(Clone)]
 pub(super) struct CodingAgentBridge {
-    state:             Arc<Mutex<ConversationState>>,
-    client:            lithos_llm::Client,
-    model_selector:    String,
-    model:             String,
-    provider:          String,
-    system_prompt:     String,
-    facts:             ModelFacts,
-    config:            CodingAgentOptions,
-    registry:          ToolRegistry,
-    env:               Arc<dyn Environment>,
-    human_input:       Option<Arc<dyn HumanInputProvider>>,
-    tool_env_provider: Arc<Mutex<Option<Arc<dyn ToolEnvProvider>>>>,
-    tool_output_stats: Arc<Mutex<HashMap<String, OutputCaptureStats>>>,
-    redactor:          Arc<dyn Redactor>,
-    emitter:           Emitter,
-    session_id:        String,
-    root_session_id:   String,
-    memory_tokens:     u64,
-    skills_tokens:     u64,
-    control:           SessionControlHandle,
+    state:          Arc<Mutex<ConversationState>>,
+    client:         lithos_llm::Client,
+    model_selector: String,
+    model:          String,
+    provider:       String,
+    system_prompt:  String,
+    facts:          ModelFacts,
+    config:         CodingAgentOptions,
+    registry:       ToolRegistry,
+    tools:          Arc<CodingToolService>,
+    emitter:        Emitter,
+    session_id:     String,
+    memory_tokens:  u64,
+    skills_tokens:  u64,
+    control:        SessionControlHandle,
     /// The session's state, moved to `Executing` for the length of a tool
     /// round and back to `Thinking` after it.
-    state_machine:     StateMachine,
+    state_machine:  StateMachine,
     /// The token that ends the prompt in progress. A child of the runtime's
     /// terminal token, so it also fires when the session is shut down, and set
     /// afresh by [`begin_prompt`](Self::begin_prompt) for every prompt.
-    prompt_cancel:     Arc<Mutex<CancellationToken>>,
-    followup_queue:    Arc<Mutex<VecDeque<String>>>,
-    subagents:         Option<SubagentSupervisor>,
-    skills:            Vec<Skill>,
+    prompt_cancel:  Arc<Mutex<CancellationToken>>,
+    followup_queue: Arc<Mutex<VecDeque<String>>>,
+    subagents:      Option<SubagentSupervisor>,
+    skills:         Vec<Skill>,
 }
 
 /// The conversation and what one prompt accumulates around it.
@@ -125,32 +118,42 @@ impl ConversationState {
 
 impl CodingAgentBridge {
     fn from_runtime(runtime: &CodingRuntime) -> Self {
+        let mut tools = CodingToolService::new(
+            runtime.registry.clone(),
+            Arc::clone(&runtime.env),
+            runtime.config.clone(),
+            runtime.emitter.clone(),
+            runtime.id.clone(),
+            runtime.root_session_id.clone(),
+            Arc::clone(&runtime.redactor),
+        );
+        if let Some(provider) = runtime.tool_env_provider.as_ref() {
+            tools = tools.with_tool_env_provider(Arc::clone(provider));
+        }
+        if let Some(provider) = runtime.human_input.as_ref() {
+            tools = tools.with_human_input(Arc::clone(provider));
+        }
         Self {
-            state:             Arc::clone(&runtime.conversation),
-            client:            runtime.client.clone(),
-            model_selector:    runtime.model_selector.clone(),
-            model:             runtime.model.clone(),
-            provider:          runtime.provider.clone(),
-            system_prompt:     runtime.system_prompt.clone(),
-            facts:             runtime.facts,
-            config:            runtime.config.clone(),
-            registry:          runtime.registry.clone(),
-            env:               Arc::clone(&runtime.env),
-            human_input:       runtime.human_input.clone(),
-            tool_env_provider: Arc::new(Mutex::new(runtime.tool_env_provider.clone())),
-            tool_output_stats: Arc::new(Mutex::new(HashMap::new())),
-            redactor:          Arc::clone(&runtime.redactor),
-            emitter:           runtime.emitter.clone(),
-            session_id:        runtime.id.clone(),
-            root_session_id:   runtime.root_session_id.clone(),
-            memory_tokens:     runtime.memory_tokens,
-            skills_tokens:     runtime.skills_tokens,
-            control:           runtime.control_handle(),
-            state_machine:     runtime.state.clone(),
-            prompt_cancel:     Arc::new(Mutex::new(runtime.cancel_token.clone())),
-            followup_queue:    Arc::clone(&runtime.followup_queue),
-            subagents:         runtime.subagents.clone(),
-            skills:            runtime.skills.clone(),
+            state:          Arc::clone(&runtime.conversation),
+            client:         runtime.client.clone(),
+            model_selector: runtime.model_selector.clone(),
+            model:          runtime.model.clone(),
+            provider:       runtime.provider.clone(),
+            system_prompt:  runtime.system_prompt.clone(),
+            facts:          runtime.facts,
+            config:         runtime.config.clone(),
+            registry:       runtime.registry.clone(),
+            tools:          Arc::new(tools),
+            emitter:        runtime.emitter.clone(),
+            session_id:     runtime.id.clone(),
+            memory_tokens:  runtime.memory_tokens,
+            skills_tokens:  runtime.skills_tokens,
+            control:        runtime.control_handle(),
+            state_machine:  runtime.state.clone(),
+            prompt_cancel:  Arc::new(Mutex::new(runtime.cancel_token.clone())),
+            followup_queue: Arc::clone(&runtime.followup_queue),
+            subagents:      runtime.subagents.clone(),
+            skills:         runtime.skills.clone(),
         }
     }
 
@@ -159,10 +162,7 @@ impl CodingAgentBridge {
             .prompt_cancel
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = prompt_cancel;
-        self.tool_output_stats
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
+        self.tools.begin_prompt();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.totals = PromptTotals::default();
         state.compaction_failed = false;
@@ -175,10 +175,7 @@ impl CodingAgentBridge {
 
     #[cfg(test)]
     pub(super) fn set_tool_env_provider(&self, provider: Arc<dyn ToolEnvProvider>) {
-        *self
-            .tool_env_provider
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(provider);
+        self.tools.set_tool_env_provider(provider);
     }
 
     /// The token that ends the prompt in progress.
@@ -222,10 +219,7 @@ impl CodingAgentBridge {
     }
 
     fn effective_tools(&self) -> Vec<ToolDefinitionWithSource> {
-        self.registry.definitions_with_source_for_policy(
-            self.config.tool_access_policy.as_deref(),
-            self.config.tool_exposure_mode,
-        )
+        self.registry.definitions_with_source()
     }
 
     pub(super) fn finish_inference(&self) {
@@ -597,117 +591,6 @@ impl agent::EventProjection for CodingAgentBridge {
 }
 
 #[async_trait]
-impl agent::ToolService for CodingAgentBridge {
-    async fn discover(
-        &self,
-        _context: agent::ToolDiscoveryContext<'_>,
-    ) -> StdResult<agent::ToolCatalog, agent::ToolSystemError> {
-        let tools = self
-            .registry
-            .definitions_with_source()
-            .into_iter()
-            .map(|tool| {
-                let name = tool.definition.name.clone();
-                let id = agent::ToolId::try_new(canonical_tool_name(&name)).map_err(|source| {
-                    agent::ToolSystemError::with_source(
-                        format!("tool `{name}` has no stable identity"),
-                        source,
-                    )
-                })?;
-                let scheduling = if is_question_tool(&name) {
-                    agent::ToolScheduling::ExclusiveRound
-                } else {
-                    agent::ToolScheduling::Concurrent
-                };
-                Ok(agent::ToolDescriptor::new(id, tool.definition).with_scheduling(scheduling))
-            })
-            .collect::<StdResult<Vec<_>, agent::ToolSystemError>>()?;
-        Ok(agent::ToolCatalog::new(tools))
-    }
-
-    async fn call(
-        &self,
-        request: agent::ToolCallRequest,
-    ) -> StdResult<agent::ToolOutcome, agent::ToolSystemError> {
-        let mut dispatch = ToolDispatch::new(
-            &self.registry,
-            &self.env,
-            &self.config,
-            &self.emitter,
-            &self.session_id,
-            &self.root_session_id,
-        );
-        let tool_env_provider = self
-            .tool_env_provider
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        if let Some(provider) = tool_env_provider.as_ref() {
-            dispatch = dispatch.with_tool_env_provider(provider);
-        }
-        if let Some(provider) = self.human_input.as_ref() {
-            dispatch = dispatch.with_human_input(provider);
-        }
-        dispatch = dispatch.with_redactor(&self.redactor);
-        let call_id = request.call().id.clone();
-        let (outcome, stats) = dispatch.execute_terminal(request).await;
-        if let Some(stats) = stats {
-            self.tool_output_stats
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(call_id, stats);
-        }
-        Ok(outcome)
-    }
-}
-
-#[async_trait]
-impl agent::ToolMiddleware for CodingAgentBridge {
-    async fn discover(
-        &self,
-        context: agent::ToolDiscoveryContext<'_>,
-        next: agent::ToolDiscoveryNext<'_>,
-    ) -> StdResult<agent::ToolCatalog, agent::ToolSystemError> {
-        next.run(context).await
-    }
-
-    async fn call(
-        &self,
-        request: agent::ToolCallRequest,
-        next: agent::ToolCallNext<'_>,
-    ) -> StdResult<agent::ToolOutcome, agent::ToolSystemError> {
-        let call = request.call().clone();
-        let dispatch = ToolDispatch::new(
-            &self.registry,
-            &self.env,
-            &self.config,
-            &self.emitter,
-            &self.session_id,
-            &self.root_session_id,
-        )
-        .with_redactor(&self.redactor);
-        dispatch.begin_terminal(&call);
-        let outcome = next.run(request).await;
-        let previous = self
-            .tool_output_stats
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&call.id);
-        match outcome {
-            Ok(outcome) => Ok(dispatch.finish_terminal(&call, outcome, previous)),
-            Err(error) => {
-                let _ = dispatch.finish_terminal(
-                    &call,
-                    agent::ToolOutcome::failure(ToolErrorKind::Execution, error.message()),
-                    previous,
-                );
-                Err(error)
-            }
-        }
-    }
-}
-
-#[async_trait]
 impl agent::TurnBoundaryHooks for CodingAgentBridge {
     async fn before_model(
         &self,
@@ -944,8 +827,8 @@ impl CodingRuntime {
         let mut builder = agent::Agent::builder(model_service, self.model_selector.clone())
             .system_prompt(self.system_prompt.clone())
             .messages(messages)
-            .tool_service(bridge.clone())
-            .tool_middleware(bridge.clone())
+            .tool_service(bridge.tools.clone())
+            .tool_middleware(bridge.tools.clone())
             .control_handle(self.agent_control.clone())
             .turn_boundary_hooks(bridge.clone())
             .event_projection(bridge.clone())

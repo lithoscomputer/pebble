@@ -8,27 +8,54 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use lithos_llm::types::{ContentPart, ToolCall, ToolDefinition, ToolResult};
+use pebble_agent::{
+    ToolCallNext, ToolCallRequest, ToolDescriptor, ToolMiddleware, ToolOutcome, ToolSystemError,
+};
 use pebble_coding_agent::CodingAgentOptions;
 use pebble_coding_agent::environment::Environment;
 use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent};
 use pebble_coding_agent::test_support::MockEnvironment;
 use pebble_coding_agent::tools::{
-    CodingToolSet, RegisteredTool, ToolAccess, ToolAccessPolicy, ToolApprovalAdapter, ToolError,
-    ToolErrorKind, ToolExposureMode, ToolHookCallback, ToolHookDecision, ToolRunner, ToolSource,
+    ApprovalDecision, CodingToolSet, PermissionMiddleware, RegisteredTool, ToolApprovalService,
+    ToolError, ToolErrorKind, ToolPermission, ToolPermissionPolicy, ToolRunner, ToolSource,
 };
-use serde_json::{Value, json};
+use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 /// A policy that denies exactly one tool.
 struct Denying(&'static str);
 
-impl ToolAccessPolicy for Denying {
-    fn access_for_tool(&self, tool_name: &str) -> ToolAccess {
-        if tool_name == self.0 {
-            ToolAccess::Denied
+impl ToolPermissionPolicy for Denying {
+    fn permission(&self, tool: &ToolDescriptor) -> ToolPermission {
+        if tool.id().as_str() == self.0 {
+            ToolPermission::Deny {
+                reason: format!("{} denied by tool permission policy", tool.id()),
+            }
         } else {
-            ToolAccess::Allowed
+            ToolPermission::Allow
         }
+    }
+}
+
+struct ApprovalRequired;
+
+impl ToolPermissionPolicy for ApprovalRequired {
+    fn permission(&self, _tool: &ToolDescriptor) -> ToolPermission {
+        ToolPermission::RequireApproval
+    }
+}
+
+struct RejectApproval;
+
+#[async_trait::async_trait]
+impl ToolApprovalService for RejectApproval {
+    async fn approve(
+        &self,
+        request: &ToolCallRequest,
+    ) -> Result<ApprovalDecision, ToolSystemError> {
+        Ok(ApprovalDecision::Deny {
+            reason: format!("{} is not allowed by approval", request.call().name),
+        })
     }
 }
 
@@ -53,24 +80,22 @@ impl HookLog {
 }
 
 #[async_trait::async_trait]
-impl ToolHookCallback for HookLog {
-    async fn pre_tool_use(&self, tool_name: &str, _tool_input: &Value) -> ToolHookDecision {
-        self.push(format!("pre {tool_name}"));
-        ToolHookDecision::Proceed
-    }
-
-    async fn post_tool_use(&self, tool_name: &str, tool_call_id: &str, _tool_output: &str) {
-        self.push(format!("post {tool_name} {tool_call_id}"));
-    }
-
-    async fn post_tool_use_failure(
+impl ToolMiddleware for HookLog {
+    async fn call(
         &self,
-        tool_name: &str,
-        tool_call_id: &str,
-        _error: &str,
-        error_kind: ToolErrorKind,
-    ) {
-        self.push(format!("fail {tool_name} {tool_call_id} {error_kind:?}"));
+        request: ToolCallRequest,
+        next: ToolCallNext<'_>,
+    ) -> Result<ToolOutcome, ToolSystemError> {
+        let name = request.call().name.clone();
+        let id = request.call().id.clone();
+        self.push(format!("pre {name}"));
+        let outcome = next.run(request).await?;
+        match &outcome {
+            ToolOutcome::Success(_) => self.push(format!("post {name} {id}")),
+            ToolOutcome::Failure { kind, .. } => self.push(format!("fail {name} {id} {kind:?}")),
+            _ => self.push(format!("fail {name} {id} unknown")),
+        }
+        Ok(outcome)
     }
 }
 
@@ -179,7 +204,8 @@ async fn a_runner_reads_and_writes_through_the_environment_and_reports_each_call
             ),
             CancellationToken::new(),
         )
-        .await;
+        .await
+        .expect("the runner completes");
     assert!(!read.is_error, "{}", text_of(&read));
     assert!(text_of(&read).contains("hello from the mock"));
 
@@ -192,7 +218,8 @@ async fn a_runner_reads_and_writes_through_the_environment_and_reports_each_call
             ),
             CancellationToken::new(),
         )
-        .await;
+        .await
+        .expect("the runner completes");
     assert!(!written.is_error, "{}", text_of(&written));
     assert_eq!(
         mock.written_files
@@ -236,22 +263,21 @@ async fn a_runner_reads_and_writes_through_the_environment_and_reports_each_call
 
 #[tokio::test]
 async fn a_runner_applies_the_policy_a_session_would() {
-    let (runner, log) = runner_with(
-        mock_environment(),
-        CodingAgentOptions::default()
-            .with_tool_access_policy(Arc::new(Denying("shell")))
-            .with_tool_exposure_mode(ToolExposureMode::IncludeRequiresApproval),
-    );
+    let (runner, log) = runner_with(mock_environment(), CodingAgentOptions::default());
+    let runner = runner.tool_middleware(Arc::new(PermissionMiddleware::new(Arc::new(Denying(
+        "shell",
+    )))));
 
     let result = runner
         .run(
             &ToolCall::function("call_shell", "shell", json!({"command": "rm -rf /"})),
             CancellationToken::new(),
         )
-        .await;
+        .await
+        .expect("the runner completes");
 
     assert!(result.is_error);
-    assert_eq!(text_of(&result), "shell tool denied by tool access policy");
+    assert_eq!(text_of(&result), "shell denied by tool permission policy");
     assert!(matches!(log.completion(), CodingEvent::ToolCallCompleted {
         is_error: true,
         error_kind: Some(ToolErrorKind::Denied),
@@ -260,13 +286,10 @@ async fn a_runner_applies_the_policy_a_session_would() {
 }
 
 #[tokio::test]
-async fn a_runner_calls_the_hooks_a_session_would() {
+async fn a_runner_calls_middleware_around_each_call() {
     let hooks = Arc::new(HookLog::default());
-    let (runner, _log) = runner_with(
-        mock_environment(),
-        CodingAgentOptions::default()
-            .with_tool_hooks(Arc::clone(&hooks) as Arc<dyn ToolHookCallback>),
-    );
+    let (runner, _log) = runner_with(mock_environment(), CodingAgentOptions::default());
+    let runner = runner.tool_middleware(Arc::clone(&hooks) as Arc<dyn ToolMiddleware>);
 
     let ok = runner
         .run(
@@ -277,7 +300,8 @@ async fn a_runner_calls_the_hooks_a_session_would() {
             ),
             CancellationToken::new(),
         )
-        .await;
+        .await
+        .expect("the runner completes");
     let missing = runner
         .run(
             &ToolCall::function(
@@ -287,7 +311,8 @@ async fn a_runner_calls_the_hooks_a_session_would() {
             ),
             CancellationToken::new(),
         )
-        .await;
+        .await
+        .expect("the runner completes");
 
     assert!(!ok.is_error);
     assert!(missing.is_error);
@@ -300,13 +325,12 @@ async fn a_runner_calls_the_hooks_a_session_would() {
 }
 
 #[tokio::test]
-async fn a_hook_that_blocks_a_call_answers_it_with_the_reason() {
-    let (runner, _log) = runner_with(
-        mock_environment(),
-        CodingAgentOptions::default().with_tool_hooks(Arc::new(ToolApprovalAdapter(Arc::new(
-            |name, _arguments| Err(format!("{name} is not allowed from a hook")),
-        )))),
-    );
+async fn an_approval_that_blocks_a_call_answers_it_with_the_reason() {
+    let (runner, _log) = runner_with(mock_environment(), CodingAgentOptions::default());
+    let runner = runner.tool_middleware(Arc::new(
+        PermissionMiddleware::new(Arc::new(ApprovalRequired))
+            .with_approval(Arc::new(RejectApproval)),
+    ));
 
     let result = runner
         .run(
@@ -317,10 +341,11 @@ async fn a_hook_that_blocks_a_call_answers_it_with_the_reason() {
             ),
             CancellationToken::new(),
         )
-        .await;
+        .await
+        .expect("the runner completes");
 
     assert!(result.is_error);
-    assert_eq!(text_of(&result), "read_file is not allowed from a hook");
+    assert_eq!(text_of(&result), "read_file is not allowed by approval");
 }
 
 #[tokio::test]
@@ -350,7 +375,8 @@ async fn a_runner_bounds_output_like_a_session() {
             &ToolCall::function("call_big", "big", json!({})),
             CancellationToken::new(),
         )
-        .await;
+        .await
+        .expect("the runner completes");
 
     assert!(!result.is_error, "a bounded output is not a failed call");
     let CodingEvent::ToolCallCompleted {
@@ -393,15 +419,17 @@ async fn an_unknown_tool_and_a_cancelled_call_are_both_answered() {
             &ToolCall::function("call_nope", "nope", json!({})),
             CancellationToken::new(),
         )
-        .await;
+        .await
+        .expect("the runner completes");
     let cancel = CancellationToken::new();
     cancel.cancel();
     let cancelled = runner
         .run(&ToolCall::function("call_wait", "waits", json!({})), cancel)
-        .await;
+        .await
+        .expect("the runner completes");
 
     assert!(unknown.is_error);
-    assert_eq!(text_of(&unknown), "Unknown tool: nope");
+    assert_eq!(text_of(&unknown), "unknown tool `nope`");
     assert!(cancelled.is_error);
     assert_eq!(text_of(&cancelled), "Cancelled");
 }

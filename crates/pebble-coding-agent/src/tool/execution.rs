@@ -4,12 +4,10 @@
 //! call it is given — including the ones it refuses — so a conversation never
 //! carries a call without its result.
 //!
-//! Each call runs the same pipeline: publish that it started, ask the session's
-//! access policy, ask the hooks, run the tool, bound its output, publish the
-//! result, tell the hooks, then cut a smaller copy for history. The order is
-//! the contract. Hooks and events always see the same bounded output, and
-//! history sees the further-truncated copy, so what an application observes and
-//! what the model re-reads next turn can differ in size but never in substance.
+//! Each call runs through one tool service and its middleware. The fixed outer
+//! layer publishes the start, application middleware may continue or refuse,
+//! the terminal runs the tool, and the outer layer bounds and publishes the
+//! result. History sees a further-truncated copy.
 //!
 //! Output is bounded twice, by
 //! [`CodingAgentOptions::tool_output_retention_bytes`] and
@@ -22,9 +20,11 @@
 //! and its peers are refused with an explanation the model can act on.
 
 use std::borrow::Cow;
-use std::sync::Arc;
-use std::time::Instant;
+use std::collections::HashMap;
+use std::result::Result as StdResult;
+use std::sync::{Arc, Mutex, PoisonError};
 
+use async_trait::async_trait;
 #[cfg(test)]
 use futures_util::future::join_all;
 use lithos_llm::types::{ContentPart, ToolCall, ToolCallKind, ToolDefinitionKind, ToolResult};
@@ -32,19 +32,16 @@ use pebble_agent as agent;
 use pebble_agent::integration::validate_tool_arguments;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
 
 use super::error::ToolError;
 use super::permissions::canonical_tool_name;
 use super::registry::{
     CodingEventEmitter, RegisteredTool, ToolContext, ToolEnvProvider, ToolRegistry,
 };
-use crate::config::{CodingAgentOptions, ToolHookDecision};
+use crate::config::CodingAgentOptions;
 use crate::environment::Environment;
 use crate::event::{Emitter, OutputCaptureStats, SessionBoundEmitter};
-use crate::human_input::HumanInputProvider;
-#[cfg(test)]
-use crate::human_input::is_question_tool;
+use crate::human_input::{HumanInputProvider, is_question_tool};
 use crate::redact::Redactor;
 use crate::truncation::{
     OutputBudgets, ToolOutputLimits, preview_tool_output, serialized_json_bytes,
@@ -67,6 +64,193 @@ const QUESTIONS_RUN_ALONE: &str = "This tool call was not executed because human
 /// What a call that never started is told.
 #[cfg(test)]
 const CANCELLED: &str = "Cancelled";
+
+/// The coding-tool terminal and its fixed event/output envelope.
+///
+/// A coding agent and a standalone runner both put this service outside their
+/// application middleware. This keeps call events and output limits identical,
+/// including when inner middleware refuses a call without reaching the tool.
+#[derive(Clone)]
+pub(crate) struct CodingToolService {
+    registry:          ToolRegistry,
+    env:               Arc<dyn Environment>,
+    config:            CodingAgentOptions,
+    emitter:           Emitter,
+    session_id:        String,
+    root_session_id:   String,
+    tool_env_provider: Arc<Mutex<Option<Arc<dyn ToolEnvProvider>>>>,
+    human_input:       Option<Arc<dyn HumanInputProvider>>,
+    redactor:          Arc<dyn Redactor>,
+    output_stats:      Arc<Mutex<HashMap<String, OutputCaptureStats>>>,
+}
+
+impl CodingToolService {
+    /// Creates a service with no optional call providers.
+    pub(crate) fn new(
+        registry: ToolRegistry,
+        env: Arc<dyn Environment>,
+        config: CodingAgentOptions,
+        emitter: Emitter,
+        session_id: String,
+        root_session_id: String,
+        redactor: Arc<dyn Redactor>,
+    ) -> Self {
+        Self {
+            registry,
+            env,
+            config,
+            emitter,
+            session_id,
+            root_session_id,
+            tool_env_provider: Arc::new(Mutex::new(None)),
+            human_input: None,
+            redactor,
+            output_stats: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Sets where a call gets its extra environment variables.
+    #[must_use]
+    pub(crate) fn with_tool_env_provider(mut self, provider: Arc<dyn ToolEnvProvider>) -> Self {
+        self.tool_env_provider = Arc::new(Mutex::new(Some(provider)));
+        self
+    }
+
+    /// Sets where a human-question tool gets its answers.
+    #[must_use]
+    pub(crate) fn with_human_input(mut self, provider: Arc<dyn HumanInputProvider>) -> Self {
+        self.human_input = Some(provider);
+        self
+    }
+
+    /// Replaces the provider used by later calls.
+    #[cfg(test)]
+    pub(crate) fn set_tool_env_provider(&self, provider: Arc<dyn ToolEnvProvider>) {
+        *self
+            .tool_env_provider
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(provider);
+    }
+
+    /// Clears process-output state left by a cancelled prompt.
+    pub(crate) fn begin_prompt(&self) {
+        self.output_stats
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+
+    fn dispatch(&self) -> ToolDispatch<'_> {
+        ToolDispatch::new(
+            &self.registry,
+            &self.env,
+            &self.config,
+            &self.emitter,
+            &self.session_id,
+            &self.root_session_id,
+        )
+        .with_redactor(&self.redactor)
+    }
+
+    /// Answers a call that the shared kernel could not enter into middleware.
+    pub(crate) fn answer_failure(
+        &self,
+        call: &ToolCall,
+        kind: ToolErrorKind,
+        message: impl Into<String>,
+    ) -> agent::ToolOutcome {
+        let dispatch = self.dispatch();
+        dispatch.begin_terminal(call);
+        dispatch.finish_terminal(call, agent::ToolOutcome::failure(kind, message), None)
+    }
+}
+
+#[async_trait]
+impl agent::ToolService for CodingToolService {
+    async fn discover(
+        &self,
+        _context: agent::ToolDiscoveryContext<'_>,
+    ) -> StdResult<agent::ToolCatalog, agent::ToolSystemError> {
+        let tools = self
+            .registry
+            .definitions_with_source()
+            .into_iter()
+            .map(|tool| {
+                let name = tool.definition.name.clone();
+                let id = agent::ToolId::try_new(canonical_tool_name(&name)).map_err(|source| {
+                    agent::ToolSystemError::with_source(
+                        format!("tool `{name}` has no stable identity"),
+                        source,
+                    )
+                })?;
+                let scheduling = if is_question_tool(&name) {
+                    agent::ToolScheduling::ExclusiveRound
+                } else {
+                    agent::ToolScheduling::Concurrent
+                };
+                Ok(agent::ToolDescriptor::new(id, tool.definition).with_scheduling(scheduling))
+            })
+            .collect::<StdResult<Vec<_>, agent::ToolSystemError>>()?;
+        Ok(agent::ToolCatalog::new(tools))
+    }
+
+    async fn call(
+        &self,
+        request: agent::ToolCallRequest,
+    ) -> StdResult<agent::ToolOutcome, agent::ToolSystemError> {
+        let call_id = request.call().id.clone();
+        let tool_env_provider = self
+            .tool_env_provider
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let mut dispatch = self.dispatch();
+        if let Some(provider) = tool_env_provider.as_ref() {
+            dispatch = dispatch.with_tool_env_provider(provider);
+        }
+        if let Some(provider) = self.human_input.as_ref() {
+            dispatch = dispatch.with_human_input(provider);
+        }
+        let (outcome, stats) = dispatch.execute_terminal(request).await;
+        if let Some(stats) = stats {
+            self.output_stats
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(call_id, stats);
+        }
+        Ok(outcome)
+    }
+}
+
+#[async_trait]
+impl agent::ToolMiddleware for CodingToolService {
+    async fn call(
+        &self,
+        request: agent::ToolCallRequest,
+        next: agent::ToolCallNext<'_>,
+    ) -> StdResult<agent::ToolOutcome, agent::ToolSystemError> {
+        let call = request.call().clone();
+        let dispatch = self.dispatch();
+        dispatch.begin_terminal(&call);
+        let outcome = next.run(request).await;
+        let previous = self
+            .output_stats
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&call.id);
+        match outcome {
+            Ok(outcome) => Ok(dispatch.finish_terminal(&call, outcome, previous)),
+            Err(error) => {
+                let _ = dispatch.finish_terminal(
+                    &call,
+                    agent::ToolOutcome::failure(ToolErrorKind::Execution, error.message()),
+                    previous,
+                );
+                Err(error)
+            }
+        }
+    }
+}
 
 /// One session's tool dispatch: the registry, the environment, and everything
 /// a call is answered with.
@@ -190,13 +374,25 @@ impl<'a> ToolDispatch<'a> {
         }
     }
 
-    /// Answers one call, publishing the same events a round would.
+    /// Answers one call without application middleware.
+    #[cfg(test)]
     pub(crate) async fn execute_one(
         &self,
         call: &ToolCall,
         cancel: CancellationToken,
     ) -> ToolResult {
-        self.execute_one_with_policy(call, cancel, true).await
+        self.emit_started(call);
+        let executed = self
+            .run_tool(call, self.registry.get(&call.name), cancel)
+            .await;
+        let retained = self.retain(executed.result, executed.output_stats);
+        self.emit_result(
+            call,
+            &retained.result,
+            retained.output_stats,
+            executed.error_kind,
+        );
+        self.truncate_for_history(retained.result, &call.name)
     }
 
     /// Runs one call after the shared agent middleware approved it.
@@ -270,82 +466,6 @@ impl<'a> ToolDispatch<'a> {
         }
     }
 
-    #[tracing::instrument(
-        name = "coding_tool_call",
-        skip_all,
-        fields(
-            session_id = self.session_id,
-            tool = %call.name,
-            tool_call_id = %call.id
-        )
-    )]
-    async fn execute_one_with_policy(
-        &self,
-        call: &ToolCall,
-        cancel: CancellationToken,
-        apply_policy: bool,
-    ) -> ToolResult {
-        self.emit_started(call);
-
-        let denial_reason = apply_policy
-            .then(|| self.config.tool_access_denial_reason(&call.name))
-            .flatten();
-        if let Some(reason) = denial_reason {
-            return self.finish_error(call, &ToolError::denied(reason));
-        }
-
-        if apply_policy && let Some(hooks) = self.config.tool_hooks.as_ref() {
-            debug!(tool = %call.name, hook_event = "pre_tool_use", "Calling tool hook");
-            let started = Instant::now();
-            let decision = hooks.pre_tool_use(&call.name, &call.arguments).await;
-            let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            debug!(
-                tool = %call.name,
-                hook_event = "pre_tool_use",
-                ?decision,
-                duration_ms,
-                "Tool hook complete"
-            );
-
-            if let ToolHookDecision::Block { reason } = decision {
-                return self.finish_error(call, &ToolError::denied(reason));
-            }
-        }
-
-        let executed = self
-            .run_tool(call, self.registry.get(&call.name), cancel.clone())
-            .await;
-        let error_kind = executed.error_kind;
-        let retained = self.retain(executed.result, executed.output_stats);
-        let result = retained.result;
-
-        self.emit_result(call, &result, retained.output_stats, error_kind);
-
-        if apply_policy && let Some(hooks) = self.config.tool_hooks.as_ref() {
-            let content = result_text(&result);
-            if result.is_error {
-                debug!(tool = %call.name, hook_event = "post_tool_use_failure", "Calling tool hook");
-                hooks
-                    .post_tool_use_failure(
-                        &call.name,
-                        &call.id,
-                        content.as_ref(),
-                        error_kind.unwrap_or(ToolErrorKind::Execution),
-                    )
-                    .await;
-                debug!(tool = %call.name, hook_event = "post_tool_use_failure", "Tool hook complete");
-            } else {
-                debug!(tool = %call.name, hook_event = "post_tool_use", "Calling tool hook");
-                hooks
-                    .post_tool_use(&call.name, &call.id, content.as_ref())
-                    .await;
-                debug!(tool = %call.name, hook_event = "post_tool_use", "Tool hook complete");
-            }
-        }
-
-        self.truncate_for_history(result, &call.name)
-    }
-
     #[cfg(test)]
     async fn execute_sequential(
         &self,
@@ -358,10 +478,7 @@ impl<'a> ToolDispatch<'a> {
                 results.push(self.cancelled_result(call));
                 continue;
             }
-            results.push(
-                self.execute_one_with_policy(call, cancel.child_token(), true)
-                    .await,
-            );
+            results.push(self.execute_one(call, cancel.child_token()).await);
         }
         results
     }
@@ -375,7 +492,7 @@ impl<'a> ToolDispatch<'a> {
         join_all(
             calls
                 .iter()
-                .map(|call| self.execute_one_with_policy(call, cancel.child_token(), true)),
+                .map(|call| self.execute_one(call, cancel.child_token())),
         )
         .await
     }
@@ -401,8 +518,7 @@ impl<'a> ToolDispatch<'a> {
             }
 
             let result = if Some(index) == first_question {
-                self.execute_one_with_policy(call, cancel.child_token(), true)
-                    .await
+                self.execute_one(call, cancel.child_token()).await
             } else if is_question_tool(&call.name) {
                 self.refuse(call, &ToolError::denied(ONE_QUESTION_PER_ROUND))
             } else {
@@ -505,6 +621,7 @@ impl<'a> ToolDispatch<'a> {
     }
 
     /// Bounds, publishes, and truncates a failure whose started event is out.
+    #[cfg(test)]
     fn finish_error(&self, call: &ToolCall, error: &ToolError) -> ToolResult {
         let retained = self.retain(self.error_result(call, error), None);
         self.emit_result(
@@ -668,8 +785,7 @@ fn text_part_mut(result: &mut ToolResult) -> Option<&mut String> {
     }
 }
 
-/// A result's output as text, which is what hooks read and what the output
-/// fragment carries.
+/// A result's output as text, which is what the output fragment carries.
 ///
 /// Also what the modules that read finished results — file tracking and the
 /// compaction transcript — see, so a tool's output is rendered the same way
@@ -691,7 +807,6 @@ fn output_value(result: &ToolResult) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
     use std::io;
     use std::sync::{Mutex, PoisonError};
 
@@ -702,9 +817,6 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::*;
-    use crate::config::{
-        ToolAccess, ToolAccessPolicy, ToolExposureMode, ToolHookCallback, ToolHookDecision,
-    };
     use crate::environment::EnvironmentError;
     use crate::error::Result as PebbleResult;
     use crate::event::{EventOptions, EventPump};
@@ -761,96 +873,6 @@ mod tests {
                     _ => None,
                 })
                 .collect()
-        }
-    }
-
-    struct NamedPolicy {
-        decisions: HashMap<String, ToolAccess>,
-    }
-
-    impl NamedPolicy {
-        fn new(decisions: impl IntoIterator<Item = (&'static str, ToolAccess)>) -> Self {
-            Self {
-                decisions: decisions
-                    .into_iter()
-                    .map(|(name, access)| (name.to_owned(), access))
-                    .collect(),
-            }
-        }
-    }
-
-    impl ToolAccessPolicy for NamedPolicy {
-        fn access_for_tool(&self, tool_name: &str) -> ToolAccess {
-            self.decisions
-                .get(tool_name)
-                .copied()
-                .unwrap_or(ToolAccess::Denied)
-        }
-    }
-
-    #[derive(Debug, Default)]
-    struct RecordingHooks {
-        pre_decision: ToolHookDecision,
-        succeeded:    Mutex<Vec<(String, String, String)>>,
-        failed:       Mutex<Vec<(String, String, String, ToolErrorKind)>>,
-    }
-
-    impl RecordingHooks {
-        fn new(pre_decision: ToolHookDecision) -> Self {
-            Self {
-                pre_decision,
-                ..Self::default()
-            }
-        }
-
-        fn succeeded(&self) -> Vec<(String, String, String)> {
-            self.succeeded
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone()
-        }
-
-        fn failed(&self) -> Vec<(String, String, String, ToolErrorKind)> {
-            self.failed
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone()
-        }
-    }
-
-    #[async_trait]
-    impl ToolHookCallback for RecordingHooks {
-        async fn pre_tool_use(&self, _tool_name: &str, _tool_input: &Value) -> ToolHookDecision {
-            self.pre_decision.clone()
-        }
-
-        async fn post_tool_use(&self, tool_name: &str, tool_call_id: &str, tool_output: &str) {
-            self.succeeded
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push((
-                    tool_name.to_owned(),
-                    tool_call_id.to_owned(),
-                    tool_output.to_owned(),
-                ));
-        }
-
-        async fn post_tool_use_failure(
-            &self,
-            tool_name: &str,
-            tool_call_id: &str,
-            error: &str,
-            error_kind: ToolErrorKind,
-        ) {
-            self.failed
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push((
-                    tool_name.to_owned(),
-                    tool_call_id.to_owned(),
-                    error.to_owned(),
-                    error_kind,
-                ));
         }
     }
 
@@ -1222,260 +1244,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_pre_hook_blocks_execution() {
-        let registry = registry_with([echo_tool()]);
-        let environment = environment();
-        let config = CodingAgentOptions {
-            tool_hooks: Some(Arc::new(RecordingHooks::new(ToolHookDecision::Block {
-                reason: "blocked by hook".to_owned(),
-            }))),
-            ..CodingAgentOptions::default()
-        };
-        let events = Events::new();
-
-        let result = ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .execute_one(
-            &call("echo", "call_1", json!({"text": "hello"})),
-            CancellationToken::new(),
-        )
-        .await;
-
-        assert!(result.is_error);
-        assert!(text_of(&result).contains("blocked by hook"));
-        assert!(matches!(
-            completion(&events.drain().await),
-            CodingEvent::ToolCallCompleted {
-                error_kind: Some(ToolErrorKind::Denied),
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn a_pre_hook_that_proceeds_lets_the_tool_run() {
-        let registry = registry_with([echo_tool()]);
-        let environment = environment();
-        let config = CodingAgentOptions {
-            tool_hooks: Some(Arc::new(RecordingHooks::new(ToolHookDecision::Proceed))),
-            ..CodingAgentOptions::default()
-        };
-        let events = Events::new();
-
-        let result = ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .execute_one(
-            &call("echo", "call_1", json!({"text": "hello"})),
-            CancellationToken::new(),
-        )
-        .await;
-
-        assert!(!result.is_error);
-        assert_eq!(text_of(&result), "echo: hello");
-    }
-
-    #[tokio::test]
-    async fn the_success_hook_fires_on_success_and_the_failure_hook_does_not() {
-        let hooks = Arc::new(RecordingHooks::new(ToolHookDecision::Proceed));
-        let registry = registry_with([echo_tool()]);
-        let environment = environment();
-        let config = CodingAgentOptions {
-            tool_hooks: Some(Arc::clone(&hooks) as Arc<dyn ToolHookCallback>),
-            ..CodingAgentOptions::default()
-        };
-        let events = Events::new();
-
-        ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .execute_one(
-            &call("echo", "call_1", json!({"text": "hello"})),
-            CancellationToken::new(),
-        )
-        .await;
-
-        let succeeded = hooks.succeeded();
-        assert_eq!(succeeded.len(), 1);
-        assert_eq!(succeeded[0].0, "echo");
-        assert_eq!(succeeded[0].1, "call_1");
-        assert!(succeeded[0].2.contains("echo: hello"));
-        assert!(hooks.failed().is_empty());
-    }
-
-    #[tokio::test]
-    async fn the_failure_hook_is_told_which_kind_of_failure_it_was() {
-        let hooks = Arc::new(RecordingHooks::new(ToolHookDecision::Proceed));
-        let registry = registry_with([failing_tool()]);
-        let environment = environment();
-        let config = CodingAgentOptions {
-            tool_hooks: Some(Arc::clone(&hooks) as Arc<dyn ToolHookCallback>),
-            ..CodingAgentOptions::default()
-        };
-        let events = Events::new();
-
-        ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .execute_one(
-            &call("fail_tool", "call_1", json!({})),
-            CancellationToken::new(),
-        )
-        .await;
-
-        let failed = hooks.failed();
-        assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].0, "fail_tool");
-        assert_eq!(failed[0].1, "call_1");
-        assert!(failed[0].2.contains("tool failed"));
-        assert_eq!(failed[0].3, ToolErrorKind::Execution);
-        assert!(hooks.succeeded().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_session_without_hooks_calls_none() {
-        let registry = registry_with([echo_tool()]);
-        let environment = environment();
-        let config = CodingAgentOptions::default();
-        let events = Events::new();
-
-        let result = ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .execute_one(
-            &call("echo", "call_1", json!({"text": "hello"})),
-            CancellationToken::new(),
-        )
-        .await;
-
-        assert!(!result.is_error);
-    }
-
-    #[tokio::test]
-    async fn a_denied_tool_is_refused_before_it_is_looked_up() {
-        let runs = Arc::new(Mutex::new(0_usize));
-        let counter = Arc::clone(&runs);
-        let registry = registry_with([RegisteredTool::new(
-            ToolDefinition::function("write_file", "Writes a file", json!({"type": "object"})),
-            Arc::new(move |_arguments, _context| {
-                let counter = Arc::clone(&counter);
-                Box::pin(async move {
-                    *counter.lock().unwrap_or_else(PoisonError::into_inner) += 1;
-                    Ok("wrote".to_owned())
-                })
-            }),
-        )
-        .with_source(ToolSource::Native)]);
-        let environment = environment();
-        let config = CodingAgentOptions {
-            tool_access_policy: Some(Arc::new(NamedPolicy::new([(
-                "write_file",
-                ToolAccess::Denied,
-            )]))),
-            tool_exposure_mode: ToolExposureMode::IncludeRequiresApproval,
-            ..CodingAgentOptions::default()
-        };
-        let events = Events::new();
-
-        let result = ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .execute_one(
-            &call("write_file", "call_1", json!({})),
-            CancellationToken::new(),
-        )
-        .await;
-
-        assert!(result.is_error);
-        assert!(text_of(&result).contains("denied by tool access policy"));
-        assert_eq!(*runs.lock().unwrap_or_else(PoisonError::into_inner), 0);
-        assert!(matches!(
-            completion(&events.drain().await),
-            CodingEvent::ToolCallCompleted {
-                error_kind: Some(ToolErrorKind::Denied),
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn a_tool_the_exposure_mode_hides_is_refused() {
-        let runs = Arc::new(Mutex::new(0_usize));
-        let counter = Arc::clone(&runs);
-        let registry = registry_with([RegisteredTool::new(
-            ToolDefinition::function("shell", "Runs a command", json!({"type": "object"})),
-            Arc::new(move |_arguments, _context| {
-                let counter = Arc::clone(&counter);
-                Box::pin(async move {
-                    *counter.lock().unwrap_or_else(PoisonError::into_inner) += 1;
-                    Ok("ran".to_owned())
-                })
-            }),
-        )
-        .with_source(ToolSource::Native)]);
-        let environment = environment();
-        let config = CodingAgentOptions {
-            tool_access_policy: Some(Arc::new(NamedPolicy::new([(
-                "shell",
-                ToolAccess::RequiresApproval,
-            )]))),
-            tool_exposure_mode: ToolExposureMode::AutoApprovedOnly,
-            ..CodingAgentOptions::default()
-        };
-        let events = Events::new();
-
-        let result = ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .execute_one(
-            &call("shell", "call_1", json!({})),
-            CancellationToken::new(),
-        )
-        .await;
-
-        assert!(result.is_error);
-        assert!(text_of(&result).contains("requires approval"));
-        assert_eq!(*runs.lock().unwrap_or_else(PoisonError::into_inner), 0);
-        drop(events.drain().await);
-    }
-
-    #[tokio::test]
     async fn tool_output_is_bounded_before_events_and_history() {
         let registry = registry_with([echo_tool()]);
         let environment = environment();
@@ -1576,11 +1344,7 @@ mod tests {
     async fn a_tool_that_runs_a_process_reports_it_before_its_own_completion() {
         let registry = registry_with([process_tool(7)]);
         let environment = environment();
-        let hooks = Arc::new(RecordingHooks::new(ToolHookDecision::Proceed));
-        let config = CodingAgentOptions {
-            tool_hooks: Some(Arc::clone(&hooks) as Arc<dyn ToolHookCallback>),
-            ..CodingAgentOptions::default()
-        };
+        let config = CodingAgentOptions::default();
         let events = Events::new();
 
         let result = ToolDispatch::new(
@@ -1612,40 +1376,6 @@ mod tests {
             .find(|event| matches!(event.event, CodingEvent::ToolProcessCompleted { .. }))
             .expect("a process event");
         assert_eq!(process.tool_call_id.as_deref(), Some("call_1"));
-
-        assert_eq!(hooks.failed().len(), 1);
-        assert!(hooks.succeeded().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_process_that_succeeds_runs_only_the_success_hook() {
-        let registry = registry_with([process_tool(0)]);
-        let environment = environment();
-        let hooks = Arc::new(RecordingHooks::new(ToolHookDecision::Proceed));
-        let config = CodingAgentOptions {
-            tool_hooks: Some(Arc::clone(&hooks) as Arc<dyn ToolHookCallback>),
-            ..CodingAgentOptions::default()
-        };
-        let events = Events::new();
-
-        let result = ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .execute_one(
-            &call("shell", "call_1", json!({})),
-            CancellationToken::new(),
-        )
-        .await;
-
-        assert!(!result.is_error);
-        assert_eq!(hooks.succeeded().len(), 1);
-        assert!(hooks.failed().is_empty());
-        drop(events.drain().await);
     }
 
     #[tokio::test]

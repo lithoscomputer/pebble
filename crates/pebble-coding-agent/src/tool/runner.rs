@@ -4,25 +4,29 @@
 //! loop — a hook that reads a file the way the agent would, a workflow step
 //! that runs a command with the agent's output budgets. [`CodingToolSet`]
 //! selects and describes the built-in tools, and [`ToolRunner`] executes one
-//! call against an [`Environment`] through the same pipeline a session uses:
-//! the same access policy, the same hooks, the same error rendering, and the
-//! same output limits. The registry and the dispatch engine underneath are not
+//! call against an [`Environment`] through the same tool service and middleware
+//! stack a session uses. The registry and dispatch engine underneath are not
 //! the supported route; this facade is.
 
 use std::fmt;
+use std::result::Result as StdResult;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lithos_llm::types::{ToolCall, ToolDefinition, ToolResult};
+use lithos_llm::types::{ContentPart, Message, ToolCall, ToolDefinition, ToolResult};
+use pebble_agent::integration::validate_tool_arguments;
+use pebble_agent::{
+    ToolCallRequest, ToolDiscoveryContext, ToolMiddleware, ToolOutcome, ToolSystem,
+};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use super::execution::ToolDispatch;
+use super::execution::CodingToolService;
 use super::registry::{RegisteredTool, ToolDefinitionWithSource, ToolEnvProvider, ToolRegistry};
 use crate::config::{CodingAgentOptions, NativeToolOptions};
 use crate::environment::Environment;
 use crate::event::{EventOptions, EventPump, EventSink, EventSinkError};
-use crate::redact::Redactor;
+use crate::redact::{NoRedaction, Redactor};
 use crate::search::SearchProvider;
 use crate::tools::{
     WebFetchSummarizer, make_edit_file_tool, make_glob_tool, make_grep_tool, make_read_file_tool,
@@ -143,6 +147,7 @@ pub struct ToolRunner {
     registry:          ToolRegistry,
     environment:       Arc<dyn Environment>,
     options:           CodingAgentOptions,
+    tool_middleware:   Vec<Arc<dyn ToolMiddleware>>,
     redactor:          Option<Arc<dyn Redactor>>,
     tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
     on_event:          Option<ToolEventCallback>,
@@ -157,6 +162,7 @@ impl ToolRunner {
             registry: tools.registry,
             environment,
             options: CodingAgentOptions::default(),
+            tool_middleware: Vec::new(),
             redactor: None,
             tool_env_provider: None,
             on_event: None,
@@ -164,14 +170,17 @@ impl ToolRunner {
         }
     }
 
-    /// Sets the policy, hooks, and output budgets calls run under.
-    ///
-    /// The same record a session takes, read the same way: the access policy
-    /// and exposure mode decide whether a call runs, the hooks bracket it, and
-    /// the output budgets bound what it answers with.
+    /// Sets the output and execution options calls run under.
     #[must_use]
     pub fn options(mut self, options: CodingAgentOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Adds one middleware inside the runner's fixed event/output envelope.
+    #[must_use]
+    pub fn tool_middleware(mut self, middleware: Arc<dyn ToolMiddleware>) -> Self {
+        self.tool_middleware.push(middleware);
         self
     }
 
@@ -217,11 +226,20 @@ impl ToolRunner {
 
     /// Executes one call and answers it.
     ///
-    /// Every call is answered, including one the policy refuses, one the hooks
-    /// block, one naming a tool the runner does not have, and one cancelled
-    /// through `cancel` before it finished: the result carries the same message
-    /// the model would have read.
-    pub async fn run(&self, call: &ToolCall, cancel: CancellationToken) -> ToolResult {
+    /// Every call is answered, including one middleware refuses, one naming a
+    /// tool the runner does not have, and one cancelled through `cancel` before
+    /// it finished. The result carries the same message the model would read.
+    ///
+    /// # Errors
+    ///
+    /// Returns a tool-system error when discovery or middleware fails. A tool
+    /// refusal or execution failure is an ordinary `ToolResult` with
+    /// `is_error` set.
+    pub async fn run(
+        &self,
+        call: &ToolCall,
+        cancel: CancellationToken,
+    ) -> StdResult<ToolResult, pebble_agent::ToolSystemError> {
         let sink = self
             .on_event
             .clone()
@@ -232,33 +250,73 @@ impl ToolRunner {
         });
         let pump = tokio::spawn(pump.run());
 
-        let result = {
-            let mut dispatch = ToolDispatch::new(
-                &self.registry,
-                &self.environment,
-                &self.options,
-                &emitter,
-                &self.session_id,
-                &self.session_id,
-            );
-            if let Some(provider) = &self.tool_env_provider {
-                dispatch = dispatch.with_tool_env_provider(provider);
-            }
-            if let Some(redactor) = &self.redactor {
-                dispatch = dispatch.with_redactor(redactor);
-            }
-            dispatch.execute_one(call, cancel).await
+        let redactor = self
+            .redactor
+            .clone()
+            .unwrap_or_else(|| Arc::new(NoRedaction));
+        let mut service = CodingToolService::new(
+            self.registry.clone(),
+            Arc::clone(&self.environment),
+            self.options.clone(),
+            emitter.clone(),
+            self.session_id.clone(),
+            self.session_id.clone(),
+            redactor,
+        );
+        if let Some(provider) = self.tool_env_provider.as_ref() {
+            service = service.with_tool_env_provider(Arc::clone(provider));
+        }
+        let service = Arc::new(service);
+        let mut system = ToolSystem::new(service.clone()).middleware(service.clone());
+        for middleware in &self.tool_middleware {
+            system = system.middleware(Arc::clone(middleware));
+        }
+
+        let messages: [Message; 0] = [];
+        let outcome = match system
+            .discover(ToolDiscoveryContext::new("standalone", 0, &messages))
+            .await
+        {
+            Ok(catalog) => match catalog.find_by_name(&call.name) {
+                Some(descriptor) => {
+                    match validate_tool_arguments(&descriptor.definition().kind, &call.arguments) {
+                        Ok(()) => {
+                            system
+                                .call(ToolCallRequest::new(
+                                    0,
+                                    call.clone(),
+                                    descriptor.clone(),
+                                    cancel,
+                                ))
+                                .await
+                        }
+                        Err(error) => Ok(service.answer_failure(
+                            call,
+                            pebble_agent::ToolErrorKind::InvalidArguments,
+                            error.to_string(),
+                        )),
+                    }
+                }
+                None => Ok(service.answer_failure(
+                    call,
+                    pebble_agent::ToolErrorKind::Unavailable,
+                    format!("unknown tool `{}`", call.name),
+                )),
+            },
+            Err(error) => Err(error),
         };
 
         // Closing the pipeline publishes everything queued, so the callback has
         // seen every event by the time the caller has the result.
+        drop(system);
+        drop(service);
         drop(emitter);
         match pump.await {
             Ok(Ok(())) => {}
             Ok(Err(error)) => warn!(%error, "a tool runner's event callback failed"),
             Err(error) => warn!(%error, "a tool runner's event pump task failed"),
         }
-        result
+        outcome.map(|outcome| result_from_outcome(call, outcome))
     }
 }
 
@@ -268,8 +326,34 @@ impl fmt::Debug for ToolRunner {
             .debug_struct("ToolRunner")
             .field("tools", &self.registry.names())
             .field("session_id", &self.session_id)
+            .field("tool_middleware", &self.tool_middleware.len())
             .field("has_event_callback", &self.on_event.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+fn result_from_outcome(call: &ToolCall, outcome: ToolOutcome) -> ToolResult {
+    match outcome {
+        ToolOutcome::Success(output) => ToolResult {
+            tool_call_id: call.id.clone(),
+            name:         Some(call.name.clone()),
+            content:      output.content().to_vec(),
+            is_error:     false,
+        },
+        ToolOutcome::Failure { message, .. } => ToolResult {
+            tool_call_id: call.id.clone(),
+            name:         Some(call.name.clone()),
+            content:      vec![ContentPart::Text { text: message }],
+            is_error:     true,
+        },
+        _ => ToolResult {
+            tool_call_id: call.id.clone(),
+            name:         Some(call.name.clone()),
+            content:      vec![ContentPart::Text {
+                text: "the tool returned an unsupported outcome".to_owned(),
+            }],
+            is_error:     true,
+        },
     }
 }
 

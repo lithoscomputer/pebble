@@ -1762,12 +1762,12 @@ mod tests {
 
     use futures_util::poll;
     use lithos_llm::types::{Role, ToolDefinitionKind};
+    use pebble_agent::ToolDescriptor;
     use serde_json::json;
     use tokio::task::yield_now;
     use tokio::time;
 
     use super::*;
-    use crate::config::{ToolAccess, ToolAccessPolicy};
     use crate::error::ErrorKind;
     use crate::record::SessionRecord;
     use crate::runtime::testing::{TestSession, noop_tool};
@@ -1775,7 +1775,10 @@ mod tests {
     use crate::test_support::{
         MockEnvironment, ScriptedCall, message_text, scripted_client, text_response,
     };
-    use crate::tool::{ToolContext, ToolDefinitionWithSource};
+    use crate::tool::{
+        PermissionMiddleware, ToolContext, ToolDefinitionWithSource, ToolPermission,
+        ToolPermissionPolicy,
+    };
     use crate::types::{CodingAgentEvent, PermissionLevel, ToolErrorKind};
 
     /// Reports the moment the task holding it is dropped, which is what an
@@ -1806,12 +1809,14 @@ mod tests {
     /// A policy that refuses one tool by name and allows the rest.
     struct DenyByName(&'static str);
 
-    impl ToolAccessPolicy for DenyByName {
-        fn access_for_tool(&self, tool_name: &str) -> ToolAccess {
-            if tool_name == self.0 {
-                ToolAccess::Denied
+    impl ToolPermissionPolicy for DenyByName {
+        fn permission(&self, tool: &ToolDescriptor) -> ToolPermission {
+            if tool.id().as_str() == self.0 {
+                ToolPermission::Deny {
+                    reason: format!("{} is forbidden", tool.id()),
+                }
             } else {
-                ToolAccess::Allowed
+                ToolPermission::Allow
             }
         }
     }
@@ -3126,15 +3131,17 @@ mod tests {
         // Registered the way an application registers tools, so what travels
         // is the parent's own tool list rather than a profile both sessions
         // happen to share.
-        let (client, _provider) =
+        let (client, provider) =
             scripted_client(vec![ScriptedCall::response(text_response("child result"))]);
         let session = testing::builder(client)
             .tools(vec![noop_tool("allowed"), noop_tool("forbidden")])
             .options(CodingAgentOptions {
                 permission_level: Some(PermissionLevel::ReadOnly),
-                tool_access_policy: Some(Arc::new(DenyByName("forbidden"))),
                 ..CodingAgentOptions::default()
             })
+            .tool_middleware(Arc::new(PermissionMiddleware::new(Arc::new(DenyByName(
+                "forbidden",
+            )))))
             .observe_children(observer)
             .build()
             .expect("the session builds");
@@ -3157,9 +3164,13 @@ mod tests {
             child_tools.iter().any(|name| name == "allowed"),
             "the parent's own tools travel with it: {child_tools:?}"
         );
+        assert!(child_tools.iter().any(|name| name == "forbidden"));
+        let requests = provider.requests();
+        let request = requests.first().expect("the child asked its model");
         assert!(
-            !child_tools.iter().any(|name| name == "forbidden"),
-            "the parent's access policy travels with the child: {child_tools:?}"
+            request.tools().iter().all(|tool| tool.name != "forbidden"),
+            "the parent's middleware filters the child's request: {:?}",
+            request.tools()
         );
         assert_eq!(child_permission, Some(PermissionLevel::ReadOnly));
         supervisor.shutdown_all().await;

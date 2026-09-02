@@ -15,7 +15,6 @@ use tokio_util::sync::CancellationToken;
 use super::error::ToolError;
 use super::native::{NativeTool, ToolVocabulary};
 use super::permissions::known_tool_category;
-use crate::config::{ToolAccessPolicy, ToolExposureMode};
 use crate::environment::Environment;
 use crate::event::{OutputCaptureStats, SessionBoundEmitter};
 use crate::human_input::HumanInputProvider;
@@ -548,47 +547,8 @@ impl ToolRegistry {
     /// Every registered tool's definition and origin, in no particular order.
     #[must_use]
     pub(crate) fn definitions_with_source(&self) -> Vec<ToolDefinitionWithSource> {
-        // With no policy the exposure mode is never consulted.
-        self.definitions_with_source_for_policy(None, ToolExposureMode::AutoApprovedOnly)
-    }
-
-    /// The definitions `policy` allows a session to advertise.
-    ///
-    /// No policy exposes everything.
-    #[must_use]
-    #[cfg(test)]
-    pub(crate) fn definitions_for_policy(
-        &self,
-        policy: Option<&dyn ToolAccessPolicy>,
-        exposure_mode: ToolExposureMode,
-    ) -> Vec<ToolDefinition> {
-        self.definitions_with_source_for_policy(policy, exposure_mode)
-            .into_iter()
-            .map(|tool| tool.definition)
-            .collect()
-    }
-
-    /// The definitions and origins `policy` allows a session to advertise.
-    ///
-    /// The policy is asked about the name the model would call — the exposed
-    /// name, after any vocabulary rename — so a policy written against pebble's
-    /// canonical names resolves them itself. See
-    /// [`canonical_tool_name`](super::permissions::canonical_tool_name).
-    #[must_use]
-    pub(crate) fn definitions_with_source_for_policy(
-        &self,
-        policy: Option<&dyn ToolAccessPolicy>,
-        exposure_mode: ToolExposureMode,
-    ) -> Vec<ToolDefinitionWithSource> {
         self.tools
             .values()
-            .filter(|tool| {
-                policy.is_none_or(|policy| {
-                    policy
-                        .access_for_tool(&tool.definition.name)
-                        .is_exposed(exposure_mode)
-                })
-            })
             .map(|tool| ToolDefinitionWithSource {
                 definition: tool.definition.clone(),
                 source:     tool.source.clone(),
@@ -708,35 +668,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::config::ToolAccess;
     use crate::event::{EventOptions, EventPump};
     use crate::human_input::{Answer, HumanInputError, Question};
     use crate::test_support::MockEnvironment;
     use crate::types::ToolErrorKind;
-
-    struct NamedPolicy {
-        decisions: HashMap<String, ToolAccess>,
-    }
-
-    impl NamedPolicy {
-        fn new(decisions: impl IntoIterator<Item = (&'static str, ToolAccess)>) -> Self {
-            Self {
-                decisions: decisions
-                    .into_iter()
-                    .map(|(name, access)| (name.to_owned(), access))
-                    .collect(),
-            }
-        }
-    }
-
-    impl ToolAccessPolicy for NamedPolicy {
-        fn access_for_tool(&self, tool_name: &str) -> ToolAccess {
-            self.decisions
-                .get(tool_name)
-                .copied()
-                .unwrap_or(ToolAccess::Denied)
-        }
-    }
 
     fn make_tool(name: &str) -> RegisteredTool {
         RegisteredTool::new(
@@ -873,84 +808,6 @@ mod tests {
             .collect();
         assert!(names.contains(&"tool_a"));
         assert!(names.contains(&"tool_b"));
-    }
-
-    #[test]
-    fn definitions_with_no_policy_returns_all_registered_tools() {
-        let mut registry = ToolRegistry::new();
-        registry.register(make_tool("allowed"));
-        registry.register(make_tool("denied"));
-
-        let definitions = registry.definitions_for_policy(None, ToolExposureMode::AutoApprovedOnly);
-
-        let names: Vec<&str> = definitions
-            .iter()
-            .map(|definition| definition.name.as_str())
-            .collect();
-        assert_eq!(definitions.len(), 2);
-        assert!(names.contains(&"allowed"));
-        assert!(names.contains(&"denied"));
-    }
-
-    #[test]
-    fn definitions_for_policy_omits_denied_tools() {
-        let mut registry = ToolRegistry::new();
-        registry.register(make_tool("read_file"));
-        registry.register(make_tool("write_file"));
-        let policy = NamedPolicy::new([
-            ("read_file", ToolAccess::Allowed),
-            ("write_file", ToolAccess::Denied),
-        ]);
-
-        let definitions = registry
-            .definitions_for_policy(Some(&policy), ToolExposureMode::IncludeRequiresApproval);
-
-        assert_eq!(definitions.len(), 1);
-        assert_eq!(definitions[0].name, "read_file");
-    }
-
-    #[test]
-    fn definitions_for_policy_exposes_approval_tools_only_when_enabled() {
-        let mut registry = ToolRegistry::new();
-        registry.register(make_tool("read_file"));
-        registry.register(make_tool("shell"));
-        let policy = NamedPolicy::new([
-            ("read_file", ToolAccess::Allowed),
-            ("shell", ToolAccess::RequiresApproval),
-        ]);
-
-        let auto_only =
-            registry.definitions_for_policy(Some(&policy), ToolExposureMode::AutoApprovedOnly);
-        let with_approval = registry
-            .definitions_for_policy(Some(&policy), ToolExposureMode::IncludeRequiresApproval);
-
-        assert_eq!(
-            auto_only
-                .iter()
-                .map(|tool| tool.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["read_file"]
-        );
-        let with_approval_names: Vec<&str> = with_approval
-            .iter()
-            .map(|tool| tool.name.as_str())
-            .collect();
-        assert_eq!(with_approval_names.len(), 2);
-        assert!(with_approval_names.contains(&"read_file"));
-        assert!(with_approval_names.contains(&"shell"));
-    }
-
-    #[test]
-    fn policy_sees_the_exposed_name_after_a_vocabulary_rename() {
-        let mut registry = ToolRegistry::with_vocabulary(ToolVocabulary::KimiCode);
-        registry.register(make_tool("read_file"));
-        let policy = NamedPolicy::new([("Read", ToolAccess::Allowed)]);
-
-        let definitions =
-            registry.definitions_for_policy(Some(&policy), ToolExposureMode::AutoApprovedOnly);
-
-        assert_eq!(definitions.len(), 1);
-        assert_eq!(definitions[0].name, "Read");
     }
 
     #[test]

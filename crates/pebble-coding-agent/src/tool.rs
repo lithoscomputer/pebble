@@ -15,7 +15,7 @@ mod registry;
 mod runner;
 
 pub use self::error::ToolError;
-pub(crate) use self::execution::{ToolDispatch, result_text};
+pub(crate) use self::execution::{CodingToolService, result_text};
 pub(crate) use self::native::{NativeTool, ToolVocabulary};
 pub use self::permissions::{
     ApprovalDecision, PermissionLevelPolicy, PermissionMiddleware, ToolApprovalService,
