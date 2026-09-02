@@ -119,6 +119,10 @@ pub trait TurnBoundaryHooks: Send + Sync {
     }
 
     /// Runs after the assistant response is committed.
+    ///
+    /// An error ends the prompt, but only after the tool calls the response
+    /// made are answered as `Cancelled` without running, so the committed
+    /// turn is never left without its results.
     async fn after_model(
         &self,
         _context: TurnBoundaryContext<'_>,

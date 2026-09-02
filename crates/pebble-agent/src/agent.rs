@@ -544,12 +544,14 @@ impl Agent {
     /// control handle. A cancellation that is already set still commits the
     /// input before the prompt aborts.
     ///
-    /// The conversation stays paired however the prompt ends. A cancellation
-    /// observed after the model asked for tools answers every pending call
-    /// with a `Cancelled` error result, without running it, and records those
-    /// results before the prompt returns [`AgentError::Aborted`]. A call that
-    /// was already running is cancelled through its own token and keeps the
-    /// result it returns.
+    /// The conversation stays paired however the prompt ends, short of the
+    /// caller dropping the future. A cancellation observed after the model
+    /// asked for tools answers every pending call with a `Cancelled` error
+    /// result, without running it, and records those results before the
+    /// prompt returns [`AgentError::Aborted`]; an `after_model` hook that
+    /// fails is answered the same way before its error is returned. A call
+    /// that was already running is cancelled through its own token and keeps
+    /// the result it returns.
     pub async fn prompt_with_cancellation(
         &mut self,
         message: impl Into<UserMessage>,
@@ -679,13 +681,21 @@ impl Agent {
                 // by now is not honored until the turn's tool calls have their
                 // results: `execute_tools` sees the fired token and answers
                 // every call as `Cancelled` without running it, so the
-                // conversation the abort leaves behind stays paired.
+                // conversation the abort leaves behind stays paired. A hook
+                // that fails is held to the same rule: the calls are answered
+                // as `Cancelled` before its error ends the prompt.
                 if let Some(hooks) = self.turn_hooks.clone() {
                     let context = TurnBoundaryContext::new(&self.model, turn, &mut self.messages);
-                    hooks
-                        .after_model(context, &response, &round_cancel)
-                        .await
-                        .map_err(|source| AgentError::TurnBoundary { source })?;
+                    let hooked = hooks.after_model(context, &response, &round_cancel).await;
+                    if let Err(source) = hooked {
+                        let calls = tool_calls(&response);
+                        if !calls.is_empty() {
+                            let results =
+                                self.answer_calls_as_cancelled(turn, &calls, &tools).await;
+                            self.messages.push(tool_results_message(&results));
+                        }
+                        return Err(AgentError::TurnBoundary { source });
+                    }
                 }
 
                 let calls = tool_calls(&response);
@@ -834,6 +844,22 @@ impl Agent {
             StreamOutcome::Interrupted => Ok(StreamResult::Interrupted),
             StreamOutcome::Failed(source) => Err(AgentError::Model { source: *source }),
         }
+    }
+
+    /// Answers every call as `Cancelled` without running one.
+    ///
+    /// The round still goes through the normal path with a token that has
+    /// already fired, so a specialized round executor records the results
+    /// where it keeps them.
+    async fn answer_calls_as_cancelled(
+        &self,
+        turn: usize,
+        calls: &[ToolCall],
+        tools: &[ResolvedTool],
+    ) -> Vec<ToolResult> {
+        let fired = CancellationToken::new();
+        fired.cancel();
+        self.execute_tools(turn, calls, tools, &fired, &fired).await
     }
 
     async fn execute_tools(
@@ -1847,6 +1873,90 @@ mod tests {
             [Role::User, Role::Assistant, Role::Tool, Role::User],
             "the next request carries the paired conversation"
         );
+    }
+
+    /// Fails the boundary that runs after the assistant turn is committed.
+    struct FailingBoundary;
+
+    #[async_trait]
+    impl TurnBoundaryHooks for FailingBoundary {
+        async fn after_model(
+            &self,
+            _context: TurnBoundaryContext<'_>,
+            _response: &Response,
+            _cancel: &CancellationToken,
+        ) -> StdResult<(), crate::TurnBoundaryError> {
+            Err(crate::TurnBoundaryError::new("the boundary failed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failing_after_model_hook_answers_the_tool_call_before_failing_the_prompt() {
+        let calls_tool = response([ContentPart::ToolCall(ToolCall::function(
+            "call_1",
+            "count",
+            json!({}),
+        ))]);
+        let executions = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&executions);
+        let counting_tool = Tool::function(
+            "count",
+            "Counts its runs",
+            json!({"type": "object"}),
+            move |_context, _arguments| {
+                let counted = Arc::clone(&counted);
+                async move {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                    Ok("ran".into())
+                }
+            },
+        );
+        let mut agent = Agent::builder(ScriptedModel::new([calls_tool]), "test/model")
+            .tools([counting_tool])
+            .turn_boundary_hooks(Arc::new(FailingBoundary))
+            .build()
+            .expect("the agent builds");
+        let mut events = agent.subscribe();
+
+        let error = agent
+            .prompt("work")
+            .await
+            .expect_err("the boundary failed the prompt");
+
+        assert!(
+            matches!(error, AgentError::TurnBoundary { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            0,
+            "a failed boundary runs no tool"
+        );
+        // The failure is reported only after the turn's calls are answered, so
+        // the conversation it leaves is one the next request can carry.
+        let messages = agent.messages();
+        assert_eq!(messages.len(), 3, "input, tool call, cancelled result");
+        assert_eq!(messages[1].role(), Role::Assistant);
+        assert_eq!(messages[2].role(), Role::Tool);
+        let ContentPart::ToolResult(result) = &messages[2].content()[0] else {
+            panic!("the cancelled call has a result");
+        };
+        assert_eq!(result.tool_call_id, "call_1");
+        assert!(result.is_error);
+        assert!(matches!(
+            &result.content[0],
+            ContentPart::Text { text } if text == "Cancelled"
+        ));
+        let events = drained(&mut events);
+        assert!(
+            position(&events, |event| matches!(
+                event,
+                AgentEvent::ToolStarted { .. } | AgentEvent::TurnInterrupted
+            ))
+            .is_none(),
+            "nothing started and nothing was interrupted"
+        );
+        assert_eq!(agent.state(), AgentState::Idle);
     }
 
     #[tokio::test]

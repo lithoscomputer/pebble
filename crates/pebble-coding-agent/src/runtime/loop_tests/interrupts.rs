@@ -19,7 +19,8 @@ use lithos_llm::middleware::RetryPolicy;
 use lithos_llm::types::{Message as LlmMessage, Role, ToolCall, ToolDefinition};
 use serde_json::json;
 use tokio::runtime::Handle;
-use tokio::sync::broadcast;
+use tokio::sync::{Notify, broadcast};
+use tokio::task::yield_now;
 use tokio::time::{sleep, timeout};
 
 use super::super::testing::{builder, event_name, wait_for_event};
@@ -27,8 +28,8 @@ use super::*;
 use crate::event::{EventSink, EventSinkError};
 use crate::task_reminder::TASK_REMINDER_TEXT;
 use crate::test_support::{
-    ScriptedCompletion, message_text, multi_tool_call_response, scripted_client, text_delta_events,
-    tool_call_events,
+    ScriptedCompletion, ScriptedProvider, message_text, multi_tool_call_response, scripted_client,
+    text_delta_events, tool_call_events,
 };
 use crate::types::LlmOutputKind;
 
@@ -655,11 +656,19 @@ async fn a_prompt_that_outlasts_its_budget_ends_with_the_budget_as_its_reason() 
     assert_eq!(answer.as_deref(), Some("Should not reach this"));
 }
 
-/// A cancellation that lands while the assistant turn is being compacted still
-/// answers the tool calls that turn made, so the record the interrupted prompt
-/// leaves behind is one the next prompt can send.
-#[tokio::test]
-async fn a_cancellation_during_compaction_answers_the_tool_call_before_ending_the_prompt() {
+/// A session whose first turn calls `count` and then compacts, with the
+/// summarizing call held behind the returned gate.
+///
+/// The tool-calling turn reports no usage of its own, so the checkpoint after
+/// it measures the conversation the session holds, and compacts it.
+fn compacting_after_a_tool_call(
+    options: CodingAgentOptions,
+) -> (
+    CodingRuntime,
+    Arc<ScriptedProvider>,
+    Arc<Counter>,
+    Arc<Notify>,
+) {
     let runs = Arc::new(Counter::default());
     let counter = Arc::clone(&runs);
     let counted = RegisteredTool::new(
@@ -673,10 +682,8 @@ async fn a_cancellation_during_compaction_answers_the_tool_call_before_ending_th
         }),
     )
     .with_source(ToolSource::Native);
-    // The tool-calling turn reports no usage of its own, so the checkpoint
-    // after it measures the conversation the session holds, and compacts it.
     let (summary, gate) = ScriptedCompletion::gated(text_response("The summary so far."));
-    let (mut session, provider) = TestSession::new(vec![
+    let (session, provider) = TestSession::new(vec![
         ScriptedCall::response(with_usage(
             tool_call_response("count", "call_1", json!({})),
             TokenCounts::default(),
@@ -690,38 +697,15 @@ async fn a_cancellation_during_compaction_answers_the_tool_call_before_ending_th
         enable_context_compaction: true,
         compaction_preserve_turns: 1,
         enable_loop_detection: false,
-        ..CodingAgentOptions::default()
+        ..options
     })
     .build();
-    let cancel = CancellationToken::new();
-    let mut events = session.subscribe();
-    let controller = {
-        let cancel = cancel.clone();
-        tokio::spawn(async move {
-            wait_for_event(&mut events, |event| {
-                matches!(event, CodingEvent::CompactionStarted { .. })
-            })
-            .await;
-            // The summarizing call is in flight: end the prompt, then let the
-            // summary arrive.
-            cancel.cancel();
-            gate.notify_one();
-        })
-    };
+    (session, provider, runs, gate)
+}
 
-    let error = timeout(
-        PATIENCE,
-        session.prompt_with_cancellation(&"x".repeat(400), Some(&cancel)),
-    )
-    .await
-    .expect("the prompt ends")
-    .expect_err("the prompt was cancelled");
-    controller.await.expect("the controller finishes");
-
-    assert!(
-        matches!(error, Error::Interrupted(InterruptReason::Cancelled)),
-        "{error:?}"
-    );
+/// What a prompt ended during compaction leaves behind: the tool never ran,
+/// its call is answered `Cancelled`, and the conversation is paired.
+fn assert_the_call_was_answered_as_cancelled(session: &CodingRuntime, runs: &Counter) {
     assert_eq!(session.state(), CodingAgentState::Idle);
     assert_eq!(
         runs.count(),
@@ -753,9 +737,11 @@ async fn a_cancellation_during_compaction_answers_the_tool_call_before_ending_th
         roles.ends_with(&[Role::Assistant, Role::Tool]),
         "the conversation the prompt left is paired: {roles:?}"
     );
+}
 
-    // The small window compacts again before the next turn, so what pins the
-    // repair is that the next prompt runs at all.
+/// The small window compacts again before the next turn, so what pins the
+/// repair is that the next prompt runs at all.
+async fn assert_the_next_prompt_runs(session: &mut CodingRuntime, provider: &ScriptedProvider) {
     let answer = timeout(PATIENCE, session.prompt("again"))
         .await
         .expect("the next prompt runs")
@@ -763,6 +749,89 @@ async fn a_cancellation_during_compaction_answers_the_tool_call_before_ending_th
 
     assert_eq!(answer.as_deref(), Some("done"));
     assert_eq!(provider.call_count(), 2, "one call per prompt");
+}
+
+/// A cancellation that lands while the assistant turn is being compacted still
+/// answers the tool calls that turn made, so the record the interrupted prompt
+/// leaves behind is one the next prompt can send.
+#[tokio::test]
+async fn a_cancellation_during_compaction_answers_the_tool_call_before_ending_the_prompt() {
+    let (mut session, provider, runs, gate) =
+        compacting_after_a_tool_call(CodingAgentOptions::default());
+    let cancel = CancellationToken::new();
+    let mut events = session.subscribe();
+    let controller = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            wait_for_event(&mut events, |event| {
+                matches!(event, CodingEvent::CompactionStarted { .. })
+            })
+            .await;
+            // The summarizing call is in flight: end the prompt, then let the
+            // summary arrive.
+            cancel.cancel();
+            // The caller's token reaches the prompt through a linking task,
+            // which has to run before the summary wakes the prompt.
+            yield_now().await;
+            gate.notify_one();
+        })
+    };
+
+    let error = timeout(
+        PATIENCE,
+        session.prompt_with_cancellation(&"x".repeat(400), Some(&cancel)),
+    )
+    .await
+    .expect("the prompt ends")
+    .expect_err("the prompt was cancelled");
+    controller.await.expect("the controller finishes");
+
+    assert!(
+        matches!(error, Error::Interrupted(InterruptReason::Cancelled)),
+        "{error:?}"
+    );
+    assert_the_call_was_answered_as_cancelled(&session, &runs);
+    assert_the_next_prompt_runs(&mut session, &provider).await;
+}
+
+/// The same window, reached by the wall clock: the budget runs out while the
+/// summarizing call is in flight.
+#[tokio::test]
+async fn a_budget_that_runs_out_during_compaction_answers_the_tool_call_before_ending_the_prompt() {
+    let (mut session, provider, runs, gate) = compacting_after_a_tool_call(CodingAgentOptions {
+        wall_clock_timeout: Some(Duration::from_millis(20)),
+        ..CodingAgentOptions::default()
+    });
+    let reason = session.interrupt_reason_handle();
+    let mut events = session.subscribe();
+    let controller = tokio::spawn(async move {
+        wait_for_event(&mut events, |event| {
+            matches!(event, CodingEvent::CompactionStarted { .. })
+        })
+        .await;
+        // The summary is held until the timer has fired, so the budget runs
+        // out while the summarizing call is in flight.
+        while reason.reason().is_none() {
+            sleep(Duration::from_millis(1)).await;
+        }
+        // The timer records its reason, then cancels the prompt; let its task
+        // get there before the summary wakes the prompt.
+        yield_now().await;
+        gate.notify_one();
+    });
+
+    let error = timeout(PATIENCE, session.prompt(&"x".repeat(400)))
+        .await
+        .expect("the budget ends the prompt")
+        .expect_err("the prompt ran out of time");
+    controller.await.expect("the controller finishes");
+
+    assert!(
+        matches!(error, Error::Interrupted(InterruptReason::WallClockTimeout)),
+        "{error:?}"
+    );
+    assert_the_call_was_answered_as_cancelled(&session, &runs);
+    assert_the_next_prompt_runs(&mut session, &provider).await;
 }
 
 #[tokio::test]
