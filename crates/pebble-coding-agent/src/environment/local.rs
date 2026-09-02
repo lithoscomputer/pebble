@@ -408,6 +408,19 @@ impl Environment for LocalEnvironment {
         })
     }
 
+    /// The trait's default names the path the caller wrote; this names the
+    /// resolved one, like every other message here.
+    async fn read_file_text(&self, path: &str) -> EnvResult<String> {
+        let full_path = self.resolve_path(path);
+        String::from_utf8(self.read_file_bytes(path).await?).map_err(|error| {
+            EnvironmentError::with_source(
+                EnvironmentErrorKind::InvalidUtf8,
+                format!("File is not valid UTF-8: {}", full_path.display()),
+                error,
+            )
+        })
+    }
+
     async fn write_file(&self, path: &str, content: &str) -> EnvResult<()> {
         let full_path = self.resolve_path(path);
         if let Some(parent) = full_path.parent() {
@@ -1033,10 +1046,19 @@ mod tests {
         assert!(error.detail().contains("caused by"), "{}", error.detail());
     }
 
-    /// Root reads a mode-000 file anyway, so the test proves nothing there.
+    /// Root reads a mode-000 file anyway, so a permission test proves nothing
+    /// there. Says so on stderr, so a skipped run is visible in test output.
     #[cfg(unix)]
-    fn running_as_root() -> bool {
-        geteuid().is_root()
+    #[expect(
+        clippy::print_stderr,
+        reason = "a test that skips itself must say why in the test output"
+    )]
+    fn skip_as_root() -> bool {
+        let root = geteuid().is_root();
+        if root {
+            eprintln!("skipped: running as root");
+        }
+        root
     }
 
     #[cfg(unix)]
@@ -1053,7 +1075,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn reading_a_refused_file_names_the_resolved_path_and_the_os_cause() {
-        if running_as_root() {
+        if skip_as_root() {
             return;
         }
         let directory = TempDir::new("local-env");
@@ -1079,7 +1101,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn writing_under_a_read_only_directory_names_the_resolved_path_and_the_os_cause() {
-        if running_as_root() {
+        if skip_as_root() {
             return;
         }
         let directory = TempDir::new("local-env");
@@ -1113,6 +1135,13 @@ mod tests {
             .expect_err("the bytes are not text");
 
         assert_eq!(error.kind(), EnvironmentErrorKind::InvalidUtf8);
+        assert_eq!(
+            error.message(),
+            format!(
+                "File is not valid UTF-8: {}",
+                directory.join("binary.bin").display()
+            )
+        );
     }
 
     #[tokio::test]

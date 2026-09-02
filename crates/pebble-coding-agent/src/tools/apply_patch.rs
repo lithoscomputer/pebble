@@ -1057,8 +1057,10 @@ mod tests {
         );
     }
 
-    /// `build` is a regular file, so nothing can be created under it. The
-    /// model reads the OS's reason, not only that the write failed.
+    /// `build` is a regular file, so no directory can be made under it. The
+    /// model reads the OS's reason, not only that the write failed. The file
+    /// goes one level deeper than `build` so the failing call is `mkdir`
+    /// under a file (`ENOTDIR`) rather than `mkdir build` itself (`EEXIST`).
     #[tokio::test]
     async fn adding_a_file_under_a_regular_file_reports_the_os_cause() {
         let directory = TempDir::new("apply-patch");
@@ -1066,31 +1068,23 @@ mod tests {
         let env = LocalEnvironment::new(directory.path());
         let patch = "\
 *** Begin Patch
-*** Add File: build/out.txt
+*** Add File: build/sub/out.txt
 +hello
 *** End Patch";
 
         let ops = parse_apply_patch(patch).expect("the patch parses");
         let error = apply_patch_operations(&ops, &env)
             .await
-            .expect_err("a regular file cannot hold a file");
+            .expect_err("a regular file cannot hold a directory");
 
-        let expected_prefix = format!(
-            "Failed to write file build/out.txt: Failed to create parent directories for {}\n  caused \
-             by: ",
-            directory.join("build").display()
+        assert_eq!(
+            error.message(),
+            format!(
+                "Failed to write file build/sub/out.txt: Failed to create parent directories for \
+                 {}\n  caused by: Not a directory (os error 20)",
+                directory.join("build/sub").display()
+            )
         );
-        assert!(
-            error.message().starts_with(&expected_prefix),
-            "{}",
-            error.message()
-        );
-        let cause = &error.message()[expected_prefix.len()..];
-        assert!(
-            cause.contains("Not a directory") || cause.contains("File exists"),
-            "{cause}"
-        );
-        assert!(cause.contains("os error"), "{cause}");
         assert_eq!(error.kind(), ToolErrorKind::Execution);
     }
 

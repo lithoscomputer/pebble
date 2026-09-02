@@ -176,7 +176,7 @@ impl ToolRunner {
     }
 
     /// Sets what strips secrets out of the process output the runner
-    /// publishes.
+    /// publishes and out of the model-facing message of every failed call.
     #[must_use]
     pub fn redactor(mut self, redactor: Arc<dyn Redactor>) -> Self {
         self.redactor = Some(redactor);

@@ -150,7 +150,8 @@ policy out of, not a policy pebble applies.
 Optional seams follow the same rule. Pebble ships no implementation and
 advertises no tool without one: an `extensions::HumanInputProvider` (no
 provider, no question tool), an `extensions::SearchProvider` (no provider, no
-`web_search`), an `extensions::Redactor` for process output, and a
+`web_search`), an `extensions::Redactor` for process output and failed tool
+call messages, and a
 `subagents::SubagentOptions` for subagents.
 
 ## The generic agent API

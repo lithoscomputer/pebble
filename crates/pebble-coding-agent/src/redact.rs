@@ -1,10 +1,12 @@
 //! The seam an application uses to strip secrets from text pebble records.
 //!
-//! Pebble ships no secret detector. It marks the places where process output
-//! leaves the session — today the
+//! Pebble ships no secret detector. It marks the places where text a process
+//! or the operating system wrote leaves the session — the
 //! [`ExecOutputTail`](crate::events::ExecOutputTail) a shell tool puts on the
-//! event stream — and calls the [`Redactor`] an application installed. Without
-//! one, [`NoRedaction`] passes text through unchanged.
+//! event stream, and the model-facing message of every failed tool call,
+//! which can carry an OS error naming a path — and calls the [`Redactor`] an
+//! application installed. Without one, [`NoRedaction`] passes text through
+//! unchanged.
 
 use std::borrow::Cow;
 

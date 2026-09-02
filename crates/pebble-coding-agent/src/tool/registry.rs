@@ -243,7 +243,9 @@ impl ToolContext {
         self
     }
 
-    /// Sets what strips secrets out of text the tool publishes.
+    /// Sets what strips secrets out of text the tool publishes. The
+    /// dispatch layer runs the same redactor over the message of every failed
+    /// call.
     #[must_use]
     pub fn with_redactor(mut self, redactor: Arc<dyn Redactor>) -> Self {
         self.redactor = redactor;

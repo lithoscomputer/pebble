@@ -249,7 +249,10 @@ mod tests {
 
     /// The source is the environment error's own cause, not the environment
     /// error: its message is already the tool error's message, and a log would
-    /// otherwise read it twice.
+    /// otherwise read it twice. The cause line itself does appear twice in
+    /// `detail()`, once inside the message and once as the source; that is
+    /// accepted, not wanted, and is the price of keeping a source for logs
+    /// while the model reads the cause in the message.
     #[test]
     fn an_environment_failure_is_not_repeated_as_its_own_first_cause() {
         let error = ToolError::from(EnvironmentError::with_source(
