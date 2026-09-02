@@ -260,6 +260,14 @@ pub enum ScriptedCompletion {
     Failure(ScriptedFailure),
     /// Never answers, so the call hangs until the caller gives up on it.
     Pending,
+    /// Answers with the response once the gate is opened, so a test can act
+    /// while the call is in flight.
+    Gated {
+        /// The response the call returns once the gate is open.
+        response: Box<Response>,
+        /// Opened with [`Notify::notify_one`]; stays open once opened.
+        gate:     Arc<Notify>,
+    },
 }
 
 impl ScriptedCompletion {
@@ -267,6 +275,23 @@ impl ScriptedCompletion {
     #[must_use]
     pub fn response(response: Response) -> Self {
         Self::Response(Box::new(response))
+    }
+
+    /// Answers with `response` once the returned gate is opened with
+    /// [`Notify::notify_one`].
+    ///
+    /// An opened gate stays open, so a script that repeats this completion
+    /// answers every later call at once.
+    #[must_use]
+    pub fn gated(response: Response) -> (Self, Arc<Notify>) {
+        let gate = Arc::new(Notify::new());
+        (
+            Self::Gated {
+                response: Box::new(response),
+                gate:     Arc::clone(&gate),
+            },
+            gate,
+        )
     }
 }
 
@@ -375,6 +400,13 @@ impl ProviderAdapter for ScriptedProvider {
             Some(ScriptedCompletion::Response(response)) => Ok(*response),
             Some(ScriptedCompletion::Failure(failure)) => Err(failure.to_error()),
             Some(ScriptedCompletion::Pending) => pending().await,
+            Some(ScriptedCompletion::Gated { response, gate }) => {
+                gate.notified().await;
+                // Hand the permit back, so the gate stays open for the next
+                // call to this completion.
+                gate.notify_one();
+                Ok(*response)
+            }
             None => Err(LlmError::new(
                 LlmErrorKind::Middleware,
                 "this scripted provider was given no completion script",

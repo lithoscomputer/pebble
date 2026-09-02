@@ -866,9 +866,13 @@ impl CodingAgent {
     ///
     /// Cancelling ends this prompt alone. The loop unwinds through its
     /// checkpoints, so every tool call the model made still gets its result and
-    /// history stays paired; the prompt returns [`Error::Interrupted`] and the
-    /// agent returns to [`Idle`](CodingAgentState::Idle), ready for the next
-    /// prompt. Only [`shutdown`](Self::shutdown) or
+    /// history stays paired: a running call is cancelled through its token and
+    /// keeps the result it returns, and a call that has not started yet — the
+    /// cancellation landed while the assistant turn was being committed or
+    /// compacted — is answered `Cancelled` without running. The prompt returns
+    /// [`Error::Interrupted`] and the agent returns to
+    /// [`Idle`](CodingAgentState::Idle), ready for the next prompt. Only
+    /// [`shutdown`](Self::shutdown) or
     /// [`abort`](CodingAgentControlHandle::abort) closes the agent.
     ///
     /// # Errors

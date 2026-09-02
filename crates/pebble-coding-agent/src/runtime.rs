@@ -1396,8 +1396,12 @@ impl CodingRuntime {
     /// Cancelling `cancel` ends this prompt alone: the loop unwinds through its
     /// checkpoints so every tool call still gets its result, the prompt reports
     /// [`Error::Interrupted`], and the session returns to
-    /// [`Idle`](CodingAgentState::Idle) ready for its next prompt. Only a
-    /// shutdown closes the session.
+    /// [`Idle`](CodingAgentState::Idle) ready for its next prompt. A call that
+    /// is running is cancelled through its token and keeps the result it
+    /// returns; a call the model asked for that has not started yet — the
+    /// cancellation landed while the assistant turn was being committed or
+    /// compacted — is answered `Cancelled` without running, so history stays
+    /// paired. Only a shutdown closes the session.
     ///
     /// # Errors
     ///
@@ -1473,8 +1477,10 @@ impl CodingRuntime {
     ///
     /// The timer cancels the prompt rather than dropping it, so the loop
     /// unwinds through its own checkpoints and every tool call still has its
-    /// result recorded. The session stays open: running out of time is the
-    /// prompt's failure, and the next prompt gets a fresh budget.
+    /// result recorded: a running call is cancelled and keeps its own result,
+    /// and a call not yet started is answered `Cancelled` without running. The
+    /// session stays open: running out of time is the prompt's failure, and
+    /// the next prompt gets a fresh budget.
     fn start_wall_clock_timer(&self, prompt_cancel: &CancellationToken) -> Option<WallClockTimer> {
         let duration = self.config.wall_clock_timeout?;
         let stop = CancellationToken::new();

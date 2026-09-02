@@ -174,6 +174,17 @@ impl<'a> ToolDispatch<'a> {
         cancel: &CancellationToken,
         agent_context: Option<ToolRoundContext<'_>>,
     ) -> Vec<ToolResult> {
+        // A round that opens after its cancellation fired — the prompt was
+        // ended while the turn was being committed — answers every call without
+        // starting one, whichever way it would have run. The sequential paths
+        // below check again per call for a cancellation that lands mid-round.
+        if cancel.is_cancelled() {
+            return calls
+                .iter()
+                .map(|call| self.cancelled_result(call))
+                .collect();
+        }
+
         if calls.iter().any(|call| is_question_tool(&call.name)) {
             return self
                 .execute_question_round(calls, cancel, agent_context)
@@ -1701,6 +1712,49 @@ mod tests {
         .await;
 
         assert_eq!(results.len(), 2);
+        for result in &results {
+            assert!(result.is_error);
+            assert_eq!(text_of(result), "Cancelled");
+        }
+        assert!(
+            events.drain().await.is_empty(),
+            "a call that never started publishes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_parallel_round_answers_every_call_without_starting_one() {
+        // A parallel round starts all its calls at once, so the check that a
+        // sequential round makes per call has to happen before any of them.
+        let registry = registry_with([echo_tool()]);
+        let environment = environment();
+        let config = CodingAgentOptions::default();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let events = Events::new();
+        let calls = [
+            call("echo", "call_1", json!({"text": "one"})),
+            call("echo", "call_2", json!({"text": "two"})),
+        ];
+
+        let results = ToolDispatch::new(
+            &registry,
+            &environment,
+            &config,
+            &events.emitter,
+            "ses_1",
+            "ses_1",
+        )
+        .execute(&calls, true, &cancel)
+        .await;
+
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.tool_call_id.as_str())
+                .collect::<Vec<_>>(),
+            ["call_1", "call_2"]
+        );
         for result in &results {
             assert!(result.is_error);
             assert_eq!(text_of(result), "Cancelled");

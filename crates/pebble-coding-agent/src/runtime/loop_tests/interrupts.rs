@@ -16,7 +16,7 @@ use std::future::pending;
 use std::time::Duration;
 
 use lithos_llm::middleware::RetryPolicy;
-use lithos_llm::types::{Role, ToolCall, ToolDefinition};
+use lithos_llm::types::{Message as LlmMessage, Role, ToolCall, ToolDefinition};
 use serde_json::json;
 use tokio::runtime::Handle;
 use tokio::sync::broadcast;
@@ -27,7 +27,8 @@ use super::*;
 use crate::event::{EventSink, EventSinkError};
 use crate::task_reminder::TASK_REMINDER_TEXT;
 use crate::test_support::{
-    message_text, multi_tool_call_response, scripted_client, text_delta_events, tool_call_events,
+    ScriptedCompletion, message_text, multi_tool_call_response, scripted_client, text_delta_events,
+    tool_call_events,
 };
 use crate::types::LlmOutputKind;
 
@@ -652,6 +653,116 @@ async fn a_prompt_that_outlasts_its_budget_ends_with_the_budget_as_its_reason() 
         .expect("the next prompt runs")
         .expect("the next prompt succeeds");
     assert_eq!(answer.as_deref(), Some("Should not reach this"));
+}
+
+/// A cancellation that lands while the assistant turn is being compacted still
+/// answers the tool calls that turn made, so the record the interrupted prompt
+/// leaves behind is one the next prompt can send.
+#[tokio::test]
+async fn a_cancellation_during_compaction_answers_the_tool_call_before_ending_the_prompt() {
+    let runs = Arc::new(Counter::default());
+    let counter = Arc::clone(&runs);
+    let counted = RegisteredTool::new(
+        ToolDefinition::function("count", "Records that it ran", json!({"type": "object"})),
+        Arc::new(move |_arguments, _context| {
+            let counter = Arc::clone(&counter);
+            Box::pin(async move {
+                counter.bump();
+                Ok("ran".to_owned())
+            })
+        }),
+    )
+    .with_source(ToolSource::Native);
+    // The tool-calling turn reports no usage of its own, so the checkpoint
+    // after it measures the conversation the session holds, and compacts it.
+    let (summary, gate) = ScriptedCompletion::gated(text_response("The summary so far."));
+    let (mut session, provider) = TestSession::new(vec![
+        ScriptedCall::response(with_usage(
+            tool_call_response("count", "call_1", json!({})),
+            TokenCounts::default(),
+        )),
+        ScriptedCall::response(text_response("done")),
+    ])
+    .model("test/small")
+    .tools([counted])
+    .completing(vec![summary])
+    .options(CodingAgentOptions {
+        enable_context_compaction: true,
+        compaction_preserve_turns: 1,
+        enable_loop_detection: false,
+        ..CodingAgentOptions::default()
+    })
+    .build();
+    let cancel = CancellationToken::new();
+    let mut events = session.subscribe();
+    let controller = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            wait_for_event(&mut events, |event| {
+                matches!(event, CodingEvent::CompactionStarted { .. })
+            })
+            .await;
+            // The summarizing call is in flight: end the prompt, then let the
+            // summary arrive.
+            cancel.cancel();
+            gate.notify_one();
+        })
+    };
+
+    let error = timeout(
+        PATIENCE,
+        session.prompt_with_cancellation(&"x".repeat(400), Some(&cancel)),
+    )
+    .await
+    .expect("the prompt ends")
+    .expect_err("the prompt was cancelled");
+    controller.await.expect("the controller finishes");
+
+    assert!(
+        matches!(error, Error::Interrupted(InterruptReason::Cancelled)),
+        "{error:?}"
+    );
+    assert_eq!(session.state(), CodingAgentState::Idle);
+    assert_eq!(
+        runs.count(),
+        0,
+        "a tool the caller stopped before never runs"
+    );
+    let turns = session.history().turns().to_vec();
+    let [
+        ..,
+        Message::Assistant { tool_calls, .. },
+        Message::ToolResults { results, .. },
+    ] = turns.as_slice()
+    else {
+        panic!("history ends with the tool call and its result: {turns:?}");
+    };
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].tool_call_id, "call_1");
+    assert!(results[0].is_error);
+    assert_eq!(result_text(&results[0]), "Cancelled");
+    // What the next request would carry: the call and its result, adjacent.
+    let roles = session
+        .history()
+        .to_llm_messages()
+        .iter()
+        .map(LlmMessage::role)
+        .collect::<Vec<_>>();
+    assert!(
+        roles.ends_with(&[Role::Assistant, Role::Tool]),
+        "the conversation the prompt left is paired: {roles:?}"
+    );
+
+    // The small window compacts again before the next turn, so what pins the
+    // repair is that the next prompt runs at all.
+    let answer = timeout(PATIENCE, session.prompt("again"))
+        .await
+        .expect("the next prompt runs")
+        .expect("the next prompt succeeds");
+
+    assert_eq!(answer.as_deref(), Some("done"));
+    assert_eq!(provider.call_count(), 2, "one call per prompt");
 }
 
 #[tokio::test]
