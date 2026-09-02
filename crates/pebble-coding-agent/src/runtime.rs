@@ -949,6 +949,11 @@ impl CodingRuntime {
     ///
     /// Returns [`Error::Interrupted`] when the session is cancelled while it is
     /// initializing, which is checked around every read and every probe.
+    #[tracing::instrument(
+        name = "coding_session_initialize",
+        skip_all,
+        fields(session_id = %self.id, provider = %self.provider, model = %self.model)
+    )]
     pub(crate) async fn initialize(&mut self) -> Result<()> {
         let cancel = self.cancel_token.clone();
 
@@ -1416,6 +1421,16 @@ impl CodingRuntime {
     /// # Errors
     ///
     /// As [`prompt`](Self::prompt).
+    #[tracing::instrument(
+        name = "coding_session_prompt",
+        skip_all,
+        fields(
+            session_id = %self.id,
+            provider = %self.provider,
+            model = %self.model,
+            input_len = input.len()
+        )
+    )]
     pub(crate) async fn prompt_with_cancellation(
         &mut self,
         input: &str,
@@ -1526,6 +1541,11 @@ impl CodingRuntime {
     /// Returns [`Error::EventSink`] when the configured sink had refused an
     /// event, and [`Error::InvalidState`] when a task the session owned failed
     /// outright. The session is closed either way.
+    #[tracing::instrument(
+        name = "coding_session_shutdown",
+        skip_all,
+        fields(session_id = %self.id, reason = ?reason)
+    )]
     pub(crate) async fn shutdown(&mut self, reason: ShutdownReason) -> Result<bool> {
         if self.ended {
             return Ok(false);

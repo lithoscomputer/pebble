@@ -60,6 +60,11 @@ pub enum StreamOutcome {
 /// application-specific extensions or observers while keeping provider and
 /// credential behavior in the injected [`ModelService`]. `max_replays` is the
 /// hard limit after the initial attempt, even when the policy allows more.
+#[tracing::instrument(
+    name = "model_stream",
+    skip_all,
+    fields(model = %request.model(), max_replays)
+)]
 pub async fn stream_response<F, O>(
     service: &dyn ModelService,
     request: Request,

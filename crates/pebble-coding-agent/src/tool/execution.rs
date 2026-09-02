@@ -208,6 +208,15 @@ impl<'a> ToolDispatch<'a> {
             .await
     }
 
+    #[tracing::instrument(
+        name = "coding_tool_call",
+        skip_all,
+        fields(
+            session_id = self.session_id,
+            tool = %call.name,
+            tool_call_id = %call.id
+        )
+    )]
     async fn execute_one_with_agent_context(
         &self,
         call: &ToolCall,

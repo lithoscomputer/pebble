@@ -875,6 +875,15 @@ impl SubagentHandle {
 }
 
 /// Runs one child session for as long as its supervisor keeps giving it turns.
+#[tracing::instrument(
+    name = "subagent_session",
+    skip_all,
+    fields(
+        session_id = %session.id(),
+        agent_id = %handle.agent_id,
+        depth = handle.depth
+    )
+)]
 async fn run_subagent_session(
     mut session: CodingRuntime,
     handle: SubagentHandle,

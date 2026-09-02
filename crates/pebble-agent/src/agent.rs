@@ -560,6 +560,11 @@ impl Agent {
         self.prompt_inner(message.into(), Some(cancel)).await
     }
 
+    #[tracing::instrument(
+        name = "agent_prompt",
+        skip_all,
+        fields(model = %self.model, input_part_count = message.content.len())
+    )]
     async fn prompt_inner(
         &mut self,
         message: UserMessage,
@@ -941,6 +946,11 @@ impl Agent {
         }
     }
 
+    #[tracing::instrument(
+        name = "tool_call",
+        skip_all,
+        fields(turn, tool = %call.name, tool_call_id = %call.id)
+    )]
     async fn execute_tool(
         &self,
         turn: usize,

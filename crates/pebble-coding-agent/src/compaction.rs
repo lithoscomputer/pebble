@@ -155,6 +155,16 @@ pub(crate) fn check_context_usage(
 /// The summary text is bounded to the visible budget after the call, because a
 /// provider enforces one combined ceiling for reasoning and output and cannot
 /// be asked to bound the visible half on its own.
+#[tracing::instrument(
+    name = "context_compaction",
+    skip_all,
+    fields(
+        session_id,
+        model = request.model,
+        estimated_tokens = request.estimate.tokens,
+        context_window_size = request.facts.context_window_tokens
+    )
+)]
 pub(crate) async fn compact_context(
     history: &mut History,
     client: &Client,
