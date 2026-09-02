@@ -102,15 +102,6 @@ pub enum AgentEvent {
         /// The completed result.
         result: ToolResult,
     },
-    /// A complete tool round was committed to conversation history.
-    ToolResultsCommitted {
-        /// The calls in model order.
-        calls:     Vec<ToolCall>,
-        /// One paired result per call, in model order.
-        results:   Vec<ToolResult>,
-        /// Whether cancellation fired before the round was committed.
-        cancelled: bool,
-    },
     /// A round was interrupted so queued steering can be applied.
     TurnInterrupted,
     /// The prompt and all queued follow-up input completed.

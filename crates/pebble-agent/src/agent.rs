@@ -16,6 +16,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::control::{AgentControlHandle, Control};
+use crate::conversation::ConversationProjection;
 use crate::error::{AgentBuildError, AgentError, Result};
 use crate::event::{AgentEvent, EventHub, EventProjection, FirstOutputKind};
 use crate::integration::{StreamObserver, StreamOutcome, stream_response};
@@ -24,7 +25,7 @@ use crate::tool::{
     StaticToolService, Tool, ToolCallRequest, ToolCatalog, ToolDiscoveryContext, ToolErrorKind,
     ToolMiddleware, ToolOutcome, ToolScheduling, ToolService, ToolSystem,
 };
-use crate::turn::{TurnBoundaryAction, TurnBoundaryContext, TurnBoundaryHooks, TurnContext};
+use crate::turn::{AfterAnswerAction, AgentLifecycle, ConversationUpdate, TurnContext};
 use crate::validation::validate_tool_arguments;
 
 /// The default number of lifecycle events held for each subscriber.
@@ -173,7 +174,8 @@ pub struct AgentBuilder {
     tools:            Vec<Tool>,
     tool_service:     Option<Arc<dyn ToolService>>,
     tool_middleware:  Vec<Arc<dyn ToolMiddleware>>,
-    turn_hooks:       Option<Arc<dyn TurnBoundaryHooks>>,
+    lifecycle:        Option<Arc<dyn AgentLifecycle>>,
+    conversation:     Option<Arc<dyn ConversationProjection>>,
     event_projection: Option<Arc<dyn EventProjection>>,
     config:           AgentConfig,
     control:          Option<AgentControlHandle>,
@@ -189,7 +191,8 @@ impl AgentBuilder {
             tools:            Vec::new(),
             tool_service:     None,
             tool_middleware:  Vec::new(),
-            turn_hooks:       None,
+            lifecycle:        None,
+            conversation:     None,
             event_projection: None,
             config:           AgentConfig::default(),
             control:          None,
@@ -241,9 +244,15 @@ impl AgentBuilder {
         self
     }
 
-    /// Sets hooks at model-turn and natural-answer boundaries.
-    pub fn turn_boundary_hooks(mut self, hooks: Arc<dyn TurnBoundaryHooks>) -> Self {
-        self.turn_hooks = Some(hooks);
+    /// Sets the lifecycle stages around model turns and natural answers.
+    pub fn lifecycle(mut self, lifecycle: Arc<dyn AgentLifecycle>) -> Self {
+        self.lifecycle = Some(lifecycle);
+        self
+    }
+
+    /// Projects explicit canonical-conversation commits into another model.
+    pub fn conversation_projection(mut self, projection: Arc<dyn ConversationProjection>) -> Self {
+        self.conversation = Some(projection);
         self
     }
 
@@ -301,7 +310,8 @@ impl AgentBuilder {
             system_prompt: self.system_prompt,
             messages: self.messages,
             tool_system,
-            turn_hooks: self.turn_hooks,
+            lifecycle: self.lifecycle,
+            conversation: self.conversation,
             config: self.config,
             events,
             control: self
@@ -398,7 +408,8 @@ pub struct Agent {
     system_prompt: String,
     messages:      Vec<Message>,
     tool_system:   ToolSystem,
-    turn_hooks:    Option<Arc<dyn TurnBoundaryHooks>>,
+    lifecycle:     Option<Arc<dyn AgentLifecycle>>,
+    conversation:  Option<Arc<dyn ConversationProjection>>,
     config:        AgentConfig,
     events:        EventHub,
     control:       Arc<Control>,
@@ -525,7 +536,7 @@ impl Agent {
     /// caller dropping the future. A cancellation observed after the model
     /// asked for tools answers every pending call with a `Cancelled` error
     /// result, without running it, and records those results before the
-    /// prompt returns [`AgentError::Aborted`]; an `after_model` hook that
+    /// prompt returns [`AgentError::Aborted`]; an `after_model` stage that
     /// fails is answered the same way before its error is returned. A call
     /// that was already running is cancelled through its own token and keeps
     /// the result it returns.
@@ -590,10 +601,7 @@ impl Agent {
         let mut tool_call_count = 0;
 
         loop {
-            self.messages.push(next_message.clone());
-            self.emit(AgentEvent::UserMessage {
-                message: next_message,
-            });
+            self.commit_user_message(next_message);
 
             let final_response = loop {
                 if prompt_cancel.is_cancelled() {
@@ -608,16 +616,11 @@ impl Agent {
                 for steering in steering {
                     let attribution = steering.attribution().cloned();
                     let message = steering.into_message();
-                    self.messages.push(message.clone());
-                    self.emit(AgentEvent::SteeringMessage {
-                        message,
-                        attribution,
-                    });
+                    self.commit_steering_message(message, attribution);
                 }
-                if let Some(hooks) = self.turn_hooks.clone() {
-                    let context =
-                        TurnBoundaryContext::new(&self.model, turn_count, &mut self.messages);
-                    let prepared = hooks.before_model(context, &round_cancel).await;
+                if let Some(lifecycle) = self.lifecycle.clone() {
+                    let context = TurnContext::new(&self.model, turn_count, &self.messages);
+                    let prepared = lifecycle.before_model(context, &round_cancel).await;
                     // Nothing is open here: the last turn's tool calls were
                     // answered before the loop came back around, so aborting
                     // leaves the conversation paired.
@@ -628,7 +631,8 @@ impl Agent {
                         self.emit(AgentEvent::TurnInterrupted);
                         continue;
                     }
-                    prepared.map_err(|source| AgentError::TurnBoundary { source })?;
+                    let update = prepared.map_err(|source| AgentError::Lifecycle { source })?;
+                    self.apply_conversation_update(update);
                 }
 
                 let tools = self.discover_tools(turn_count).await?;
@@ -652,31 +656,32 @@ impl Agent {
                 let turn = turn_count;
                 turn_count += 1;
 
-                let assistant = response_message(&response);
-                self.messages.push(assistant);
-                self.emit(AgentEvent::AssistantMessage {
-                    response: response.clone(),
-                });
+                self.commit_assistant_message(&response);
 
-                // The assistant turn is committed, and the hook can take a
+                // The assistant turn is committed, and the lifecycle can take a
                 // while (the coding layer compacts here). A prompt cancelled
                 // by now is not honored until the turn's tool calls have their
                 // results: `execute_tools` sees the fired token and answers
                 // every call as `Cancelled` without running it, so the
-                // conversation the abort leaves behind stays paired. A hook
+                // conversation the abort leaves behind stays paired. A stage
                 // that fails is held to the same rule: the calls are answered
                 // as `Cancelled` before its error ends the prompt.
-                if let Some(hooks) = self.turn_hooks.clone() {
-                    let context = TurnBoundaryContext::new(&self.model, turn, &mut self.messages);
-                    let hooked = hooks.after_model(context, &response, &round_cancel).await;
-                    if let Err(source) = hooked {
-                        let calls = tool_calls(&response);
-                        if !calls.is_empty() {
-                            let results =
-                                self.answer_calls_as_cancelled(turn, &calls, &tools).await;
-                            self.commit_tool_results(&calls, results, true);
+                if let Some(lifecycle) = self.lifecycle.clone() {
+                    let context = TurnContext::new(&self.model, turn, &self.messages);
+                    match lifecycle
+                        .after_model(context, &response, &round_cancel)
+                        .await
+                    {
+                        Ok(update) => self.apply_conversation_update(update),
+                        Err(source) => {
+                            let calls = tool_calls(&response);
+                            if !calls.is_empty() {
+                                let results =
+                                    self.answer_calls_as_cancelled(turn, &calls, &tools).await;
+                                self.commit_tool_results(&calls, &results, true);
+                            }
+                            return Err(AgentError::Lifecycle { source });
                         }
-                        return Err(AgentError::TurnBoundary { source });
                     }
                 }
 
@@ -692,23 +697,22 @@ impl Agent {
                         }
                         continue;
                     }
-                    if let Some(hooks) = self.turn_hooks.clone() {
+                    if let Some(lifecycle) = self.lifecycle.clone() {
                         let context = TurnContext::new(&self.model, turn, &self.messages);
-                        let boundary_action = hooks
+                        let boundary_action = lifecycle
                             .after_answer(context, &response, prompt_cancel)
                             .await
-                            .map_err(|source| AgentError::TurnBoundary { source })?;
+                            .map_err(|source| AgentError::Lifecycle { source })?;
                         // Still nothing open: the answer had no tool calls.
                         if prompt_cancel.is_cancelled() {
                             return Err(AgentError::Aborted);
                         }
                         match boundary_action {
-                            TurnBoundaryAction::Complete => {}
-                            TurnBoundaryAction::Continue => continue,
-                            TurnBoundaryAction::ContinueWith(message) => {
+                            AfterAnswerAction::Complete => {}
+                            AfterAnswerAction::Continue => continue,
+                            AfterAnswerAction::ContinueWith(message) => {
                                 let message = message.into_message();
-                                self.messages.push(message.clone());
-                                self.emit(AgentEvent::UserMessage { message });
+                                self.commit_user_message(message);
                                 continue;
                             }
                         }
@@ -725,7 +729,7 @@ impl Agent {
                     .execute_tools(turn, &calls, &tools, prompt_cancel, &round_cancel)
                     .await;
                 let cancelled = prompt_cancel.is_cancelled() || round_cancel.is_cancelled();
-                self.commit_tool_results(&calls, execution.results, cancelled);
+                self.commit_tool_results(&calls, &execution.results, cancelled);
 
                 if let Some(source) = execution.system_error {
                     return Err(AgentError::ToolSystem { source });
@@ -843,18 +847,48 @@ impl Agent {
             .results
     }
 
-    fn commit_tool_results(
-        &mut self,
-        calls: &[ToolCall],
-        results: Vec<ToolResult>,
-        cancelled: bool,
-    ) {
-        self.messages.push(tool_results_message(&results));
-        self.emit(AgentEvent::ToolResultsCommitted {
-            calls: calls.to_vec(),
-            results,
-            cancelled,
+    fn commit_user_message(&mut self, message: Message) {
+        self.messages.push(message.clone());
+        if let Some(projection) = &self.conversation {
+            projection.user_message_committed(&message);
+        }
+        self.emit(AgentEvent::UserMessage { message });
+    }
+
+    fn apply_conversation_update(&mut self, update: ConversationUpdate) {
+        if update.apply(&mut self.messages)
+            && let Some(projection) = &self.conversation
+        {
+            projection.conversation_replaced(&self.messages);
+        }
+    }
+
+    fn commit_steering_message(&mut self, message: Message, attribution: Option<Value>) {
+        self.messages.push(message.clone());
+        if let Some(projection) = &self.conversation {
+            projection.steering_message_committed(&message, attribution.as_ref());
+        }
+        self.emit(AgentEvent::SteeringMessage {
+            message,
+            attribution,
         });
+    }
+
+    fn commit_assistant_message(&mut self, response: &Response) {
+        self.messages.push(response_message(response));
+        if let Some(projection) = &self.conversation {
+            projection.assistant_message_committed(response);
+        }
+        self.emit(AgentEvent::AssistantMessage {
+            response: response.clone(),
+        });
+    }
+
+    fn commit_tool_results(&mut self, calls: &[ToolCall], results: &[ToolResult], cancelled: bool) {
+        self.messages.push(tool_results_message(results));
+        if let Some(projection) = &self.conversation {
+            projection.tool_results_committed(calls, results, cancelled);
+        }
     }
 
     async fn execute_tools(
@@ -1423,31 +1457,108 @@ mod tests {
         trace: Arc<Mutex<Vec<String>>>,
     }
 
+    struct PreparingLifecycle {
+        prepared: AtomicBool,
+    }
+
     #[async_trait]
-    impl TurnBoundaryHooks for BackgroundBoundary {
+    impl AgentLifecycle for PreparingLifecycle {
         async fn before_model(
             &self,
-            context: TurnBoundaryContext<'_>,
+            _context: TurnContext<'_>,
             _cancel: &CancellationToken,
-        ) -> StdResult<(), crate::TurnBoundaryError> {
+        ) -> StdResult<ConversationUpdate, crate::LifecycleError> {
+            if self.prepared.swap(true, Ordering::SeqCst) {
+                return Ok(ConversationUpdate::unchanged());
+            }
+            Ok(ConversationUpdate::replace(vec![Message::new(
+                Role::User,
+                [ContentPart::Text {
+                    text: "prepared".to_owned(),
+                }],
+            )]))
+        }
+    }
+
+    struct RecordingConversation {
+        commits: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ConversationProjection for RecordingConversation {
+        fn user_message_committed(&self, message: &Message) {
+            self.commits
+                .lock()
+                .expect("the commit lock is healthy")
+                .push(format!("user:{}", message_text_content(message)));
+        }
+
+        fn assistant_message_committed(&self, response: &Response) {
+            self.commits
+                .lock()
+                .expect("the commit lock is healthy")
+                .push(format!("assistant:{}", response.text()));
+        }
+
+        fn tool_results_committed(
+            &self,
+            calls: &[ToolCall],
+            results: &[ToolResult],
+            cancelled: bool,
+        ) {
+            self.commits
+                .lock()
+                .expect("the commit lock is healthy")
+                .push(format!(
+                    "tools:{}:{}:{cancelled}",
+                    calls.len(),
+                    results.len()
+                ));
+        }
+
+        fn conversation_replaced(&self, messages: &[Message]) {
+            self.commits
+                .lock()
+                .expect("the commit lock is healthy")
+                .push(format!("replace:{}", messages.len()));
+        }
+    }
+
+    fn message_text_content(message: &Message) -> String {
+        message
+            .content()
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[async_trait]
+    impl AgentLifecycle for BackgroundBoundary {
+        async fn before_model(
+            &self,
+            context: TurnContext<'_>,
+            _cancel: &CancellationToken,
+        ) -> StdResult<crate::ConversationUpdate, crate::LifecycleError> {
             self.trace
                 .lock()
                 .expect("the trace lock is healthy")
                 .push(format!("before:{}", context.turn()));
-            Ok(())
+            Ok(crate::ConversationUpdate::unchanged())
         }
 
         async fn after_model(
             &self,
-            context: TurnBoundaryContext<'_>,
+            context: TurnContext<'_>,
             _response: &Response,
             _cancel: &CancellationToken,
-        ) -> StdResult<(), crate::TurnBoundaryError> {
+        ) -> StdResult<crate::ConversationUpdate, crate::LifecycleError> {
             self.trace
                 .lock()
                 .expect("the trace lock is healthy")
                 .push(format!("after:{}", context.turn()));
-            Ok(())
+            Ok(crate::ConversationUpdate::unchanged())
         }
 
         async fn after_answer(
@@ -1455,15 +1566,15 @@ mod tests {
             context: TurnContext<'_>,
             _response: &Response,
             _cancel: &CancellationToken,
-        ) -> StdResult<TurnBoundaryAction, crate::TurnBoundaryError> {
+        ) -> StdResult<AfterAnswerAction, crate::LifecycleError> {
             self.trace
                 .lock()
                 .expect("the trace lock is healthy")
                 .push(format!("answer:{}", context.turn()));
             Ok(if context.turn() == 0 {
-                TurnBoundaryAction::ContinueWith(UserMessage::text("background result"))
+                AfterAnswerAction::ContinueWith(UserMessage::text("background result"))
             } else {
-                TurnBoundaryAction::Complete
+                AfterAnswerAction::Complete
             })
         }
     }
@@ -1481,6 +1592,47 @@ mod tests {
         assert_eq!(outcome.tool_call_count(), 0);
         assert_eq!(agent.messages().len(), 2);
         assert_eq!(agent.state(), AgentState::Idle);
+    }
+
+    #[tokio::test]
+    async fn lifecycle_updates_and_conversation_commits_are_explicit() {
+        let calls_tool = response([ContentPart::ToolCall(ToolCall::function(
+            "call_1",
+            "inspect",
+            json!({}),
+        ))]);
+        let (model, requests) = ScriptedModel::recording([calls_tool, text_response("finished")]);
+        let tool = Tool::function(
+            "inspect",
+            "Inspect",
+            json!({}),
+            |_context, _arguments| async { Ok("done".into()) },
+        )
+        .expect("the inspect tool is valid");
+        let commits = Arc::new(Mutex::new(Vec::new()));
+        let mut agent = Agent::builder(model, "test/model")
+            .tools([tool])
+            .lifecycle(Arc::new(PreparingLifecycle {
+                prepared: AtomicBool::new(false),
+            }))
+            .conversation_projection(Arc::new(RecordingConversation {
+                commits: Arc::clone(&commits),
+            }))
+            .build()
+            .expect("the agent builds");
+
+        agent.prompt("original").await.expect("the prompt succeeds");
+
+        let requests = requests.lock().expect("the request lock is healthy");
+        assert_eq!(message_text_content(&requests[0].messages()[0]), "prepared");
+        assert_eq!(agent.messages().len(), 4);
+        assert_eq!(*commits.lock().expect("the commit lock is healthy"), [
+            "user:original",
+            "replace:1",
+            "assistant:",
+            "tools:1:1:false",
+            "assistant:finished",
+        ]);
     }
 
     #[tokio::test]
@@ -1677,13 +1829,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_boundary_hooks_can_continue_with_a_background_result() {
+    async fn lifecycle_can_continue_with_a_background_result() {
         let trace = Arc::new(Mutex::new(Vec::new()));
         let mut agent = Agent::builder(
             ScriptedModel::new([text_response("first"), text_response("second")]),
             "test/model",
         )
-        .turn_boundary_hooks(Arc::new(BackgroundBoundary {
+        .lifecycle(Arc::new(BackgroundBoundary {
             trace: Arc::clone(&trace),
         }))
         .build()
@@ -1698,7 +1850,7 @@ mod tests {
         ]);
     }
 
-    /// Aborts the prompt once, from the hook that runs after the assistant
+    /// Aborts the prompt once, from the stage that runs after the assistant
     /// turn is committed and before its tool calls are answered.
     struct AbortingBoundary {
         control: AgentControlHandle,
@@ -1706,17 +1858,17 @@ mod tests {
     }
 
     #[async_trait]
-    impl TurnBoundaryHooks for AbortingBoundary {
+    impl AgentLifecycle for AbortingBoundary {
         async fn after_model(
             &self,
-            _context: TurnBoundaryContext<'_>,
+            _context: TurnContext<'_>,
             _response: &Response,
             _cancel: &CancellationToken,
-        ) -> StdResult<(), crate::TurnBoundaryError> {
+        ) -> StdResult<crate::ConversationUpdate, crate::LifecycleError> {
             if !self.fired.swap(true, Ordering::SeqCst) {
                 assert!(self.control.abort(), "a prompt is running to abort");
             }
-            Ok(())
+            Ok(crate::ConversationUpdate::unchanged())
         }
     }
 
@@ -1747,7 +1899,7 @@ mod tests {
         let mut agent = Agent::builder(model, "test/model")
             .control_handle(control.clone())
             .tools([counting_tool])
-            .turn_boundary_hooks(Arc::new(AbortingBoundary {
+            .lifecycle(Arc::new(AbortingBoundary {
                 control,
                 fired: AtomicBool::new(false),
             }))
@@ -1824,19 +1976,19 @@ mod tests {
     struct FailingBoundary;
 
     #[async_trait]
-    impl TurnBoundaryHooks for FailingBoundary {
+    impl AgentLifecycle for FailingBoundary {
         async fn after_model(
             &self,
-            _context: TurnBoundaryContext<'_>,
+            _context: TurnContext<'_>,
             _response: &Response,
             _cancel: &CancellationToken,
-        ) -> StdResult<(), crate::TurnBoundaryError> {
-            Err(crate::TurnBoundaryError::new("the boundary failed"))
+        ) -> StdResult<crate::ConversationUpdate, crate::LifecycleError> {
+            Err(crate::LifecycleError::new("the lifecycle failed"))
         }
     }
 
     #[tokio::test]
-    async fn a_failing_after_model_hook_answers_the_tool_call_before_failing_the_prompt() {
+    async fn a_failing_after_model_stage_answers_the_tool_call_before_failing_the_prompt() {
         let calls_tool = response([ContentPart::ToolCall(ToolCall::function(
             "call_1",
             "count",
@@ -1859,7 +2011,7 @@ mod tests {
         .expect("the count tool is valid");
         let mut agent = Agent::builder(ScriptedModel::new([calls_tool]), "test/model")
             .tools([counting_tool])
-            .turn_boundary_hooks(Arc::new(FailingBoundary))
+            .lifecycle(Arc::new(FailingBoundary))
             .build()
             .expect("the agent builds");
         let mut events = agent.subscribe();
@@ -1869,10 +2021,7 @@ mod tests {
             .await
             .expect_err("the boundary failed the prompt");
 
-        assert!(
-            matches!(error, AgentError::TurnBoundary { .. }),
-            "{error:?}"
-        );
+        assert!(matches!(error, AgentError::Lifecycle { .. }), "{error:?}");
         assert_eq!(
             executions.load(Ordering::SeqCst),
             0,

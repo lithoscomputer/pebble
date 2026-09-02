@@ -1,4 +1,4 @@
-//! Hooks at stable model-turn boundaries.
+//! Lifecycle stages at stable model-turn boundaries.
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -13,7 +13,7 @@ use crate::agent::UserMessage;
 /// What the agent does after a model turn answers without tool calls.
 #[derive(Clone, Debug, Default, PartialEq)]
 #[non_exhaustive]
-pub enum TurnBoundaryAction {
+pub enum AfterAnswerAction {
     /// Finish the prompt with this answer.
     #[default]
     Complete,
@@ -59,45 +59,36 @@ impl<'a> TurnContext<'a> {
     }
 }
 
-/// A mutable conversation view at a model-turn boundary.
-pub struct TurnBoundaryContext<'a> {
-    model:    &'a str,
-    turn:     usize,
-    messages: &'a mut Vec<Message>,
+/// A typed conversation change returned from a lifecycle stage.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ConversationUpdate {
+    replacement: Option<Vec<Message>>,
 }
 
-impl<'a> TurnBoundaryContext<'a> {
-    pub(crate) fn new(model: &'a str, turn: usize, messages: &'a mut Vec<Message>) -> Self {
+impl ConversationUpdate {
+    /// Leaves the canonical conversation unchanged.
+    #[must_use]
+    pub const fn unchanged() -> Self {
+        Self { replacement: None }
+    }
+
+    /// Replaces the canonical conversation at a stable turn boundary.
+    ///
+    /// The replacement must preserve tool-call and tool-result pairing.
+    #[must_use]
+    pub fn replace(messages: Vec<Message>) -> Self {
         Self {
-            model,
-            turn,
-            messages,
+            replacement: Some(messages),
         }
     }
 
-    /// The model selector for this turn.
-    #[must_use]
-    pub const fn model(&self) -> &str {
-        self.model
-    }
-
-    /// The zero-based model-turn number in the current prompt.
-    #[must_use]
-    pub const fn turn(&self) -> usize {
-        self.turn
-    }
-
-    /// The committed conversation at this boundary.
-    #[must_use]
-    pub fn messages(&self) -> &[Message] {
-        self.messages
-    }
-
-    /// Mutates the conversation before the next operation.
-    ///
-    /// Implementations must preserve valid tool-call and tool-result pairing.
-    pub fn messages_mut(&mut self) -> &mut Vec<Message> {
-        self.messages
+    pub(crate) fn apply(self, messages: &mut Vec<Message>) -> bool {
+        if let Some(replacement) = self.replacement {
+            *messages = replacement;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -108,14 +99,14 @@ impl<'a> TurnBoundaryContext<'a> {
 /// answer. Returning a message from [`after_answer`](Self::after_answer)
 /// continues the same prompt with that message.
 #[async_trait]
-pub trait TurnBoundaryHooks: Send + Sync {
+pub trait AgentLifecycle: Send + Sync {
     /// Runs after steering is committed and before tools are resolved.
     async fn before_model(
         &self,
-        _context: TurnBoundaryContext<'_>,
+        _context: TurnContext<'_>,
         _cancel: &CancellationToken,
-    ) -> StdResult<(), TurnBoundaryError> {
-        Ok(())
+    ) -> StdResult<ConversationUpdate, LifecycleError> {
+        Ok(ConversationUpdate::unchanged())
     }
 
     /// Runs after the assistant response is committed.
@@ -125,11 +116,11 @@ pub trait TurnBoundaryHooks: Send + Sync {
     /// turn is never left without its results.
     async fn after_model(
         &self,
-        _context: TurnBoundaryContext<'_>,
+        _context: TurnContext<'_>,
         _response: &Response,
         _cancel: &CancellationToken,
-    ) -> StdResult<(), TurnBoundaryError> {
-        Ok(())
+    ) -> StdResult<ConversationUpdate, LifecycleError> {
+        Ok(ConversationUpdate::unchanged())
     }
 
     /// Runs before a natural answer completes the prompt.
@@ -140,19 +131,19 @@ pub trait TurnBoundaryHooks: Send + Sync {
         _context: TurnContext<'_>,
         _response: &Response,
         _cancel: &CancellationToken,
-    ) -> StdResult<TurnBoundaryAction, TurnBoundaryError> {
-        Ok(TurnBoundaryAction::Complete)
+    ) -> StdResult<AfterAnswerAction, LifecycleError> {
+        Ok(AfterAnswerAction::Complete)
     }
 }
 
-/// A turn-boundary hook failure with an optional source chain.
+/// A lifecycle-stage failure with an optional source chain.
 #[derive(Debug)]
-pub struct TurnBoundaryError {
+pub struct LifecycleError {
     message: String,
     source:  Option<Box<dyn StdError + Send + Sync>>,
 }
 
-impl TurnBoundaryError {
+impl LifecycleError {
     /// Creates a failure with no lower-level source.
     #[must_use]
     pub fn new(message: impl Into<String>) -> Self {
@@ -174,13 +165,13 @@ impl TurnBoundaryError {
     }
 }
 
-impl fmt::Display for TurnBoundaryError {
+impl fmt::Display for LifecycleError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.message)
     }
 }
 
-impl StdError for TurnBoundaryError {
+impl StdError for LifecycleError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         self.source
             .as_deref()

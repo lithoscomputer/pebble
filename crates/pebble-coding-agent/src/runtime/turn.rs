@@ -196,17 +196,17 @@ impl CodingAgentBridge {
 
     /// Keeps a typed coding-layer failure while the generic loop receives its
     /// boundary representation.
-    fn record_boundary_error(&self, error: Error) -> agent::TurnBoundaryError {
+    fn record_boundary_error(&self, error: Error) -> agent::LifecycleError {
         let message = ErrorData::from(&error).message;
         self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .boundary_error = Some(error);
-        agent::TurnBoundaryError::new(message)
+        agent::LifecycleError::new(message)
     }
 
     /// Waits for the tree stream at a stable turn boundary.
-    async fn flush_events(&self) -> StdResult<(), agent::TurnBoundaryError> {
+    async fn flush_events(&self) -> StdResult<(), agent::LifecycleError> {
         self.emitter
             .flush()
             .await
@@ -319,12 +319,13 @@ impl CodingAgentBridge {
             });
     }
 
-    fn sync_messages(&self, context: &mut agent::TurnBoundaryContext<'_>, include_reminder: bool) {
+    fn conversation_update(&self, include_reminder: bool) -> agent::ConversationUpdate {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        *context.messages_mut() = state.history.to_llm_messages();
+        let mut messages = state.history.to_llm_messages();
         if include_reminder && let Some(reminder) = &state.pending_task_reminder {
-            context.messages_mut().push(reminder.to_llm_message());
+            messages.push(reminder.to_llm_message());
         }
+        agent::ConversationUpdate::replace(messages)
     }
 
     fn commit_user_message(&self, message: &LlmMessage) {
@@ -461,11 +462,6 @@ impl CodingAgentBridge {
 impl agent::EventProjection for CodingAgentBridge {
     fn project(&self, event: &agent::AgentEvent) {
         match event {
-            agent::AgentEvent::UserMessage { message } => self.commit_user_message(message),
-            agent::AgentEvent::SteeringMessage {
-                message,
-                attribution,
-            } => self.commit_steering(message, attribution.as_ref()),
             agent::AgentEvent::ModelRequestStarted { request, .. } => {
                 let local = self.measure_request(request);
                 let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -516,7 +512,6 @@ impl agent::EventProjection for CodingAgentBridge {
                     phase:      LlmRetryPhase::Consume,
                 });
             }
-            agent::AgentEvent::AssistantMessage { response } => self.commit_assistant(response),
             agent::AgentEvent::ToolStarted { call } => {
                 self.state_machine.transition(CodingAgentState::Executing);
                 let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -572,11 +567,6 @@ impl agent::EventProjection for CodingAgentBridge {
                     Some(result.tool_call_id.clone()),
                 );
             }
-            agent::AgentEvent::ToolResultsCommitted {
-                calls,
-                results,
-                cancelled,
-            } => self.commit_tool_results(calls, results, *cancelled),
             agent::AgentEvent::TurnInterrupted => {
                 self.finish_inference();
                 self.state
@@ -591,39 +581,39 @@ impl agent::EventProjection for CodingAgentBridge {
 }
 
 #[async_trait]
-impl agent::TurnBoundaryHooks for CodingAgentBridge {
+impl agent::AgentLifecycle for CodingAgentBridge {
     async fn before_model(
         &self,
-        mut context: agent::TurnBoundaryContext<'_>,
+        _context: agent::TurnContext<'_>,
         cancel: &CancellationToken,
-    ) -> StdResult<(), agent::TurnBoundaryError> {
+    ) -> StdResult<agent::ConversationUpdate, agent::LifecycleError> {
         self.settle_interrupts();
         if cancel.is_cancelled() || self.prompt_cancel().is_cancelled() {
-            return Ok(());
+            return Ok(agent::ConversationUpdate::unchanged());
         }
 
         // Commit the input and any steering before work on the next request.
         self.flush_events().await?;
         self.compact_once_if_needed().await;
         self.stage_task_reminder();
-        self.sync_messages(&mut context, true);
+        let update = self.conversation_update(true);
         // Compaction can publish its own result or failure.
         self.flush_events().await?;
-        Ok(())
+        Ok(update)
     }
 
     async fn after_model(
         &self,
-        mut context: agent::TurnBoundaryContext<'_>,
+        _context: agent::TurnContext<'_>,
         _response: &Response,
         _cancel: &CancellationToken,
-    ) -> StdResult<(), agent::TurnBoundaryError> {
+    ) -> StdResult<agent::ConversationUpdate, agent::LifecycleError> {
         // Do not run tools until the response that requested them is durable.
         self.flush_events().await?;
         self.compact_once_if_needed().await;
-        self.sync_messages(&mut context, false);
+        let update = self.conversation_update(false);
         self.flush_events().await?;
-        Ok(())
+        Ok(update)
     }
 
     async fn after_answer(
@@ -631,7 +621,7 @@ impl agent::TurnBoundaryHooks for CodingAgentBridge {
         _context: agent::TurnContext<'_>,
         _response: &Response,
         cancel: &CancellationToken,
-    ) -> StdResult<agent::TurnBoundaryAction, agent::TurnBoundaryError> {
+    ) -> StdResult<agent::AfterAnswerAction, agent::LifecycleError> {
         // The completion close-door race. A steer may be queued right now, or a
         // steering lease may be held by an external source that is about to
         // send one. Anything queued sends the loop around again to drain it; an
@@ -645,7 +635,7 @@ impl agent::TurnBoundaryHooks for CodingAgentBridge {
             notified.as_mut().enable();
 
             if self.control.pending_steering() > 0 {
-                return Ok(agent::TurnBoundaryAction::Continue);
+                return Ok(agent::AfterAnswerAction::Continue);
             }
             let parked = self.control.steering_lease_count() > 0;
             if !parked || cancel.is_cancelled() || prompt_cancel.is_cancelled() {
@@ -683,19 +673,35 @@ impl agent::TurnBoundaryHooks for CodingAgentBridge {
                     source:     SkillActivationSource::Slash,
                 });
             }
-            return Ok(agent::TurnBoundaryAction::ContinueWith(
-                expanded.text.into(),
-            ));
+            return Ok(agent::AfterAnswerAction::ContinueWith(expanded.text.into()));
         }
 
         let Some(supervisor) = self.subagents.as_ref() else {
-            return Ok(agent::TurnBoundaryAction::Complete);
+            return Ok(agent::AfterAnswerAction::Complete);
         };
         match supervisor.next_parent_notification_turn(cancel).await {
-            Ok(Some(turn)) => Ok(agent::TurnBoundaryAction::ContinueWith(turn.into())),
-            Ok(None) => Ok(agent::TurnBoundaryAction::Complete),
+            Ok(Some(turn)) => Ok(agent::AfterAnswerAction::ContinueWith(turn.into())),
+            Ok(None) => Ok(agent::AfterAnswerAction::Complete),
             Err(error) => Err(self.record_boundary_error(error)),
         }
+    }
+}
+
+impl agent::ConversationProjection for CodingAgentBridge {
+    fn user_message_committed(&self, message: &LlmMessage) {
+        self.commit_user_message(message);
+    }
+
+    fn steering_message_committed(&self, message: &LlmMessage, attribution: Option<&Value>) {
+        self.commit_steering(message, attribution);
+    }
+
+    fn assistant_message_committed(&self, response: &Response) {
+        self.commit_assistant(response);
+    }
+
+    fn tool_results_committed(&self, calls: &[ToolCall], results: &[ToolResult], cancelled: bool) {
+        self.commit_tool_results(calls, results, cancelled);
     }
 }
 
@@ -830,7 +836,8 @@ impl CodingRuntime {
             .tool_service(bridge.tools.clone())
             .tool_middleware(bridge.tools.clone())
             .control_handle(self.agent_control.clone())
-            .turn_boundary_hooks(bridge.clone())
+            .lifecycle(bridge.clone())
+            .conversation_projection(bridge.clone())
             .event_projection(bridge.clone())
             .config(config);
         for middleware in &self.tool_middleware {

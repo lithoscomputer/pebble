@@ -6,7 +6,7 @@ use lithos_llm::types::{Error as LlmError, RequestBuildError};
 use thiserror::Error;
 
 use crate::tool::{ToolId, ToolSystemError};
-use crate::turn::TurnBoundaryError;
+use crate::turn::LifecycleError;
 
 /// A result returned while an agent processes a prompt.
 pub type Result<T> = StdResult<T, AgentError>;
@@ -84,11 +84,11 @@ pub enum AgentError {
         #[source]
         source: ToolSystemError,
     },
-    /// A configured turn-boundary hook failed.
-    #[error("processing a model-turn boundary")]
-    TurnBoundary {
-        /// The hook failure.
+    /// A configured lifecycle stage failed.
+    #[error("running an agent lifecycle stage")]
+    Lifecycle {
+        /// The lifecycle failure.
         #[source]
-        source: TurnBoundaryError,
+        source: LifecycleError,
     },
 }

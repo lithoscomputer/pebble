@@ -6,7 +6,7 @@
 //! subagents, persistence, credentials, or provider construction.
 //!
 //! Specialized layers supply a [`ToolService`] and compose policy through
-//! [`ToolMiddleware`]. [`TurnBoundaryHooks`] own compaction and
+//! [`ToolMiddleware`]. [`AgentLifecycle`] owns compaction and
 //! background-result boundaries, and [`EventProjection`] maps the generic
 //! lifecycle into a durable application event model.
 //!
@@ -43,6 +43,7 @@
 
 mod agent;
 mod control;
+mod conversation;
 mod error;
 mod event;
 mod model;
@@ -55,6 +56,7 @@ pub use self::agent::{
     Agent, AgentBuilder, AgentConfig, AgentSnapshot, AgentState, PromptOutcome, UserMessage,
 };
 pub use self::control::{AgentControlHandle, QueueOutcome};
+pub use self::conversation::ConversationProjection;
 pub use self::error::{AgentBuildError, AgentError, Result};
 pub use self::event::{AgentEvent, EventProjection, FirstOutputKind};
 pub use self::model::ModelService;
@@ -65,7 +67,7 @@ pub use self::tool::{
     ToolSystemError,
 };
 pub use self::turn::{
-    TurnBoundaryAction, TurnBoundaryContext, TurnBoundaryError, TurnBoundaryHooks, TurnContext,
+    AfterAnswerAction, AgentLifecycle, ConversationUpdate, LifecycleError, TurnContext,
 };
 
 /// The small specialization interface a layer built on this crate uses.
