@@ -302,19 +302,35 @@ fn skip_past(text: &str, from: usize, terminator: &str) -> usize {
 ///
 /// The body of one of these elements is not markup, so the only thing that
 /// ends it is its own closing tag, in whatever case the page wrote it and with
-/// any whitespace before its `>`. A closing tag of some other element inside
-/// the body is body text. A body that never closes takes the rest of the page
-/// with it, which is what a browser does.
+/// anything before its `>`: `</SCRIPT>`, `</script >`, `</script foo>` and
+/// `</script/>` all close it, as they do in a browser. A closing tag of some
+/// other element inside the body is body text. A body that never closes takes
+/// the rest of the page with it, which is what a browser does.
+///
+/// The page is untrusted, so each `</` costs a fixed amount of work: the name
+/// is compared in place and the `>` is found with one linear search. Parsing
+/// each candidate as a tag would walk to the end of the page for every `</`
+/// in a body built to have no `>` at all.
 fn skip_raw_text(text: &str, from: usize, name: &str) -> usize {
     let mut index = from;
     while let Some(offset) = text[index..].find("</") {
-        let start = index + offset;
-        if let Some(tag) = Tag::parse(text, start)
-            && tag.name == name
-        {
-            return tag.end;
+        let name_start = index + offset + 2;
+        let name_end = name_start + name.len();
+        let named = text
+            .get(name_start..name_end)
+            .is_some_and(|candidate| candidate.eq_ignore_ascii_case(name));
+        if named {
+            match text.as_bytes().get(name_end) {
+                Some(b'>') => return name_end + 1,
+                Some(byte) if byte.is_ascii_whitespace() || *byte == b'/' => {
+                    return text[name_end..]
+                        .find('>')
+                        .map_or(text.len(), |close| name_end + close + 1);
+                }
+                _ => {}
+            }
         }
-        index = start + 2;
+        index = name_start;
     }
     text.len()
 }
@@ -478,6 +494,9 @@ fn entity(name: &str) -> Option<char> {
 
 #[cfg(test)]
 mod tests {
+    use std::iter::repeat_n;
+    use std::time::{Duration, Instant};
+
     use super::*;
 
     #[test]
@@ -612,6 +631,7 @@ mod tests {
     #[test]
     fn an_unterminated_script_swallows_only_the_rest_of_the_page() {
         assert_eq!(html_to_markdown("<p>before</p><script>alert(1)"), "before");
+        assert_eq!(html_to_markdown("<p>before</p><SCRIPT>alert(1)"), "before");
     }
 
     /// A page may close its script or style in any case, and may put
@@ -648,9 +668,43 @@ mod tests {
         );
     }
 
+    /// A closing tag closes with anything between its name and its `>`, and a
+    /// name that merely starts with the element's name is body text.
     #[test]
-    fn an_unterminated_uppercase_script_swallows_only_the_rest_of_the_page() {
-        assert_eq!(html_to_markdown("<p>before</p><SCRIPT>alert(1)"), "before");
+    fn a_closing_tag_closes_with_anything_before_its_bracket() {
+        assert_eq!(
+            html_to_markdown("<script>a</script foo=\"b\"><p>Content</p>"),
+            "Content"
+        );
+        assert_eq!(
+            html_to_markdown("<script>a</SCRIPT/><p>Content</p>"),
+            "Content"
+        );
+        assert_eq!(
+            html_to_markdown("<script>a</scriptx> b</script><p>Content</p>"),
+            "Content"
+        );
+    }
+
+    /// A fetched page is untrusted. A script body built so that no `</` is
+    /// ever followed by a `>` must cost a fixed amount of work per `</`;
+    /// parsing each one as a tag walked to the end of the page every time,
+    /// and a body this size then took minutes.
+    #[test]
+    fn a_hostile_script_body_converts_in_linear_time() {
+        let mut html = String::from("<p>before</p><script>");
+        html.extend(repeat_n("</a \"", 200_000));
+        html.push_str("</script><p>Content</p>");
+        let started = Instant::now();
+
+        let markdown = html_to_markdown(&html);
+
+        assert_eq!(markdown, "before\n\nContent");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     /// A page that carries its real destination in `href` and a tracking copy
