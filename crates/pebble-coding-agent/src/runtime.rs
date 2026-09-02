@@ -43,7 +43,7 @@ pub(crate) use crate::coding_agent::{
 use crate::config::CodingAgentOptions;
 use crate::context_window::{memory_prompt_tokens, skills_prompt_tokens};
 use crate::environment::{Environment, ExecRequest};
-use crate::error::{Error, ErrorData, InterruptReason, Result, TaskKind};
+use crate::error::{Error, ErrorData, ErrorKind, InterruptReason, Result, TaskKind};
 use crate::event::{Emitter, EventCapacity, EventOptions, EventPump, EventSink, EventSinkTimeout};
 use crate::file_tracker::FileTracker;
 use crate::history::History;
@@ -1444,19 +1444,23 @@ impl CodingRuntime {
             return Err(Error::SessionClosed);
         }
 
-        // A child of the terminal token, so a shutdown ends the prompt too, and
-        // linked to the caller's token where one was given.
+        // A child of the terminal token, so a shutdown ends the prompt too.
+        // Caller cancellation and a failed durable stream are joined in by
+        // tasks because a cancellation token has only one parent.
         let prompt_cancel = self.cancel_token.child_token();
-        let link = cancel.map(|caller| link_cancellation(caller, &prompt_cancel));
+        let caller_link = cancel.map(|caller| link_cancellation(caller, &prompt_cancel));
+        let event_failure = self.emitter.failure_token();
+        let event_link = link_cancellation(&event_failure, &prompt_cancel);
 
         let timer = self.start_wall_clock_timer(&prompt_cancel);
         let result = self
             .process_input(input, SkillExpansion::Apply, &prompt_cancel)
             .await;
 
-        if let Some(link) = link {
+        if let Some(link) = caller_link {
             link.abort();
         }
+        event_link.abort();
         let mut task_failure = stop_wall_clock_timer(timer).await;
         // The reason has been reported by now. Clearing it here rather than at
         // the start of the next prompt keeps a reason a watchdog records just
@@ -1476,15 +1480,35 @@ impl CodingRuntime {
                 ShutdownReason::Error
             };
             if let Err(error) = self.shutdown(reason).await {
-                task_failure = task_failure.or(Some(error));
+                remember_failure(&mut task_failure, error);
             }
         } else {
             self.state.transition(CodingAgentState::Idle);
             // `ProcessingEnd` is the prompt's durability barrier. The prompt
             // cannot finish before it and every earlier event reach the sink.
             if let Err(error) = self.flush_events().await {
-                task_failure = task_failure.or(Some(error));
+                remember_failure(&mut task_failure, error);
             }
+        }
+
+        // A failure found by the final barrier moved the session to `Closed`
+        // after the branch above began. Finish the shutdown now so children and
+        // the pump do not outlive the prompt that reports it.
+        if self.state.current() == CodingAgentState::Closed
+            && !self.ended
+            && let Err(error) = self.shutdown(ShutdownReason::Error).await
+        {
+            remember_failure(&mut task_failure, error);
+        }
+
+        // The durable stream is the record of every other outcome. If it is
+        // incomplete, that is the failure the caller must act on even when the
+        // model or a cleanup task also failed.
+        if task_failure
+            .as_ref()
+            .is_some_and(|error| error.kind() == ErrorKind::EventStream)
+        {
+            return Err(task_failure.expect("the failure was present"));
         }
 
         match (result, task_failure) {
@@ -1790,6 +1814,18 @@ fn link_cancellation(
     })
 }
 
+/// Keeps the event-stream failure when cleanup finds more than one failure.
+fn remember_failure(stored: &mut Option<Error>, failure: Error) {
+    match stored.as_ref().map(Error::kind) {
+        None => *stored = Some(failure),
+        Some(ErrorKind::EventStream) if failure.kind() == ErrorKind::EventStream => {}
+        Some(_) if failure.kind() == ErrorKind::EventStream => *stored = Some(failure),
+        Some(_) => {
+            warn!(error = ?failure, "A session task also failed while the prompt was ending");
+        }
+    }
+}
+
 /// The task watching one prompt's wall-clock budget.
 struct WallClockTimer {
     stop: CancellationToken,
@@ -1838,6 +1874,7 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use tokio::sync::Notify;
     use tokio::sync::broadcast::error::RecvError;
     use tokio::task::yield_now;
     use tokio::time::timeout;
@@ -1848,7 +1885,8 @@ mod tests {
     use crate::event::EventSinkError;
     use crate::record::SESSION_RECORD_FORMAT_VERSION;
     use crate::test_support::{
-        MockEnvironment, ScriptedCall, ScriptedFailure, scripted_client, text_response,
+        MockEnvironment, ScriptedCall, ScriptedFailure, scripted_client, text_delta_events,
+        text_response,
     };
     use crate::types::Message;
 
@@ -2230,6 +2268,89 @@ mod tests {
         async fn record(&self, _event: &CodingAgentEvent) -> StdResult<(), EventSinkError> {
             Err(EventSinkError::new("the disk is full"))
         }
+    }
+
+    /// Holds the user event until a test lets the next model request begin.
+    #[derive(Debug, Default)]
+    struct UserInputGate {
+        reached: Notify,
+        release: Notify,
+    }
+
+    #[async_trait]
+    impl EventSink for UserInputGate {
+        async fn record(&self, event: &CodingAgentEvent) -> StdResult<(), EventSinkError> {
+            if matches!(event.event, CodingEvent::UserInput { .. }) {
+                self.reached.notify_one();
+                self.release.notified().await;
+            }
+            Ok(())
+        }
+    }
+
+    /// Accepts setup events, then breaks while a model stream is still open.
+    struct RefuseTextDeltaSink;
+
+    #[async_trait]
+    impl EventSink for RefuseTextDeltaSink {
+        async fn record(&self, event: &CodingAgentEvent) -> StdResult<(), EventSinkError> {
+            if matches!(event.event, CodingEvent::TextDelta { .. }) {
+                return Err(EventSinkError::new("the event store disconnected"));
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_model_request_waits_until_its_input_is_durable() {
+        let sink = Arc::new(UserInputGate::default());
+        let (client, provider) =
+            scripted_client(vec![ScriptedCall::response(text_response("done"))]);
+        let mut session = builder(client)
+            .event_sink(Arc::clone(&sink) as Arc<dyn EventSink>)
+            .build()
+            .expect("the session builds");
+        let prompt = session.prompt("do a thing");
+        tokio::pin!(prompt);
+
+        tokio::select! {
+            () = sink.reached.notified() => {}
+            result = &mut prompt => panic!("the prompt passed its durability boundary: {result:?}"),
+        }
+        assert_eq!(
+            provider.call_count(),
+            0,
+            "the model is not called before its input reaches the sink"
+        );
+
+        sink.release.notify_one();
+        prompt.await.expect("the prompt continues after the commit");
+    }
+
+    #[tokio::test]
+    async fn a_mid_stream_sink_failure_cancels_the_model_and_keeps_its_error() {
+        let (client, _provider) = scripted_client(vec![ScriptedCall::EventsThenPending(
+            text_delta_events("partial"),
+        )]);
+        let mut session = builder(client)
+            .event_sink(Arc::new(RefuseTextDeltaSink))
+            .build()
+            .expect("the session builds");
+
+        let failure = timeout(Duration::from_secs(5), session.prompt("do a thing"))
+            .await
+            .expect("the failed stream cancels a model response that never ends")
+            .expect_err("the prompt reports the sink failure");
+
+        assert_eq!(failure.kind(), ErrorKind::EventStream);
+        assert!(
+            ErrorData::from(&failure)
+                .message
+                .contains("the event store disconnected")
+        );
+        assert_eq!(session.state(), CodingAgentState::Closed);
+        assert!(session.ended, "the failing prompt completed its shutdown");
+        assert!(session.pump.is_none(), "the failing prompt joined its pump");
     }
 
     #[tokio::test]

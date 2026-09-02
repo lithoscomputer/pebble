@@ -931,7 +931,15 @@ impl CodingAgent {
     /// The returned value is the highest committed sequence number at this
     /// barrier. A sink failure closes the agent and is returned here.
     pub async fn flush_events(&mut self) -> Result<u64, Error> {
-        self.inner.flush_events().await
+        match self.inner.flush_events().await {
+            Ok(seq) => Ok(seq),
+            Err(error) => {
+                // This is a public operation boundary. Finish the close that
+                // the failed pipeline began before returning.
+                let _ = self.inner.shutdown(ShutdownReason::Error).await;
+                Err(error)
+            }
+        }
     }
 
     /// The highest event sequence accepted by the durable sink.

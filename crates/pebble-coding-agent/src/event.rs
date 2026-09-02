@@ -447,6 +447,12 @@ impl Emitter {
         self.state.failure()
     }
 
+    /// Fires as soon as this pipeline can no longer record a complete stream.
+    #[must_use]
+    pub(crate) fn failure_token(&self) -> CancellationToken {
+        self.state.failed.clone()
+    }
+
     /// Waits until every event queued before this call has reached the sink.
     ///
     /// The returned number is the last committed sequence at that barrier.

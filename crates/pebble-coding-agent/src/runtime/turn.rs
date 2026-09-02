@@ -200,6 +200,15 @@ impl CodingAgentBridge {
         agent::TurnBoundaryError::new(message)
     }
 
+    /// Waits for the tree stream at a stable turn boundary.
+    async fn flush_events(&self) -> StdResult<(), agent::TurnBoundaryError> {
+        self.emitter
+            .flush()
+            .await
+            .map(|_| ())
+            .map_err(|failure| self.record_boundary_error(failure.into_runtime_error()))
+    }
+
     fn emit(&self, event: CodingEvent) {
         self.emitter.emit(self.session_id.clone(), event);
     }
@@ -659,9 +668,13 @@ impl agent::TurnBoundaryHooks for CodingAgentBridge {
             return Ok(());
         }
 
+        // Commit the input and any steering before work on the next request.
+        self.flush_events().await?;
         self.compact_once_if_needed().await;
         self.stage_task_reminder();
         self.sync_messages(&mut context, true);
+        // Compaction can publish its own result or failure.
+        self.flush_events().await?;
         Ok(())
     }
 
@@ -671,8 +684,11 @@ impl agent::TurnBoundaryHooks for CodingAgentBridge {
         _response: &Response,
         _cancel: &CancellationToken,
     ) -> StdResult<(), agent::TurnBoundaryError> {
+        // Do not run tools until the response that requested them is durable.
+        self.flush_events().await?;
         self.compact_once_if_needed().await;
         self.sync_messages(&mut context, false);
+        self.flush_events().await?;
         Ok(())
     }
 
@@ -818,6 +834,9 @@ impl CodingRuntime {
             .await;
         self.coding_agent = Some(agent);
         bridge.finish_inference();
+        // A failed stream cancels the generic loop. Recover its exact error
+        // before an abort can be mistaken for caller cancellation.
+        self.check_pump().await?;
         if let Some(error) = bridge.take_boundary_error() {
             // The supervisor's wait answers a cancellation with a plain
             // `Cancelled`, whoever cancelled and whatever reason they recorded
