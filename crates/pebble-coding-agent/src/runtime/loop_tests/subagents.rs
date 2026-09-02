@@ -29,8 +29,7 @@ use super::*;
 use crate::event::{EventSink, EventSinkError};
 use crate::human_input::{Answer, HumanInputError, HumanInputProvider, Question};
 use crate::subagent::{
-    ChildAgentFactory, ChildAgentSpec, SubagentLimits, SubagentResult, SubagentStatus,
-    SubagentSupervisor,
+    ChildObserver, SubagentLimits, SubagentResult, SubagentStatus, SubagentSupervisor,
 };
 use crate::test_support::{MockEnvironment, scripted_client};
 use crate::types::ToolErrorKind;
@@ -46,16 +45,15 @@ struct ChildHandle {
     supervisor: SubagentSupervisor,
 }
 
-/// A factory that builds children the plain way and keeps hold of each one.
+/// An observer that keeps hold of each child the tree builds.
 ///
 /// A child session is moved into its runner task as soon as it is supervised,
-/// so the factory is the only place a test can take its identity and the
+/// so the observer is the only place a test can take its identity and the
 /// supervisor that drives its own children.
-fn recording_factory() -> (ChildAgentFactory, Arc<Mutex<Vec<ChildHandle>>>) {
+fn recording_observer() -> (ChildObserver, Arc<Mutex<Vec<ChildHandle>>>) {
     let recorded: Arc<Mutex<Vec<ChildHandle>>> = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::clone(&recorded);
-    let factory: ChildAgentFactory = Arc::new(move |spec: ChildAgentSpec| {
-        let child = spec.build()?;
+    let observer: ChildObserver = Arc::new(move |child: &CodingRuntime| {
         if let Some(supervisor) = child.subagent_supervisor() {
             recorder
                 .lock()
@@ -65,9 +63,8 @@ fn recording_factory() -> (ChildAgentFactory, Arc<Mutex<Vec<ChildHandle>>>) {
                     supervisor: supervisor.clone(),
                 });
         }
-        Ok(child)
     });
-    (factory, recorded)
+    (observer, recorded)
 }
 
 /// The first child the recording factory built.
@@ -551,8 +548,10 @@ async fn a_spawn_the_tree_has_no_room_for_is_answered_and_the_parent_carries_on(
 
 #[tokio::test]
 async fn a_grandchilds_news_reaches_the_root_stream() {
-    let (factory, children) = recording_factory();
-    let (mut parent, _provider) = TestSession::new(answers("done")).subagents(factory).build();
+    let (observer, children) = recording_observer();
+    let (mut parent, _provider) = TestSession::new(answers("done"))
+        .observe_children(observer)
+        .build();
     let supervisor = parent
         .subagent_supervisor()
         .expect("the test session was given a factory")
@@ -652,8 +651,10 @@ async fn a_grandchilds_news_reaches_the_root_stream() {
 
 #[tokio::test]
 async fn a_shutdown_joins_every_task_in_a_tree() {
-    let (factory, children) = recording_factory();
-    let (mut parent, _provider) = TestSession::new(answers("done")).subagents(factory).build();
+    let (observer, children) = recording_observer();
+    let (mut parent, _provider) = TestSession::new(answers("done"))
+        .observe_children(observer)
+        .build();
     let supervisor = parent
         .subagent_supervisor()
         .expect("the test session was given a factory")
@@ -768,7 +769,7 @@ async fn a_childs_events_reach_the_parents_durable_stream() {
     let (client, _provider) = scripted_client(answers("child result"));
     let mut parent = builder(client)
         .event_sink(Arc::clone(&sink) as Arc<dyn EventSink>)
-        .subagents(Arc::new(ChildAgentSpec::build))
+        .subagents(SubagentOptions::enabled())
         .build()
         .expect("the session builds");
     let supervisor = parent
@@ -836,8 +837,7 @@ async fn a_child_inherits_only_the_tools_marked_for_it_under_its_parents_policy(
 
     let child_tools: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::clone(&child_tools);
-    let factory: ChildAgentFactory = Arc::new(move |spec: ChildAgentSpec| {
-        let child = spec.build()?;
+    let observer: ChildObserver = Arc::new(move |child: &CodingRuntime| {
         let mut names: Vec<String> = child
             .effective_tools()
             .into_iter()
@@ -848,7 +848,6 @@ async fn a_child_inherits_only_the_tools_marked_for_it_under_its_parents_policy(
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(names);
-        Ok(child)
     });
 
     // Registered on the builder as an application would register them, not
@@ -869,7 +868,7 @@ async fn a_child_inherits_only_the_tools_marked_for_it_under_its_parents_policy(
             tool_exposure_mode: ToolExposureMode::IncludeRequiresApproval,
             ..CodingAgentOptions::default()
         })
-        .subagents(factory)
+        .observe_children(observer)
         .build()
         .expect("the parent builds");
     parent.initialize().await.expect("initialization succeeds");

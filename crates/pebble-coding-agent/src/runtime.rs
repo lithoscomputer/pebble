@@ -57,8 +57,8 @@ use crate::redact::{NoRedaction, Redactor};
 use crate::search::SearchProvider;
 use crate::skills::{Skill, SkillExpansion, discover_skills};
 use crate::subagent::{
-    ChildAgentFactory, ChildDeps, ChildIdentity, OpenSessions, SubagentCallbackEvent,
-    SubagentEventCallback, SubagentLimits, SubagentSupervisor,
+    ChildDeps, ChildIdentity, ChildObserver, OpenSessions, SubagentCallbackEvent,
+    SubagentEventCallback, SubagentLimits, SubagentOptions, SubagentSupervisor,
 };
 use crate::tool::{
     NativeTool, RegisteredTool, StaticEnvProvider, ToolDefinitionWithSource, ToolEnvProvider,
@@ -140,7 +140,8 @@ pub(crate) struct CodingRuntimeBuilder {
     events:               EventOptions,
     profile:              Option<Arc<dyn AgentProfile>>,
     prompt_transform:     Option<Arc<dyn SystemPromptTransform>>,
-    subagents:            Option<ChildAgentFactory>,
+    subagents_enabled:    bool,
+    child_observer:       Option<ChildObserver>,
     subagent_limits:      SubagentLimits,
     child:                Option<ChildIdentity>,
 }
@@ -162,7 +163,8 @@ impl CodingRuntimeBuilder {
             events: EventOptions::default(),
             profile: None,
             prompt_transform: None,
-            subagents: None,
+            subagents_enabled: false,
+            child_observer: None,
             subagent_limits: SubagentLimits::default(),
             child: None,
         }
@@ -317,18 +319,17 @@ impl CodingRuntimeBuilder {
     /// environment, the inheritable tools, the
     /// access policy, and the hooks its parent had, and never a
     /// [`HumanInputProvider`]: a child cannot ask a person a question.
-    pub(crate) fn subagents(mut self, factory: ChildAgentFactory) -> Self {
-        self.subagents = Some(factory);
+    pub(crate) fn subagents(mut self, options: SubagentOptions) -> Self {
+        self.subagents_enabled = options.is_enabled();
+        self.subagent_limits = options.limits();
         self
     }
 
-    /// Sets how many sessions this tree may hold open at once.
-    ///
-    /// Set on the root; children inherit the root's counter, so the limit
-    /// covers the whole tree however deep it goes. Without a
-    /// [`ChildAgentFactory`](Self::subagents) it does nothing.
-    pub(crate) const fn subagent_limits(mut self, limits: SubagentLimits) -> Self {
-        self.subagent_limits = limits;
+    /// Sees each child this session's tree builds, for the crate's own tests.
+    #[cfg(test)]
+    pub(crate) fn observe_children(mut self, observer: ChildObserver) -> Self {
+        self.subagents_enabled = true;
+        self.child_observer = Some(observer);
         self
     }
 
@@ -439,25 +440,25 @@ impl CodingRuntimeBuilder {
 
         // A child was placed in its tree by whoever spawned it; a root names
         // itself and starts the tree's budget.
-        let (parent_session_id, root_session_id, depth, open_sessions, built_from) =
-            match self.child {
-                Some(child) => (
-                    Some(child.parent_session_id),
-                    child.root_session_id,
-                    child.depth,
-                    child.open_sessions,
-                    Some(child.built_from),
-                ),
-                None => (
-                    None,
-                    id.clone(),
-                    0,
-                    OpenSessions::root(self.subagent_limits),
-                    None,
-                ),
-            };
+        let (parent_session_id, root_session_id, depth, open_sessions, observer) = match self.child
+        {
+            Some(child) => (
+                Some(child.parent_session_id),
+                child.root_session_id,
+                child.depth,
+                child.open_sessions,
+                child.observer,
+            ),
+            None => (
+                None,
+                id.clone(),
+                0,
+                OpenSessions::root(self.subagent_limits),
+                self.child_observer,
+            ),
+        };
 
-        let supervisor = self.subagents.map(|factory| {
+        let supervisor = self.subagents_enabled.then(|| {
             SubagentSupervisor::new(Arc::new(ChildDeps {
                 client: self.client.clone(),
                 model_selector: handle.to_string(),
@@ -469,7 +470,7 @@ impl CodingRuntimeBuilder {
                 redactor: Arc::clone(&self.redactor),
                 search_provider: self.search_provider.clone(),
                 event_capacity: self.events.capacity,
-                factory,
+                observer,
                 open_sessions,
                 depth,
             }))
@@ -487,7 +488,6 @@ impl CodingRuntimeBuilder {
         let session = CodingRuntime {
             root_session_id,
             parent_session_id,
-            built_from,
             id,
             created_at,
             config: self.options,
@@ -678,9 +678,6 @@ pub(crate) struct CodingRuntime {
     root_session_id:   String,
     /// The session that spawned this one, for a child. A root has none.
     parent_session_id: Option<String>,
-    /// What this child was built from, for the supervisor to recognize its own
-    /// specification in the session a factory answered with. A root has none.
-    built_from:        Option<Arc<ChildDeps>>,
     created_at:        SystemTime,
     config:            CodingAgentOptions,
     /// The conversation and what the current prompt has accumulated, shared
@@ -1169,6 +1166,18 @@ impl CodingRuntime {
         self.facts
     }
 
+    /// Where this session's tools act, for the crate's own tests.
+    #[cfg(test)]
+    pub(crate) const fn environment(&self) -> &Arc<dyn Environment> {
+        &self.env
+    }
+
+    /// How this session was configured, for the crate's own tests.
+    #[cfg(test)]
+    pub(crate) const fn config(&self) -> &CodingAgentOptions {
+        &self.config
+    }
+
     /// The permission level the application recorded for this session.
     #[cfg(test)]
     pub(crate) fn permission_level(&self) -> Option<PermissionLevel> {
@@ -1319,15 +1328,6 @@ impl CodingRuntime {
         })
     }
 
-    /// Whether this session was built from `deps`, which is how a supervisor
-    /// recognizes the child it specified in the session a factory answered
-    /// with.
-    pub(crate) fn was_built_from(&self, deps: &Arc<ChildDeps>) -> bool {
-        self.built_from
-            .as_ref()
-            .is_some_and(|built_from| Arc::ptr_eq(built_from, deps))
-    }
-
     /// This session's children, for the crate's own tests.
     #[cfg(test)]
     pub(crate) const fn subagent_supervisor(&self) -> Option<&SubagentSupervisor> {
@@ -1374,12 +1374,6 @@ impl CodingRuntime {
         if let Some(bridge) = &self.coding_bridge {
             bridge.set_tool_env_provider(provider);
         }
-    }
-
-    /// Sets fixed extra environment variables for every tool call.
-    #[cfg(test)]
-    pub(crate) fn set_tool_env(&mut self, env: HashMap<String, String>) {
-        self.set_tool_env_provider(Arc::new(StaticEnvProvider(env)));
     }
 
     /// Processes one input to completion, answering with the assistant's final

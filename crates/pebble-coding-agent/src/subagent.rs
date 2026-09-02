@@ -6,12 +6,11 @@
 //!
 //! # What a child is built from
 //!
-//! Pebble builds the [`ChildAgentSpec`] and the application's
-//! [`ChildAgentFactory`] turns it into a session. The spec carries the parent's
-//! own dependencies — the same client, model, harness, environment, tools, and
-//! policy — so a child inherits what its parent had and cannot be given more:
-//! there is no method on the spec that widens anything, and no
-//! [`HumanInputProvider`](crate::extensions::HumanInputProvider) travels on it,
+//! Pebble builds each child itself, from the parent's own [`ChildDeps`] — the
+//! same client, model, harness, environment, policy, and the tools marked
+//! inheritable — so a child inherits what its parent had and cannot be given
+//! more. Nothing outside the crate takes part in building one, and no
+//! [`HumanInputProvider`](crate::extensions::HumanInputProvider) travels down,
 //! which is what makes questions root-only.
 //!
 //! # How many sessions a tree may hold open
@@ -43,8 +42,6 @@ use std::time::Duration;
 
 use futures_util::future::join_all;
 use lithos_llm::Client;
-#[cfg(test)]
-use lithos_llm::types::ReasoningEffort;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{Instant, timeout_at};
@@ -57,16 +54,10 @@ use crate::environment::Environment;
 use crate::error::{Error, ErrorData, ErrorKind, InterruptReason, Result};
 use crate::event::EventCapacity;
 use crate::profile::AgentProfile;
-#[cfg(test)]
-use crate::record::SessionRecord;
 use crate::redact::Redactor;
 use crate::runtime::{CodingAgentBuildError, CodingRuntime, ShutdownReason};
 use crate::search::SearchProvider;
-#[cfg(test)]
-use crate::tool::ToolDefinitionWithSource;
 use crate::tool::{RegisteredTool, ToolEnvProvider, ToolError};
-#[cfg(test)]
-use crate::types::PermissionLevel;
 use crate::types::{
     CodingAgentEvent, CodingAgentState, CodingEvent, INITIAL_SUBAGENT_GENERATION, ToolErrorKind,
 };
@@ -194,8 +185,8 @@ impl Default for SubagentOptions {
 
 /// The open-session count one tree of agents shares.
 ///
-/// Created by the root session and inherited by every child through
-/// [`ChildAgentSpec`], so the limit is a property of the tree rather than of
+/// Created by the root session and inherited by every child through its
+/// [`ChildIdentity`], so the limit is a property of the tree rather than of
 /// one supervisor.
 #[derive(Debug)]
 pub(crate) struct OpenSessions {
@@ -273,219 +264,56 @@ impl Drop for SessionSlot {
     }
 }
 
-/// Builds one child agent from the dependencies Pebble hands it.
+/// Observes each child the moment it is built, before it is supervised.
 ///
-/// Crate-internal: an application turns subagents on with
-/// [`SubagentOptions`], and pebble installs [`ChildAgentSpec::build`] as the
-/// factory. The crate's own tests install a recording factory to keep hold of
-/// the children a tree builds. What no factory can do is widen the child:
-/// everything a child needs comes from the spec, which is built from the
-/// parent.
-pub(crate) type ChildAgentFactory =
-    Arc<dyn Fn(ChildAgentSpec) -> StdResult<ChildAgent, CodingAgentBuildError> + Send + Sync>;
+/// The crate's own tests keep hold of a child's identity and its supervisor
+/// this way. Nothing in production observes children, and an observer cannot
+/// change what it is shown: what a child inherits is decided by
+/// [`build_child`] alone.
+pub(crate) type ChildObserver = Arc<dyn Fn(&CodingRuntime) + Send + Sync>;
 
-/// A child agent prepared for Pebble's subagent supervisor.
+/// Builds one child session from its parent's dependencies.
 ///
-/// The wrapper exposes only the settings a factory may narrow or coordinate.
-/// Its inherited model, tools, environment, and tree identity cannot be
-/// replaced.
-pub(crate) struct ChildAgent {
-    inner: CodingRuntime,
-}
-
-impl fmt::Debug for ChildAgent {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ChildAgent")
-            .field("model", &self.inner.model())
-            .finish_non_exhaustive()
-    }
-}
-
-impl ChildAgent {
-    /// The child's stable session identifier.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn id(&self) -> &str {
-        self.inner.id()
-    }
-
-    /// The root session identifier shared by the subagent tree.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn root_session_id(&self) -> &str {
-        self.inner.root_session_id()
-    }
-
-    /// The tools the child will expose after access policy is applied.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn effective_tools(&self) -> Vec<ToolDefinitionWithSource> {
-        self.inner.effective_tools()
-    }
-
-    /// The permission level inherited from the parent.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn permission_level(&self) -> Option<PermissionLevel> {
-        self.inner.permission_level()
-    }
-
-    /// Captures the child's durable state before the supervisor starts it.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn to_record(&self) -> SessionRecord {
-        self.inner.to_record()
-    }
-
-    /// Sets the reasoning effort used by the child.
-    #[cfg(test)]
-    pub(crate) fn set_reasoning_effort(&mut self, effort: Option<ReasoningEffort>) {
-        self.inner.set_reasoning_effort(effort);
-    }
-
-    /// Sets fixed environment variables for the child's tool calls.
-    #[cfg(test)]
-    pub(crate) fn set_tool_env(&mut self, env: HashMap<String, String>) {
-        self.inner.set_tool_env(env);
-    }
-
-    fn into_runtime(self) -> CodingRuntime {
-        self.inner
-    }
-
-    #[cfg(test)]
-    pub(crate) fn subagent_supervisor(&self) -> Option<&SubagentSupervisor> {
-        self.inner.subagent_supervisor()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn has_human_input(&self) -> bool {
-        self.inner.has_human_input()
-    }
-}
-
-/// Everything a child session is built from.
-///
-/// Pebble fills this in from the parent, hands it to the application's
-/// [`ChildAgentFactory`], and the factory turns it into a session with
-/// [`build`](Self::build). The type deliberately exposes no way to change what
-/// a child receives: inheritance is structural, not a convention a factory is
-/// asked to follow.
-#[must_use = "a spec builds nothing until `build` is called"]
-pub(crate) struct ChildAgentSpec {
-    deps:              Arc<ChildDeps>,
+/// Everything a child is comes from `deps` and its place in the tree: the
+/// parent's client, model, harness, environment, options, and the tools marked
+/// inheritable. Nothing else can be handed to it.
+fn build_child(
+    deps: &Arc<ChildDeps>,
     parent_session_id: String,
-    root_session_id:   String,
-    depth:             usize,
-}
-
-impl fmt::Debug for ChildAgentSpec {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ChildAgentSpec")
-            .field("parent_session_id", &self.parent_session_id)
-            .field("root_session_id", &self.root_session_id)
-            .field("depth", &self.depth)
-            .field("model", &self.deps.model_selector)
-            .finish_non_exhaustive()
+    root_session_id: String,
+    depth: usize,
+) -> StdResult<CodingRuntime, CodingAgentBuildError> {
+    // A child is given a task, not the application's integrations: an
+    // application tool reaches it only when marked inheritable, and a tool
+    // that needs a person never does, because a child has nobody to ask.
+    let inherited = deps
+        .tools
+        .iter()
+        .filter(|tool| tool.is_inheritable())
+        .cloned();
+    let mut builder = CodingRuntime::builder(deps.client.clone())
+        .model(deps.model_selector.clone())
+        .environment(Arc::clone(&deps.environment))
+        .with_profile(Arc::clone(&deps.profile))
+        .tools(inherited)
+        .options(deps.options.clone())
+        .event_capacity(deps.event_capacity)
+        .subagents(SubagentOptions::enabled())
+        .child_of(ChildIdentity {
+            parent_session_id,
+            root_session_id,
+            depth,
+            open_sessions: Arc::clone(&deps.open_sessions),
+            observer: deps.observer.clone(),
+        });
+    if let Some(provider) = deps.tool_env_provider.as_ref() {
+        builder = builder.tool_env_provider(Arc::clone(provider));
     }
-}
-
-impl ChildAgentSpec {
-    /// The session that is spawning this child.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn parent_session_id(&self) -> &str {
-        &self.parent_session_id
+    builder = builder.redactor(Arc::clone(&deps.redactor));
+    if let Some(provider) = deps.search_provider.as_ref() {
+        builder = builder.search_provider(Arc::clone(provider));
     }
-
-    /// The root of the tree this child belongs to, which root-scoped tools —
-    /// one shared todo list across a tree of agents — key on.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn root_session_id(&self) -> &str {
-        &self.root_session_id
-    }
-
-    /// How deep this child sits below the root, counting the root as zero.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) const fn depth(&self) -> usize {
-        self.depth
-    }
-
-    /// The model the child will run, as the parent's catalog spells it.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn model(&self) -> &str {
-        &self.deps.model_selector
-    }
-
-    /// Where the child's tools will act, which is where the parent's do.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn environment(&self) -> &Arc<dyn Environment> {
-        &self.deps.environment
-    }
-
-    /// How the child will behave, which is how the parent does apart from the
-    /// memory files and skill directories the root loaded once.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn options(&self) -> &CodingAgentOptions {
-        &self.deps.options
-    }
-
-    /// Builds the child agent for Pebble's supervisor.
-    ///
-    /// # What a factory may still change
-    ///
-    /// The factory can adjust the returned [`ChildAgent`]'s execution settings
-    /// before handing it back. It cannot replace inherited tools, permissions,
-    /// environment access, human input, or tree identity.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CodingAgentBuildError`](crate::CodingAgentBuildError) for the
-    /// same configuration failures as
-    /// [`CodingAgentBuilder::build`](crate::CodingAgentBuilder::build).
-    /// A parent that built successfully normally means its child does too,
-    /// because the selector and the harness are the parent's own.
-    pub(crate) fn build(self) -> StdResult<ChildAgent, CodingAgentBuildError> {
-        let deps = Arc::clone(&self.deps);
-        // A child is given a task, not the application's integrations: an
-        // application tool reaches it only when marked inheritable, and a tool
-        // that needs a person never does, because a child has nobody to ask.
-        let inherited = deps
-            .tools
-            .iter()
-            .filter(|tool| tool.is_inheritable())
-            .cloned();
-        let mut builder = CodingRuntime::builder(deps.client.clone())
-            .model(deps.model_selector.clone())
-            .environment(Arc::clone(&deps.environment))
-            .with_profile(Arc::clone(&deps.profile))
-            .tools(inherited)
-            .options(deps.options.clone())
-            .event_capacity(deps.event_capacity)
-            .subagents(Arc::clone(&deps.factory))
-            .child_of(ChildIdentity {
-                parent_session_id: self.parent_session_id,
-                root_session_id:   self.root_session_id,
-                depth:             self.depth,
-                open_sessions:     Arc::clone(&deps.open_sessions),
-                built_from:        Arc::clone(&deps),
-            });
-        if let Some(provider) = deps.tool_env_provider.as_ref() {
-            builder = builder.tool_env_provider(Arc::clone(provider));
-        }
-        builder = builder.redactor(Arc::clone(&deps.redactor));
-        if let Some(provider) = deps.search_provider.as_ref() {
-            builder = builder.search_provider(Arc::clone(provider));
-        }
-        builder.build().map(|inner| ChildAgent { inner })
-    }
+    builder.build()
 }
 
 /// What one session gives its children.
@@ -509,7 +337,8 @@ pub(crate) struct ChildDeps {
     /// the task its parent gave it.
     pub(crate) search_provider:   Option<Arc<dyn SearchProvider>>,
     pub(crate) event_capacity:    EventCapacity,
-    pub(crate) factory:           ChildAgentFactory,
+    /// What sees each child as it is built, for the crate's own tests.
+    pub(crate) observer:          Option<ChildObserver>,
     pub(crate) open_sessions:     Arc<OpenSessions>,
     /// The depth of the session these deps belong to. Its children sit one
     /// deeper.
@@ -522,10 +351,9 @@ pub(crate) struct ChildIdentity {
     pub(crate) root_session_id:   String,
     pub(crate) depth:             usize,
     pub(crate) open_sessions:     Arc<OpenSessions>,
-    /// The dependencies this child was built from, kept so the supervisor can
-    /// check that the session a factory handed back is the one pebble
-    /// specified.
-    pub(crate) built_from:        Arc<ChildDeps>,
+    /// What sees this child's own children as they are built, inherited
+    /// from the root for the crate's own tests.
+    pub(crate) observer:          Option<ChildObserver>,
 }
 
 /// One event a supervisor hands to the session that owns it.
@@ -1286,32 +1114,25 @@ impl SubagentSupervisor {
             .ok_or_else(|| limit_reached(self.deps.open_sessions.max()))?;
 
         let child_depth = self.deps.depth.saturating_add(1);
-        let spec = ChildAgentSpec {
-            deps:              Arc::clone(&self.deps),
-            parent_session_id: parent_session_id.to_owned(),
-            root_session_id:   root_session_id.to_owned(),
-            depth:             child_depth,
-        };
-        let child = (self.deps.factory)(spec).map_err(|error| {
+        let child = build_child(
+            &self.deps,
+            parent_session_id.to_owned(),
+            root_session_id.to_owned(),
+            child_depth,
+        )
+        .map_err(|error| {
             ToolError::with_source(
                 ToolErrorKind::Execution,
                 format!("Could not start a subagent session: {error}"),
                 error,
             )
         })?;
-        // What makes inheritance a guarantee rather than a convention: the
-        // session a factory hands back must be the one built from the spec
-        // pebble wrote, not one the factory assembled itself with wider
-        // capabilities.
-        if !child.inner.was_built_from(&self.deps) {
-            return Err(ToolError::execution(
-                "Could not start a subagent session: the session factory answered with a session \
-                 it did not build from the spec it was given",
-            ));
+        if let Some(observer) = &self.deps.observer {
+            observer(&child);
         }
 
         Ok(self.supervise(
-            child.into_runtime(),
+            child,
             task_prompt,
             child_depth,
             parent_notification_description,
@@ -2059,7 +1880,6 @@ mod tests {
     use super::*;
     use crate::config::{ToolAccess, ToolAccessPolicy};
     use crate::error::ErrorKind;
-    use crate::human_input::{Answer, HumanInputError, HumanInputProvider, Question};
     use crate::record::SessionRecord;
     use crate::runtime::testing::{TestSession, noop_tool};
     use crate::runtime::{ResumeMode, testing};
@@ -2068,21 +1888,6 @@ mod tests {
     };
     use crate::tool::{ToolContext, ToolDefinitionWithSource};
     use crate::types::{PermissionLevel, ToolErrorKind};
-
-    /// A person who is never actually asked, for a session that has one.
-    struct AlwaysSilent;
-
-    #[async_trait::async_trait]
-    impl HumanInputProvider for AlwaysSilent {
-        async fn ask_questions(
-            &self,
-            _tool_call_id: &str,
-            _questions: Vec<Question>,
-            _cancel_token: CancellationToken,
-        ) -> StdResult<Vec<Answer>, HumanInputError> {
-            Ok(Vec::new())
-        }
-    }
 
     /// Reports the moment the task holding it is dropped, which is what an
     /// abort does to a task that never returns on its own.
@@ -2198,8 +2003,7 @@ mod tests {
     ) {
         let recorded: Arc<Mutex<Vec<ChildHandle>>> = Arc::new(Mutex::new(Vec::new()));
         let recorder = Arc::clone(&recorded);
-        let factory: ChildAgentFactory = Arc::new(move |spec: ChildAgentSpec| {
-            let child = spec.build()?;
+        let observer: ChildObserver = Arc::new(move |child: &CodingRuntime| {
             if let Some(supervisor) = child.subagent_supervisor() {
                 recorder
                     .lock()
@@ -2209,13 +2013,12 @@ mod tests {
                         supervisor: supervisor.clone(),
                     });
             }
-            Ok(child)
         });
         let calls = answers
             .into_iter()
             .map(|text| ScriptedCall::response(text_response(text)))
             .collect();
-        let (session, _provider) = TestSession::new(calls).subagents(factory).build();
+        let (session, _provider) = TestSession::new(calls).observe_children(observer).build();
         let supervisor = supervisor_of(&session);
         (session, supervisor, recorded)
     }
@@ -3392,35 +3195,30 @@ mod tests {
         let recorded_ask = Arc::clone(&asked);
         let environment: Arc<dyn Environment> = Arc::new(MockEnvironment::linux());
         let parent_environment = Arc::clone(&environment);
-        let factory: ChildAgentFactory = Arc::new(move |spec: ChildAgentSpec| {
+        let observer: ChildObserver = Arc::new(move |child: &CodingRuntime| {
             assert!(
-                Arc::ptr_eq(spec.environment(), &parent_environment),
+                Arc::ptr_eq(child.environment(), &parent_environment),
                 "a child acts where its parent does"
             );
-            assert_eq!(spec.depth(), 1);
             assert!(
-                spec.options().memory_files.is_empty(),
+                child.config().memory_files.is_empty(),
                 "a child is given a task, not the project briefing"
             );
-            assert!(spec.options().skill_dirs.is_empty());
-            let model = spec.model().to_owned();
-            let parent = spec.parent_session_id().to_owned();
-            let child = spec.build()?;
+            assert!(child.config().skill_dirs.is_empty());
             recorded
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(Built {
-                    model,
-                    root: child.root_session_id().to_owned(),
-                    parent,
+                    model:  format!("{}/{}", child.provider(), child.model()),
+                    root:   child.root_session_id().to_owned(),
+                    parent: child.to_record().parent_session_id.unwrap_or_default(),
                 });
             recorded_ask.store(child.has_human_input(), Ordering::SeqCst);
-            Ok(child)
         });
         let (session, _provider) =
             TestSession::new(vec![ScriptedCall::response(text_response("child result"))])
                 .environment(Arc::clone(&environment))
-                .subagents(factory)
+                .observe_children(observer)
                 .build();
         let supervisor = supervisor_of(&session);
 
@@ -3455,103 +3253,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_factory_that_widens_its_child_is_refused() {
-        // The spec has no method that widens anything, so a factory can only
-        // try to widen a child by ignoring the spec and assembling a session
-        // itself — with a person to ask, a fuller permission level, and a tool
-        // its parent never had. The type system stops the first route; this is
-        // the runtime check that stops the second.
-        let (session, _provider) =
-            TestSession::new(vec![ScriptedCall::response(text_response("child result"))])
-                .options(CodingAgentOptions {
-                    permission_level: Some(PermissionLevel::ReadOnly),
-                    ..CodingAgentOptions::default()
-                })
-                .subagents(Arc::new(|_spec: ChildAgentSpec| {
-                    let (wider, _provider) =
-                        TestSession::new(vec![ScriptedCall::response(text_response("mine"))])
-                            .tools(vec![noop_tool("privileged")])
-                            .options(CodingAgentOptions {
-                                permission_level: Some(PermissionLevel::Full),
-                                ..CodingAgentOptions::default()
-                            })
-                            .human_input(Arc::new(AlwaysSilent))
-                            .build();
-                    Ok(ChildAgent { inner: wider })
-                }))
-                .build();
-        let supervisor = supervisor_of(&session);
-
-        let refused = supervisor
-            .spawn(session.id(), session.root_session_id(), "task".to_owned())
-            .expect_err("a session the factory assembled is not this session's child");
-
-        assert_eq!(refused.kind(), ToolErrorKind::Execution);
-        assert!(
-            refused
-                .message()
-                .contains("did not build from the spec it was given"),
-            "{}",
-            refused.message()
-        );
-        assert!(supervisor.is_empty(), "nothing was supervised");
-        assert_eq!(
-            supervisor.open_sessions(),
-            1,
-            "a refused spawn gives its slot back"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_factory_may_settle_its_childs_details_but_not_its_place_in_the_tree() {
-        // The third route into a child, after the spec and the assembled
-        // session: the mutators a built child still has. They are the
-        // application's own latitude and the spawn accepts them — none of them
-        // hands the child a tool, a permission, a hook or a person to ask —
-        // and the one thing they cannot do is move the child, because where a
-        // session sits in its tree is settled by `build` and has no setter.
-        let seen: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
-        let recorded = Arc::clone(&seen);
-        let factory: ChildAgentFactory = Arc::new(move |spec: ChildAgentSpec| {
-            let specified_root = spec.root_session_id().to_owned();
-            let mut child = spec.build()?;
-            child.set_tool_env(HashMap::from([(
-                "FROM_THE_FACTORY".to_owned(),
-                "1".to_owned(),
-            )]));
-            child.set_reasoning_effort(None);
-            recorded
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push((specified_root, child.root_session_id().to_owned()));
-            Ok(child)
-        });
-        let (session, _provider) =
-            TestSession::new(vec![ScriptedCall::response(text_response("child result"))])
-                .subagents(factory)
-                .build();
-        let supervisor = supervisor_of(&session);
-
-        let agent_id = spawn(&supervisor, &session, "task");
-        let result = supervisor
-            .wait(&agent_id)
-            .await
-            .expect("a child the factory touched is still supervised");
-
-        assert_eq!(result.output, "child result");
-        let (specified, built) = {
-            let seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
-            seen.first().expect("the factory built the child").clone()
-        };
-        assert_eq!(specified, session.root_session_id());
-        assert_eq!(
-            built, specified,
-            "a child stays in the tree its spec placed it in"
-        );
-        supervisor.shutdown_all().await;
-    }
-
-    #[tokio::test]
     async fn a_child_is_shown_exactly_the_tools_and_permissions_its_parent_has() {
         /// What the child came out as, for the parent to be compared against.
         struct Inherited {
@@ -3561,8 +3262,7 @@ mod tests {
 
         let inherited: Arc<Mutex<Option<Inherited>>> = Arc::new(Mutex::new(None));
         let recorder = Arc::clone(&inherited);
-        let factory: ChildAgentFactory = Arc::new(move |spec: ChildAgentSpec| {
-            let child = spec.build()?;
+        let observer: ChildObserver = Arc::new(move |child: &CodingRuntime| {
             let mut tools: Vec<String> = child
                 .effective_tools()
                 .into_iter()
@@ -3573,7 +3273,6 @@ mod tests {
                 tools,
                 permission: child.permission_level(),
             });
-            Ok(child)
         });
         // Registered the way an application registers tools, so what travels
         // is the parent's own tool list rather than a profile both sessions
@@ -3587,7 +3286,7 @@ mod tests {
                 tool_access_policy: Some(Arc::new(DenyByName("forbidden"))),
                 ..CodingAgentOptions::default()
             })
-            .subagents(factory)
+            .observe_children(observer)
             .build()
             .expect("the session builds");
         let supervisor = supervisor_of(&session);
@@ -3621,14 +3320,12 @@ mod tests {
     async fn a_child_records_the_session_that_spawned_it() {
         let built: Arc<Mutex<Option<SessionRecord>>> = Arc::new(Mutex::new(None));
         let recorder = Arc::clone(&built);
-        let factory: ChildAgentFactory = Arc::new(move |spec: ChildAgentSpec| {
-            let child = spec.build()?;
+        let observer: ChildObserver = Arc::new(move |child: &CodingRuntime| {
             *recorder.lock().unwrap_or_else(PoisonError::into_inner) = Some(child.to_record());
-            Ok(child)
         });
         let (session, _provider) =
             TestSession::new(vec![ScriptedCall::response(text_response("child result"))])
-                .subagents(factory)
+                .observe_children(observer)
                 .build();
         let supervisor = supervisor_of(&session);
 
@@ -3745,7 +3442,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_session_with_a_factory_is_given_the_tools_to_delegate() {
+    async fn a_session_with_subagents_enabled_is_given_the_tools_to_delegate() {
         let (session, _provider) =
             TestSession::new(vec![ScriptedCall::response(text_response("child result"))])
                 .with_subagents()

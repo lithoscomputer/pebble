@@ -19,7 +19,7 @@ use super::super::testing::TestProfile;
 use super::*;
 use crate::human_input::{Answer, HumanInputError, HumanInputProvider, Question};
 use crate::search::{SearchError, SearchProvider, SearchRequest, SearchResult};
-use crate::subagent::{ChildAgent, ChildAgentFactory, ChildAgentSpec};
+use crate::subagent::{ChildObserver, SubagentOptions};
 use crate::test_support::{
     MockEnvironment, ScriptedProvider, TEST_CATALOG, message_text, scripted_client,
     scripted_client_builder,
@@ -215,7 +215,7 @@ async fn initialized(selector: &str, configured: Configured) -> CodingRuntime {
         builder = builder.search_provider(Arc::new(Unused));
     }
     if configured.subagents {
-        builder = builder.subagents(Arc::new(ChildAgentSpec::build));
+        builder = builder.subagents(SubagentOptions::enabled());
     }
     if configured.questions {
         builder = builder.human_input(Arc::new(Unused));
@@ -244,7 +244,7 @@ fn tool_names(session: &CodingRuntime) -> Vec<String> {
     names
 }
 
-fn child_tool_names(child: &ChildAgent) -> Vec<String> {
+fn child_tool_names(child: &CodingRuntime) -> Vec<String> {
     let mut names: Vec<String> = child
         .effective_tools()
         .into_iter()
@@ -549,7 +549,7 @@ async fn every_harness_shows_its_model_exactly_these_tools() {
 /// one.
 ///
 /// A child inherits its parent's engine and its factory through the spec, and
-/// deliberately inherits no person to ask: `ChildAgentSpec` carries no
+/// deliberately inherits no person to ask: a child is built with no
 /// `HumanInputProvider`, which is the whole of what makes questions root-only.
 /// So a root configured with all three shows its model exactly one tool more
 /// than its child does.
@@ -562,13 +562,11 @@ async fn every_harness_shows_its_model_exactly_these_tools() {
 async fn a_child_is_shown_its_parents_tools_without_the_person_to_ask() {
     let child_tools: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::clone(&child_tools);
-    let factory: ChildAgentFactory = Arc::new(move |spec: ChildAgentSpec| {
-        let child = spec.build()?;
+    let observer: ChildObserver = Arc::new(move |child: &CodingRuntime| {
         recorder
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(child_tool_names(&child));
-        Ok(child)
+            .push(child_tool_names(child));
     });
 
     let (client, _provider) = scripted_client(answers("done"));
@@ -577,7 +575,7 @@ async fn a_child_is_shown_its_parents_tools_without_the_person_to_ask() {
         .environment(Arc::new(MockEnvironment::linux()))
         .search_provider(Arc::new(Unused))
         .human_input(Arc::new(Unused))
-        .subagents(factory)
+        .observe_children(observer)
         .build()
         .expect("the session builds");
     parent.initialize().await.expect("initialization succeeds");
@@ -689,13 +687,11 @@ fn requested_system_prompt(provider: &ScriptedProvider) -> String {
 async fn a_child_is_never_told_to_ask_the_user_a_question() {
     let child_tools: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::clone(&child_tools);
-    let factory: ChildAgentFactory = Arc::new(move |spec: ChildAgentSpec| {
-        let child = spec.build()?;
+    let observer: ChildObserver = Arc::new(move |child: &CodingRuntime| {
         recorder
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(child_tool_names(&child));
-        Ok(child)
+            .push(child_tool_names(child));
     });
 
     let (client, provider) = claude5_scripted_client(answers("done"));
@@ -704,7 +700,7 @@ async fn a_child_is_never_told_to_ask_the_user_a_question() {
         .environment(Arc::new(MockEnvironment::linux()))
         .search_provider(Arc::new(Unused))
         .human_input(Arc::new(Unused))
-        .subagents(factory)
+        .observe_children(observer)
         .build()
         .expect("the session builds");
     parent.initialize().await.expect("initialization succeeds");

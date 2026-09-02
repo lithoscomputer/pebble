@@ -24,7 +24,7 @@ use crate::environment::{Environment, ExecResult};
 use crate::redact::Redactor;
 use crate::runtime::testing::{TestProfile, builder};
 use crate::search::{SearchError, SearchProvider, SearchRequest, SearchResult};
-use crate::subagent::{ChildAgentFactory, ChildAgentSpec};
+use crate::subagent::ChildObserver;
 use crate::test_support::{
     MockEnvironment, MutableMockEnvironment, ScriptedCompletion, ScriptedProvider, client_from,
     custom_tool_call_response, scripted_client,
@@ -594,8 +594,7 @@ async fn a_configured_search_provider_reaches_the_registered_tool() {
 async fn a_child_inherits_its_parents_search_provider() {
     let searched: Arc<Mutex<Vec<bool>>> = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::clone(&searched);
-    let factory: ChildAgentFactory = Arc::new(move |spec: ChildAgentSpec| {
-        let child = spec.build()?;
+    let observer: ChildObserver = Arc::new(move |child: &CodingRuntime| {
         recorder
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -605,11 +604,10 @@ async fn a_child_inherits_its_parents_search_provider() {
                     .iter()
                     .any(|tool| tool.definition.name == "web_search"),
             );
-        Ok(child)
     });
     let (parent, _provider) = TestSession::new(answers("ok"))
         .searching_with(Arc::new(RecordingSearch::default()))
-        .subagents(factory)
+        .observe_children(observer)
         .build();
     let supervisor = parent
         .subagent_supervisor()

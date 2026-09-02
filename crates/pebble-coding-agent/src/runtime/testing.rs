@@ -31,7 +31,7 @@ use crate::profile::{AgentProfile, EnvContext};
 use crate::redact::Redactor;
 use crate::search::SearchProvider;
 use crate::skills::{Skill, format_skills_prompt_section};
-use crate::subagent::{ChildAgentFactory, ChildAgentSpec, SubagentLimits};
+use crate::subagent::{ChildObserver, SubagentLimits, SubagentOptions};
 use crate::test_support::{
     MockEnvironment, ScriptedCall, ScriptedCompletion, ScriptedProvider, client_from,
     scripted_client_builder,
@@ -109,7 +109,8 @@ pub(crate) struct TestSession {
     environment:     Option<Arc<dyn Environment>>,
     retries:         Option<RetryPolicy>,
     concurrency:     Option<NonZeroUsize>,
-    subagents:       Option<ChildAgentFactory>,
+    subagents:       bool,
+    observer:        Option<ChildObserver>,
     limits:          SubagentLimits,
     human_input:     Option<Arc<dyn HumanInputProvider>>,
     redactor:        Option<Arc<dyn Redactor>>,
@@ -129,7 +130,8 @@ impl TestSession {
             environment: None,
             retries: None,
             concurrency: None,
-            subagents: None,
+            subagents: false,
+            observer: None,
             limits: SubagentLimits::default(),
             human_input: None,
             redactor: None,
@@ -151,13 +153,14 @@ impl TestSession {
 
     /// Lets the session spawn children, built the plain way.
     pub(crate) fn with_subagents(mut self) -> Self {
-        self.subagents = Some(Arc::new(ChildAgentSpec::build));
+        self.subagents = true;
         self
     }
 
     /// Lets the session spawn children, built by `factory`.
-    pub(crate) fn subagents(mut self, factory: ChildAgentFactory) -> Self {
-        self.subagents = Some(factory);
+    pub(crate) fn observe_children(mut self, observer: ChildObserver) -> Self {
+        self.subagents = true;
+        self.observer = Some(observer);
         self
     }
 
@@ -260,10 +263,12 @@ impl TestSession {
             .model(self.model)
             .environment(environment)
             .with_profile(TestProfile::with_tools(self.tools))
-            .options(self.options)
-            .subagent_limits(self.limits);
-        if let Some(factory) = self.subagents {
-            builder = builder.subagents(factory);
+            .options(self.options);
+        if self.subagents {
+            builder = builder.subagents(SubagentOptions::enabled().with_limits(self.limits));
+        }
+        if let Some(observer) = self.observer {
+            builder = builder.observe_children(observer);
         }
         if let Some(provider) = self.human_input {
             builder = builder.human_input(provider);

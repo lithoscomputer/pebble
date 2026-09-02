@@ -27,7 +27,7 @@ use crate::runtime::{
     SteeringLease, WarmState, actor_from_attribution,
 };
 use crate::search::SearchProvider;
-use crate::subagent::{ChildAgentSpec, SubagentOptions};
+use crate::subagent::SubagentOptions;
 use crate::tool::{RegisteredTool, ToolEnvProvider};
 use crate::types::{Actor, CodingAgentEvent, CodingAgentState, Message, TokenUsage};
 
@@ -374,12 +374,7 @@ impl CodingAgentBuilder {
     /// Without this call, or with [`SubagentOptions::disabled`], no subagent
     /// tools are advertised.
     pub fn subagents(mut self, options: SubagentOptions) -> Self {
-        if options.is_enabled() {
-            self.inner = self
-                .inner
-                .subagents(Arc::new(ChildAgentSpec::build))
-                .subagent_limits(options.limits());
-        }
+        self.inner = self.inner.subagents(options);
         self
     }
 
