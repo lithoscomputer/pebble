@@ -282,6 +282,22 @@ mod tests {
         assert_eq!(output, "2 | line2\n3 | line3\n");
     }
 
+    /// Some providers spell every number as a float; a `limit` of `3.0` is
+    /// the three lines the model asked for, not a reason to read two thousand.
+    #[tokio::test]
+    async fn read_file_honors_a_limit_spelled_as_a_whole_float() {
+        let tool = make_read_file_tool();
+
+        let output = (tool.executor)(
+            json!({"file_path": "/test.txt", "offset": 2.0, "limit": 3.0}),
+            file_context("/test.txt", "line1\nline2\nline3\nline4\nline5\nline6"),
+        )
+        .await
+        .expect("the file is read");
+
+        assert_eq!(output, "2 | line2\n3 | line3\n4 | line4\n");
+    }
+
     #[tokio::test]
     async fn read_file_without_a_path_is_an_argument_error() {
         let tool = make_read_file_tool();

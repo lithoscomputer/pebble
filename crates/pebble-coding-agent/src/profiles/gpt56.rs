@@ -24,7 +24,9 @@ use super::{EmbeddedPrompt, FileEditToolKind, ProfileDeps, assemble_system_promp
 use crate::config::NativeToolOptions;
 use crate::profile::{AgentProfile, EnvContext};
 use crate::skills::Skill;
-use crate::tool::{NativeTool, RegisteredTool, ToolRegistry, ToolVocabulary, required_str};
+use crate::tool::{
+    NativeTool, RegisteredTool, ToolRegistry, ToolVocabulary, optional_integer_arg, required_str,
+};
 use crate::tools::shell::run_shell_command;
 use crate::tools::{TodoRuntime, make_update_plan_tool, make_web_search_tool};
 use crate::types::{AgentProfileKind, ToolSource};
@@ -128,9 +130,7 @@ fn make_shell_command_tool(
             Box::pin(async move {
                 let command = required_str(&arguments, "command")?;
                 let workdir = arguments.get("workdir").and_then(Value::as_str);
-                let timeout_ms = arguments
-                    .get("timeout_ms")
-                    .and_then(Value::as_u64)
+                let timeout_ms = optional_integer_arg(&arguments, "timeout_ms")
                     .unwrap_or(default_timeout_ms)
                     .min(max_timeout_ms);
 

@@ -26,7 +26,9 @@ use serde_json::{Value, json};
 
 use super::definition;
 use crate::environment::{GrepOptions, format_lines_numbered};
-use crate::tool::{NativeTool, RegisteredTool, ToolError, optional_usize_arg, required_str};
+use crate::tool::{
+    NativeTool, RegisteredTool, ToolError, optional_integer_arg, optional_usize_arg, required_str,
+};
 use crate::tools::files::DEFAULT_READ_LINES;
 use crate::tools::make_edit_file_tool;
 use crate::tools::search::{execute_grep, grep_result_path};
@@ -112,7 +114,7 @@ explicitly asked. Never run commands requiring superuser privileges unless expli
                 let command = required_str(&arguments, "command")?;
                 let cwd = arguments.get("cwd").and_then(Value::as_str);
                 // Seconds on the wire, milliseconds in the environment.
-                let timeout_ms = match arguments.get("timeout").and_then(Value::as_u64) {
+                let timeout_ms = match optional_integer_arg::<u64>(&arguments, "timeout") {
                     Some(seconds) => seconds.saturating_mul(1000).min(max_timeout_ms),
                     None => default_timeout_ms,
                 };
@@ -209,7 +211,7 @@ depends on an exact file, API, or output shape, inspect the final result before 
                         "n_lines must be between 1 and {DEFAULT_READ_LINES}"
                     )));
                 }
-                let line_offset = arguments.get("line_offset").and_then(Value::as_i64);
+                let line_offset = optional_integer_arg::<i64>(&arguments, "line_offset");
                 if line_offset == Some(0) {
                     return Err(ToolError::invalid_arguments("line_offset must not be zero"));
                 }

@@ -25,6 +25,7 @@ pub use self::registry::{
     ToolExecutor,
 };
 pub(crate) use self::registry::{
-    ToolDefinitionWithSource, ToolRegistry, optional_usize_arg, required_str,
+    ToolDefinitionWithSource, ToolRegistry, optional_integer_arg, optional_usize_arg, required_str,
+    whole_number,
 };
 pub use self::runner::{CodingToolSet, ToolEventCallback, ToolRunner};

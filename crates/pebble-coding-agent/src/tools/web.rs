@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::char_boundary::floor_char_boundary;
 use crate::environment::ExecRequest;
-use crate::tool::{NativeTool, RegisteredTool, ToolError, required_str};
+use crate::tool::{NativeTool, RegisteredTool, ToolError, optional_integer_arg, required_str};
 use crate::types::{ToolErrorKind, ToolSource};
 
 mod markdown;
@@ -123,9 +123,7 @@ pub fn make_web_fetch_tool(summarizer: Option<Arc<WebFetchSummarizer>>) -> Regis
             Box::pin(async move {
                 let url = required_str(&args, "url")?;
                 let prompt = args.get("prompt").and_then(Value::as_str);
-                let timeout_ms = args
-                    .get("timeout_ms")
-                    .and_then(Value::as_u64)
+                let timeout_ms: u64 = optional_integer_arg(&args, "timeout_ms")
                     .unwrap_or(30_000)
                     .min(60_000);
 

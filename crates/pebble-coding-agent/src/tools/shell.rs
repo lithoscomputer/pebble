@@ -12,13 +12,14 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use lithos_llm::types::ToolDefinition;
-use serde_json::Value;
 use tokio::task;
 use tracing::{debug, warn};
 
 use crate::config::NativeToolOptions;
 use crate::environment::{ExecOutcome, ExecRequest};
-use crate::tool::{NativeTool, RegisteredTool, ToolContext, ToolError, required_str};
+use crate::tool::{
+    NativeTool, RegisteredTool, ToolContext, ToolError, optional_integer_arg, required_str,
+};
 use crate::truncation::{DEFAULT_TOOL_OUTPUT_RETENTION_BYTES, retain_tool_output};
 use crate::types::{CodingEvent, CommandTermination, ToolSource};
 
@@ -59,9 +60,7 @@ pub fn make_shell_tool_with_options(options: &NativeToolOptions) -> RegisteredTo
         ), Arc::new(move |args, ctx| {
             Box::pin(async move {
                 let command = required_str(&args, "command")?;
-                let timeout_ms = args
-                    .get("timeout_ms")
-                    .and_then(Value::as_u64)
+                let timeout_ms = optional_integer_arg(&args, "timeout_ms")
                     .unwrap_or(default_timeout)
                     .min(max_timeout);
 
@@ -431,6 +430,29 @@ mod tests {
                 .lock()
                 .expect("captured_timeout lock is not poisoned"),
             Some(5000)
+        );
+    }
+
+    /// Some providers spell every number as a float; a `timeout_ms` of
+    /// `30000.0` is the timeout the model asked for, not a reason to fall
+    /// back to the default.
+    #[tokio::test]
+    async fn a_timeout_spelled_as_a_whole_float_is_honored() {
+        let tool = make_shell_tool();
+        let environment = Arc::new(MockEnvironment::default());
+
+        let _ = (tool.executor)(
+            json!({"command": "sleep 1", "timeout_ms": 30000.0}),
+            context_for(Arc::clone(&environment)),
+        )
+        .await;
+
+        assert_eq!(
+            *environment
+                .captured_timeout
+                .lock()
+                .expect("captured_timeout lock is not poisoned"),
+            Some(30_000)
         );
     }
 

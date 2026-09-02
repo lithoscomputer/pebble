@@ -115,11 +115,23 @@ fn is_type(name: &str, value: &Value) -> bool {
         "array" => value.is_array(),
         "string" => value.is_string(),
         "number" => value.is_number(),
-        "integer" => value.is_i64() || value.is_u64(),
+        "integer" => value.is_i64() || value.is_u64() || is_whole_float(value),
         "boolean" => value.is_boolean(),
         "null" => value.is_null(),
         _ => true,
     }
+}
+
+/// Whether `value` is a float with nothing after the point.
+///
+/// JSON has one number type, and some providers spell an integer as `2000.0`.
+/// JSON Schema counts any number with a zero fractional part as an integer, so
+/// pebble does too; `2.5` is not one. Infinity and NaN have no fractional
+/// part to speak of and are not integers either.
+fn is_whole_float(value: &Value) -> bool {
+    value
+        .as_f64()
+        .is_some_and(|number| number.is_finite() && number.fract() == 0.0)
 }
 
 fn render_type(expected: &Value) -> String {
@@ -142,5 +154,43 @@ const fn type_name(value: &Value) -> &'static str {
         Value::String(_) => "string",
         Value::Array(_) => "array",
         Value::Object(_) => "object",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn limit_schema() -> ToolDefinitionKind {
+        ToolDefinitionKind::Function {
+            input_schema: json!({
+                "type": "object",
+                "properties": {"limit": {"type": "integer"}},
+            }),
+        }
+    }
+
+    #[test]
+    fn an_integer_may_be_spelled_as_a_whole_float() {
+        let kind = limit_schema();
+
+        assert!(validate_tool_arguments(&kind, &json!({"limit": 2000})).is_ok());
+        assert!(validate_tool_arguments(&kind, &json!({"limit": 2000.0})).is_ok());
+        assert!(validate_tool_arguments(&kind, &json!({"limit": -3.0})).is_ok());
+    }
+
+    #[test]
+    fn a_fraction_is_not_an_integer() {
+        let kind = limit_schema();
+
+        let error = validate_tool_arguments(&kind, &json!({"limit": 2.5}))
+            .expect_err("2.5 has a fractional part");
+
+        assert_eq!(
+            error.to_string(),
+            "Tool argument validation failed: arguments.limit: expected integer, got number"
+        );
     }
 }

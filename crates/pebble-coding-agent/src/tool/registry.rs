@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::ops::Range;
 use std::pin::Pin;
 use std::result::Result as StdResult;
 use std::sync::Arc;
@@ -629,7 +630,7 @@ pub(crate) fn required_str<'a>(arguments: &'a Value, key: &str) -> StdResult<&'a
 
 /// One optional counting argument, or the error the model is given instead.
 ///
-/// An argument that is absent, negative, or not a number at all is `None`, so
+/// An argument that is absent, negative, or not a whole number is `None`, so
 /// a tool falls back to its own default rather than refusing the call. A
 /// number too large for this machine is refused, because silently clamping a
 /// line offset would answer a question the model did not ask.
@@ -643,9 +644,8 @@ pub(crate) fn optional_usize_arg(
     arguments: &Value,
     key: &str,
 ) -> StdResult<Option<usize>, ToolError> {
-    arguments
-        .get(key)
-        .and_then(Value::as_u64)
+    optional_integer_arg::<i128>(arguments, key)
+        .filter(|value| *value >= 0)
         .map(|value| {
             usize::try_from(value).map_err(|_| {
                 ToolError::invalid_arguments(format!("Parameter {key} is too large: {value}"))
@@ -653,6 +653,53 @@ pub(crate) fn optional_usize_arg(
         })
         .transpose()
 }
+
+/// One optional integer argument as `T`, or `None`.
+///
+/// `None` when `key` is absent, is not a whole number, or names a whole
+/// number `T` cannot hold. See [`whole_number`] for what counts as a whole
+/// number.
+pub(crate) fn optional_integer_arg<T: TryFrom<i128>>(arguments: &Value, key: &str) -> Option<T> {
+    arguments.get(key).and_then(whole_number)
+}
+
+/// The integer a JSON number carries, as `T`, or `None`.
+///
+/// JSON has one number type, and some providers spell an integer as `2000.0`.
+/// A number with no fractional part is the integer it names, however it was
+/// spelled, so `2000`, `2000.0` and `-3.0` all read; `2.5`, text and anything
+/// else are `None`. A whole number `T` cannot hold — a negative count for an
+/// unsigned `T`, or a number past `T`'s range — is `None` too, so a caller
+/// that wants to refuse one rather than fall back reads an `i128` and
+/// narrows it itself.
+pub(crate) fn whole_number<T: TryFrom<i128>>(value: &Value) -> Option<T> {
+    let wide: i128 = if let Some(number) = value.as_i64() {
+        number.into()
+    } else if let Some(number) = value.as_u64() {
+        number.into()
+    } else {
+        let number = value.as_f64()?;
+        // Every whole float inside this range is an integer `i128` holds
+        // exactly, and the range check is what keeps the cast from
+        // saturating. NaN and infinity are outside every range.
+        if number.fract() != 0.0 || !I128_RANGE_AS_F64.contains(&number) {
+            return None;
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a whole float inside the i128 range converts exactly"
+        )]
+        {
+            number as i128
+        }
+    };
+    T::try_from(wide).ok()
+}
+
+/// The floats that name an `i128`: from `i128::MIN`, which a float holds
+/// exactly, up to but not including 2^127, the first magnitude past it.
+const I128_RANGE_AS_F64: Range<f64> = -170_141_183_460_469_231_731_687_303_715_884_105_728.0
+    ..170_141_183_460_469_231_731_687_303_715_884_105_728.0;
 
 #[cfg(test)]
 mod tests {
@@ -1175,7 +1222,9 @@ mod tests {
     fn an_optional_count_falls_back_rather_than_refusing_the_call() {
         let arguments = json!({
             "limit": 12,
+            "spelled_as_a_float": 12.0,
             "negative": -1,
+            "negative_float": -1.0,
             "fractional": 1.5,
             "text": "12",
         });
@@ -1184,12 +1233,76 @@ mod tests {
             optional_usize_arg(&arguments, "limit").expect("a whole number"),
             Some(12)
         );
-        for key in ["absent", "negative", "fractional", "text"] {
+        assert_eq!(
+            optional_usize_arg(&arguments, "spelled_as_a_float").expect("a whole number"),
+            Some(12)
+        );
+        for key in ["absent", "negative", "negative_float", "fractional", "text"] {
             assert_eq!(
                 optional_usize_arg(&arguments, key).expect("nothing to refuse"),
                 None,
                 "{key} is not a count, so the tool uses its own default"
             );
         }
+    }
+
+    #[test]
+    fn an_optional_count_past_this_machine_is_refused() {
+        let arguments = json!({"limit": 1e30});
+
+        let error = optional_usize_arg(&arguments, "limit").expect_err("1e30 is past usize");
+
+        assert_eq!(error.kind(), ToolErrorKind::InvalidArguments);
+        assert_eq!(
+            error.message(),
+            "Parameter limit is too large: 1000000000000000019884624838656"
+        );
+    }
+
+    #[test]
+    fn a_whole_number_reads_however_json_spelled_it() {
+        assert_eq!(whole_number::<u64>(&json!(2000)), Some(2000));
+        assert_eq!(whole_number::<u64>(&json!(2000.0)), Some(2000));
+        assert_eq!(whole_number::<i64>(&json!(-3)), Some(-3));
+        assert_eq!(whole_number::<i64>(&json!(-3.0)), Some(-3));
+        assert_eq!(whole_number::<u64>(&json!(u64::MAX)), Some(u64::MAX));
+        assert_eq!(
+            whole_number::<i128>(&json!(1e30)),
+            Some(1_000_000_000_000_000_019_884_624_838_656)
+        );
+    }
+
+    #[test]
+    fn a_whole_number_is_none_when_it_is_not_one_or_does_not_fit() {
+        // Not a whole number.
+        assert_eq!(whole_number::<i128>(&json!(2.5)), None);
+        assert_eq!(whole_number::<i128>(&json!("2000")), None);
+        assert_eq!(whole_number::<i128>(&json!(null)), None);
+        assert_eq!(whole_number::<i128>(&json!(true)), None);
+        // Negative into unsigned.
+        assert_eq!(whole_number::<u64>(&json!(-1)), None);
+        assert_eq!(whole_number::<u64>(&json!(-1.0)), None);
+        assert_eq!(whole_number::<usize>(&json!(-1)), None);
+        // Past the target type.
+        assert_eq!(whole_number::<u8>(&json!(256)), None);
+        assert_eq!(whole_number::<u8>(&json!(256.0)), None);
+        assert_eq!(whole_number::<i64>(&json!(u64::MAX)), None);
+        assert_eq!(whole_number::<u64>(&json!(1e30)), None);
+        // Past i128 itself, either way.
+        assert_eq!(whole_number::<i128>(&json!(1e40)), None);
+        assert_eq!(whole_number::<i128>(&json!(-1e40)), None);
+    }
+
+    #[test]
+    fn an_optional_integer_argument_is_read_by_key() {
+        let arguments = json!({"timeout_ms": 30000.0, "offset": -2});
+
+        assert_eq!(
+            optional_integer_arg::<u64>(&arguments, "timeout_ms"),
+            Some(30_000)
+        );
+        assert_eq!(optional_integer_arg::<i64>(&arguments, "offset"), Some(-2));
+        assert_eq!(optional_integer_arg::<u64>(&arguments, "offset"), None);
+        assert_eq!(optional_integer_arg::<u64>(&arguments, "absent"), None);
     }
 }

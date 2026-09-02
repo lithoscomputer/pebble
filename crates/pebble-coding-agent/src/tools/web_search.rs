@@ -7,7 +7,7 @@ use lithos_llm::types::ToolDefinition;
 use serde_json::Value;
 
 use crate::search::{SearchProvider, SearchRequest, SearchResult};
-use crate::tool::{NativeTool, RegisteredTool, required_str};
+use crate::tool::{NativeTool, RegisteredTool, optional_integer_arg, required_str};
 use crate::types::ToolSource;
 
 /// How many results a call returns when the model names no number.
@@ -54,8 +54,7 @@ pub fn make_web_search_tool(provider: Arc<dyn SearchProvider>) -> RegisteredTool
 /// error: the number is a preference, and refusing the call over it would cost
 /// a round trip for nothing.
 fn max_results_arg(args: &Value) -> u32 {
-    args.get("max_results")
-        .and_then(Value::as_u64)
+    optional_integer_arg::<u64>(args, "max_results")
         // A number past what a `u32` holds is past the bound anyway.
         .map_or(DEFAULT_MAX_RESULTS, |requested| {
             u32::try_from(requested).unwrap_or(MAX_RESULTS)

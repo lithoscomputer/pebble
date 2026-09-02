@@ -25,7 +25,9 @@ use super::definition;
 use crate::config::NativeToolOptions;
 use crate::search::SearchProvider;
 use crate::subagent::{SubagentResult, SubagentStatus, SubagentSupervisor, tree_position};
-use crate::tool::{NativeTool, RegisteredTool, ToolError, required_str};
+use crate::tool::{
+    NativeTool, RegisteredTool, ToolError, optional_integer_arg, required_str, whole_number,
+};
 use crate::tools::shell::run_shell_command;
 use crate::tools::{
     WebFetchSummarizer, make_edit_file_tool, make_read_file_tool, make_web_fetch_tool,
@@ -121,9 +123,7 @@ pub(crate) fn make_bash_tool(options: &NativeToolOptions) -> RegisteredTool {
         Arc::new(move |arguments, context| {
             Box::pin(async move {
                 let command = required_str(&arguments, "command")?;
-                let timeout_ms = arguments
-                    .get("timeout")
-                    .and_then(Value::as_u64)
+                let timeout_ms = optional_integer_arg(&arguments, "timeout")
                     .unwrap_or(default_timeout_ms)
                     .min(max_timeout_ms);
                 run_shell_command(&context, command, timeout_ms, None).await
@@ -289,7 +289,7 @@ fn optional_bool(arguments: &Value, key: &str, default: bool) -> Result<bool, To
 fn optional_u64(arguments: &Value, key: &str, default: u64) -> Result<u64, ToolError> {
     match arguments.get(key) {
         None | Some(Value::Null) => Ok(default),
-        Some(value) => value.as_u64().ok_or_else(|| {
+        Some(value) => whole_number(value).ok_or_else(|| {
             ToolError::invalid_arguments(format!("{key} must be a non-negative integer"))
         }),
     }
