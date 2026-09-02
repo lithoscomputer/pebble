@@ -31,7 +31,7 @@ use crate::human_input::{Answer, HumanInputError, HumanInputProvider, Question};
 use crate::subagent::{
     ChildObserver, SubagentLimits, SubagentResult, SubagentStatus, SubagentSupervisor,
 };
-use crate::test_support::{MockEnvironment, scripted_client};
+use crate::test_support::{MockEnvironment, ScriptedProvider, scripted_client};
 use crate::types::ToolErrorKind;
 
 /// The identifier the blocked child is supervised under, so a script can name
@@ -926,4 +926,113 @@ async fn a_child_inherits_only_the_tools_marked_for_it_under_its_parents_policy(
         .shutdown(ShutdownReason::Completed)
         .await
         .expect("the parent shuts down");
+}
+
+// --- The reason a wait on a child ends with ---
+
+/// A parent whose answer arrives while a background child is still running, so
+/// its prompt parks at the boundary waiting for the child's notification.
+///
+/// The child takes the first script entry and never gets an answer; the parent
+/// takes the second. Answers with the parent and the provider both read from.
+async fn parent_parked_on_a_background_child(
+    options: CodingAgentOptions,
+) -> (CodingRuntime, Arc<ScriptedProvider>) {
+    let (parent, provider) = TestSession::new(vec![
+        ScriptedCall::PendingOpen,
+        ScriptedCall::response(text_response("delegated")),
+    ])
+    .with_subagents()
+    .options(options)
+    .build();
+    let supervisor = parent
+        .subagent_supervisor()
+        .expect("the test session was given a factory")
+        .clone();
+    supervisor
+        .spawn_with_parent_notification(
+            parent.id(),
+            parent.root_session_id(),
+            "take your time".to_owned(),
+            "Slow task".to_owned(),
+        )
+        .expect("the spawn succeeds");
+    // The child's model call has begun, so the parent's prompt is next in line
+    // for the script and the child is still running when it gets there.
+    provider.wait_for_call().await;
+    (parent, provider)
+}
+
+#[tokio::test]
+async fn a_budget_that_runs_out_while_the_parent_waits_on_a_child_is_the_reason_reported() {
+    let (mut parent, provider) = parent_parked_on_a_background_child(CodingAgentOptions {
+        wall_clock_timeout: Some(Duration::from_millis(50)),
+        ..CodingAgentOptions::default()
+    })
+    .await;
+
+    let error = timeout(Duration::from_secs(1), parent.prompt("Delegate this"))
+        .await
+        .expect("the budget ends the prompt")
+        .expect_err("the prompt ran out of time");
+
+    assert!(
+        matches!(error, Error::Interrupted(InterruptReason::WallClockTimeout)),
+        "the budget, not a plain cancellation, is the reason: {error:?}"
+    );
+    assert_eq!(
+        provider.call_count(),
+        2,
+        "the child's call and the parent's"
+    );
+    assert!(
+        matches!(
+            parent.history().turns().last(),
+            Some(Message::Assistant { content, .. }) if content == "delegated"
+        ),
+        "the prompt was parked on the child after its answer: {:?}",
+        parent.history().turns()
+    );
+    // Running out of time is the prompt's failure, not the session's.
+    assert_eq!(parent.state(), CodingAgentState::Idle);
+
+    parent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the parent shuts down");
+}
+
+#[tokio::test]
+async fn a_session_cancelled_while_the_parent_waits_on_a_child_closes() {
+    let (mut parent, _provider) =
+        parent_parked_on_a_background_child(CodingAgentOptions::default()).await;
+    let reason = parent.interrupt_reason_handle();
+    let terminal = parent.cancel_token();
+    let mut events = parent.subscribe();
+    let canceller = tokio::spawn(async move {
+        // The answer is committed by the time it is published, so the prompt is
+        // at, or on its way to, the wait on the child.
+        wait_for_event(&mut events, |event| {
+            matches!(event, CodingEvent::AssistantMessage { .. })
+        })
+        .await;
+        reason.record(InterruptReason::Cancelled);
+        terminal.cancel();
+    });
+
+    let error = timeout(Duration::from_secs(1), parent.prompt("Delegate this"))
+        .await
+        .expect("the cancellation ends the prompt")
+        .expect_err("the prompt was cancelled");
+    canceller.await.expect("the canceller finishes");
+
+    assert!(
+        matches!(error, Error::Interrupted(InterruptReason::Cancelled)),
+        "{error:?}"
+    );
+    assert_eq!(
+        parent.state(),
+        CodingAgentState::Closed,
+        "the session's own cancellation closes it, wherever the prompt was"
+    );
 }

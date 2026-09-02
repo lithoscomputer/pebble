@@ -25,7 +25,7 @@ use crate::context_window::{
     ContextWindowInput, build_local_snapshot, context_window_from_response_usage,
 };
 use crate::environment::Environment;
-use crate::error::{Error, ErrorData, Result};
+use crate::error::{Error, ErrorData, InterruptReason, Result};
 use crate::event::Emitter;
 use crate::file_tracker::FileTracker;
 use crate::history::History;
@@ -816,6 +816,14 @@ impl CodingRuntime {
         self.coding_agent = Some(agent);
         bridge.finish_inference();
         if let Some(error) = bridge.take_boundary_error() {
+            // The supervisor's wait answers a cancellation with a plain
+            // `Cancelled`, whoever cancelled and whatever reason they recorded
+            // first. The prompt ends the way an abort at any other checkpoint
+            // does: with the recorded reason, and closed when the cancellation
+            // was the session's own.
+            if matches!(error, Error::Interrupted(InterruptReason::Cancelled)) {
+                return Err(self.prompt_aborted().await);
+            }
             return Err(error);
         }
 
