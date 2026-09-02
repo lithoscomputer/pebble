@@ -298,7 +298,7 @@ mod tests {
 
         let invalid = ToolError::from(EnvironmentError::new(
             EnvironmentErrorKind::InvalidInput,
-            "Invalid glob pattern: ../*",
+            "Invalid glob pattern \"../*\": pattern cannot traverse to a parent directory",
         ));
         assert_eq!(invalid.kind(), ToolErrorKind::InvalidArguments);
     }

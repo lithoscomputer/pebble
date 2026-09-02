@@ -509,11 +509,12 @@ impl Environment for LocalEnvironment {
     async fn glob(&self, pattern: &str, path: Option<&str>) -> EnvResult<Vec<String>> {
         let compiled = WorkspaceGlob::try_new(pattern).map_err(|error| {
             // The reason goes in the message because that is all the model
-            // reads; it has to see what was wrong to try again.
-            EnvironmentError::with_source(
+            // reads; it has to see what was wrong to try again. The pattern is
+            // quoted as the model sent it. Nothing branches on the glob error,
+            // so it is not kept as a source, which would repeat the reason.
+            EnvironmentError::new(
                 EnvironmentErrorKind::InvalidInput,
-                format!("Invalid glob pattern {:?}: {error}", error.pattern()),
-                error,
+                format!("Invalid glob pattern {pattern:?}: {error}"),
             )
         })?;
 
@@ -1927,6 +1928,13 @@ mod tests {
                 "[**]",
                 "Invalid glob pattern \"[**]\": wildcards are not valid inside a character class",
             ),
+            // The pattern is quoted as the model sent it, `./` prefix and all.
+            (
+                "./src/*/",
+                "Invalid glob pattern \"./src/*/\": pattern ends with \"/\"; glob matches \
+                 files, drop the trailing slash or add a filename pattern",
+            ),
+            ("./", "Invalid glob pattern \"./\": pattern cannot be empty"),
         ];
 
         for (pattern, expected) in cases {
@@ -1941,6 +1949,9 @@ mod tests {
                 "pattern {pattern:?}"
             );
             assert_eq!(error.message(), expected, "pattern {pattern:?}");
+            // The reason is in the message and nowhere else, so the full
+            // rendering does not say it twice.
+            assert_eq!(error.detail(), expected, "pattern {pattern:?}");
         }
     }
 

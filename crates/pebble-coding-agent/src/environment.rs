@@ -527,8 +527,10 @@ pub trait Environment: Send + Sync {
     /// Patterns are relative and use `/`: `*` and `?` stay inside one path
     /// segment, `**` crosses segments, and `[abc]` matches a character class.
     /// An absolute pattern, a `..` segment, or a backslash is
-    /// [`EnvironmentErrorKind::InvalidInput`]. Results are the environment's
-    /// own paths, sorted by the matched relative path.
+    /// [`EnvironmentErrorKind::InvalidInput`]. So is a pattern that ends with
+    /// `/`, since a glob names files, and a `/` or `*` inside `[...]`. The
+    /// error's message names the mistake so a model can correct it. Results
+    /// are the environment's own paths, sorted by the matched relative path.
     async fn glob(&self, pattern: &str, path: Option<&str>) -> EnvResult<Vec<String>>;
 
     /// Runs a command to completion and returns its bounded output.
