@@ -933,17 +933,17 @@ async fn a_child_inherits_only_the_tools_marked_for_it_under_its_parents_policy(
 /// A parent whose answer arrives while a background child is still running, so
 /// its prompt parks at the boundary waiting for the child's notification.
 ///
-/// The child takes the first script entry and never gets an answer; the parent
-/// takes the second. Answers with the parent and the provider both read from.
-async fn parent_parked_on_a_background_child(
-    options: CodingAgentOptions,
-) -> (CodingRuntime, Arc<ScriptedProvider>) {
+/// The child takes the first script entry, whose open never completes, and is
+/// answered only when something cancels it; the parent takes the second. Both
+/// are built with the default options, because a child inherits its parent's
+/// options and a budget on the parent would be a budget on the child too.
+/// Answers with the parent and the provider both read from.
+async fn parent_parked_on_a_background_child() -> (CodingRuntime, Arc<ScriptedProvider>) {
     let (parent, provider) = TestSession::new(vec![
         ScriptedCall::PendingOpen,
         ScriptedCall::response(text_response("delegated")),
     ])
     .with_subagents()
-    .options(options)
     .build();
     let supervisor = parent
         .subagent_supervisor()
@@ -965,16 +965,33 @@ async fn parent_parked_on_a_background_child(
 
 #[tokio::test]
 async fn a_budget_that_runs_out_while_the_parent_waits_on_a_child_is_the_reason_reported() {
-    let (mut parent, provider) = parent_parked_on_a_background_child(CodingAgentOptions {
-        wall_clock_timeout: Some(Duration::from_millis(50)),
-        ..CodingAgentOptions::default()
-    })
-    .await;
+    // What the wall-clock timer does when it fires, done by hand once the
+    // prompt is parked, so the timing is the test's rather than the clock's.
+    // The timer's own path to the reason is covered with the interrupts.
+    let (mut parent, provider) = parent_parked_on_a_background_child().await;
+    let reason = parent.interrupt_reason_handle();
+    let budget = CancellationToken::new();
+    let watchdog = budget.clone();
+    let mut events = parent.subscribe();
+    let timer = tokio::spawn(async move {
+        // The answer is committed by the time it is published, so the prompt is
+        // at, or on its way to, the wait on the child.
+        wait_for_event(&mut events, |event| {
+            matches!(event, CodingEvent::AssistantMessage { .. })
+        })
+        .await;
+        reason.record(InterruptReason::WallClockTimeout);
+        watchdog.cancel();
+    });
 
-    let error = timeout(Duration::from_secs(1), parent.prompt("Delegate this"))
-        .await
-        .expect("the budget ends the prompt")
-        .expect_err("the prompt ran out of time");
+    let error = timeout(
+        Duration::from_secs(1),
+        parent.prompt_with_cancellation("Delegate this", Some(&budget)),
+    )
+    .await
+    .expect("the budget ends the prompt")
+    .expect_err("the prompt ran out of time");
+    timer.await.expect("the timer finishes");
 
     assert!(
         matches!(error, Error::Interrupted(InterruptReason::WallClockTimeout)),
@@ -1004,8 +1021,7 @@ async fn a_budget_that_runs_out_while_the_parent_waits_on_a_child_is_the_reason_
 
 #[tokio::test]
 async fn a_session_cancelled_while_the_parent_waits_on_a_child_closes() {
-    let (mut parent, _provider) =
-        parent_parked_on_a_background_child(CodingAgentOptions::default()).await;
+    let (mut parent, _provider) = parent_parked_on_a_background_child().await;
     let reason = parent.interrupt_reason_handle();
     let terminal = parent.cancel_token();
     let mut events = parent.subscribe();
