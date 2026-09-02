@@ -1,5 +1,7 @@
 //! Generic tools exposed to an agent.
 
+mod system;
+
 use std::error::Error as StdError;
 use std::fmt;
 use std::future::Future;
@@ -12,6 +14,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+pub use self::system::{
+    ToolCallNext, ToolCallRequest, ToolCatalog, ToolDescriptor, ToolDiscoveryContext,
+    ToolDiscoveryNext, ToolId, ToolIdError, ToolMiddleware, ToolOutcome, ToolScheduling,
+    ToolService, ToolSystem, ToolSystemError,
+};
 use crate::event::{AgentEvent, EventHub};
 use crate::turn::TurnContext;
 
