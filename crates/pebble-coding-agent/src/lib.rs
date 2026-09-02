@@ -28,6 +28,7 @@ mod loop_detection;
 mod memory;
 mod profile;
 mod profiles;
+mod prompt_transform;
 mod reasoning;
 mod record;
 mod redact;

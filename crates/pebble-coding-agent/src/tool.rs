@@ -12,6 +12,7 @@ mod execution;
 mod native;
 mod permissions;
 mod registry;
+mod runner;
 
 pub use self::error::ToolError;
 pub(crate) use self::execution::result_text;
@@ -23,3 +24,4 @@ pub use self::registry::{
     ToolEnvProvider, ToolExecutor, ToolRegistry,
 };
 pub(crate) use self::registry::{optional_usize_arg, required_str};
+pub use self::runner::{CodingToolSet, ToolEventCallback, ToolRunner};

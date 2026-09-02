@@ -51,6 +51,7 @@ use crate::human_input::HumanInputProvider;
 use crate::memory::{MEMORY_BUDGET_BYTES, MemoryDocument, load_memory};
 use crate::profile::{AgentProfile, EnvContext, ModelFacts, SubagentSupport, builtin_profile};
 use crate::profiles::{FileEditToolKind, ProfileDeps};
+use crate::prompt_transform::{SystemPromptContext, SystemPromptTransform};
 use crate::record::{RecordMigrationError, SessionRecord};
 use crate::redact::{NoRedaction, Redactor};
 use crate::search::SearchProvider;
@@ -139,6 +140,7 @@ pub(crate) struct CodingRuntimeBuilder {
     options:              CodingAgentOptions,
     events:               EventOptions,
     profile:              Option<Arc<dyn AgentProfile>>,
+    prompt_transform:     Option<Arc<dyn SystemPromptTransform>>,
     subagents:            Option<ChildAgentFactory>,
     subagent_limits:      SubagentLimits,
     child:                Option<ChildIdentity>,
@@ -160,10 +162,25 @@ impl CodingRuntimeBuilder {
             options: CodingAgentOptions::default(),
             events: EventOptions::default(),
             profile: None,
+            prompt_transform: None,
             subagents: None,
             subagent_limits: SubagentLimits::default(),
             child: None,
         }
+    }
+
+    /// Lets the application adjust the system prompt the profile writes.
+    ///
+    /// The transform sees the default prompt and the context it was written
+    /// from, and answers with the default, an addition, or a replacement. It
+    /// applies to this root session only: a child runs its parent's profile and
+    /// prompt.
+    pub(crate) fn system_prompt_transform(
+        mut self,
+        transform: Arc<dyn SystemPromptTransform>,
+    ) -> Self {
+        self.prompt_transform = Some(transform);
+        self
     }
 
     /// Names the model, as the client's catalog spells it.
@@ -506,6 +523,7 @@ impl CodingRuntimeBuilder {
             activated_skill_context_observed: false,
             file_tracker: FileTracker::default(),
             subagents: supervisor,
+            prompt_transform: self.prompt_transform,
             last_prompt: PromptTotals::default(),
             coding_agent: None,
             coding_bridge: None,
@@ -710,6 +728,9 @@ pub(crate) struct CodingRuntime {
     activated_skill_context_observed: bool,
     file_tracker: FileTracker,
     subagents: Option<SubagentSupervisor>,
+    /// The application's adjustment to the system prompt, applied once when
+    /// the session initializes.
+    prompt_transform: Option<Arc<dyn SystemPromptTransform>>,
     last_prompt: PromptTotals,
     /// The provider-neutral conversation loop, created after initialization on
     /// the first prompt and retained for the rest of the session.
@@ -948,10 +969,12 @@ impl CodingRuntime {
 
         let memory = memory?;
         // The files are described, never quoted: the durable stream must not
-        // carry the bytes of a project's own instructions.
+        // carry the bytes of a project's own instructions. The same
+        // descriptions are what a prompt transform is shown.
+        let memory_summaries: Vec<_> = memory.iter().map(MemoryDocument::to_summary).collect();
         self.emit(CodingEvent::MemoryLoaded {
             profile:            profile.clone(),
-            files:              memory.iter().map(MemoryDocument::to_summary).collect(),
+            files:              memory_summaries.clone(),
             total_loaded_bytes: memory.iter().map(|document| document.loaded_bytes).sum(),
             budget_bytes:       MEMORY_BUDGET_BYTES,
         });
@@ -996,13 +1019,36 @@ impl CodingRuntime {
         // The registry is complete by now — the builder froze it and the skill
         // tool above is the last addition — so a profile that gates a prompt
         // section on a tool reads the session's real answer.
-        self.system_prompt = self.profile.build_system_prompt(
+        let default_prompt = self.profile.build_system_prompt(
             &self.registry,
             &env_context,
             &memory,
             self.config.user_instructions.as_deref(),
             &self.skills,
         );
+        // The application's one chance to adjust the words the model reads
+        // first. It sees the prompt as written and the session as the prompt
+        // describes it, and the tools, their names, and everything around them
+        // stay exactly as the profile decided.
+        self.system_prompt = match &self.prompt_transform {
+            Some(transform) => {
+                let tools: Vec<_> = self
+                    .effective_tools()
+                    .iter()
+                    .map(ToolDefinitionWithSource::to_tool_summary)
+                    .collect();
+                let skills: Vec<_> = self.skills.iter().map(Skill::to_summary).collect();
+                let context = SystemPromptContext::new(
+                    &default_prompt,
+                    &env_context,
+                    &tools,
+                    &memory_summaries,
+                    &skills,
+                );
+                transform.transform(context).apply(default_prompt)
+            }
+            None => default_prompt,
+        };
 
         Ok(())
     }

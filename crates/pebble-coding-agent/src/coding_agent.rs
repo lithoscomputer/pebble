@@ -18,6 +18,7 @@ use crate::error::{Error, InterruptReason};
 use crate::event::{EventCapacity, EventSink};
 use crate::history::History;
 use crate::human_input::HumanInputProvider;
+use crate::prompt_transform::SystemPromptTransform;
 use crate::record::SessionRecord;
 use crate::redact::Redactor;
 use crate::runtime::{
@@ -329,6 +330,17 @@ impl CodingAgentBuilder {
     /// Sets the provider behind the profile's web-search tool.
     pub fn search_provider(mut self, provider: Arc<dyn SearchProvider>) -> Self {
         self.inner = self.inner.search_provider(provider);
+        self
+    }
+
+    /// Lets the application adjust the system prompt the selected profile
+    /// writes: use it, add to it, or replace it.
+    ///
+    /// The tools, their names, and the runtime behavior around them are the
+    /// profile's whatever the transform answers. It applies to this agent only,
+    /// not to the subagents it spawns.
+    pub fn system_prompt_transform(mut self, transform: Arc<dyn SystemPromptTransform>) -> Self {
+        self.inner = self.inner.system_prompt_transform(transform);
         self
     }
 

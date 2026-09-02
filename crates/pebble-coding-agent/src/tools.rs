@@ -55,9 +55,10 @@ pub use crate::config::{
     ToolExposureMode, ToolHookCallback, ToolHookDecision,
 };
 pub use crate::tool::{
-    CodingEventEmitter, NativeTool, RegisteredTool, StaticEnvProvider, ToolContext,
-    ToolDefinitionWithSource, ToolDispatch, ToolEnvProvider, ToolError, ToolExecutor, ToolRegistry,
-    ToolVocabulary, canonical_tool_name, known_tool_category, tool_category, validate_tool_args,
+    CodingEventEmitter, CodingToolSet, NativeTool, RegisteredTool, StaticEnvProvider, ToolContext,
+    ToolDefinitionWithSource, ToolDispatch, ToolEnvProvider, ToolError, ToolEventCallback,
+    ToolExecutor, ToolRegistry, ToolRunner, ToolVocabulary, canonical_tool_name,
+    known_tool_category, tool_category, validate_tool_args,
 };
 pub use crate::truncation::{
     DEFAULT_TOOL_OUTPUT_RETENTION_BYTES, DEFAULT_TOOL_OUTPUT_SERIALIZED_BYTES, OutputBudgets,
