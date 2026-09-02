@@ -108,8 +108,9 @@ pub fn make_glob_tool() -> RegisteredTool {
     RegisteredTool::new(ToolDefinition::function(
             NativeTool::Glob.canonical_name(),
             "Find files by search-root-relative path using a glob pattern. Use path to choose the \
-             search root. `*` stays within one path segment and `**` searches recursively. Prefer \
-             this over shell find or ls when locating repository files.",
+             search root. `*` stays within one path segment and `**` searches recursively. \
+             Patterns match files, so a trailing `/` is rejected. Prefer this over shell find or \
+             ls when locating repository files.",
             serde_json::json!({
                 "type": "object",
                 "properties": {

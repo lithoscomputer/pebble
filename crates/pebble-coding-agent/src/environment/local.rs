@@ -508,9 +508,11 @@ impl Environment for LocalEnvironment {
 
     async fn glob(&self, pattern: &str, path: Option<&str>) -> EnvResult<Vec<String>> {
         let compiled = WorkspaceGlob::try_new(pattern).map_err(|error| {
+            // The reason goes in the message because that is all the model
+            // reads; it has to see what was wrong to try again.
             EnvironmentError::with_source(
                 EnvironmentErrorKind::InvalidInput,
-                format!("Invalid glob pattern: {pattern}"),
+                format!("Invalid glob pattern {:?}: {error}", error.pattern()),
                 error,
             )
         })?;
@@ -1900,7 +1902,46 @@ mod tests {
             .expect_err("the pattern reaches outside the base");
 
         assert_eq!(error.kind(), EnvironmentErrorKind::InvalidInput);
-        assert!(error.detail().contains("must be relative"), "{error}");
+        assert_eq!(
+            error.message(),
+            "Invalid glob pattern \"/absolute/*.rs\": pattern must be relative"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_pattern_tells_the_model_what_is_wrong() {
+        let directory = TempDir::new("local-env");
+        directory.write("src/a.rs", "");
+        let cases = [
+            (
+                "src/*/",
+                "Invalid glob pattern \"src/*/\": pattern ends with \"/\"; glob matches files, \
+                 drop the trailing slash or add a filename pattern",
+            ),
+            (
+                "src/[a/b].rs",
+                "Invalid glob pattern \"src/[a/b].rs\": a \"/\" cannot appear inside a character \
+                 class",
+            ),
+            (
+                "[**]",
+                "Invalid glob pattern \"[**]\": wildcards are not valid inside a character class",
+            ),
+        ];
+
+        for (pattern, expected) in cases {
+            let error = environment(&directory)
+                .glob(pattern, None)
+                .await
+                .expect_err("the pattern is malformed");
+
+            assert_eq!(
+                error.kind(),
+                EnvironmentErrorKind::InvalidInput,
+                "pattern {pattern:?}"
+            );
+            assert_eq!(error.message(), expected, "pattern {pattern:?}");
+        }
     }
 
     #[tokio::test]

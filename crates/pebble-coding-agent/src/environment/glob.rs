@@ -8,11 +8,19 @@
 //! of a pattern matches at least one segment, so `docs/**` names what is inside
 //! `docs` rather than `docs` itself.
 //!
+//! A glob names files, so a pattern that ends with `/` is rejected rather than
+//! read as if the slash were not there, and a `/` or a wildcard inside `[...]`
+//! is rejected too. Each rejection names the mistake: the patterns come from a
+//! model, and a precise error is what lets it correct itself. Fabro's glob
+//! crate accepted all of these; this is a deliberate divergence.
+//!
 //! The matcher is written here rather than taken from a glob crate so the
 //! semantics stay pinned to the tests below.
 
 use std::borrow::Cow;
+use std::iter::Peekable;
 use std::path::Path;
+use std::str::Chars;
 
 /// A validated glob matched against `/`-separated paths relative to a base
 /// directory.
@@ -45,21 +53,14 @@ impl WorkspaceGlob {
                 pattern: source.to_owned(),
             });
         }
-
-        let mut segments: Vec<Segment> = Vec::new();
-        for segment in source.split('/').filter(|segment| !segment.is_empty()) {
-            let parsed = parse_segment(segment, source)?;
-            // `**/**` matches exactly what `**` does, and collapsing the pair
-            // keeps matching from branching once per repetition.
-            let repeats_recursion = matches!(parsed, Segment::Recursive)
-                && matches!(segments.last(), Some(Segment::Recursive));
-            if !repeats_recursion {
-                segments.push(parsed);
-            }
+        if source.ends_with('/') {
+            return Err(WorkspaceGlobError::TrailingSeparator {
+                pattern: source.to_owned(),
+            });
         }
 
         Ok(Self {
-            segments,
+            segments:       parse_segments(source)?,
             traversal_root: literal_traversal_root(source),
         })
     }
@@ -89,25 +90,57 @@ impl WorkspaceGlob {
 }
 
 /// Why a glob pattern was rejected.
+///
+/// The message is the reason alone, written so a model can act on it. The
+/// caller that reports the error names the operation and the pattern.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum WorkspaceGlobError {
-    #[error("glob pattern cannot be empty")]
+    #[error("pattern cannot be empty")]
     Empty,
 
-    #[error("glob pattern must use '/' as its path separator: {pattern:?}")]
+    #[error("pattern must use \"/\" as its path separator")]
     BackslashSeparator { pattern: String },
 
-    #[error("glob pattern must be relative: {pattern:?}")]
+    #[error("pattern must be relative")]
     Absolute { pattern: String },
 
-    #[error("glob pattern cannot traverse to a parent directory: {pattern:?}")]
+    #[error("pattern cannot traverse to a parent directory")]
     ParentTraversal { pattern: String },
 
-    #[error("glob pattern {pattern:?} has an unclosed character class")]
+    #[error(
+        "pattern ends with \"/\"; glob matches files, drop the trailing slash or add a filename \
+         pattern"
+    )]
+    TrailingSeparator { pattern: String },
+
+    #[error("pattern has an unclosed character class")]
     UnclosedCharacterClass { pattern: String },
 
-    #[error("glob pattern {pattern:?} uses '**' inside a path segment")]
+    #[error("a \"/\" cannot appear inside a character class")]
+    SeparatorInCharacterClass { pattern: String },
+
+    #[error("wildcards are not valid inside a character class")]
+    WildcardInCharacterClass { pattern: String },
+
+    #[error("\"**\" must be a whole path segment")]
     RecursiveWildcardInSegment { pattern: String },
+}
+
+impl WorkspaceGlobError {
+    /// The pattern that was rejected, as it was read.
+    pub(crate) fn pattern(&self) -> &str {
+        match self {
+            Self::Empty => "",
+            Self::BackslashSeparator { pattern }
+            | Self::Absolute { pattern }
+            | Self::ParentTraversal { pattern }
+            | Self::TrailingSeparator { pattern }
+            | Self::UnclosedCharacterClass { pattern }
+            | Self::SeparatorInCharacterClass { pattern }
+            | Self::WildcardInCharacterClass { pattern }
+            | Self::RecursiveWildcardInSegment { pattern } => pattern,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -144,62 +177,120 @@ impl ClassMember {
     }
 }
 
-fn parse_segment(segment: &str, pattern: &str) -> Result<Segment, WorkspaceGlobError> {
-    if segment.contains("**") {
-        if segment == "**" {
-            return Ok(Segment::Recursive);
+/// Reads `pattern` into one segment per `/`-separated part.
+///
+/// Character classes are read before the pattern is split, so a `/` inside
+/// `[...]` is reported as that rather than as an unclosed class. A repeated
+/// separator (`a//b`) reads as one.
+fn parse_segments(pattern: &str) -> Result<Vec<Segment>, WorkspaceGlobError> {
+    let mut segments: Vec<Segment> = Vec::new();
+    let mut characters = pattern.chars().peekable();
+    while characters.peek().is_some() {
+        let tokens = parse_segment_tokens(&mut characters, pattern)?;
+        if tokens.is_empty() {
+            continue;
         }
-        return Err(WorkspaceGlobError::RecursiveWildcardInSegment {
-            pattern: pattern.to_owned(),
-        });
+        let parsed = segment_from_tokens(tokens, pattern)?;
+        // `**/**` matches exactly what `**` does, and collapsing the pair
+        // keeps matching from branching once per repetition.
+        let repeats_recursion = matches!(parsed, Segment::Recursive)
+            && matches!(segments.last(), Some(Segment::Recursive));
+        if !repeats_recursion {
+            segments.push(parsed);
+        }
     }
+    Ok(segments)
+}
 
+/// Reads tokens up to the next `/` outside a character class, consuming that
+/// `/`, or to the end of the pattern.
+fn parse_segment_tokens(
+    characters: &mut Peekable<Chars<'_>>,
+    pattern: &str,
+) -> Result<Vec<Token>, WorkspaceGlobError> {
     let mut tokens = Vec::new();
-    let mut characters = segment.chars().peekable();
     while let Some(character) = characters.next() {
         match character {
+            '/' => break,
             '*' => tokens.push(Token::AnyRun),
             '?' => tokens.push(Token::AnyCharacter),
-            '[' => {
-                let negated = characters.peek() == Some(&'!');
-                if negated {
-                    characters.next();
-                }
-                let mut members = Vec::new();
-                let mut closed = false;
-                // A `]` immediately after the opening bracket is a member.
-                while let Some(member) = characters.next() {
-                    if member == ']' && !members.is_empty() {
-                        closed = true;
-                        break;
-                    }
-                    if characters.peek() == Some(&'-') {
-                        let mut lookahead = characters.clone();
-                        lookahead.next();
-                        match lookahead.peek().copied() {
-                            Some(end) if end != ']' => {
-                                characters.next();
-                                characters.next();
-                                members.push(ClassMember::Range(member, end));
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-                    members.push(ClassMember::Character(member));
-                }
-                if !closed {
-                    return Err(WorkspaceGlobError::UnclosedCharacterClass {
-                        pattern: pattern.to_owned(),
-                    });
-                }
-                tokens.push(Token::Class { negated, members });
-            }
+            '[' => tokens.push(parse_class(characters, pattern)?),
             literal => tokens.push(Token::Literal(literal)),
         }
     }
+    Ok(tokens)
+}
 
-    Ok(Segment::Tokens(tokens))
+/// Reads the body of a character class; the opening `[` is already consumed.
+fn parse_class(
+    characters: &mut Peekable<Chars<'_>>,
+    pattern: &str,
+) -> Result<Token, WorkspaceGlobError> {
+    let negated = characters.peek() == Some(&'!');
+    if negated {
+        characters.next();
+    }
+    let mut members = Vec::new();
+    let mut closed = false;
+    // A `]` immediately after the opening bracket is a member.
+    while let Some(member) = characters.next() {
+        if member == ']' && !members.is_empty() {
+            closed = true;
+            break;
+        }
+        let member = class_member(member, pattern)?;
+        if characters.peek() == Some(&'-') {
+            let mut lookahead = characters.clone();
+            lookahead.next();
+            match lookahead.peek().copied() {
+                Some(end) if end != ']' => {
+                    characters.next();
+                    characters.next();
+                    members.push(ClassMember::Range(member, class_member(end, pattern)?));
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        members.push(ClassMember::Character(member));
+    }
+    if !closed {
+        return Err(WorkspaceGlobError::UnclosedCharacterClass {
+            pattern: pattern.to_owned(),
+        });
+    }
+    Ok(Token::Class { negated, members })
+}
+
+/// A character that may stand in a class: not the separator and not `*`,
+/// which are the mistakes a class is most often written with.
+fn class_member(character: char, pattern: &str) -> Result<char, WorkspaceGlobError> {
+    match character {
+        '/' => Err(WorkspaceGlobError::SeparatorInCharacterClass {
+            pattern: pattern.to_owned(),
+        }),
+        '*' => Err(WorkspaceGlobError::WildcardInCharacterClass {
+            pattern: pattern.to_owned(),
+        }),
+        member => Ok(member),
+    }
+}
+
+/// `**` on its own is the recursive segment; `**` next to anything else has
+/// no meaning and is rejected.
+fn segment_from_tokens(tokens: Vec<Token>, pattern: &str) -> Result<Segment, WorkspaceGlobError> {
+    let has_recursive_run = tokens
+        .windows(2)
+        .any(|pair| matches!(pair, [Token::AnyRun, Token::AnyRun]));
+    if !has_recursive_run {
+        return Ok(Segment::Tokens(tokens));
+    }
+    if tokens.len() == 2 {
+        return Ok(Segment::Recursive);
+    }
+    Err(WorkspaceGlobError::RecursiveWildcardInSegment {
+        pattern: pattern.to_owned(),
+    })
 }
 
 fn match_segments(pattern: &[Segment], path: &[&str]) -> bool {
@@ -431,6 +522,71 @@ mod tests {
             WorkspaceGlob::try_new("src**/*.rs"),
             Err(WorkspaceGlobError::RecursiveWildcardInSegment { .. })
         ));
+    }
+
+    #[test]
+    fn malformed_patterns_are_rejected_with_the_mistake_named() {
+        let cases = [
+            (
+                "src/[a/b].rs",
+                "a \"/\" cannot appear inside a character class",
+            ),
+            (
+                "**/[!/]*.md",
+                "a \"/\" cannot appear inside a character class",
+            ),
+            (
+                "src/*/",
+                "pattern ends with \"/\"; glob matches files, drop the trailing slash or add a \
+                 filename pattern",
+            ),
+            (
+                "*/",
+                "pattern ends with \"/\"; glob matches files, drop the trailing slash or add a \
+                 filename pattern",
+            ),
+            ("[**]", "wildcards are not valid inside a character class"),
+            (
+                "src/[a-*].rs",
+                "wildcards are not valid inside a character class",
+            ),
+            ("src/[abc", "pattern has an unclosed character class"),
+            ("src**/*.rs", "\"**\" must be a whole path segment"),
+        ];
+
+        for (pattern, expected) in cases {
+            let error = WorkspaceGlob::try_new(pattern).expect_err("pattern is malformed");
+            assert_eq!(error.to_string(), expected, "pattern {pattern:?}");
+            assert_eq!(error.pattern(), pattern, "pattern {pattern:?}");
+        }
+    }
+
+    #[test]
+    fn unusual_class_members_stay_valid() {
+        let cases = [
+            ("src/[?]ib.rs", "src/?ib.rs", true),
+            ("src/[?]ib.rs", "src/lib.rs", false),
+            ("src/[]a]ib.rs", "src/]ib.rs", true),
+            ("src/[]a]ib.rs", "src/aib.rs", true),
+            ("src/[a-]ib.rs", "src/-ib.rs", true),
+            ("src/[!]]ib.rs", "src/lib.rs", true),
+        ];
+
+        for (pattern, candidate, expected) in cases {
+            let glob = WorkspaceGlob::try_new(pattern).expect("pattern compiles");
+            assert_eq!(
+                glob.is_match(candidate),
+                expected,
+                "pattern {pattern:?}, candidate {candidate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_separator_reads_as_one() {
+        let glob = WorkspaceGlob::try_new("src//*.rs").expect("pattern compiles");
+
+        assert!(glob.is_match("src/lib.rs"));
     }
 
     #[test]
