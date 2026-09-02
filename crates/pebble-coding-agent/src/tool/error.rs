@@ -13,10 +13,13 @@ use crate::types::ToolErrorKind;
 /// [`message`](Self::message) is written for the model — it names what failed
 /// and what to do about it, and it never carries a secret, a stack, or an
 /// internal identifier — while the underlying failure stays attached as the
-/// error's source, for logs and for the application.
+/// error's source, for logs and for the application. An OS error string is
+/// not a secret: an environment failure puts its causes into the message, so
+/// the model can tell a missing file from a refused one.
 ///
-/// The execution layer owns rendering: it puts the message in the tool result,
-/// marks the result as an error, and reports [`kind`](Self::kind) on
+/// The execution layer owns rendering: it puts the message in the tool result
+/// after the session's redactor has seen it, marks the result as an error, and
+/// reports [`kind`](Self::kind) on
 /// [`CodingEvent::ToolCallCompleted`](crate::events::CodingEvent::ToolCallCompleted) so
 /// hooks and event consumers can branch without parsing text.
 #[derive(Debug, thiserror::Error)]
@@ -127,7 +130,9 @@ impl ToolError {
 
     /// The message followed by one `"\n  caused by: ..."` line per cause.
     ///
-    /// For logs. What the model reads is [`message`](Self::message).
+    /// For logs. What the model reads is [`message`](Self::message); a
+    /// producer that wants the model to see a cause writes it into the
+    /// message, as [`From<EnvironmentError>`](Self::from) does.
     #[must_use]
     pub fn detail(&self) -> String {
         let mut rendered = self.message.clone();
@@ -141,11 +146,16 @@ impl ToolError {
 }
 
 impl From<EnvironmentError> for ToolError {
-    /// Carries an environment failure to the model.
+    /// Carries an environment failure to the model, causes included.
     ///
-    /// The environment's message is already written for the model, so it is
-    /// kept as-is and the environment error becomes the cause. Only the kind
-    /// is translated: an operation the environment does not offer is
+    /// The model-facing message is the environment's
+    /// [`detail`](EnvironmentError::detail): its message plus one `caused by`
+    /// line per cause, so `Permission denied` and `No such file or directory`
+    /// read differently. The environment error's own cause is carried on as
+    /// the source, rather than the whole error, so [`detail`](Self::detail)
+    /// does not repeat the message as its own first cause; it does repeat the
+    /// cause line, because the message carries it too. Only the kind is
+    /// translated: an operation the environment does not offer is
     /// [`Unavailable`](ToolErrorKind::Unavailable), an argument it rejected is
     /// [`InvalidArguments`](ToolErrorKind::InvalidArguments), and everything
     /// else is a failure of the running tool.
@@ -155,12 +165,18 @@ impl From<EnvironmentError> for ToolError {
             EnvironmentErrorKind::InvalidInput => ToolErrorKind::InvalidArguments,
             _ => ToolErrorKind::Execution,
         };
-        Self::with_source(kind, error.message().to_owned(), error)
+        let message = error.detail();
+        match error.into_source() {
+            Some(source) => Self::with_boxed_source(kind, message, source),
+            None => Self::new(kind, message),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, ErrorKind};
+
     use super::*;
 
     #[derive(Debug, thiserror::Error)]
@@ -197,7 +213,7 @@ mod tests {
     }
 
     #[test]
-    fn a_source_stays_out_of_the_model_facing_message() {
+    fn a_source_given_directly_stays_out_of_the_model_facing_message() {
         let error = ToolError::with_source(
             ToolErrorKind::Execution,
             "Failed to write file: /work/out.txt",
@@ -213,19 +229,60 @@ mod tests {
     }
 
     #[test]
-    fn environment_failures_keep_their_message_and_become_a_cause() {
-        let environment = EnvironmentError::new(
+    fn an_environment_io_cause_is_part_of_the_model_facing_message() {
+        let refused = io::Error::new(
+            ErrorKind::PermissionDenied,
+            "Permission denied (os error 13)",
+        );
+        let error = ToolError::from(EnvironmentError::io(
+            "Failed to read /work/config.yml",
+            refused,
+        ));
+
+        assert_eq!(error.kind(), ToolErrorKind::Execution);
+        assert_eq!(
+            error.message(),
+            "Failed to read /work/config.yml\n  caused by: Permission denied (os error 13)"
+        );
+        assert_eq!(error.to_string(), error.message());
+    }
+
+    /// The source is the environment error's own cause, not the environment
+    /// error: its message is already the tool error's message, and a log would
+    /// otherwise read it twice.
+    #[test]
+    fn an_environment_failure_is_not_repeated_as_its_own_first_cause() {
+        let error = ToolError::from(EnvironmentError::with_source(
+            EnvironmentErrorKind::Io,
+            "Failed to write /work/out.txt",
+            Cause,
+        ));
+
+        assert_eq!(
+            error.message(),
+            "Failed to write /work/out.txt\n  caused by: disk is full"
+        );
+        assert_eq!(
+            StdError::source(&error).map(ToString::to_string),
+            Some("disk is full".to_owned())
+        );
+        assert_eq!(
+            error.detail(),
+            "Failed to write /work/out.txt\n  caused by: disk is full\n  caused by: disk is full"
+        );
+    }
+
+    #[test]
+    fn an_environment_failure_without_a_cause_has_no_source() {
+        let error = ToolError::from(EnvironmentError::new(
             EnvironmentErrorKind::NotFound,
             "File not found: /work/a.txt",
-        );
-        let error = ToolError::from(environment);
+        ));
 
         assert_eq!(error.kind(), ToolErrorKind::Execution);
         assert_eq!(error.message(), "File not found: /work/a.txt");
-        assert_eq!(
-            error.detail(),
-            "File not found: /work/a.txt\n  caused by: File not found: /work/a.txt"
-        );
+        assert_eq!(error.detail(), "File not found: /work/a.txt");
+        assert!(StdError::source(&error).is_none());
     }
 
     #[test]

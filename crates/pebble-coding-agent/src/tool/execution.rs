@@ -128,8 +128,10 @@ impl<'a> ToolDispatch<'a> {
 
     /// Sets what strips secrets out of text a tool publishes.
     ///
-    /// Without one, process output reaches the event stream exactly as the
-    /// process wrote it.
+    /// It runs over process output a tool puts on the event stream and over
+    /// the message of every failed call, which can carry an OS error naming a
+    /// path. Without one, both reach the model and the event stream exactly
+    /// as they were written.
     #[must_use]
     pub(crate) fn with_redactor(mut self, redactor: &'a Arc<dyn Redactor>) -> Self {
         self.redactor = Some(redactor);
@@ -286,7 +288,7 @@ impl<'a> ToolDispatch<'a> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
             if cancel.is_cancelled() {
-                results.push(cancelled_result(call));
+                results.push(self.cancelled_result(call));
                 continue;
             }
             results.push(
@@ -325,7 +327,7 @@ impl<'a> ToolDispatch<'a> {
 
         for (index, call) in calls.iter().enumerate() {
             if cancel.is_cancelled() {
-                results.push(cancelled_result(call));
+                results.push(self.cancelled_result(call));
                 continue;
             }
 
@@ -351,7 +353,7 @@ impl<'a> ToolDispatch<'a> {
         cancel: CancellationToken,
     ) -> ExecutedTool {
         let Some(tool) = registered else {
-            return ExecutedTool::failed(
+            return self.failed(
                 call,
                 &ToolError::unavailable(format!("Unknown tool: {}", call.name)),
             );
@@ -362,7 +364,7 @@ impl<'a> ToolDispatch<'a> {
         if !matches!(call.kind, ToolCallKind::Custom)
             && let Err(error) = validate_tool_args(&tool.definition.kind, &call.arguments)
         {
-            return ExecutedTool::failed(call, &error);
+            return self.failed(call, &error);
         }
 
         let bound = Arc::new(SessionBoundEmitter::new(
@@ -387,7 +389,7 @@ impl<'a> ToolDispatch<'a> {
 
         let (result, error_kind) = match (tool.executor)(call.arguments.clone(), context).await {
             Ok(output) => (text_result(call, output, false), None),
-            Err(error) => (error_result(call, &error), Some(error.kind())),
+            Err(error) => (self.error_result(call, &error), Some(error.kind())),
         };
 
         ExecutedTool {
@@ -395,6 +397,34 @@ impl<'a> ToolDispatch<'a> {
             error_kind,
             output_stats: bound.take_tool_output_stats(),
         }
+    }
+
+    /// A failure the tool never got to see.
+    fn failed(&self, call: &ToolCall, error: &ToolError) -> ExecutedTool {
+        ExecutedTool {
+            result:       self.error_result(call, error),
+            error_kind:   Some(error.kind()),
+            output_stats: None,
+        }
+    }
+
+    /// A failed call, rendering the error's model-facing message.
+    ///
+    /// The message passes through the session's redactor first. A message is
+    /// written without secrets, but an environment failure carries an OS
+    /// error under it, and the path in that error is whatever the model
+    /// asked for.
+    fn error_result(&self, call: &ToolCall, error: &ToolError) -> ToolResult {
+        let message = match self.redactor {
+            Some(redactor) => redactor.redact(error.message()).into_owned(),
+            None => error.message().to_owned(),
+        };
+        text_result(call, message, true)
+    }
+
+    /// A call that was cancelled before it started.
+    fn cancelled_result(&self, call: &ToolCall) -> ToolResult {
+        self.error_result(call, &ToolError::cancelled(CANCELLED))
     }
 
     /// Publishes the started event this call never got, then refuses it.
@@ -405,7 +435,7 @@ impl<'a> ToolDispatch<'a> {
 
     /// Bounds, publishes, and truncates a failure whose started event is out.
     fn finish_error(&self, call: &ToolCall, error: &ToolError) -> ToolResult {
-        let retained = self.retain(error_result(call, error), None);
+        let retained = self.retain(self.error_result(call, error), None);
         self.emit_result(
             call,
             &retained.result,
@@ -511,17 +541,6 @@ struct ExecutedTool {
     output_stats: Option<OutputCaptureStats>,
 }
 
-impl ExecutedTool {
-    /// A failure the tool never got to see.
-    fn failed(call: &ToolCall, error: &ToolError) -> Self {
-        Self {
-            result:       error_result(call, error),
-            error_kind:   Some(error.kind()),
-            output_stats: None,
-        }
-    }
-}
-
 /// One call's result inside the session's output budgets.
 struct Retained {
     result:       ToolResult,
@@ -570,16 +589,6 @@ fn text_result(call: &ToolCall, text: String, is_error: bool) -> ToolResult {
     }
 }
 
-/// A failed call, rendering only the error's model-facing message.
-fn error_result(call: &ToolCall, error: &ToolError) -> ToolResult {
-    text_result(call, error.message().to_owned(), true)
-}
-
-/// A call that was cancelled before it started.
-fn cancelled_result(call: &ToolCall) -> ToolResult {
-    error_result(call, &ToolError::cancelled(CANCELLED))
-}
-
 /// The text of a single-text-part result, for rewriting in place.
 fn text_part_mut(result: &mut ToolResult) -> Option<&mut String> {
     match result.content.as_mut_slice() {
@@ -612,6 +621,7 @@ fn output_value(result: &ToolResult) -> Value {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::io;
     use std::sync::{Mutex, PoisonError};
 
     use async_trait::async_trait;
@@ -624,6 +634,7 @@ mod tests {
     use crate::config::{
         ToolAccess, ToolAccessPolicy, ToolExposureMode, ToolHookCallback, ToolHookDecision,
     };
+    use crate::environment::EnvironmentError;
     use crate::error::Result as PebbleResult;
     use crate::event::{EventOptions, EventPump};
     use crate::human_input::{Answer, AnswerStatus, HumanInputError, Question, QuestionKind};
@@ -997,6 +1008,72 @@ mod tests {
                 error_kind: Some(ToolErrorKind::Execution),
                 ..
             }
+        ));
+    }
+
+    /// An environment failure's OS cause reaches the model, and the redactor
+    /// sees it on the way: the path in an io error is whatever the model asked
+    /// to read.
+    #[tokio::test]
+    async fn a_failed_call_is_redacted_before_the_model_reads_it() {
+        struct DropKeys;
+
+        impl Redactor for DropKeys {
+            fn redact<'a>(&self, text: &'a str) -> Cow<'a, str> {
+                Cow::Owned(text.replace("AKIAYRWQG5EJLPZLBYNP", "[REDACTED]"))
+            }
+        }
+
+        let tool = RegisteredTool::new(
+            ToolDefinition::function("read_secret", "Fails with a secret", json!({})),
+            Arc::new(|_arguments, _context| {
+                Box::pin(async {
+                    Err(ToolError::from(EnvironmentError::io(
+                        "Failed to read /work/keys/AKIAYRWQG5EJLPZLBYNP.pem",
+                        io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "Permission denied opening AKIAYRWQG5EJLPZLBYNP.pem",
+                        ),
+                    )))
+                })
+            }),
+        )
+        .with_source(ToolSource::Native);
+        let registry = registry_with([tool]);
+        let environment = environment();
+        let config = CodingAgentOptions::default();
+        let events = Events::new();
+        let redactor: Arc<dyn Redactor> = Arc::new(DropKeys);
+
+        let result = ToolDispatch::new(
+            &registry,
+            &environment,
+            &config,
+            &events.emitter,
+            "ses_1",
+            "ses_1",
+        )
+        .with_redactor(&redactor)
+        .execute_one(
+            &call("read_secret", "call_1", json!({})),
+            CancellationToken::new(),
+        )
+        .await;
+
+        assert!(result.is_error);
+        assert_eq!(
+            text_of(&result),
+            "Failed to read /work/keys/[REDACTED].pem\n  caused by: Permission denied opening \
+             [REDACTED].pem"
+        );
+        assert!(matches!(
+            completion(&events.drain().await),
+            CodingEvent::ToolCallCompleted {
+                output,
+                is_error: true,
+                error_kind: Some(ToolErrorKind::Execution),
+                ..
+            } if !output.to_string().contains("AKIA")
         ));
     }
 

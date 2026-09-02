@@ -386,10 +386,11 @@ pub(crate) async fn apply_patch_operations(
 
 /// An environment failure, said the way the patch tool says it.
 ///
-/// The environment's own message is kept after the prefix, and the environment
-/// error stays attached as the cause.
+/// The environment's own rendering — its message and its causes — is kept
+/// after the prefix, so the model reads why the file operation failed, and the
+/// environment error's cause stays attached for logs.
 fn failure(prefix: &str, error: EnvironmentError) -> ToolError {
-    let message = format!("{prefix}: {}", error.message());
+    let message = format!("{prefix}: {}", error.detail());
     ToolError::from(error).with_message(message)
 }
 
@@ -1054,6 +1055,43 @@ mod tests {
             directory.read("src/lib.rs"),
             "fn hello() {\n    println!(\"new\");\n}\n"
         );
+    }
+
+    /// `build` is a regular file, so nothing can be created under it. The
+    /// model reads the OS's reason, not only that the write failed.
+    #[tokio::test]
+    async fn adding_a_file_under_a_regular_file_reports_the_os_cause() {
+        let directory = TempDir::new("apply-patch");
+        directory.write("build", "not a directory");
+        let env = LocalEnvironment::new(directory.path());
+        let patch = "\
+*** Begin Patch
+*** Add File: build/out.txt
++hello
+*** End Patch";
+
+        let ops = parse_apply_patch(patch).expect("the patch parses");
+        let error = apply_patch_operations(&ops, &env)
+            .await
+            .expect_err("a regular file cannot hold a file");
+
+        let expected_prefix = format!(
+            "Failed to write file build/out.txt: Failed to create parent directories for {}\n  caused \
+             by: ",
+            directory.join("build").display()
+        );
+        assert!(
+            error.message().starts_with(&expected_prefix),
+            "{}",
+            error.message()
+        );
+        let cause = &error.message()[expected_prefix.len()..];
+        assert!(
+            cause.contains("Not a directory") || cause.contains("File exists"),
+            "{cause}"
+        );
+        assert!(cause.contains("os error"), "{cause}");
+        assert_eq!(error.kind(), ToolErrorKind::Execution);
     }
 
     #[test]

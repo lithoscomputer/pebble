@@ -66,11 +66,12 @@ pub enum EnvironmentErrorKind {
 
 /// A failure from an [`Environment`] operation.
 ///
-/// The message is written for the model: tools render it into a tool result,
-/// so it names the operation and the path and carries no secrets. The
-/// underlying failure stays attached as the error's source, which
-/// [`detail`](Self::detail) renders for a log or a tool result that wants the
-/// whole chain.
+/// The message is written for the model: it names the operation and the path
+/// as the environment resolved it, and it carries no secrets. The underlying
+/// failure stays attached as the error's source. [`detail`](Self::detail)
+/// renders the message with its causes, and that is what a tool hands back to
+/// the model: an OS error string is what lets the model tell a missing file
+/// from a refused one.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 pub struct EnvironmentError {
@@ -124,7 +125,9 @@ impl EnvironmentError {
         self.kind
     }
 
-    /// The model-facing message, without its causes.
+    /// The message alone, without its causes.
+    ///
+    /// What the model reads is [`detail`](Self::detail).
     #[must_use]
     pub fn message(&self) -> &str {
         &self.message
@@ -144,6 +147,16 @@ impl EnvironmentError {
             current = cause.source();
         }
         rendered
+    }
+
+    /// Gives up the error's own cause.
+    ///
+    /// For a caller that carries this failure on inside another error and has
+    /// already rendered the message: keeping the cause alone means the message
+    /// is not repeated as a cause of itself.
+    #[must_use]
+    pub(crate) fn into_source(self) -> Option<Box<dyn StdError + Send + Sync + 'static>> {
+        self.source
     }
 }
 

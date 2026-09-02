@@ -397,11 +397,15 @@ impl Environment for LocalEnvironment {
             .clone()
     }
 
+    // Every message names the path as it was resolved, not as the caller
+    // wrote it: the OS reports on the resolved path, and a model reading
+    // `Permission denied` under it can tell which file that was.
+
     async fn read_file_bytes(&self, path: &str) -> EnvResult<Vec<u8>> {
         let full_path = self.resolve_path(path);
-        fs::read(&full_path)
-            .await
-            .map_err(|error| EnvironmentError::io(format!("Failed to read {path}"), error))
+        fs::read(&full_path).await.map_err(|error| {
+            EnvironmentError::io(format!("Failed to read {}", full_path.display()), error)
+        })
     }
 
     async fn write_file(&self, path: &str, content: &str) -> EnvResult<()> {
@@ -409,21 +413,24 @@ impl Environment for LocalEnvironment {
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent).await.map_err(|error| {
                 EnvironmentError::io(
-                    format!("Failed to create parent directories for {path}"),
+                    format!(
+                        "Failed to create parent directories for {}",
+                        parent.display()
+                    ),
                     error,
                 )
             })?;
         }
-        fs::write(&full_path, content)
-            .await
-            .map_err(|error| EnvironmentError::io(format!("Failed to write {path}"), error))
+        fs::write(&full_path, content).await.map_err(|error| {
+            EnvironmentError::io(format!("Failed to write {}", full_path.display()), error)
+        })
     }
 
     async fn delete_file(&self, path: &str) -> EnvResult<()> {
         let full_path = self.resolve_path(path);
-        fs::remove_file(&full_path)
-            .await
-            .map_err(|error| EnvironmentError::io(format!("Failed to delete {path}"), error))
+        fs::remove_file(&full_path).await.map_err(|error| {
+            EnvironmentError::io(format!("Failed to delete {}", full_path.display()), error)
+        })
     }
 
     async fn file_exists(&self, path: &str) -> EnvResult<bool> {
@@ -433,7 +440,7 @@ impl Environment for LocalEnvironment {
 
     async fn list_directory(&self, path: &str, depth: Option<usize>) -> EnvResult<Vec<DirEntry>> {
         let full_path = self.resolve_path(path);
-        let display = path.to_owned();
+        let display = full_path.display().to_string();
         let max_depth = depth.unwrap_or(1);
 
         // The walk is synchronous recursion over `read_dir`, so it runs off
@@ -959,6 +966,9 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
+    #[cfg(unix)]
+    use rustix::process::geteuid;
+
     use super::*;
     use crate::tools::testing::TempDir;
 
@@ -1013,8 +1023,83 @@ mod tests {
             .expect_err("the file does not exist");
 
         assert_eq!(error.kind(), EnvironmentErrorKind::NotFound);
-        assert!(error.message().contains("nonexistent.txt"), "{error}");
+        assert_eq!(
+            error.message(),
+            format!(
+                "Failed to read {}",
+                directory.join("nonexistent.txt").display()
+            )
+        );
         assert!(error.detail().contains("caused by"), "{}", error.detail());
+    }
+
+    /// Root reads a mode-000 file anyway, so the test proves nothing there.
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        geteuid().is_root()
+    }
+
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut permissions = sync_fs::metadata(path)
+            .expect("fixture exists")
+            .permissions();
+        permissions.set_mode(mode);
+        sync_fs::set_permissions(path, permissions).expect("mode is settable");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reading_a_refused_file_names_the_resolved_path_and_the_os_cause() {
+        if running_as_root() {
+            return;
+        }
+        let directory = TempDir::new("local-env");
+        directory.write("secret.txt", "hidden");
+        set_mode(&directory.join("secret.txt"), 0o000);
+
+        let error = environment(&directory)
+            .read_file("secret.txt", None, None)
+            .await
+            .expect_err("the file is unreadable");
+
+        assert_eq!(error.kind(), EnvironmentErrorKind::Io);
+        assert_eq!(
+            error.detail(),
+            format!(
+                "Failed to read {}\n  caused by: Permission denied (os error 13)",
+                directory.join("secret.txt").display()
+            )
+        );
+        set_mode(&directory.join("secret.txt"), 0o644);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn writing_under_a_read_only_directory_names_the_resolved_path_and_the_os_cause() {
+        if running_as_root() {
+            return;
+        }
+        let directory = TempDir::new("local-env");
+        sync_fs::create_dir(directory.join("frozen")).expect("directory is creatable");
+        set_mode(&directory.join("frozen"), 0o555);
+
+        let error = environment(&directory)
+            .write_file("frozen/out.txt", "content")
+            .await
+            .expect_err("the directory refuses new files");
+
+        assert_eq!(error.kind(), EnvironmentErrorKind::Io);
+        assert_eq!(
+            error.detail(),
+            format!(
+                "Failed to write {}\n  caused by: Permission denied (os error 13)",
+                directory.join("frozen/out.txt").display()
+            )
+        );
+        set_mode(&directory.join("frozen"), 0o755);
     }
 
     #[tokio::test]
