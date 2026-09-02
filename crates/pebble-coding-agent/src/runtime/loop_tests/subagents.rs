@@ -17,6 +17,7 @@
 //! what a closed tree leaves running.
 
 use std::collections::HashMap;
+use std::iter;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
@@ -142,13 +143,7 @@ fn parent_waiting_on_a_blocked_child() -> (
             turns_used: 0,
         })
     });
-    let forwarder = tokio::spawn(async {});
-    supervisor.supervise_test_task(
-        BLOCKED_AGENT.to_owned(),
-        child,
-        child_cancel.clone(),
-        Some(forwarder),
-    );
+    supervisor.supervise_test_task(BLOCKED_AGENT.to_owned(), child, child_cancel.clone());
 
     let events = session.subscribe();
     let watcher = tokio::spawn(async move {
@@ -411,16 +406,27 @@ async fn shutdown_cleans_up_subagents_before_emitting_session_ended() {
         supervisor.status(&agent_id),
         Some(SubagentStatus::Closed)
     ));
-    let published = drain(&mut events);
-    let closed = position(&published, |event| {
-        matches!(event, CodingEvent::SubAgentClosed { .. })
-    })
-    .expect("the child was closed");
-    let ended = position(&published, |event| {
-        matches!(event, CodingEvent::SessionEnded)
-    })
-    .expect("the session published its end");
-    assert!(closed < ended, "a tree unwinds from the leaves");
+    let published: Vec<_> = iter::from_fn(|| events.try_recv().ok()).collect();
+    let child_ended = published
+        .iter()
+        .position(|event| {
+            event.session_id != session.id() && matches!(event.event, CodingEvent::SessionEnded)
+        })
+        .expect("the child published its end");
+    let closed = published
+        .iter()
+        .position(|event| matches!(event.event, CodingEvent::SubAgentClosed { .. }))
+        .expect("the child was closed");
+    let ended = published
+        .iter()
+        .position(|event| {
+            event.session_id == session.id() && matches!(event.event, CodingEvent::SessionEnded)
+        })
+        .expect("the session published its end");
+    assert!(
+        child_ended < closed && closed < ended,
+        "a tree unwinds from the leaves"
+    );
 }
 
 // --- What a child may and may not be given ---
@@ -570,9 +576,8 @@ async fn a_grandchilds_news_reaches_the_root_stream() {
             "the leaf task".to_owned(),
         )
         .expect("a child may spawn a child of its own");
-    // A third level, because forwarding a level is not the same thing as
-    // forwarding a chain: this event is stamped by the child it passes through
-    // and then relayed by the parent without being stamped again.
+    // A third level proves that every descendant writes to the same stream and
+    // still names its immediate parent.
     let grandchild_session = nth_child(&children, 1);
     let great_grandchild = grandchild_session
         .supervisor
@@ -605,11 +610,12 @@ async fn a_grandchilds_news_reaches_the_root_stream() {
     assert_eq!(
         from_depth_two.parent_session_id.as_deref(),
         Some(parent.id()),
-        "and gains the parent it was forwarded through"
+        "and names its immediate parent"
     );
+    assert_eq!(from_depth_two.stream_id, parent.id());
     assert!(
         from_depth_two.seq > 0,
-        "a forwarded event takes a parent-stream sequence number"
+        "a child event takes a shared-stream sequence number"
     );
     let CodingEvent::SubAgentSpawned { agent_id, .. } = &from_depth_two.event else {
         panic!("the event is a spawn: {from_depth_two:?}");
@@ -623,8 +629,9 @@ async fn a_grandchilds_news_reaches_the_root_stream() {
     assert_eq!(
         from_depth_three.parent_session_id.as_deref(),
         Some(child.id.as_str()),
-        "the parent it names is the session it was forwarded from, not the root"
+        "the parent it names is its immediate parent, not the root"
     );
+    assert_eq!(from_depth_three.stream_id, parent.id());
     assert!(from_depth_three.seq > 0);
     let CodingEvent::SubAgentSpawned { agent_id, .. } = &from_depth_three.event else {
         panic!("the event is a spawn: {from_depth_three:?}");
@@ -692,7 +699,7 @@ async fn a_shutdown_joins_every_task_in_a_tree() {
     assert_eq!(
         Handle::current().metrics().num_alive_tasks(),
         0,
-        "a closed tree leaves no task running: no runner, monitor, forwarder, cleanup or pump"
+        "a closed tree leaves no task running: no runner, monitor, cleanup or pump"
     );
 }
 
@@ -733,11 +740,11 @@ async fn a_session_with_no_factory_answers_a_spawn_as_a_tool_it_does_not_have() 
 /// A sink that remembers where each event it recorded came from.
 #[derive(Debug, Default)]
 struct TreeSink {
-    recorded: Mutex<Vec<(u64, String, Option<String>)>>,
+    recorded: Mutex<Vec<CodingAgentEvent>>,
 }
 
 impl TreeSink {
-    fn recorded(&self) -> Vec<(u64, String, Option<String>)> {
+    fn recorded(&self) -> Vec<CodingAgentEvent> {
         self.recorded
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -751,20 +758,15 @@ impl EventSink for TreeSink {
         self.recorded
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push((
-                event.seq,
-                event.session_id.clone(),
-                event.parent_session_id.clone(),
-            ));
+            .push(event.clone());
         Ok(())
     }
 }
 
 #[tokio::test]
 async fn a_childs_events_reach_the_parents_durable_stream() {
-    // A child has no sink of its own: what makes its events durable is that
-    // they are forwarded through the parent's pump, which is the session the
-    // application configured a sink on.
+    // A child has no pump or sink of its own. The whole tree writes directly
+    // through the root pipeline the application configured.
     let sink = Arc::new(TreeSink::default());
     let (client, _provider) = scripted_client(answers("child result"));
     let mut parent = builder(client)
@@ -791,12 +793,18 @@ async fn a_childs_events_reach_the_parents_durable_stream() {
 
     let recorded = sink.recorded();
     assert!(
-        recorded.iter().any(|(_, session_id, parent_session_id)| {
-            session_id != parent.id() && parent_session_id.as_deref() == Some(parent.id())
+        recorded.iter().any(|event| {
+            event.session_id != parent.id()
+                && event.parent_session_id.as_deref() == Some(parent.id())
+                && matches!(event.event, CodingEvent::SessionEnded)
         }),
-        "a child's own events are recorded on its parent's stream: {recorded:?}"
+        "the durable stream contains the child's final event: {recorded:?}"
     );
-    let numbering: Vec<u64> = recorded.iter().map(|(seq, ..)| *seq).collect();
+    assert!(
+        recorded.iter().all(|event| event.stream_id == parent.id()),
+        "every event names the root stream: {recorded:?}"
+    );
+    let numbering: Vec<u64> = recorded.iter().map(|event| event.seq).collect();
     assert_eq!(
         numbering,
         (1..=u64::try_from(recorded.len()).expect("a small stream")).collect::<Vec<_>>(),

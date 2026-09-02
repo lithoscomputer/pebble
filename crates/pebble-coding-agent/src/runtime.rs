@@ -57,8 +57,8 @@ use crate::redact::{NoRedaction, Redactor};
 use crate::search::SearchProvider;
 use crate::skills::{Skill, SkillExpansion, discover_skills};
 use crate::subagent::{
-    ChildDeps, ChildIdentity, ChildObserver, OpenSessions, SubagentCallbackEvent,
-    SubagentEventCallback, SubagentLimits, SubagentOptions, SubagentSupervisor,
+    ChildDeps, ChildIdentity, ChildObserver, OpenSessions, SubagentEventCallback, SubagentLimits,
+    SubagentOptions, SubagentSupervisor,
 };
 use crate::tool::{
     NativeTool, RegisteredTool, StaticEnvProvider, ToolDefinitionWithSource, ToolEnvProvider,
@@ -446,22 +446,32 @@ impl CodingRuntimeBuilder {
 
         // A child was placed in its tree by whoever spawned it; a root names
         // itself and starts the tree's budget.
-        let (parent_session_id, root_session_id, depth, open_sessions, observer) = match self.child
-        {
-            Some(child) => (
-                Some(child.parent_session_id),
-                child.root_session_id,
-                child.depth,
-                child.open_sessions,
-                child.observer,
-            ),
-            None => (
-                None,
-                id.clone(),
-                0,
-                OpenSessions::root(self.subagent_limits),
-                self.child_observer,
-            ),
+        let (parent_session_id, root_session_id, depth, open_sessions, observer, inherited_emitter) =
+            match self.child {
+                Some(child) => (
+                    Some(child.parent_session_id),
+                    child.root_session_id,
+                    child.depth,
+                    child.open_sessions,
+                    child.observer,
+                    Some(child.event_emitter),
+                ),
+                None => (
+                    None,
+                    id.clone(),
+                    0,
+                    OpenSessions::root(self.subagent_limits),
+                    self.child_observer,
+                    None,
+                ),
+            };
+
+        let (emitter, pump) = if let Some(emitter) = inherited_emitter {
+            (emitter, None)
+        } else {
+            let (emitter, pump) = EventPump::new(self.events);
+            let emitter = emitter.in_stream(root_session_id.clone());
+            (emitter, Some(tokio::spawn(pump.run())))
         };
 
         let supervisor = self.subagents_enabled.then(|| {
@@ -475,7 +485,7 @@ impl CodingRuntimeBuilder {
                 tool_env_provider: self.tool_env_provider.clone(),
                 redactor: Arc::clone(&self.redactor),
                 search_provider: self.search_provider.clone(),
-                event_capacity: self.events.capacity,
+                event_emitter: emitter.clone(),
                 observer,
                 open_sessions,
                 depth,
@@ -488,8 +498,6 @@ impl CodingRuntimeBuilder {
             registry.register(tool);
         }
 
-        let (emitter, pump) = EventPump::new(self.events);
-        let pump = tokio::spawn(pump.run());
         let state = StateMachine::new(emitter.clone(), id.clone());
 
         let session = CodingRuntime {
@@ -500,7 +508,7 @@ impl CodingRuntimeBuilder {
             config: self.options,
             conversation: Arc::new(Mutex::new(ConversationState::new(History::default()))),
             emitter,
-            pump: Some(pump),
+            pump,
             state,
             ended: false,
             client: self.client,
@@ -771,8 +779,8 @@ impl CodingRuntime {
     /// client, the environment, the tools, the options. `mode` decides the
     /// model: the exact route the record names, restored without guessing, or
     /// a selector the caller chose for failover. Event numbering continues from
-    /// the record, so one session's events stay uniquely numbered across
-    /// restarts.
+    /// the record, so the root session tree's events stay uniquely numbered
+    /// across restarts.
     ///
     /// # Errors
     ///
@@ -1149,9 +1157,10 @@ impl CodingRuntime {
     ///
     /// Read-only for the same reason [`CodingRuntimeBuilder`]'s `child_of` is
     /// crate-internal: a session's place in its tree is settled when it is
-    /// built, by whoever spawned it. Root-scoped tools, forwarded events and
-    /// stored records all key on this, so a session that could be re-rooted
-    /// afterwards could be detached from the tree that owns it.
+    /// built, by whoever spawned it. Root-scoped tools, the shared event
+    /// stream, and stored records all key on this, so a session that could
+    /// be re-rooted afterwards could be detached from the tree that owns
+    /// it.
     #[cfg(test)]
     pub(crate) fn root_session_id(&self) -> &str {
         &self.root_session_id
@@ -1324,27 +1333,16 @@ impl CodingRuntime {
         self.cancel_token.clone()
     }
 
-    /// Where this session's supervisor sends what its children produce.
+    /// Where this session's supervisor publishes child-lifecycle facts.
     ///
-    /// Lifecycle facts about a child are the parent's own news, so they are
-    /// published under the parent's identity. A child's own event is forwarded
-    /// as it stands — its `session_id` untouched — and only gains a
-    /// `parent_session_id` when it does not already have one, so a grandchild's
-    /// event keeps naming its real parent. Forwarded events go through this
-    /// session's pump, which is what gives them parent-stream sequence numbers.
+    /// A child's own events already use the tree's shared pipeline. Lifecycle
+    /// facts are the parent's news, so this callback publishes them under the
+    /// parent's session identity on that same pipeline.
     pub(crate) fn sub_agent_event_callback(&self) -> SubagentEventCallback {
         let emitter = self.emitter.clone();
         let parent_session_id = self.id.clone();
-        Arc::new(move |event| match event {
-            SubagentCallbackEvent::Lifecycle(event) => {
-                emitter.emit(parent_session_id.clone(), event);
-            }
-            SubagentCallbackEvent::Forwarded(mut event) => {
-                if event.parent_session_id.is_none() {
-                    event.parent_session_id = Some(parent_session_id.clone());
-                }
-                emitter.forward(event);
-            }
+        Arc::new(move |event| {
+            emitter.emit(parent_session_id.clone(), event);
         })
     }
 

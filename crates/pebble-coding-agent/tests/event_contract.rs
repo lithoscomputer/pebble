@@ -300,6 +300,7 @@ fn the_coding_agent_event_envelope_keeps_its_serialized_shape() {
             moment(),
         )
         .with_seq(42)
+        .with_stream_id("ses_root")
         .with_parent_session_id("ses_root")
         .with_tool_call_id("call_1"),
     ];

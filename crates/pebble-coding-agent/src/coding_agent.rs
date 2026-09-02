@@ -373,7 +373,7 @@ impl CodingAgentBuilder {
     ///
     /// Pebble builds the children itself. A child acts through this agent's
     /// environment, runs on its model under its tool access policy and hooks,
-    /// forwards its events through this agent's stream, and inherits only the
+    /// writes events to this tree's shared stream, and inherits only the
     /// application tools marked
     /// [`allow_in_subagents`](RegisteredTool::allow_in_subagents) — never one
     /// that [`requires_human_input`](RegisteredTool::requires_human_input).

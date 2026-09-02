@@ -5,12 +5,14 @@ expression: render(&events)
 [
   {
     "seq": 1,
+    "stream_id": "ses_root",
     "event": "SessionEnded",
     "timestamp": "2026-01-01T00:00:00.500Z",
     "session_id": "ses_root"
   },
   {
     "seq": 42,
+    "stream_id": "ses_root",
     "event": {
       "ToolCallOutputDelta": {
         "delta": "running"

@@ -34,8 +34,8 @@ use serde_json::json;
 use tokio::time::timeout;
 
 use super::testing::{
-    TestSession, blocking_tool, count, drain, drained, echo_tool, failing_tool, noop_tool,
-    position, settled, wait_for_event,
+    TestSession, blocking_tool, count, drained, echo_tool, failing_tool, noop_tool, position,
+    settled, wait_for_event,
 };
 use super::*;
 use crate::test_support::{

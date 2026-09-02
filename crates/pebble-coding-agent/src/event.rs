@@ -1,12 +1,12 @@
-//! The event pipeline: how a session publishes what it does.
+//! The event pipeline: how a session tree publishes what it does.
 //!
-//! One session owns one pipeline. Every producer — the turn loop, a running
-//! tool, the retry observer, a subagent forwarding its child stream — holds a
+//! One root session and all its descendants own one pipeline. Every producer —
+//! the turn loop, a running tool, the retry observer, or a subagent — holds a
 //! cheap [`Emitter`] clone and calls [`Emitter::emit`] from ordinary
 //! synchronous code, which queues the event and returns. The queue is bounded;
-//! filling it stops the stream rather than discarding an event. The session
-//! drives one [`EventPump`], and the pump alone publishes: it stamps each
-//! event with the next per-session sequence number, hands it to the configured
+//! filling it stops the stream rather than discarding an event. The root
+//! session drives one [`EventPump`], and the pump alone publishes: it stamps
+//! each event with the next stream sequence number, hands it to the configured
 //! [`EventSink`] and waits for that to succeed, and only then broadcasts it to
 //! live subscribers.
 //!
@@ -50,18 +50,19 @@ pub const DEFAULT_EVENT_CAPACITY: usize = 1024;
 /// The longest the event pump waits for one sink write by default.
 pub const DEFAULT_EVENT_SINK_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A durable recorder of one session's event stream.
+/// A durable recorder of one session tree's event stream.
 ///
 /// Implementors receive events in sequence order, and the pump waits for each
 /// call to return before the event reaches live subscribers. A slow sink puts
 /// pressure on the bounded event queue, and a failing sink stops it: the pump
 /// returns [`crate::Error::EventSink`] and publishes nothing further, and the
-/// session it belongs to closes rather than run on with nothing recording it.
+/// session tree it belongs to closes rather than run on with nothing recording
+/// it.
 ///
 /// A process can stop after a sink commits an event but before it returns.
-/// Implementations must therefore treat `(session_id, seq)` as an idempotency
-/// key. They must also be cheap enough to run on the session's critical path
-/// and must not call back into the session that owns them.
+/// Implementations must therefore treat `(event.stream_id(), event.seq)` as an
+/// idempotency key. They must also be cheap enough to run on the session tree's
+/// critical path and must not call back into a session that owns them.
 #[async_trait]
 pub trait EventSink: Send + Sync {
     /// Records one event durably.
@@ -170,7 +171,7 @@ impl Default for EventSequence {
     }
 }
 
-/// How one session's event pipeline is wired.
+/// How one session tree's event pipeline is wired.
 ///
 /// A plain configuration record: name the fields that differ and take the rest
 /// from [`Default`].
@@ -196,7 +197,7 @@ pub(crate) struct EventOptions {
     /// The longest one call to [`EventSink::record`] may take.
     pub(crate) sink_timeout: EventSinkTimeout,
 
-    /// The last sequence number a previous prompt of this session published.
+    /// The last sequence number a previous prompt of this stream published.
     ///
     /// Zero for a new session;
     /// [`crate::state::SessionRecord::last_event_seq`] for a
@@ -351,15 +352,17 @@ impl EventPipelineState {
 /// nothing either way.
 #[derive(Clone, Debug)]
 pub(crate) struct Emitter {
-    outbox:    mpsc::Sender<Queued>,
+    outbox:            mpsc::Sender<Queued>,
     /// A weak handle to the broadcast side, upgraded only for the moment
     /// [`Emitter::subscribe`] takes to hand out a receiver.
     ///
     /// Weak on purpose: the pump holds the one sender, so the live stream ends
     /// when the pump is joined rather than when the last emitter is dropped.
-    published: broadcast::WeakSender<CodingAgentEvent>,
-    sequence:  Arc<EventSequence>,
-    state:     Arc<EventPipelineState>,
+    published:         broadcast::WeakSender<CodingAgentEvent>,
+    sequence:          Arc<EventSequence>,
+    state:             Arc<EventPipelineState>,
+    stream_id:         Option<Arc<str>>,
+    parent_session_id: Option<Arc<str>>,
 }
 
 /// One item on the queue between the emitters and the pump.
@@ -393,21 +396,26 @@ impl Emitter {
         event.trace(&session_id);
         self.queue(CodingAgentEvent {
             seq: 0,
+            stream_id: self.stream_id.as_deref().unwrap_or(&session_id).to_owned(),
             event,
             timestamp: SystemTime::now(),
             session_id,
-            parent_session_id: None,
+            parent_session_id: self.parent_session_id.as_deref().map(ToOwned::to_owned),
             tool_call_id,
         });
     }
 
-    /// Republishes an envelope another session built.
-    ///
-    /// The child's `session_id`, `parent_session_id`, and timestamp pass
-    /// through untouched; only the sequence number is reassigned, because a
-    /// forwarded event takes its place in the parent's stream.
-    pub(crate) fn forward(&self, event: CodingAgentEvent) {
-        self.queue(event);
+    /// Binds this pipeline to its root session.
+    pub(crate) fn in_stream(mut self, stream_id: impl Into<Arc<str>>) -> Self {
+        self.stream_id = Some(stream_id.into());
+        self
+    }
+
+    /// Gives one child a view of this tree's pipeline.
+    pub(crate) fn for_child(&self, parent_session_id: impl Into<Arc<str>>) -> Self {
+        let mut child = self.clone();
+        child.parent_session_id = Some(parent_session_id.into());
+        child
     }
 
     /// Subscribes to the live event stream.
@@ -545,7 +553,7 @@ fn ended_stream() -> broadcast::Receiver<CodingAgentEvent> {
     receiver
 }
 
-/// The publishing half of one session's event pipeline.
+/// The publishing half of one session tree's event pipeline.
 ///
 /// The session owns the pump and decides where it runs, normally by spawning
 /// [`EventPump::run`] and joining the handle at shutdown so a sink failure is
@@ -582,7 +590,7 @@ impl fmt::Debug for EventPump {
 }
 
 impl EventPump {
-    /// Creates one session's pipeline.
+    /// Creates one session tree's pipeline.
     ///
     /// The [`Emitter`] is cloned to every producer; the pump is driven once.
     /// The pump keeps the sender and the emitter takes a weak handle, so the
@@ -603,6 +611,8 @@ impl EventPump {
             published: published.downgrade(),
             sequence: Arc::clone(&sequence),
             state: Arc::clone(&state),
+            stream_id: None,
+            parent_session_id: None,
         };
         let pump = Self {
             inbox,
@@ -934,31 +944,6 @@ mod tests {
         emitter.emit("ses_5", CodingEvent::LoopDetected);
 
         assert!(emitter.is_closed());
-    }
-
-    #[tokio::test]
-    async fn forward_preserves_the_child_envelope() {
-        let (emitter, _pump) = pipeline();
-        let mut receiver = emitter.subscribe();
-        let stamped = SystemTime::UNIX_EPOCH;
-
-        emitter.forward(CodingAgentEvent {
-            seq:               17,
-            event:             session_started(),
-            timestamp:         stamped,
-            session_id:        "ses_child".into(),
-            parent_session_id: Some("ses_root".into()),
-            tool_call_id:      None,
-        });
-
-        let event = receiver.recv().await.unwrap();
-        assert_eq!(event.session_id, "ses_child");
-        assert_eq!(event.parent_session_id.as_deref(), Some("ses_root"));
-        assert_eq!(event.timestamp, stamped);
-        assert_eq!(
-            event.seq, 1,
-            "a forwarded event is renumbered into the parent stream"
-        );
     }
 
     #[tokio::test]

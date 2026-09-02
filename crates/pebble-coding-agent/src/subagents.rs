@@ -13,7 +13,7 @@
 //!   [`requires_human_input`](crate::tools::RegisteredTool::requires_human_input)
 //!   never reaches a child however it is marked;
 //! - a child runs on its parent's model;
-//! - a child's events forward through its parent's event stream;
+//! - a child writes events to the session tree's shared event stream;
 //! - a child has nobody to ask a question, so no question tool.
 
 pub use crate::subagent::{SubagentLimits, SubagentOptions};

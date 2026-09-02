@@ -936,8 +936,8 @@ pub enum CodingEvent {
 impl CodingEvent {
     /// Whether this is a streaming-delta or buffer-replacement event.
     ///
-    /// These are typically filtered out before an event stream is forwarded or
-    /// persisted.
+    /// A presentation can filter these out when it does not need incremental
+    /// updates. The durable event sink still receives them.
     #[must_use]
     pub fn is_streaming_noise(&self) -> bool {
         matches!(
@@ -1275,11 +1275,16 @@ impl CodingEvent {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct CodingAgentEvent {
-    /// A monotonic per-session sequence number, assigned as the event is
-    /// published. Events forwarded from a child session are renumbered into
-    /// the parent's stream.
+    /// A monotonic per-stream sequence number, assigned as the event is
+    /// published. One root session and all its descendants share a stream.
     #[serde(default)]
     pub seq:               u64,
+    /// The root session whose event pump owns this stream.
+    ///
+    /// Empty only when reading an envelope written before this field existed;
+    /// in that case `session_id` identifies the legacy stream.
+    #[serde(default)]
+    pub stream_id:         String,
     /// What happened.
     pub event:             CodingEvent,
     /// When it happened.
@@ -1302,11 +1307,13 @@ impl CodingAgentEvent {
     /// carries; the session's event pump assigns the real one as it publishes.
     #[must_use]
     pub fn new(session_id: impl Into<String>, event: CodingEvent, timestamp: SystemTime) -> Self {
+        let session_id = session_id.into();
         Self {
             seq: 0,
+            stream_id: session_id.clone(),
             event,
             timestamp,
-            session_id: session_id.into(),
+            session_id,
             parent_session_id: None,
             tool_call_id: None,
         }
@@ -1317,6 +1324,26 @@ impl CodingAgentEvent {
     pub fn with_seq(mut self, seq: u64) -> Self {
         self.seq = seq;
         self
+    }
+
+    /// Places this envelope in the stream owned by `stream_id`.
+    #[must_use]
+    pub fn with_stream_id(mut self, stream_id: impl Into<String>) -> Self {
+        self.stream_id = stream_id.into();
+        self
+    }
+
+    /// The stable identifier for the stream that contains this event.
+    ///
+    /// Envelopes written before `stream_id` existed use their producing
+    /// session as the stream identity.
+    #[must_use]
+    pub fn stream_id(&self) -> &str {
+        if self.stream_id.is_empty() {
+            &self.session_id
+        } else {
+            &self.stream_id
+        }
     }
 
     /// Records the parent session, for an event a subagent produced.
@@ -1638,6 +1665,7 @@ mod tests {
         let envelope = CodingAgentEvent::new("ses_1", CodingEvent::SessionEnded, moment());
 
         assert_eq!(envelope.seq, 0, "an unpublished envelope carries no place");
+        assert_eq!(envelope.stream_id, "ses_1");
         assert_eq!(envelope.parent_session_id, None);
         assert_eq!(envelope.tool_call_id, None);
 
@@ -1647,6 +1675,7 @@ mod tests {
             .with_tool_call_id("call_1");
 
         assert_eq!(placed.seq, 9);
+        assert_eq!(placed.stream_id, "ses_1");
         assert_eq!(placed.session_id, "ses_1");
         assert_eq!(placed.timestamp, moment());
         assert_eq!(placed.parent_session_id.as_deref(), Some("ses_root"));
@@ -1662,6 +1691,8 @@ mod tests {
         }))
         .expect("parses");
         assert_eq!(event.seq, 0);
+        assert!(event.stream_id.is_empty());
+        assert_eq!(event.stream_id(), "ses_1");
     }
 
     // --- Event vocabulary ---

@@ -26,9 +26,10 @@
 //!
 //! Lifecycle facts about a child — spawned, turn started, completed, failed,
 //! closed — are published on the *parent's* stream, because they are the
-//! parent's news. The child's own events are forwarded verbatim through the
-//! parent's pump, keeping their own `session_id`, gaining
-//! `parent_session_id`, and taking parent-stream sequence numbers.
+//! parent's news. Each child writes its own events directly to the tree's one
+//! shared pipeline. Those events keep the child's `session_id`, name its
+//! immediate parent in `parent_session_id`, and take the next shared sequence
+//! number.
 
 mod tools;
 
@@ -42,7 +43,7 @@ use std::time::Duration;
 
 use futures_util::future::join_all;
 use lithos_llm::Client;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
@@ -52,28 +53,16 @@ pub(crate) use self::tools::{subagent_tools, tree_position};
 use crate::config::CodingAgentOptions;
 use crate::environment::Environment;
 use crate::error::{Error, ErrorData, ErrorKind, InterruptReason, Result, TaskKind};
-use crate::event::EventCapacity;
+use crate::event::Emitter;
 use crate::profile::AgentProfile;
 use crate::redact::Redactor;
 use crate::runtime::{CodingAgentBuildError, CodingRuntime, ShutdownReason};
 use crate::search::SearchProvider;
 use crate::tool::{RegisteredTool, ToolEnvProvider, ToolError};
-use crate::types::{
-    CodingAgentEvent, CodingAgentState, CodingEvent, INITIAL_SUBAGENT_GENERATION, ToolErrorKind,
-};
+use crate::types::{CodingAgentState, CodingEvent, INITIAL_SUBAGENT_GENERATION, ToolErrorKind};
 
 /// How long a closing child has to stop on its own before it is aborted.
 const SUBAGENT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
-
-/// How long the forwarder has to deliver what the child already published,
-/// once the runner it was following has been joined.
-///
-/// Its own window rather than what the runner left of the grace period: a
-/// runner that used the whole grace would otherwise leave the forwarder none,
-/// and a forwarder that is draining cooperatively would be aborted with the
-/// child's last events still in hand. Short, because a drain only re-emits
-/// what is already buffered.
-const SUBAGENT_EVENT_DRAIN_GRACE: Duration = Duration::from_secs(1);
 
 /// One idle child accepts one next turn. `send_input` reserves this single slot
 /// before it makes the agent running, so an agent can never be running with no
@@ -297,9 +286,9 @@ fn build_child(
         .with_profile(Arc::clone(&deps.profile))
         .tools(inherited)
         .options(deps.options.clone())
-        .event_capacity(deps.event_capacity)
         .subagents(SubagentOptions::enabled())
         .child_of(ChildIdentity {
+            event_emitter: deps.event_emitter.for_child(parent_session_id.clone()),
             parent_session_id,
             root_session_id,
             depth,
@@ -336,7 +325,8 @@ pub(crate) struct ChildDeps {
     /// Where a child's web searches go. Inherited, because a child researches
     /// the task its parent gave it.
     pub(crate) search_provider:   Option<Arc<dyn SearchProvider>>,
-    pub(crate) event_capacity:    EventCapacity,
+    /// The one lossless pipeline shared by this whole session tree.
+    pub(crate) event_emitter:     Emitter,
     /// What sees each child as it is built, for the crate's own tests.
     pub(crate) observer:          Option<ChildObserver>,
     pub(crate) open_sessions:     Arc<OpenSessions>,
@@ -347,6 +337,8 @@ pub(crate) struct ChildDeps {
 
 /// Where a child sits in its tree, and which budget it spends.
 pub(crate) struct ChildIdentity {
+    /// This child's view of the tree's shared event pipeline.
+    pub(crate) event_emitter:     Emitter,
     pub(crate) parent_session_id: String,
     pub(crate) root_session_id:   String,
     pub(crate) depth:             usize,
@@ -356,17 +348,8 @@ pub(crate) struct ChildIdentity {
     pub(crate) observer:          Option<ChildObserver>,
 }
 
-/// One event a supervisor hands to the session that owns it.
-#[derive(Debug, Clone)]
-pub(crate) enum SubagentCallbackEvent {
-    /// A fact about a child, for the parent's own stream.
-    Lifecycle(CodingEvent),
-    /// A child's own event, to be republished as it stands.
-    Forwarded(CodingAgentEvent),
-}
-
-/// Where a supervisor sends what its children produce.
-pub(crate) type SubagentEventCallback = Arc<dyn Fn(SubagentCallbackEvent) + Send + Sync>;
+/// Where a supervisor sends its child-lifecycle events.
+pub(crate) type SubagentEventCallback = Arc<dyn Fn(CodingEvent) + Send + Sync>;
 
 /// What one turn of a child produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -475,10 +458,6 @@ struct SubAgent {
     runner_stop:         CancellationToken,
     cleanup_done:        watch::Sender<bool>,
     monitor_task:        Option<JoinHandle<()>>,
-    event_forwarder:     Option<JoinHandle<()>>,
-    /// Tells the forwarder that its child has stopped and everything it
-    /// published is already in hand, so it can drain and finish.
-    forwarder_stop:      CancellationToken,
     cleanup_task:        Option<JoinHandle<()>>,
     child_abort_handle:  AbortHandle,
     followup_queue:      Arc<Mutex<VecDeque<String>>>,
@@ -503,13 +482,9 @@ struct SubAgent {
 impl Drop for SubAgent {
     fn drop(&mut self) {
         self.runner_stop.cancel();
-        self.forwarder_stop.cancel();
         self.cancel_token.cancel();
         self.child_abort_handle.abort();
         if let Some(task) = self.monitor_task.take() {
-            task.abort();
-        }
-        if let Some(task) = self.event_forwarder.take() {
             task.abort();
         }
         if let Some(task) = self.cleanup_task.take() {
@@ -600,8 +575,6 @@ struct ShutdownWork {
     status:              watch::Sender<SubagentStatus>,
     cleanup_done:        watch::Sender<bool>,
     monitor_task:        Option<JoinHandle<()>>,
-    event_forwarder:     Option<JoinHandle<()>>,
-    forwarder_stop:      CancellationToken,
     child_abort_handle:  AbortHandle,
     cancel_token:        CancellationToken,
     runner_stop:         CancellationToken,
@@ -611,13 +584,9 @@ struct ShutdownWork {
 impl Drop for ShutdownWork {
     fn drop(&mut self) {
         self.runner_stop.cancel();
-        self.forwarder_stop.cancel();
         self.cancel_token.cancel();
         self.child_abort_handle.abort();
         if let Some(task) = self.monitor_task.take() {
-            task.abort();
-        }
-        if let Some(task) = self.event_forwarder.take() {
             task.abort();
         }
     }
@@ -728,7 +697,7 @@ fn drain_lifecycle_events(
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         if let Some(callback) = callback {
-            callback(SubagentCallbackEvent::Lifecycle(event));
+            callback(event);
         }
     }
 }
@@ -1059,14 +1028,11 @@ impl SubagentSupervisor {
         drain_lifecycle_events(&self.state, &self.event_callback);
     }
 
-    /// Sends everything this supervisor's children produce to `callback`.
+    /// Sends this supervisor's child-lifecycle events to `callback`.
     ///
     /// The session builder installs the session's own callback, so an
-    /// application cannot forget to and lose every child event.
-    ///
-    /// A child spawned before a callback is installed forwards nothing: the
-    /// forwarding task is created at spawn time only when there is somewhere to
-    /// forward to.
+    /// application cannot forget to connect them. Each child's own events use
+    /// the shared tree pipeline directly and do not pass through this callback.
     pub(crate) fn set_event_callback(&self, callback: SubagentEventCallback) {
         *self
             .event_callback
@@ -1163,11 +1129,6 @@ impl SubagentSupervisor {
         let followup_queue = session.followup_queue_handle();
         let cancel_token = session.cancel_token();
 
-        // Subscribe before moving the session into its task. The forwarding
-        // task is owned by the supervisor and joined during shutdown.
-        let forwarder_stop = CancellationToken::new();
-        let event_forwarder = self.spawn_event_forwarder(&session, forwarder_stop.clone());
-
         let (start_tx, start_rx) = oneshot::channel();
         let (command_tx, command_rx) = mpsc::channel(SUBAGENT_COMMAND_CAPACITY);
         let runner_stop = CancellationToken::new();
@@ -1202,8 +1163,6 @@ impl SubagentSupervisor {
                 runner_stop,
                 cleanup_done,
                 monitor_task: Some(monitor_task),
-                event_forwarder,
-                forwarder_stop,
                 cleanup_task: None,
                 child_abort_handle,
                 followup_queue,
@@ -1226,72 +1185,6 @@ impl SubagentSupervisor {
         let _ = start_tx.send(());
 
         agent_id
-    }
-
-    /// The task that republishes one child's own events, when there is a
-    /// callback to republish them to.
-    ///
-    /// It ends when its child's stream closes, or when `stop` says the child
-    /// has been joined and everything it published is already in the buffer.
-    /// The token is what keeps a close cheap: a child's stream closes when the
-    /// child's own session is shut down, and a child that is merely finished
-    /// with this task is reused rather than closed, so a forwarder waiting for
-    /// the stream would sit out the whole grace period on every close.
-    fn spawn_event_forwarder(
-        &self,
-        session: &CodingRuntime,
-        stop: CancellationToken,
-    ) -> Option<JoinHandle<()>> {
-        if self
-            .event_callback
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_none()
-        {
-            return None;
-        }
-        let mut receiver = session.subscribe();
-        let callback = Arc::clone(&self.event_callback);
-        Some(tokio::spawn(async move {
-            loop {
-                // Biased towards the stream: a buffered event is forwarded even
-                // after the stop, so the child's last words are not lost to the
-                // close that follows them.
-                let received = tokio::select! {
-                    biased;
-                    received = receiver.recv() => received,
-                    () = stop.cancelled() => break,
-                };
-                let event = match received {
-                    Ok(event) => event,
-                    // A lagged receiver stays usable, and a reused child
-                    // forwards for the whole parent session. Giving up here
-                    // would silence the child for the rest of its life.
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                };
-                // The parent's stream carries the child's news, not its
-                // keystrokes: streaming deltas and the child's own session
-                // bookends stay on the child's stream.
-                if event.event.is_streaming_noise()
-                    || matches!(
-                        &event.event,
-                        CodingEvent::SessionStarted { .. }
-                            | CodingEvent::SessionEnded
-                            | CodingEvent::ProcessingEnd
-                    )
-                {
-                    continue;
-                }
-                let callback = callback
-                    .read()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .clone();
-                if let Some(callback) = callback {
-                    callback(SubagentCallbackEvent::Forwarded(event));
-                }
-            }
-        }))
     }
 
     /// Gives a child more to do.
@@ -1630,8 +1523,6 @@ impl SubagentSupervisor {
             status: agent.status.clone(),
             cleanup_done: agent.cleanup_done.clone(),
             monitor_task: agent.monitor_task.take(),
-            event_forwarder: agent.event_forwarder.take(),
-            forwarder_stop: agent.forwarder_stop.clone(),
             child_abort_handle: agent.child_abort_handle.clone(),
             cancel_token: agent.cancel_token.clone(),
             runner_stop: agent.runner_stop.clone(),
@@ -1656,20 +1547,6 @@ impl SubagentSupervisor {
             && timeout_at(deadline, &mut task).await.is_err()
         {
             work.child_abort_handle.abort();
-            let _ = task.await;
-        }
-
-        // The runner has been joined, so the child has published everything it
-        // ever will and the forwarder has it all in hand: it may drain and
-        // stop. A forwarder that ignores the signal is aborted like the runner,
-        // after a window that starts here rather than one the runner may have
-        // spent.
-        work.forwarder_stop.cancel();
-        let drain_deadline = Instant::now() + SUBAGENT_EVENT_DRAIN_GRACE;
-        if let Some(mut task) = work.event_forwarder.take()
-            && timeout_at(drain_deadline, &mut task).await.is_err()
-        {
-            task.abort();
             let _ = task.await;
         }
 
@@ -1827,10 +1704,8 @@ impl SubagentSupervisor {
         agent_id: String,
         child_task: JoinHandle<Result<SubagentResult>>,
         cancel_token: CancellationToken,
-        event_forwarder: Option<JoinHandle<()>>,
     ) {
         let child_abort_handle = child_task.abort_handle();
-        let forwarder_stop = CancellationToken::new();
         let (status, _) = watch::channel(SubagentStatus::Running);
         let (cleanup_done, _) = watch::channel(false);
         let (command_tx, command_rx) = mpsc::channel(SUBAGENT_COMMAND_CAPACITY);
@@ -1860,8 +1735,6 @@ impl SubagentSupervisor {
                 runner_stop,
                 cleanup_done,
                 monitor_task: Some(monitor_task),
-                event_forwarder,
-                forwarder_stop,
                 cleanup_task: None,
                 child_abort_handle,
                 followup_queue: Arc::new(Mutex::new(VecDeque::new())),
@@ -1881,7 +1754,6 @@ mod tests {
     use std::future::pending;
     use std::sync::Barrier;
     use std::sync::atomic::AtomicBool;
-    use std::time::SystemTime;
     use std::{iter, thread};
 
     use futures_util::poll;
@@ -1900,7 +1772,7 @@ mod tests {
         MockEnvironment, ScriptedCall, message_text, scripted_client, text_response,
     };
     use crate::tool::{ToolContext, ToolDefinitionWithSource};
-    use crate::types::{PermissionLevel, ToolErrorKind};
+    use crate::types::{CodingAgentEvent, PermissionLevel, ToolErrorKind};
 
     /// Reports the moment the task holding it is dropped, which is what an
     /// abort does to a task that never returns on its own.
@@ -2064,7 +1936,7 @@ mod tests {
     }
 
     /// A callback that records everything the supervisor publishes.
-    type Captured = Arc<Mutex<Vec<SubagentCallbackEvent>>>;
+    type Captured = Arc<Mutex<Vec<CodingEvent>>>;
 
     fn captured_events() -> (SubagentEventCallback, Captured) {
         let captured: Captured = Arc::new(Mutex::new(Vec::new()));
@@ -2082,12 +1954,7 @@ mod tests {
         captured
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .filter_map(|event| match event {
-                SubagentCallbackEvent::Lifecycle(event) => Some(event.clone()),
-                SubagentCallbackEvent::Forwarded(_) => None,
-            })
-            .collect()
+            .clone()
     }
 
     fn tool_named(tools: &[RegisteredTool], name: &str) -> RegisteredTool {
@@ -2115,12 +1982,10 @@ mod tests {
         let seen: SeenEvents = Arc::new(Mutex::new(Vec::new()));
         let recorder = Arc::clone(&seen);
         let callback: SubagentEventCallback = Arc::new(move |event| {
-            if let SubagentCallbackEvent::Lifecycle(event) = event {
-                recorder
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push(event);
-            }
+            recorder
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(event);
         });
         (Arc::new(RwLock::new(Some(callback))), seen)
     }
@@ -3050,12 +2915,17 @@ mod tests {
             .expect("the parent shuts down");
 
         let published: Vec<CodingAgentEvent> = iter::from_fn(|| events.try_recv().ok()).collect();
-        let forwarded = published
+        let child_event = published
             .iter()
             .find(|event| event.session_id != parent.id())
-            .expect("the child's own events are forwarded");
+            .expect("the child's own events use the tree stream");
 
-        assert_eq!(forwarded.parent_session_id.as_deref(), Some(parent.id()));
+        assert_eq!(child_event.stream_id, parent.id());
+        assert_eq!(child_event.parent_session_id.as_deref(), Some(parent.id()));
+        assert!(
+            published.iter().all(|event| event.stream_id == parent.id()),
+            "one root owns the whole tree stream: {published:?}"
+        );
         assert!(
             published.iter().any(|event| {
                 event.session_id != parent.id()
@@ -3071,57 +2941,19 @@ mod tests {
             "the parent's own news about the child is on the same stream"
         );
         // One numbering for the whole stream: the parent's own events and the
-        // child's forwarded ones share it, in the order the pump published
+        // child's events share it, in the order the pump published
         // them, with nothing skipped and nothing repeated.
         let numbering: Vec<u64> = published.iter().map(|event| event.seq).collect();
         assert_eq!(
             numbering,
             (1..=u64::try_from(published.len()).expect("a small stream")).collect::<Vec<_>>(),
-            "a forwarded event takes a parent-stream sequence number"
+            "every tree event takes one root-stream sequence number"
         );
         assert!(
-            !published
-                .iter()
-                .any(|event| matches!(event.event, CodingEvent::TextDelta { .. })),
-            "the parent's stream carries the child's news, not its keystrokes"
+            published.iter().any(|event| event.session_id != parent.id()
+                && matches!(event.event, CodingEvent::SessionEnded)),
+            "the lossless tree stream includes the child's session boundary"
         );
-    }
-
-    #[tokio::test]
-    async fn a_parent_stamps_only_an_event_that_names_no_parent() {
-        let (mut parent, _supervisor) = parent_over(vec!["unused"]);
-        let mut events = parent.subscribe();
-        let callback = parent.sub_agent_event_callback();
-
-        let grandchild = CodingAgentEvent::new(
-            "ses_grandchild".to_owned(),
-            CodingEvent::ProcessingEnd,
-            SystemTime::now(),
-        )
-        .with_parent_session_id("ses_child".to_owned());
-        callback(SubagentCallbackEvent::Forwarded(grandchild));
-        let child = CodingAgentEvent::new(
-            "ses_child".to_owned(),
-            CodingEvent::ProcessingEnd,
-            SystemTime::now(),
-        );
-        callback(SubagentCallbackEvent::Forwarded(child));
-        parent
-            .shutdown(ShutdownReason::Completed)
-            .await
-            .expect("the parent shuts down");
-
-        let published: Vec<CodingAgentEvent> = iter::from_fn(|| events.try_recv().ok()).collect();
-        let stamped: Vec<(String, Option<String>)> = published
-            .iter()
-            .filter(|event| event.session_id != parent.id())
-            .map(|event| (event.session_id.clone(), event.parent_session_id.clone()))
-            .collect();
-
-        assert_eq!(stamped, vec![
-            ("ses_grandchild".to_owned(), Some("ses_child".to_owned())),
-            ("ses_child".to_owned(), Some(parent.id().to_owned())),
-        ]);
     }
 
     #[tokio::test]
@@ -3426,16 +3258,11 @@ mod tests {
         let timed_out = tokio::spawn(async {
             Err::<SubagentResult, Error>(Error::Interrupted(InterruptReason::WallClockTimeout))
         });
-        supervisor.supervise_test_task(
-            "timed-out".to_owned(),
-            timed_out,
-            CancellationToken::new(),
-            None,
-        );
+        supervisor.supervise_test_task("timed-out".to_owned(), timed_out, CancellationToken::new());
         let broken = tokio::spawn(async {
             Err::<SubagentResult, Error>(Error::ToolExecution("the tool gave up".to_owned()))
         });
-        supervisor.supervise_test_task("broken".to_owned(), broken, CancellationToken::new(), None);
+        supervisor.supervise_test_task("broken".to_owned(), broken, CancellationToken::new());
 
         let interrupted = supervisor
             .wait("timed-out")
@@ -3637,7 +3464,7 @@ mod tests {
             })
         });
         let agent_id = "blocked-agent".to_owned();
-        supervisor.supervise_test_task(agent_id.clone(), task, child_cancel, None);
+        supervisor.supervise_test_task(agent_id.clone(), task, child_cancel);
 
         let tools = subagent_tools(&supervisor);
         let tool_cancel = CancellationToken::new();
@@ -3675,19 +3502,8 @@ mod tests {
             pending::<()>().await;
             unreachable!("the task is aborted before it returns")
         });
-        let forwarder_dropped = Arc::new(AtomicBool::new(false));
-        let forwarder_probe = Arc::clone(&forwarder_dropped);
-        let forwarder = tokio::spawn(async move {
-            let _probe = DropProbe(forwarder_probe);
-            pending::<()>().await;
-        });
         let agent_id = "uncooperative".to_owned();
-        supervisor.supervise_test_task(
-            agent_id.clone(),
-            child,
-            child_cancel.clone(),
-            Some(forwarder),
-        );
+        supervisor.supervise_test_task(agent_id.clone(), child, child_cancel.clone());
 
         let closer = {
             let supervisor = supervisor.clone();
@@ -3716,10 +3532,6 @@ mod tests {
             supervisor.status(&agent_id),
             Some(SubagentStatus::Closed)
         ));
-        assert!(
-            forwarder_dropped.load(Ordering::SeqCst),
-            "the forwarder was aborted rather than left running"
-        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -3753,13 +3565,12 @@ mod tests {
                 "grandchild".to_owned(),
                 grandchild,
                 CancellationToken::new(),
-                None,
             );
             pending::<()>().await;
             unreachable!("the child is aborted, never finished")
         });
         let agent_id = "uncooperative".to_owned();
-        supervisor.supervise_test_task(agent_id.clone(), child, CancellationToken::new(), None);
+        supervisor.supervise_test_task(agent_id.clone(), child, CancellationToken::new());
 
         let closer = {
             let supervisor = supervisor.clone();
@@ -3833,7 +3644,7 @@ mod tests {
             })
         });
         let agent_id = "concurrent-close".to_owned();
-        supervisor.supervise_test_task(agent_id.clone(), child, child_cancel, None);
+        supervisor.supervise_test_task(agent_id.clone(), child, child_cancel);
 
         tokio::join!(supervisor.shutdown_all(), supervisor.shutdown_all());
 
@@ -3850,10 +3661,8 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let recorder = Arc::clone(&seen);
         supervisor.set_event_callback(Arc::new(move |event| {
-            let SubagentCallbackEvent::Lifecycle(
-                CodingEvent::SubAgentSpawned { agent_id, .. }
-                | CodingEvent::SubAgentCompleted { agent_id, .. },
-            ) = &event
+            let (CodingEvent::SubAgentSpawned { agent_id, .. }
+            | CodingEvent::SubAgentCompleted { agent_id, .. }) = &event
             else {
                 return;
             };
@@ -3926,7 +3735,7 @@ mod tests {
             })
         });
         let agent_id = "spent-agent".to_owned();
-        supervisor.supervise_test_task(agent_id.clone(), task, CancellationToken::new(), None);
+        supervisor.supervise_test_task(agent_id.clone(), task, CancellationToken::new());
         supervisor
             .wait(&agent_id)
             .await
@@ -4009,10 +3818,9 @@ mod tests {
     async fn closing_a_child_does_not_wait_out_the_grace_period() {
         let (parent, supervisor, children) = parent_over_recording_children(vec!["child result"]);
         let agent_id = spawn(&supervisor, &parent, "task");
-        // The child's own supervisor is held here, so an emitter of the
-        // child's outlives the close. That holds nothing open — a stream ends
-        // with its pump — and the forwarder is told to stop rather than waited
-        // out, so a close costs nothing.
+        // The child's own supervisor is held here, so one child view of the
+        // shared emitter outlives the close. That holds nothing open: a stream
+        // ends with its root pump, so a close costs nothing.
         let _child = first_child(&children);
         supervisor.wait(&agent_id).await.expect("the child answers");
 

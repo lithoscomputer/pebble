@@ -72,9 +72,9 @@ pub struct SessionRecord {
     #[serde(with = "rfc3339_millis")]
     pub updated_at: SystemTime,
 
-    /// The highest sequence number accepted by the session's event sink.
+    /// The highest sequence number accepted by the session tree's event sink.
     ///
-    /// A resumed session continues numbering from here, so one session's
+    /// A resumed root session continues numbering from here, so one tree's
     /// events stay uniquely numbered across restarts. Events still queued when
     /// the record is taken are not counted.
     #[serde(default, deserialize_with = "null_as_default")]
