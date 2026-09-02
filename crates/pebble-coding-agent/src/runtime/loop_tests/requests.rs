@@ -312,7 +312,7 @@ async fn an_approved_call_runs() {
 }
 
 #[tokio::test]
-async fn the_approval_hook_sees_the_call_the_model_asked_for() {
+async fn the_approval_service_sees_the_call_the_model_asked_for() {
     let captured: Arc<Mutex<Option<(String, Value)>>> = Arc::new(Mutex::new(None));
     let recorder = Arc::clone(&captured);
     let (mut session, _provider) = TestSession::new(vec![
@@ -336,7 +336,7 @@ async fn the_approval_hook_sees_the_call_the_model_asked_for() {
         .expect("the prompt succeeds");
 
     let seen = captured.lock().unwrap_or_else(PoisonError::into_inner);
-    let (name, arguments) = seen.as_ref().expect("the hook was called");
+    let (name, arguments) = seen.as_ref().expect("the approval service was called");
     assert_eq!(name, "echo");
     assert_eq!(arguments, &json!({"text": "world"}));
 }

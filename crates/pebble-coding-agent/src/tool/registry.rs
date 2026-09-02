@@ -556,6 +556,25 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// The request's tool definitions paired with their registered origins.
+    #[must_use]
+    pub(crate) fn sources_for(
+        &self,
+        definitions: &[ToolDefinition],
+    ) -> Vec<ToolDefinitionWithSource> {
+        definitions
+            .iter()
+            .filter_map(|definition| {
+                self.tools
+                    .get(&definition.name)
+                    .map(|tool| ToolDefinitionWithSource {
+                        definition: definition.clone(),
+                        source:     tool.source.clone(),
+                    })
+            })
+            .collect()
+    }
+
     /// The names every registered tool is exposed under, in no particular
     /// order.
     #[must_use]
@@ -808,6 +827,21 @@ mod tests {
             .collect();
         assert!(names.contains(&"tool_a"));
         assert!(names.contains(&"tool_b"));
+    }
+
+    #[test]
+    fn sources_for_keeps_only_the_definitions_in_the_request() {
+        let mut registry = ToolRegistry::new();
+        registry.register(make_tool("visible"));
+        registry.register(make_tool("hidden"));
+        let visible = ToolDefinition::function("visible", "Filtered view", json!({}));
+
+        let tools = registry.sources_for(&[visible]);
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].definition.name, "visible");
+        assert_eq!(tools[0].definition.description, "Filtered view");
+        assert_eq!(tools[0].source, ToolSource::Native);
     }
 
     #[test]

@@ -330,7 +330,7 @@ impl CodingRuntimeBuilder {
     /// Pebble builds the [`ChildAgentSpec`](crate::subagent::ChildAgentSpec)
     /// each call receives from this session, so a child inherits the
     /// environment, the inheritable tools, the
-    /// access policy, and the hooks its parent had, and never a
+    /// tool middleware its parent had, and never a
     /// [`HumanInputProvider`]: a child cannot ask a person a question.
     pub(crate) fn subagents(mut self, options: SubagentOptions) -> Self {
         self.subagents_enabled = options.is_enabled();
@@ -558,7 +558,7 @@ impl CodingRuntimeBuilder {
 /// What a child session inherits from its parent's options.
 ///
 /// Everything that bounds or governs the child comes across unchanged — the
-/// access policy, the hooks, the permission level, the output budgets, the
+/// tool middleware, the permission level, the output budgets, the
 /// wall-clock budget — so a factory cannot be handed anything wider than the
 /// parent had. What does not come across is what the root loads once: the
 /// memory files and the skill directories. A child is given a task, not a
@@ -1056,7 +1056,7 @@ impl CodingRuntime {
         self.system_prompt = match &self.prompt_transform {
             Some(transform) => {
                 let tools: Vec<_> = self
-                    .effective_tools()
+                    .registered_tools()
                     .iter()
                     .map(ToolDefinitionWithSource::to_tool_summary)
                     .collect();
@@ -1256,7 +1256,7 @@ impl CodingRuntime {
     }
 
     /// The tools registered for this session before middleware filters them.
-    pub(crate) fn effective_tools(&self) -> Vec<ToolDefinitionWithSource> {
+    pub(crate) fn registered_tools(&self) -> Vec<ToolDefinitionWithSource> {
         self.registry.definitions_with_source()
     }
 

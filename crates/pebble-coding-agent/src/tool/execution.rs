@@ -635,7 +635,7 @@ impl<'a> ToolDispatch<'a> {
 
     /// Cuts a tool's output down to what the session is willing to carry.
     ///
-    /// This is the form hooks, events, and the model all see. Bytes the
+    /// This is the form middleware, events, and the model all see. Bytes the
     /// environment already dropped while draining the process are carried in
     /// through `previous`, so the counters describe everything the tool
     /// produced rather than everything that reached this point.

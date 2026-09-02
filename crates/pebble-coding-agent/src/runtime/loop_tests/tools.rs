@@ -307,7 +307,7 @@ async fn a_session_that_discovered_skills_advertises_the_tool_that_loads_one() {
 
     assert!(
         !session
-            .effective_tools()
+            .registered_tools()
             .iter()
             .any(|tool| tool.definition.name == "use_skill"),
         "nothing is advertised before the directories are read"
@@ -315,7 +315,7 @@ async fn a_session_that_discovered_skills_advertises_the_tool_that_loads_one() {
     session.initialize().await.expect("initialization succeeds");
 
     let skill_tool = session
-        .effective_tools()
+        .registered_tools()
         .into_iter()
         .find(|tool| tool.definition.name == "use_skill")
         .expect("the skill tool is registered");
@@ -330,7 +330,7 @@ async fn a_session_with_no_skills_advertises_no_way_to_load_one() {
 
     assert!(
         !session
-            .effective_tools()
+            .registered_tools()
             .iter()
             .any(|tool| tool.definition.name == "use_skill")
     );
@@ -585,7 +585,7 @@ async fn a_session_with_no_search_provider_advertises_no_search_tool() {
 
     assert!(
         !session
-            .effective_tools()
+            .registered_tools()
             .iter()
             .any(|tool| tool.definition.name == "web_search"),
         "nothing to search through is nothing to advertise"
@@ -610,7 +610,7 @@ async fn a_configured_search_provider_reaches_the_registered_tool() {
 
     assert!(
         session
-            .effective_tools()
+            .registered_tools()
             .iter()
             .any(|tool| tool.definition.name == "web_search"),
         "a session that can search says so"
@@ -640,7 +640,7 @@ async fn a_child_inherits_its_parents_search_provider() {
             .unwrap_or_else(PoisonError::into_inner)
             .push(
                 child
-                    .effective_tools()
+                    .registered_tools()
                     .iter()
                     .any(|tool| tool.definition.name == "web_search"),
             );

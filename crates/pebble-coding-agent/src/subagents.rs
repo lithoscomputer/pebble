@@ -5,8 +5,7 @@
 //! child inherits is decided here, not by the application:
 //!
 //! - a child acts through its parent's environment;
-//! - a child runs under its parent's tool access policy and hooks, and cannot
-//!   widen either;
+//! - a child runs under its parent's tool middleware, and cannot widen either;
 //! - an application tool is root-only unless it was marked
 //!   [`allow_in_subagents`](crate::tools::RegisteredTool::allow_in_subagents),
 //!   and a tool marked

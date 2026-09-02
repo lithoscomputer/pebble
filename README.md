@@ -161,11 +161,40 @@ finishing a prompt both wait for their events to reach the sink. Use
 `CodingAgent::flush_events` for an explicit durability boundary and
 `CodingAgent::committed_event_seq` to read its committed cursor.
 
-**A policy, if the agent should not do everything.** Pebble installs none: with
-no `pebble_coding_agent::tools::ToolAccessPolicy` and no
-`pebble_coding_agent::tools::ToolHookCallback`, every registered tool is exposed and every
-call runs. `pebble_coding_agent::tools::PermissionLevel` and its table are there to build a
-policy out of, not a policy pebble applies.
+**Tool middleware, if the agent should not do everything.** Pebble installs no
+application policy. With no middleware, every registered tool is exposed and
+every valid call runs. Add each layer with `CodingAgentBuilder::tool_middleware`.
+The first added layer is outermost.
+
+Permissions use the same middleware path as logging, metering, or other tool
+behavior. `PermissionMiddleware` filters discovery and checks every call again.
+The call check sees the validated arguments. Several permission layers compose
+by narrowing access.
+
+```rust
+# use std::sync::Arc;
+# use pebble_coding_agent::{CodingAgentBuilder, CodingAgentOptions};
+use pebble_coding_agent::tools::{
+    PermissionLevel, PermissionLevelPolicy, PermissionMiddleware,
+};
+
+# fn configure(builder: CodingAgentBuilder) -> CodingAgentBuilder {
+let level = PermissionLevel::ReadWrite;
+let permissions = PermissionMiddleware::new(Arc::new(
+    PermissionLevelPolicy::new(level),
+));
+
+builder
+    .options(CodingAgentOptions::default().with_permission_level(level))
+    .tool_middleware(Arc::new(permissions))
+# }
+```
+
+`CodingAgentOptions::with_permission_level` records the selected value in the
+session. The middleware enforces it. Add a `ToolApprovalService` with
+`PermissionMiddleware::with_approval` when calls that are not auto-approved
+should remain visible and ask for approval. Without an approval service, those
+tools are hidden and direct attempts are denied.
 
 Optional seams follow the same rule. Pebble ships no implementation and
 advertises no tool without one: an `extensions::HumanInputProvider` (no
@@ -191,7 +220,7 @@ let inspect = Tool::function(
     |_context, arguments| async move {
         Ok(format!("inspected {}", arguments["name"]).into())
     },
-);
+)?;
 
 let mut agent = Agent::builder(client, "provider/model")
     .system_prompt("Use tools when they help.")
@@ -228,8 +257,8 @@ let inspect = RegisteredTool::function(
 ```
 
 Pass it to `CodingAgentBuilder::tools`. Pebble records its source as
-`ToolSource::Application` and keeps coding-layer policy and event behavior
-around its execution.
+`ToolSource::Application`. The call then uses the same middleware, event,
+output, and cancellation path as a built-in tool.
 
 ## Which harness a session runs
 

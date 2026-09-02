@@ -213,7 +213,7 @@ impl CodingAgentBridge {
         self.emitter.emit(self.session_id.clone(), event);
     }
 
-    fn effective_tools(&self) -> Vec<ToolDefinitionWithSource> {
+    fn registered_tools(&self) -> Vec<ToolDefinitionWithSource> {
         self.registry.definitions_with_source()
     }
 
@@ -295,7 +295,7 @@ impl CodingAgentBridge {
     }
 
     fn stage_task_reminder(&self) {
-        let tools = self.effective_tools();
+        let tools = self.registered_tools();
         let names = tools
             .iter()
             .map(|tool| tool.definition.name.as_str())
@@ -427,7 +427,7 @@ impl CodingAgentBridge {
     }
 
     fn measure_request(&self, request: &Request) -> ContextWindowSnapshot {
-        let tools = self.effective_tools();
+        let tools = self.registry.sources_for(request.tools());
         let activated = self
             .state
             .lock()

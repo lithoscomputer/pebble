@@ -7,8 +7,9 @@
 //!
 //! Specialized layers supply a [`ToolService`] and compose policy through
 //! [`ToolMiddleware`]. [`AgentLifecycle`] owns compaction and
-//! background-result boundaries, and [`EventProjection`] maps the generic
-//! lifecycle into a durable application event model.
+//! background-result boundaries. [`ConversationProjection`] receives explicit
+//! conversation commits, while [`EventProjection`] maps observable lifecycle
+//! events into an application event model.
 //!
 //! # One agent
 //!

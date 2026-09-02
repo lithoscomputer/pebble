@@ -267,7 +267,7 @@ impl CodingAgentOptions {
     }
 
     /// Sets how many bytes of one tool's output the session retains: the form
-    /// events, hooks, and the model all see.
+    /// events, middleware, and the model all see.
     #[must_use]
     pub const fn with_tool_output_retention_bytes(mut self, bytes: usize) -> Self {
         self.tool_output_retention_bytes = bytes;

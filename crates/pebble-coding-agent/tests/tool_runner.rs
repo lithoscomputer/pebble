@@ -1,8 +1,8 @@
 //! Pebble's coding tools, run without a coding agent.
 //!
-//! A hook or a workflow step sometimes needs one tool call answered the way a
-//! session would answer it: the same policy, the same hooks, the same rendering
-//! of a failure, the same output budgets, and the same events. This is the
+//! A workflow step sometimes needs one tool call answered the way a session
+//! would answer it: the same middleware, failure rendering, output budgets,
+//! and events. This is the
 //! supported route for that, exercised from outside the crate.
 
 use std::sync::{Arc, Mutex, PoisonError};
@@ -59,11 +59,11 @@ impl ToolApprovalService for RejectApproval {
     }
 }
 
-/// Records the order the hooks were called in.
+/// Records the order the middleware was called in.
 #[derive(Debug, Default)]
-struct HookLog(Mutex<Vec<String>>);
+struct MiddlewareLog(Mutex<Vec<String>>);
 
-impl HookLog {
+impl MiddlewareLog {
     fn entries(&self) -> Vec<String> {
         self.0
             .lock()
@@ -80,7 +80,7 @@ impl HookLog {
 }
 
 #[async_trait::async_trait]
-impl ToolMiddleware for HookLog {
+impl ToolMiddleware for MiddlewareLog {
     async fn call(
         &self,
         request: ToolCallRequest,
@@ -148,7 +148,7 @@ fn runner_with(
     let recorder = Arc::clone(&log);
     let runner = ToolRunner::new(CodingToolSet::core(), environment)
         .options(options)
-        .session_id("hook-1")
+        .session_id("runner-1")
         .on_event(move |event| {
             recorder
                 .0
@@ -242,7 +242,7 @@ async fn a_runner_reads_and_writes_through_the_environment_and_reports_each_call
             .map(|event| &event.event)
             .collect()
     };
-    assert!(events.iter().all(|event| event.session_id == "hook-1"));
+    assert!(events.iter().all(|event| event.session_id == "runner-1"));
     assert!(matches!(for_call("call_read").as_slice(), [
         CodingEvent::ToolCallStarted { tool_name, .. },
         CodingEvent::ToolCallOutputDelta { .. },
@@ -287,9 +287,9 @@ async fn a_runner_applies_the_policy_a_session_would() {
 
 #[tokio::test]
 async fn a_runner_calls_middleware_around_each_call() {
-    let hooks = Arc::new(HookLog::default());
+    let middleware = Arc::new(MiddlewareLog::default());
     let (runner, _log) = runner_with(mock_environment(), CodingAgentOptions::default());
-    let runner = runner.tool_middleware(Arc::clone(&hooks) as Arc<dyn ToolMiddleware>);
+    let runner = runner.tool_middleware(Arc::clone(&middleware) as Arc<dyn ToolMiddleware>);
 
     let ok = runner
         .run(
@@ -316,7 +316,7 @@ async fn a_runner_calls_middleware_around_each_call() {
 
     assert!(!ok.is_error);
     assert!(missing.is_error);
-    assert_eq!(hooks.entries(), [
+    assert_eq!(middleware.entries(), [
         "pre read_file",
         "post read_file call_read",
         "pre read_file",

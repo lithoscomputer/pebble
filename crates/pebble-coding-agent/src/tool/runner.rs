@@ -1,7 +1,7 @@
 //! Running pebble's coding tools outside a coding agent.
 //!
 //! An application sometimes needs one of pebble's tools without a model in the
-//! loop — a hook that reads a file the way the agent would, a workflow step
+//! loop — a workflow step that reads a file the way the agent would, or one
 //! that runs a command with the agent's output budgets. [`CodingToolSet`]
 //! selects and describes the built-in tools, and [`ToolRunner`] executes one
 //! call against an [`Environment`] through the same tool service and middleware
@@ -137,11 +137,10 @@ pub type ToolEventCallback = Arc<dyn Fn(CodingAgentEvent) + Send + Sync>;
 
 /// Executes one coding tool call at a time, the way a session would.
 ///
-/// A call goes through the pipeline a session's rounds use: the access policy
-/// and hooks on the [`CodingAgentOptions`], the same rendering of a refusal or
-/// a failure, and the same output budgets. The events the call publishes reach
-/// the callback given to [`on_event`](Self::on_event), in order, before
-/// [`run`](Self::run) returns.
+/// A call goes through the pipeline a session's rounds use: configured tool
+/// middleware inside the same fixed event and output envelope. The events the
+/// call publishes reach the callback given to [`on_event`](Self::on_event), in
+/// order, before [`run`](Self::run) returns.
 #[derive(Clone)]
 pub struct ToolRunner {
     registry:          ToolRegistry,

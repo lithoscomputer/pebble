@@ -5,8 +5,8 @@
 //! First, **retention**: whatever a tool produced is cut down to what a
 //! session is willing to carry — one budget in bytes for the text itself and
 //! one for its serialized JSON, because JSON escaping can inflate output far
-//! past its own length. This is the form events, hooks, and the model all see,
-//! and it is where the "output was truncated" notice is written.
+//! past its own length. This is the form events, middleware, and the model all
+//! see, and it is where the "output was truncated" notice is written.
 //!
 //! Then, **per-tool truncation**: the copy that stays in history is cut again
 //! to the character and line limits that tool deserves, because a session

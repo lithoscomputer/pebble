@@ -91,7 +91,7 @@ pub struct ToolSummary {
 ///
 /// Each level is a superset of the one before it. Pebble ships the ladder and
 /// an auto-approval table as an optional helper; the loop consults only the
-/// access policy an embedder installs.
+/// permission middleware an embedder installs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionLevel {

@@ -851,7 +851,7 @@ async fn a_child_inherits_only_marked_tools_and_its_parents_middleware() {
     let recorder = Arc::clone(&child_tools);
     let observer: ChildObserver = Arc::new(move |child: &CodingRuntime| {
         let mut names: Vec<String> = child
-            .effective_tools()
+            .registered_tools()
             .into_iter()
             .map(|tool| tool.definition.name)
             .collect();
@@ -894,7 +894,7 @@ async fn a_child_inherits_only_marked_tools_and_its_parents_middleware() {
         .expect("the child answers");
 
     let parent_tools: Vec<String> = parent
-        .effective_tools()
+        .registered_tools()
         .into_iter()
         .map(|tool| tool.definition.name)
         .collect();

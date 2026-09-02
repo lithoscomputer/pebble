@@ -1,7 +1,7 @@
 //! Test doubles for code that embeds pebble.
 //!
 //! These are the doubles pebble's own tests run against, published so an
-//! application can drive its tools and hooks without a real machine
+//! application can drive its tools and middleware without a real machine
 //! underneath. Enable the `test-util` feature to reach them:
 //!
 //! ```toml

@@ -21,7 +21,7 @@ use crate::types::ToolErrorKind;
 /// after the session's redactor has seen it, marks the result as an error, and
 /// reports [`kind`](Self::kind) on
 /// [`CodingEvent::ToolCallCompleted`](crate::events::CodingEvent::ToolCallCompleted) so
-/// hooks and event consumers can branch without parsing text.
+/// middleware and event consumers can branch without parsing text.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
 #[non_exhaustive]

@@ -10,6 +10,8 @@
 //! concept. The environment a session acts through is in [`environment`].
 //! Durable event types and the sink that records them are in [`events`]. Tool
 //! contracts, built-in tools, and the standalone tool runner are in [`tools`].
+//! Tool permissions are ordinary `pebble-agent` middleware, with the coding
+//! policies and approval service contracts also in [`tools`].
 //! Durable state is in [`state`]. Optional application services — human input,
 //! search, redaction, the prompt transform — are in [`extensions`], and
 //! subagent configuration is in [`subagents`]. The runtime underneath is not

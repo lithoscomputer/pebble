@@ -1825,7 +1825,7 @@ mod tests {
     /// be compared however their registries happen to iterate.
     fn tool_names(session: &CodingRuntime) -> Vec<String> {
         let mut names: Vec<String> = session
-            .effective_tools()
+            .registered_tools()
             .iter()
             .map(|tool| tool.definition.name.clone())
             .collect();
@@ -3118,7 +3118,7 @@ mod tests {
         let recorder = Arc::clone(&inherited);
         let observer: ChildObserver = Arc::new(move |child: &CodingRuntime| {
             let mut tools: Vec<String> = child
-                .effective_tools()
+                .registered_tools()
                 .into_iter()
                 .map(|tool| tool.definition.name)
                 .collect();
@@ -3321,7 +3321,7 @@ mod tests {
         assert!(session.subagent_supervisor().is_none());
         assert!(
             !session
-                .effective_tools()
+                .registered_tools()
                 .iter()
                 .map(ToolDefinitionWithSource::to_tool_summary)
                 .any(|summary| summary.name == "spawn_agent")

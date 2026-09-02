@@ -856,10 +856,11 @@ impl CodingAgent {
     /// This is the handoff between two agents in one process: the successor
     /// keeps the identity, the conversation, the system prompt, and the
     /// discovered skills, and binds whatever services the builder gives it —
-    /// a different human-input provider, different tool hooks — for its own
-    /// life. It runs on the exported route; a change of model goes through
-    /// [`resume`](Self::resume). The successor uses a new event pump but keeps
-    /// the stream identity and continues numbering from the export.
+    /// a different human-input provider or different tool middleware for its
+    /// own life. It runs on the exported route; a change of model goes
+    /// through [`resume`](Self::resume). The successor uses a new event
+    /// pump but keeps the stream identity and continues numbering from the
+    /// export.
     pub fn resume_from_export(
         client: Client,
         environment: Arc<dyn Environment>,

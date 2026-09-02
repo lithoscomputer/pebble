@@ -228,7 +228,7 @@ async fn initialized(selector: &str, configured: Configured) -> CodingRuntime {
 /// Whether `session` advertises a tool called `name`.
 fn advertises(session: &CodingRuntime, name: &str) -> bool {
     session
-        .effective_tools()
+        .registered_tools()
         .iter()
         .any(|tool| tool.definition.name == name)
 }
@@ -236,7 +236,7 @@ fn advertises(session: &CodingRuntime, name: &str) -> bool {
 /// Every tool `session` shows its model, sorted.
 fn tool_names(session: &CodingRuntime) -> Vec<String> {
     let mut names: Vec<String> = session
-        .effective_tools()
+        .registered_tools()
         .into_iter()
         .map(|tool| tool.definition.name)
         .collect();
@@ -246,7 +246,7 @@ fn tool_names(session: &CodingRuntime) -> Vec<String> {
 
 fn child_tool_names(child: &CodingRuntime) -> Vec<String> {
     let mut names: Vec<String> = child
-        .effective_tools()
+        .registered_tools()
         .into_iter()
         .map(|tool| tool.definition.name)
         .collect();
@@ -338,7 +338,7 @@ async fn the_route_decides_which_file_editor_the_openai_harness_offers() {
     assert!(compatible.system_prompt.contains("## edit_file"));
     assert!(
         compatible
-            .effective_tools()
+            .registered_tools()
             .iter()
             .all(|tool| !tool.definition.is_custom()),
         "a codec that refuses freeform tools must be offered none"
@@ -356,7 +356,7 @@ async fn the_route_decides_which_file_editor_the_openai_harness_offers() {
 async fn the_route_decides_which_file_editor_the_gpt56_harness_offers() {
     let describe_shell = |session: &CodingRuntime| {
         session
-            .effective_tools()
+            .registered_tools()
             .into_iter()
             .find(|tool| tool.definition.name == "shell_command")
             .expect("the harness offers Codex's shell")
@@ -387,7 +387,7 @@ async fn the_route_decides_which_file_editor_the_gpt56_harness_offers() {
     );
     assert!(
         compatible
-            .effective_tools()
+            .registered_tools()
             .iter()
             .all(|tool| !tool.definition.is_custom()),
         "a codec that refuses freeform tools must be offered none"
