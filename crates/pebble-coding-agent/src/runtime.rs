@@ -930,9 +930,9 @@ impl CodingRuntime {
     /// can be read back in shape; the tree itself is the application's to
     /// rebuild, because a child's supervisor is not stored.
     ///
-    /// The record stores the last sequence accepted by the event sink. Public
-    /// callers take records between prompts, after the prompt's event barrier
-    /// has committed its complete history.
+    /// The record stores the last sequence committed by the event pipeline.
+    /// Public callers take records between prompts, after the prompt's event
+    /// barrier has committed its complete history.
     pub(crate) fn to_record(&self) -> SessionRecord {
         let mut record = SessionRecord::new(self.id.clone());
         record.parent_session_id.clone_from(&self.parent_session_id);
@@ -1610,7 +1610,9 @@ impl CodingRuntime {
         }
     }
 
-    /// The highest event sequence accepted by the durable sink.
+    /// The highest event sequence committed by the event pipeline.
+    ///
+    /// With a durable sink, commitment means the sink accepted the event.
     pub(crate) fn committed_event_seq(&self) -> u64 {
         self.emitter.committed_seq()
     }

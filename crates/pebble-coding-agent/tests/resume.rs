@@ -83,25 +83,39 @@ fn environment_with_a_skill() -> Arc<dyn Environment> {
     })
 }
 
-/// A sink that keeps every sequence number it is given.
+/// A sink that keeps every stream position it is given.
 #[derive(Default)]
 struct SequenceLog {
-    seqs: Mutex<Vec<u64>>,
+    positions: Mutex<Vec<(String, u64)>>,
 }
 
 impl SequenceLog {
     fn seqs(&self) -> Vec<u64> {
-        self.seqs.lock().expect("the log lock is held").clone()
+        self.positions
+            .lock()
+            .expect("the log lock is held")
+            .iter()
+            .map(|(_, seq)| *seq)
+            .collect()
+    }
+
+    fn stream_ids(&self) -> Vec<String> {
+        self.positions
+            .lock()
+            .expect("the log lock is held")
+            .iter()
+            .map(|(stream_id, _)| stream_id.clone())
+            .collect()
     }
 }
 
 #[async_trait]
 impl EventSink for SequenceLog {
     async fn record(&self, event: &CodingAgentEvent) -> Result<(), EventSinkError> {
-        self.seqs
+        self.positions
             .lock()
             .expect("the log lock is held")
-            .push(event.seq);
+            .push((event.stream_id().to_owned(), event.seq));
         Ok(())
     }
 }
@@ -424,9 +438,12 @@ async fn a_record_from_a_format_this_build_does_not_read_is_refused() {
 #[tokio::test]
 async fn event_numbering_continues_where_the_record_left_off() {
     let (client, _) = scripted_client(vec![ScriptedCall::response(text_response("one"))]);
-    let (record, _, _) = stored_session(client, "test/model").await;
-    let last_seq = record.last_event_seq;
-    assert!(last_seq > 0, "the first session published events");
+    let (mut record, _, _) = stored_session(client, "test/model").await;
+    let recorded_seq = record.last_event_seq;
+    let stream_id = record.session_id.clone();
+    assert!(recorded_seq > 0, "the first session published events");
+    let durable_seq = recorded_seq + 3;
+    record.advance_event_cursor(durable_seq);
 
     let log = Arc::new(SequenceLog::default());
     let (client, _) = scripted_client(vec![ScriptedCall::response(text_response("two"))]);
@@ -447,12 +464,16 @@ async fn event_numbering_continues_where_the_record_left_off() {
     let seqs = log.seqs();
     assert_eq!(
         seqs.first().copied(),
-        Some(last_seq + 1),
-        "the resumed session starts numbering above the record"
+        Some(durable_seq + 1),
+        "the resumed session starts above both the record and durable log"
     );
     assert!(
         seqs.windows(2).all(|pair| pair[0] < pair[1]),
         "sequence numbers stay strictly increasing: {seqs:?}"
+    );
+    assert!(
+        log.stream_ids().iter().all(|id| id == &stream_id),
+        "resuming keeps the stable stream identity"
     );
 }
 
@@ -538,6 +559,10 @@ async fn an_export_continues_in_memory_without_initializing_again() {
     assert_eq!(
         seqs.first().copied(),
         Some(export.record().last_event_seq + 1),
-        "numbering continues from the export on the successor's fresh stream"
+        "numbering continues from the export on the successor's new pump"
+    );
+    assert!(
+        log.stream_ids().iter().all(|stream_id| stream_id == &id),
+        "a warm successor keeps the stable stream identity"
     );
 }

@@ -63,6 +63,13 @@ pub const DEFAULT_EVENT_SINK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Implementations must therefore treat `(event.stream_id(), event.seq)` as an
 /// idempotency key. They must also be cheap enough to run on the session tree's
 /// critical path and must not call back into a session that owns them.
+///
+/// When the event log and [`SessionRecord`](crate::state::SessionRecord) do not
+/// share one storage transaction, the application must read the log's highest
+/// committed sequence and call
+/// [`SessionRecord::advance_event_cursor`](crate::state::SessionRecord::advance_event_cursor)
+/// before resume. This prevents a record that survived a crash from reusing a
+/// position already present in the log.
 #[async_trait]
 pub trait EventSink: Send + Sync {
     /// Records one event durably.
@@ -150,12 +157,12 @@ impl EventSequence {
         }
     }
 
-    /// Records that the sink accepted `seq`.
+    /// Records that the pipeline committed `seq`.
     pub(crate) fn commit(&self, seq: u64) {
         self.committed.store(seq, Ordering::Release);
     }
 
-    /// The highest number the sink accepted.
+    /// The highest number the pipeline committed.
     ///
     /// Read from outside the publishing task this is a snapshot. Use
     /// [`Emitter::flush`] when the caller needs a durability boundary before
@@ -436,7 +443,9 @@ impl Emitter {
         }
     }
 
-    /// The highest sequence number the sink has accepted.
+    /// The highest sequence number the pipeline has committed.
+    ///
+    /// With a durable sink, commitment means that sink accepted the event.
     #[must_use]
     pub(crate) fn committed_seq(&self) -> u64 {
         self.sequence.committed()
@@ -796,6 +805,7 @@ impl SessionBoundEmitter {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::future::pending;
     use std::io;
 
@@ -1000,6 +1010,63 @@ mod tests {
         assert_eq!(recorded.len(), 2);
         assert_eq!(recorded[0].seq, 1);
         assert_eq!(recorded[1].seq, 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_tree_producers_share_one_complete_ordered_stream() {
+        const PRODUCERS: usize = 8;
+        const EVENTS_PER_PRODUCER: usize = 64;
+
+        let sink = Arc::new(RecordingSink::default());
+        let (emitter, pump) = spawn_pipeline(EventOptions {
+            sink: Some(Arc::clone(&sink) as Arc<dyn EventSink>),
+            ..EventOptions::default()
+        });
+        let emitter = emitter.in_stream("ses_root");
+        let mut tasks = Vec::new();
+        for producer in 0..PRODUCERS {
+            let child = emitter.for_child("ses_root");
+            tasks.push(tokio::spawn(async move {
+                for index in 0..EVENTS_PER_PRODUCER {
+                    child.emit(format!("ses_child_{producer}"), CodingEvent::UserInput {
+                        text: format!("{producer}:{index}"),
+                    });
+                    yield_now().await;
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.expect("the producer finishes");
+        }
+        let expected = PRODUCERS * EVENTS_PER_PRODUCER;
+        assert_eq!(
+            emitter.flush().await.expect("the stream commits"),
+            u64::try_from(expected).expect("the test count fits")
+        );
+        emitter.close().await.expect("the stream closes");
+        pump.await.expect("the pump joins").expect("the pump stops");
+
+        let recorded = sink.recorded();
+        assert_eq!(recorded.len(), expected);
+        assert_eq!(
+            recorded.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            (1..=u64::try_from(expected).expect("the test count fits")).collect::<Vec<_>>()
+        );
+        assert!(
+            recorded.iter().all(|event| {
+                event.stream_id == "ses_root"
+                    && event.parent_session_id.as_deref() == Some("ses_root")
+            }),
+            "every producer writes directly to the root stream"
+        );
+        let payloads: HashSet<_> = recorded
+            .iter()
+            .filter_map(|event| match &event.event {
+                CodingEvent::UserInput { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(payloads.len(), expected, "no producer event was lost");
     }
 
     #[tokio::test]

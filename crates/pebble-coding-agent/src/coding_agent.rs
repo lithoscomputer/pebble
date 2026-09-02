@@ -351,19 +351,27 @@ impl CodingAgentBuilder {
         self
     }
 
-    /// Records every coding event before a live subscriber sees it.
+    /// Records the whole session tree's ordered event stream durably.
+    ///
+    /// The sink receives every event before live subscribers do. A refusal
+    /// closes the tree and fails the operation that observed it.
     pub fn event_sink(mut self, sink: Arc<dyn EventSink>) -> Self {
         self.inner = self.inner.event_sink(sink);
         self
     }
 
-    /// Sets the pending event queue and live subscription capacity.
+    /// Sets the pending event queue and each live subscription's capacity.
+    ///
+    /// Filling the producer queue is fatal to the stream. A live subscriber
+    /// that falls behind instead receives `RecvError::Lagged`.
     pub fn event_capacity(mut self, capacity: impl Into<EventCapacity>) -> Self {
         self.inner = self.inner.event_capacity(capacity);
         self
     }
 
     /// Sets the longest one call to the durable event sink may take.
+    ///
+    /// Exceeding this limit stops the stream and closes the session tree.
     pub fn event_sink_timeout(mut self, timeout: impl Into<EventSinkTimeout>) -> Self {
         self.inner = self.inner.event_sink_timeout(timeout);
         self
@@ -802,6 +810,10 @@ impl CodingAgent {
     /// [`ResumeMode::UseModel`] failover gets a prompt written for the model it
     /// runs on.
     ///
+    /// If the event sink and record were not saved in one transaction, first
+    /// reconcile the record with
+    /// [`SessionRecord::advance_event_cursor`](crate::state::SessionRecord::advance_event_cursor).
+    ///
     /// ```no_run
     /// use pebble_coding_agent::{CodingAgent, ResumeMode};
     /// # use std::sync::Arc;
@@ -850,8 +862,8 @@ impl CodingAgent {
     /// discovered skills, and binds whatever services the builder gives it —
     /// a different human-input provider, different tool hooks — for its own
     /// life. It runs on the exported route; a change of model goes through
-    /// [`resume`](Self::resume). Event numbering continues from the export, on
-    /// a fresh event stream.
+    /// [`resume`](Self::resume). The successor uses a new event pump but keeps
+    /// the stream identity and continues numbering from the export.
     pub fn resume_from_export(
         client: Client,
         environment: Arc<dyn Environment>,
@@ -920,7 +932,11 @@ impl CodingAgent {
         })
     }
 
-    /// Subscribes to coding-agent events.
+    /// Watches events published after this call.
+    ///
+    /// This path is bounded and can lag. Use an [`EventSink`] for a complete
+    /// record. The receiver ends after [`shutdown`](Self::shutdown) returns,
+    /// even while this agent value is still alive.
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<CodingAgentEvent> {
         self.inner.subscribe()
@@ -942,7 +958,10 @@ impl CodingAgent {
         }
     }
 
-    /// The highest event sequence accepted by the durable sink.
+    /// The highest event sequence committed by the event pipeline.
+    ///
+    /// With a durable sink, commitment means the sink accepted the event. This
+    /// is a committed cursor, not the number most recently queued.
     #[must_use]
     pub fn committed_event_seq(&self) -> u64 {
         self.inner.committed_event_seq()
@@ -984,7 +1003,7 @@ impl CodingAgent {
         self.inner.set_speed(speed);
     }
 
-    /// The stable durable-session identifier.
+    /// The stable durable-session and root-stream identifier.
     #[must_use]
     pub fn id(&self) -> &str {
         self.inner.id()

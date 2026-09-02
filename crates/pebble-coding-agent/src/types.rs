@@ -1319,7 +1319,7 @@ impl CodingAgentEvent {
         }
     }
 
-    /// Places this envelope at `seq` in its session's stream.
+    /// Places this envelope at `seq` in its stream.
     #[must_use]
     pub fn with_seq(mut self, seq: u64) -> Self {
         self.seq = seq;

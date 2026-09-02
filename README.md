@@ -139,9 +139,27 @@ The stream ends with the agent rather than with the agent value: once
 `CodingAgent::shutdown` has returned, a reader looping until
 `RecvError::Closed` finishes, so a renderer task can be joined before the
 agent is dropped. An application that must see every event installs a
-`pebble_coding_agent::events::EventSink` instead. Each event is recorded there, in sequence,
-before any subscriber sees it. A sink that refuses one stops the prompt,
-because a session that cannot record what it did is worse than one that stops.
+`pebble_coding_agent::events::EventSink` instead.
+
+One root agent and all its subagents write directly to one ordered stream. Each
+`CodingAgentEvent` names that stream with `stream_id`, names its producer with
+`session_id`, and has a contiguous `seq` within the stream. The stream identity
+and numbering continue when the root session resumes. A sink receives every
+event, including streaming deltas, in sequence before a live subscriber sees
+it. Treat `(event.stream_id(), event.seq)` as the idempotency key because a
+process can stop after storage commits an event but before its latest session
+record is saved. If the log and record do not share one transaction, read the
+log's highest sequence and call `SessionRecord::advance_event_cursor` before
+resume. This prevents the resumed stream from reusing an already committed
+position.
+
+The producer queue is bounded by `event_capacity`. A full queue, a refused sink
+write, or a write longer than `event_sink_timeout` stops the stream, cancels
+active work, closes the session tree, and returns an `event_stream` error. It
+never lets the agent continue with a partial ledger. Building an agent and
+finishing a prompt both wait for their events to reach the sink. Use
+`CodingAgent::flush_events` for an explicit durability boundary and
+`CodingAgent::committed_event_seq` to read its committed cursor.
 
 **A policy, if the agent should not do everything.** Pebble installs none: with
 no `pebble_coding_agent::tools::ToolAccessPolicy` and no

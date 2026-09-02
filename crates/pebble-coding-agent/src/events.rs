@@ -1,10 +1,11 @@
 //! Durable coding events, the sink that records them, and retry observation.
 //!
 //! Every event a coding agent publishes is a [`CodingAgentEvent`]: a numbered
-//! envelope around one [`CodingEvent`]. An application records them through an
-//! [`EventSink`] and watches them live through
+//! envelope around one [`CodingEvent`]. One root agent and all its descendants
+//! share one ordered stream. An application records it without loss through an
+//! [`EventSink`] and watches it live, with bounded lag, through
 //! [`CodingAgent::subscribe`](crate::CodingAgent::subscribe). The serialized
-//! form of both is public API.
+//! form of both event types is public API.
 
 pub use crate::error::{ErrorData, ErrorKind};
 pub use crate::event::{

@@ -72,10 +72,12 @@ pub struct SessionRecord {
     #[serde(with = "rfc3339_millis")]
     pub updated_at: SystemTime,
 
-    /// The highest sequence number accepted by the session tree's event sink.
+    /// The highest sequence number committed by the session tree's event
+    /// pipeline.
     ///
     /// A resumed root session continues numbering from here, so one tree's
-    /// events stay uniquely numbered across restarts. Events still queued when
+    /// events stay uniquely numbered across restarts. With a durable sink,
+    /// commitment means the sink accepted the event. Events still queued when
     /// the record is taken are not counted.
     #[serde(default, deserialize_with = "null_as_default")]
     pub last_event_seq: u64,
@@ -111,6 +113,16 @@ impl SessionRecord {
     #[must_use]
     pub const fn is_supported(&self) -> bool {
         self.format_version <= SESSION_RECORD_FORMAT_VERSION
+    }
+
+    /// Advances the event cursor to include events already held by the sink.
+    ///
+    /// Use this before resume when the event log and this record were not saved
+    /// in one transaction. A crash can leave the log ahead of the record; the
+    /// next event must start above both. This method never moves the cursor
+    /// backwards.
+    pub fn advance_event_cursor(&mut self, committed_seq: u64) {
+        self.last_event_seq = self.last_event_seq.max(committed_seq);
     }
 
     /// The exact route the session last ran on, as a `provider/model` selector
@@ -478,6 +490,18 @@ mod tests {
         record.format_version = SESSION_RECORD_FORMAT_VERSION + 1;
 
         assert!(!record.is_supported());
+    }
+
+    #[test]
+    fn reconciling_an_event_cursor_only_moves_it_forward() {
+        let mut record = SessionRecord::new("ses_1");
+        record.last_event_seq = 41;
+
+        record.advance_event_cursor(45);
+        assert_eq!(record.last_event_seq, 45);
+
+        record.advance_event_cursor(42);
+        assert_eq!(record.last_event_seq, 45);
     }
 
     #[test]

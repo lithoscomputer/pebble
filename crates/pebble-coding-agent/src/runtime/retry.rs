@@ -53,8 +53,8 @@ use crate::types::{CodingEvent, LlmRetryPhase};
 /// Install it on the middleware, once, when building the client. It reports
 /// only for calls a pebble session made — it finds the session's event pipeline
 /// on the call itself — so one client shared by several sessions sends each
-/// session's retries to that session's own stream, and a call pebble did not
-/// make is ignored.
+/// session's retries to its tree's stream, and a call pebble did not make is
+/// ignored.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RetryEventObserver;
 

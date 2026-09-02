@@ -401,6 +401,7 @@ fn an_event_with_unknown_members_still_parses() {
 
     assert_eq!(envelope.seq, 7);
     assert_eq!(envelope.session_id, "ses_root");
+    assert_eq!(envelope.stream_id(), "ses_root");
     assert_eq!(envelope.parent_session_id, None);
     assert!(matches!(
         envelope.event,
@@ -417,15 +418,18 @@ fn an_event_variant_this_build_does_not_know_is_read_through_the_envelope() {
     #[derive(serde::Deserialize)]
     struct RawEnvelope {
         seq:        u64,
+        stream_id:  String,
         session_id: String,
         event:      serde_json::Value,
     }
 
     let line = json!({
         "seq": 9,
+        "stream_id": "ses_root",
         "event": { "SandboxEscaped": { "detail": "from a newer pebble" } },
         "timestamp": "2026-01-01T00:00:00.500Z",
-        "session_id": "ses_root",
+        "session_id": "ses_child",
+        "parent_session_id": "ses_root",
     });
 
     serde_json::from_value::<CodingAgentEvent>(line.clone())
@@ -434,7 +438,8 @@ fn an_event_variant_this_build_does_not_know_is_read_through_the_envelope() {
     let envelope: RawEnvelope =
         serde_json::from_value(line).expect("the envelope parses without the payload");
     assert_eq!(envelope.seq, 9);
-    assert_eq!(envelope.session_id, "ses_root");
+    assert_eq!(envelope.stream_id, "ses_root");
+    assert_eq!(envelope.session_id, "ses_child");
     serde_json::from_value::<CodingEvent>(envelope.event)
         .expect_err("the payload is what this build cannot read");
 }
@@ -449,6 +454,11 @@ fn an_event_without_its_optional_members_still_parses() {
     .expect("optional members may be absent");
 
     assert_eq!(envelope.seq, 0, "an unsequenced event reads as sequence 0");
+    assert_eq!(
+        envelope.stream_id(),
+        "ses_root",
+        "an older envelope falls back to its session identity"
+    );
     assert_eq!(envelope.tool_call_id, None);
     assert!(matches!(envelope.event, CodingEvent::SessionEnded));
 }
