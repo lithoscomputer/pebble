@@ -115,7 +115,7 @@ impl Converter {
             return start + 1;
         };
         if !tag.closing && matches!(tag.name.as_str(), "script" | "style") {
-            return skip_past(text, tag.end, &format!("</{}>", tag.name));
+            return skip_raw_text(text, tag.end, &tag.name);
         }
         self.handle(&tag);
         tag.end
@@ -295,6 +295,28 @@ fn skip_past(text: &str, from: usize, terminator: &str) -> usize {
     text[from..]
         .find(terminator)
         .map_or(text.len(), |offset| from + offset + terminator.len())
+}
+
+/// Where `text` continues after the closing tag of the `<script>` or
+/// `<style>` element named `name` that is open at `from`.
+///
+/// The body of one of these elements is not markup, so the only thing that
+/// ends it is its own closing tag, in whatever case the page wrote it and with
+/// any whitespace before its `>`. A closing tag of some other element inside
+/// the body is body text. A body that never closes takes the rest of the page
+/// with it, which is what a browser does.
+fn skip_raw_text(text: &str, from: usize, name: &str) -> usize {
+    let mut index = from;
+    while let Some(offset) = text[index..].find("</") {
+        let start = index + offset;
+        if let Some(tag) = Tag::parse(text, start)
+            && tag.name == name
+        {
+            return tag.end;
+        }
+        index = start + 2;
+    }
+    text.len()
 }
 
 /// One parsed tag.
@@ -590,6 +612,45 @@ mod tests {
     #[test]
     fn an_unterminated_script_swallows_only_the_rest_of_the_page() {
         assert_eq!(html_to_markdown("<p>before</p><script>alert(1)"), "before");
+    }
+
+    /// A page may close its script or style in any case, and may put
+    /// whitespace before the `>`. Only the element's own closing tag ends it.
+    #[test]
+    fn a_closing_tag_in_another_case_still_ends_the_script_or_style() {
+        assert_eq!(
+            html_to_markdown("<SCRIPT>alert(1)</SCRIPT><p>Content</p>"),
+            "Content"
+        );
+        assert_eq!(
+            html_to_markdown("<Style>a{}</STYLE ><p>Content</p>"),
+            "Content"
+        );
+    }
+
+    #[test]
+    fn a_closing_tag_of_another_element_is_script_text() {
+        assert_eq!(
+            html_to_markdown("<script>var s = \"</div>\";</script><p>Content</p>"),
+            "Content"
+        );
+    }
+
+    #[test]
+    fn adjacent_and_nested_scripts_and_styles_are_all_dropped() {
+        assert_eq!(
+            html_to_markdown("<html><SCRIPT>a</SCRIPT><STYLE>b</STYLE><p>Content</p></html>"),
+            "Content"
+        );
+        assert_eq!(
+            html_to_markdown("<script>x<style>y</style>z</script><p>Content</p>"),
+            "Content"
+        );
+    }
+
+    #[test]
+    fn an_unterminated_uppercase_script_swallows_only_the_rest_of_the_page() {
+        assert_eq!(html_to_markdown("<p>before</p><SCRIPT>alert(1)"), "before");
     }
 
     /// A page that carries its real destination in `href` and a tracking copy
