@@ -15,8 +15,8 @@
 //! - `Grep` returns one of three **output shapes** and pages through them.
 //!
 //! Everything they do reaches the workspace through the same
-//! [`Environment`](crate::Environment) methods pebble's own tools use, so
-//! environment behavior and path policy are unchanged.
+//! [`Environment`](crate::environment::Environment) methods pebble's own tools
+//! use, so environment behavior and path policy are unchanged.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -406,8 +406,8 @@ impl GrepOutputMode {
 /// These are all shapes of the result list the environment already returns, so
 /// no environment work is needed. Kimi Code's `type`, `multiline` and
 /// `include_ignored` are deliberately absent: they would have to reach ripgrep
-/// flags through new [`Environment`](crate::Environment) methods, and
-/// advertising a parameter that is ignored is worse than omitting it.
+/// flags through new [`Environment`](crate::environment::Environment) methods,
+/// and advertising a parameter that is ignored is worse than omitting it.
 #[must_use]
 pub(crate) fn make_kimi_grep_tool() -> RegisteredTool {
     RegisteredTool::new(definition(

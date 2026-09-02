@@ -49,7 +49,8 @@ use lithos_llm::catalog::Catalog;
 use lithos_llm::credentials::EnvironmentCredentials;
 use lithos_llm::middleware::{RetryMiddleware, RetryPolicy};
 use pebble_coding_agent::events::RetryEventObserver;
-use pebble_coding_agent::{CodingAgent, LocalEnvironment, ShutdownReason};
+use pebble_coding_agent::environment::LocalEnvironment;
+use pebble_coding_agent::{CodingAgent, ShutdownReason};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -84,10 +85,12 @@ initialization step to remember. `prompt` returns a `PromptOutcome` with the fin
 message, text, token usage, cost, and timing.
 
 The crate root contains the normal coding-agent path and the environment
-contract. Durable event types are in `pebble_coding_agent::events`. Tool
-contracts and built-in tools are in `pebble_coding_agent::tools`. Durable
-session state is in `pebble_coding_agent::resources`. Optional application
-services are in `pebble_coding_agent::extensions`. Subagent construction is in
+contract. The environment a session acts through is in
+`pebble_coding_agent::environment`. Durable event types are in
+`pebble_coding_agent::events`. Tool contracts, built-in tools, and the standalone
+tool runner are in `pebble_coding_agent::tools`. Durable session state is in
+`pebble_coding_agent::state`. Optional application services are in
+`pebble_coding_agent::extensions`. Subagent configuration is in
 `pebble_coding_agent::subagents`. The internal runtime is not public.
 
 Take a `CodingAgentControlHandle` before calling `prompt` when another task
@@ -221,7 +224,7 @@ is a build error, not a session that runs with the wrong prompt.
 
 The serialized form of `pebble_coding_agent::events::CodingAgentEvent` and
 `pebble_coding_agent::events::CodingEvent` is public API. So is
-`pebble_coding_agent::resources::SessionRecord`, which carries a format version. Evolution
+`pebble_coding_agent::state::SessionRecord`, which carries a format version. Evolution
 is additive: new variants and new optional fields. Consumers should ignore
 members they do not know and tolerate variants they do not know.
 

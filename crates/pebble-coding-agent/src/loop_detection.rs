@@ -32,13 +32,13 @@ const MAX_PATTERN_LEN: usize = 3;
 ///
 /// Fewer than two tool-calling turns is never a loop.
 ///
-/// ```
+/// ```ignore
 /// # use pebble_coding_agent::resources::{History, detect_loop};
 /// let history = History::default();
 /// assert!(!detect_loop(&history, 10));
 /// ```
 #[must_use]
-pub fn detect_loop(history: &History, window_size: usize) -> bool {
+pub(crate) fn detect_loop(history: &History, window_size: usize) -> bool {
     let signatures = recent_turn_signatures(history, window_size);
 
     if signatures.len() < 2 {

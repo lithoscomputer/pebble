@@ -845,8 +845,8 @@ impl CodingAgent {
     /// # use std::sync::Arc;
     /// # async fn example(
     /// #     client: lithos_llm::Client,
-    /// #     environment: Arc<dyn pebble_coding_agent::Environment>,
-    /// #     record: pebble_coding_agent::resources::SessionRecord,
+    /// #     environment: Arc<dyn pebble_coding_agent::environment::Environment>,
+    /// #     record: pebble_coding_agent::state::SessionRecord,
     /// # ) -> Result<(), Box<dyn std::error::Error>> {
     /// let same = CodingAgent::resume(
     ///     client.clone(),

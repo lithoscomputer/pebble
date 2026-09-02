@@ -47,7 +47,7 @@ const TRANSCRIPT_FIELD_BYTES: usize = 500;
 /// How the size of the active conversation was arrived at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
-pub enum ContextEstimateMethod {
+pub(crate) enum ContextEstimateMethod {
     /// The last usage the provider reported, plus a local estimate of the
     /// turns recorded since.
     ApiUsagePlusLocalDelta,
@@ -59,7 +59,7 @@ pub enum ContextEstimateMethod {
 impl ContextEstimateMethod {
     /// The stable identifier the warning event carries.
     #[must_use]
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::ApiUsagePlusLocalDelta => "api_usage_plus_local_delta",
             Self::LocalEstimate => "local_estimate",
@@ -75,11 +75,11 @@ impl fmt::Display for ContextEstimateMethod {
 
 /// How large the active conversation is, and how that was worked out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ContextEstimate {
+pub(crate) struct ContextEstimate {
     /// The estimated prompt size, in tokens.
-    pub tokens: usize,
+    pub(crate) tokens: usize,
     /// How the number was arrived at.
-    pub method: ContextEstimateMethod,
+    pub(crate) method: ContextEstimateMethod,
 }
 
 /// What one compaction run needs to know about the session it is compacting.
@@ -87,22 +87,22 @@ pub struct ContextEstimate {
 /// An argument bundle rather than something an application reads back, so it is
 /// plainly constructible and a member added later is a breaking change.
 #[derive(Debug, Clone, Copy)]
-pub struct CompactionRequest<'a> {
+pub(crate) struct CompactionRequest<'a> {
     /// The model selector the session runs on. Compaction summarizes with the
     /// same model, so the summary reads the conversation the way its author
     /// did.
-    pub model:          &'a str,
+    pub(crate) model:          &'a str,
     /// The budgets that model works within.
-    pub facts:          ModelFacts,
+    pub(crate) facts:          ModelFacts,
     /// How many recent turns to leave untouched.
     ///
     /// One turn is always left, whatever this says. Compaction runs at a turn
     /// boundary where the newest turn may hold tool calls whose results have
     /// not been recorded yet, and summarizing that turn away would leave the
     /// results that follow it answering calls no provider can see.
-    pub preserve_turns: usize,
+    pub(crate) preserve_turns: usize,
     /// The estimate that triggered this run, reported on the started event.
-    pub estimate:       ContextEstimate,
+    pub(crate) estimate:       ContextEstimate,
 }
 
 /// Whether the session has crossed the compaction threshold, and by how much.
@@ -112,7 +112,7 @@ pub struct CompactionRequest<'a> {
 /// `None` for a model whose window is unknown, because a threshold on an
 /// unknown window means nothing.
 #[must_use]
-pub fn check_context_usage(
+pub(crate) fn check_context_usage(
     system_prompt: &str,
     history: &History,
     context_window_tokens: usize,
@@ -155,7 +155,7 @@ pub fn check_context_usage(
 /// The summary text is bounded to the visible budget after the call, because a
 /// provider enforces one combined ceiling for reasoning and output and cannot
 /// be asked to bound the visible half on its own.
-pub async fn compact_context(
+pub(crate) async fn compact_context(
     history: &mut History,
     client: &Client,
     file_tracker: &FileTracker,
@@ -312,7 +312,10 @@ fn summary_max_approx_bytes() -> usize {
 /// any assistant turn carries usage there is nothing to anchor to, so the whole
 /// prompt is estimated locally.
 #[must_use]
-pub fn estimate_active_context_usage(system_prompt: &str, history: &History) -> ContextEstimate {
+pub(crate) fn estimate_active_context_usage(
+    system_prompt: &str,
+    history: &History,
+) -> ContextEstimate {
     let turns = history.turns();
 
     if let Some((index, reported)) = latest_reported_usage(turns) {
@@ -380,7 +383,7 @@ fn single_turn_chars(turn: &Message) -> usize {
 /// Long tool arguments and tool output are cut, because the summary is about
 /// what happened rather than about every byte that moved.
 #[must_use]
-pub fn render_turns_for_summary(turns: &[Message]) -> String {
+pub(crate) fn render_turns_for_summary(turns: &[Message]) -> String {
     let mut out = String::new();
     for turn in turns {
         match turn {

@@ -14,9 +14,10 @@ use lithos_llm::Client;
 use lithos_llm::catalog::Catalog;
 use lithos_llm::client::ClientBuild;
 use lithos_llm::types::{Message as LlmMessage, Request, Role};
+use pebble_coding_agent::environment::Environment;
 use pebble_coding_agent::events::{CodingAgentEvent, EventSink, EventSinkError};
 use pebble_coding_agent::extensions::{Answer, HumanInputError, HumanInputProvider, Question};
-use pebble_coding_agent::resources::{
+use pebble_coding_agent::state::{
     Message, SESSION_RECORD_FORMAT_VERSION, SessionRecord, StoredMessage,
 };
 use pebble_coding_agent::test_support::{
@@ -24,7 +25,7 @@ use pebble_coding_agent::test_support::{
     scripted_client_builder, text_response,
 };
 use pebble_coding_agent::{
-    CodingAgent, CodingAgentBuildError, CodingAgentOptions, Environment, ResumeMode, ShutdownReason,
+    CodingAgent, CodingAgentBuildError, CodingAgentOptions, ResumeMode, ShutdownReason,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -467,10 +468,7 @@ async fn an_export_continues_in_memory_without_initializing_again() {
         scripted_client(vec![ScriptedCall::response(text_response("one"))]);
     let mut first = CodingAgent::builder(client, environment_with_a_skill())
         .model("test/model")
-        .options(CodingAgentOptions {
-            skill_dirs: vec!["/skills".to_owned()],
-            ..CodingAgentOptions::default()
-        })
+        .options(CodingAgentOptions::default().with_skill_dirs(["/skills".to_owned()]))
         .build()
         .await
         .expect("the first agent builds");

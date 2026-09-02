@@ -36,10 +36,10 @@ use lithos_llm::catalog::Catalog;
 use lithos_llm::client::ClientBuild;
 use lithos_llm::credentials::EnvironmentCredentials;
 use lithos_llm::middleware::{RetryMiddleware, RetryPolicy};
+use pebble_coding_agent::environment::LocalEnvironment;
 use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent, RetryEventObserver, TokenUsage};
 use pebble_coding_agent::{
-    CodingAgent, CodingAgentControlHandle, CodingAgentOptions, LocalEnvironment, PromptOutcome,
-    ShutdownReason,
+    CodingAgent, CodingAgentControlHandle, CodingAgentOptions, PromptOutcome, ShutdownReason,
 };
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
@@ -119,13 +119,13 @@ async fn run() -> Result<(), Box<dyn StdError>> {
 
     let mut session = CodingAgent::builder(client, Arc::new(environment))
         .model(&model)
-        .options(CodingAgentOptions {
-            wall_clock_timeout: Some(PROMPT_BUDGET),
-            // This example chooses the same spacing for request retry and
-            // turn replay. Applications can configure them independently.
-            turn_replay: policy,
-            ..CodingAgentOptions::default()
-        })
+        .options(
+            CodingAgentOptions::default()
+                .with_wall_clock_timeout(PROMPT_BUDGET)
+                // This example chooses the same spacing for request retry and
+                // turn replay. Applications can configure them independently.
+                .with_turn_replay(policy),
+        )
         .build()
         .await?;
 

@@ -18,14 +18,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, process};
 
 use lithos_llm::types::ToolDefinition;
+use pebble_coding_agent::environment::LocalEnvironment;
 use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent, ToolSource};
-use pebble_coding_agent::resources::Message;
+use pebble_coding_agent::state::Message;
 use pebble_coding_agent::test_support::{
     ScriptedCall, ScriptedProvider, client_from, message_text, text_delta_events, text_response,
     tool_call_response, with_cost,
 };
 use pebble_coding_agent::tools::RegisteredTool;
-use pebble_coding_agent::{CodingAgent, LocalEnvironment, ShutdownReason};
+use pebble_coding_agent::{CodingAgent, ShutdownReason};
 use serde_json::json;
 use tokio::sync::{Notify, broadcast};
 use tokio::time::timeout;

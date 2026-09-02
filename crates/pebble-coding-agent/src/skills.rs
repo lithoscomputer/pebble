@@ -34,19 +34,19 @@ const SKILL_FILE_GLOB: &str = "*/SKILL.md";
 /// Pebble carries the three parts every profile's prompt assembly needs: what
 /// to call it, when to reach for it, and what it says.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Skill {
+pub(crate) struct Skill {
     /// What the skill is named, and what a person types to invoke it.
-    pub name:        String,
+    pub(crate) name:        String,
     /// When to use the skill, written for the model.
-    pub description: String,
+    pub(crate) description: String,
     /// The prompt the skill expands into.
-    pub template:    String,
+    pub(crate) template:    String,
 }
 
 impl Skill {
     /// The description of this skill that the event stream carries.
     #[must_use]
-    pub fn to_summary(&self) -> SkillSummary {
+    pub(crate) fn to_summary(&self) -> SkillSummary {
         SkillSummary {
             name:        self.name.clone(),
             description: self.description.clone(),
@@ -60,7 +60,7 @@ impl Skill {
 /// only when it parses a file itself.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
-pub enum SkillParseError {
+pub(crate) enum SkillParseError {
     /// The file does not open with a `---` frontmatter delimiter.
     #[error("Missing YAML frontmatter delimiters")]
     MissingFrontmatter,
@@ -75,7 +75,7 @@ pub enum SkillParseError {
 /// Why a `/name` reference could not be expanded.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
-pub enum SkillExpansionError {
+pub(crate) enum SkillExpansionError {
     /// The input named more than one skill. One input runs one skill.
     #[error("Only one skill reference per input is allowed")]
     MultipleReferences,
@@ -95,7 +95,7 @@ pub enum SkillExpansionError {
 /// template over the envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
-pub enum SkillExpansion {
+pub(crate) enum SkillExpansion {
     /// Expand a `/name` reference in the input.
     Apply,
     /// Send the input through unchanged.
@@ -104,11 +104,11 @@ pub enum SkillExpansion {
 
 /// Input after a `/name` reference was expanded.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExpandedInput {
+pub(crate) struct ExpandedInput {
     /// What the session sends as the user turn.
-    pub text:       String,
+    pub(crate) text:       String,
     /// The skill that was expanded, when one was.
-    pub skill_name: Option<String>,
+    pub(crate) skill_name: Option<String>,
 }
 
 /// Reads a `SKILL.md` file.
@@ -119,14 +119,14 @@ pub struct ExpandedInput {
 /// `name` is required, `description` defaults to empty, and the body becomes
 /// the template with its surrounding blank lines trimmed.
 ///
-/// ```
+/// ```ignore
 /// # use pebble_coding_agent::resources::{SkillParseError, parse_skill};
 /// let skill = parse_skill("---\nname: commit\n---\nWrite a commit.")?;
 /// assert_eq!(skill.name, "commit");
 /// assert_eq!(skill.template, "Write a commit.");
 /// # Ok::<(), SkillParseError>(())
 /// ```
-pub fn parse_skill(content: &str) -> StdResult<Skill, SkillParseError> {
+pub(crate) fn parse_skill(content: &str) -> StdResult<Skill, SkillParseError> {
     let trimmed = content.trim();
     let Some(after_opening) = trimmed.strip_prefix("---") else {
         return Err(SkillParseError::MissingFrontmatter);
@@ -164,7 +164,7 @@ pub fn parse_skill(content: &str) -> StdResult<Skill, SkillParseError> {
 /// `{{user_input}}` placeholder; a template with no placeholder replaces the
 /// input entirely.
 ///
-/// ```
+/// ```ignore
 /// # use pebble_coding_agent::resources::{Skill, SkillExpansionError, expand_skill};
 /// let skills = [Skill {
 ///     name:        "commit".to_owned(),
@@ -178,7 +178,7 @@ pub fn parse_skill(content: &str) -> StdResult<Skill, SkillParseError> {
 /// assert!(expanded.text.ends_with("only the staged files"));
 /// # Ok::<(), SkillExpansionError>(())
 /// ```
-pub fn expand_skill(
+pub(crate) fn expand_skill(
     skills: &[Skill],
     input: &str,
 ) -> StdResult<ExpandedInput, SkillExpansionError> {
@@ -285,7 +285,7 @@ fn find_skill_references(input: &str) -> Vec<SkillReference> {
 /// way `vocabulary` spells it, because the model has to be told the name it can
 /// actually call.
 #[must_use]
-pub fn format_skills_prompt_section(skills: &[Skill], vocabulary: ToolVocabulary) -> String {
+pub(crate) fn format_skills_prompt_section(skills: &[Skill], vocabulary: ToolVocabulary) -> String {
     if skills.is_empty() {
         return String::new();
     }
@@ -321,7 +321,7 @@ pub fn format_skills_prompt_section(skills: &[Skill], vocabulary: ToolVocabulary
 ///
 /// Returns [`Error::Interrupted`] when `cancel` fires, which is checked around
 /// every search and every read.
-pub async fn discover_skills(
+pub(crate) async fn discover_skills(
     env: &dyn Environment,
     dirs: &[String],
     cancel: &CancellationToken,

@@ -30,7 +30,8 @@ const USE_SKILL_DESCRIPTION: &str = "Load a skill's instructions by name. Call t
 /// The registry renames it as it is registered, so a session speaking another
 /// vocabulary still builds it this way.
 #[must_use]
-pub fn make_use_skill_tool(skills: Arc<[Skill]>) -> RegisteredTool {
+#[cfg(test)]
+pub(crate) fn make_use_skill_tool(skills: Arc<[Skill]>) -> RegisteredTool {
     make_use_skill_tool_for_vocabulary(skills, ToolVocabulary::Canonical)
 }
 
@@ -41,7 +42,7 @@ pub fn make_use_skill_tool(skills: Arc<[Skill]>) -> RegisteredTool {
 /// the skill's name changes, and the optional `args` string is read the same
 /// way wherever it is offered.
 #[must_use]
-pub fn make_use_skill_tool_for_vocabulary(
+pub(crate) fn make_use_skill_tool_for_vocabulary(
     skills: Arc<[Skill]>,
     vocabulary: ToolVocabulary,
 ) -> RegisteredTool {

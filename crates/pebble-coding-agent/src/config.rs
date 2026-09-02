@@ -1,10 +1,10 @@
 //! How an application configures one session.
 //!
-//! [`CodingAgentOptions`] is a plain record with a [`Default`]: build one with
-//! `..Default::default()` and set only what differs. Everything that needs a
-//! decision from the application rather than a value — which tools may run,
-//! what happens around each call — arrives as a trait object on the same
-//! record.
+//! [`CodingAgentOptions`] starts from its [`Default`] and is adjusted through
+//! focused `with_*` methods, so an option cannot be left half-set. Everything
+//! that needs a decision from the application rather than a value — which tools
+//! may run, what happens around each call — arrives as a trait object through
+//! the same methods.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -201,81 +201,84 @@ impl Default for NativeToolOptions {
 
 /// Everything one session's behavior is tuned by.
 ///
-/// Every member has a default that runs a session, so set the ones that
-/// matter:
+/// Every setting has a default that runs a session, so start from
+/// [`default`](Self::default) and set the ones that matter through the
+/// `with_*` methods:
 ///
 /// ```
+/// use std::time::Duration;
+///
 /// use pebble_coding_agent::CodingAgentOptions;
 ///
-/// let options = CodingAgentOptions {
-///     enable_context_compaction: false,
-///     ..CodingAgentOptions::default()
-/// };
-/// assert_eq!(options.compaction_preserve_turns, 6);
+/// let options = CodingAgentOptions::default()
+///     .with_context_compaction(false)
+///     .with_wall_clock_timeout(Duration::from_secs(600))
+///     .with_user_instructions("Always run the tests.");
+/// # let _ = options;
 /// ```
 #[derive(Clone)]
 pub struct CodingAgentOptions {
     /// How hard the model should think, where the provider offers a choice.
-    pub reasoning_effort: Option<ReasoningEffort>,
+    pub(crate) reasoning_effort: Option<ReasoningEffort>,
     /// Which latency or cost tier to ask for, where the provider offers one.
-    pub speed: Option<Speed>,
+    pub(crate) speed: Option<Speed>,
     /// The most tokens the model may produce per turn. Absent takes the
     /// catalog's default for the model.
-    pub max_tokens: Option<i64>,
+    pub(crate) max_tokens: Option<i64>,
     /// Per-tool character budgets for what history keeps, keyed by the name
     /// the model calls or by pebble's canonical name. Overrides the built-in
     /// limits.
-    pub tool_output_limits: HashMap<String, usize>,
+    pub(crate) tool_output_limits: HashMap<String, usize>,
     /// Per-tool line budgets for what history keeps, keyed the same way.
-    pub tool_line_limits: HashMap<String, usize>,
+    pub(crate) tool_line_limits: HashMap<String, usize>,
     /// Bytes of one tool's output the session retains: the form events, hooks,
     /// and the model all see.
-    pub tool_output_retention_bytes: usize,
+    pub(crate) tool_output_retention_bytes: usize,
     /// Bytes that retained output may occupy once serialized as JSON, which
     /// escaping can inflate well past the text's own length.
-    pub tool_output_serialized_bytes: usize,
+    pub(crate) tool_output_serialized_bytes: usize,
     /// Whether to stop a session that is repeating itself.
-    pub enable_loop_detection: bool,
+    pub(crate) enable_loop_detection: bool,
     /// How many recent turns loop detection compares.
-    pub loop_detection_window: usize,
+    pub(crate) loop_detection_window: usize,
     /// The repository root, when the work has one. Prompt assembly and tools
     /// read it; it is not a sandbox boundary.
-    pub git_root: Option<String>,
+    pub(crate) git_root: Option<String>,
     /// Extra instructions to put in the system prompt.
-    pub user_instructions: Option<String>,
+    pub(crate) user_instructions: Option<String>,
     /// Files whose contents are loaded into the system prompt as memory.
     ///
     /// Paths are explicit and resolved through the session's environment.
     /// Empty loads nothing: pebble looks in no conventional location and
     /// guesses no filename.
-    pub memory_files: Vec<String>,
+    pub(crate) memory_files: Vec<String>,
     /// Directories searched for skills.
     ///
     /// Explicit, like [`memory_files`](Self::memory_files); empty discovers no
     /// skills.
-    pub skill_dirs: Vec<String>,
+    pub(crate) skill_dirs: Vec<String>,
     /// What runs around each tool call.
-    pub tool_hooks: Option<Arc<dyn ToolHookCallback>>,
+    pub(crate) tool_hooks: Option<Arc<dyn ToolHookCallback>>,
     /// Which tools may be advertised and run. Absent exposes every registered
     /// tool.
-    pub tool_access_policy: Option<Arc<dyn ToolAccessPolicy>>,
+    pub(crate) tool_access_policy: Option<Arc<dyn ToolAccessPolicy>>,
     /// The permission level the session started under, for an application that
     /// builds its policy from pebble's table and wants the level recorded
     /// beside it.
-    pub permission_level: Option<PermissionLevel>,
+    pub(crate) permission_level: Option<PermissionLevel>,
     /// Whether approval-required tools are advertised, when a policy is
     /// installed.
-    pub tool_exposure_mode: ToolExposureMode,
+    pub(crate) tool_exposure_mode: ToolExposureMode,
     /// Whether history is summarized as it approaches the context window.
-    pub enable_context_compaction: bool,
+    pub(crate) enable_context_compaction: bool,
     /// The share of the context window that triggers compaction.
-    pub compaction_threshold_percent: usize,
+    pub(crate) compaction_threshold_percent: usize,
     /// How many recent turns compaction leaves untouched. Compaction leaves
     /// the newest turn whatever this says, because it may hold tool calls that
     /// have not been answered yet.
-    pub compaction_preserve_turns: usize,
+    pub(crate) compaction_preserve_turns: usize,
     /// How long one prompt may take before the session cancels itself.
-    pub wall_clock_timeout: Option<Duration>,
+    pub(crate) wall_clock_timeout: Option<Duration>,
     /// How the session spaces the turn replays it owns.
     ///
     /// A stream that fails **after** the model produced visible output is
@@ -292,7 +295,7 @@ pub struct CodingAgentOptions {
     ///
     /// The type is reexported as
     /// [`lithos_llm::middleware::RetryPolicy`].
-    pub turn_replay: RetryPolicy,
+    pub(crate) turn_replay: RetryPolicy,
 }
 
 impl fmt::Debug for CodingAgentOptions {
@@ -378,10 +381,184 @@ impl Default for CodingAgentOptions {
 const DEFAULT_RETRY_ATTEMPTS: u32 = 4;
 
 impl CodingAgentOptions {
+    /// Sets how hard the model should think, where the provider offers a
+    /// choice.
+    #[must_use]
+    pub const fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+
+    /// Sets which latency or cost tier to ask for, where the provider offers
+    /// one.
+    #[must_use]
+    pub const fn with_speed(mut self, speed: Option<Speed>) -> Self {
+        self.speed = speed;
+        self
+    }
+
+    /// Sets the most tokens the model may produce per turn. `None` takes the
+    /// catalog's default for the model.
+    #[must_use]
+    pub const fn with_max_tokens(mut self, max_tokens: Option<i64>) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Sets the character budget history keeps of one tool's output, keyed by
+    /// the name the model calls or by pebble's canonical name. Overrides the
+    /// built-in limit for that tool.
+    #[must_use]
+    pub fn with_tool_output_limit(mut self, tool_name: impl Into<String>, chars: usize) -> Self {
+        self.tool_output_limits.insert(tool_name.into(), chars);
+        self
+    }
+
+    /// Sets the line budget history keeps of one tool's output, keyed the same
+    /// way as [`with_tool_output_limit`](Self::with_tool_output_limit).
+    #[must_use]
+    pub fn with_tool_line_limit(mut self, tool_name: impl Into<String>, lines: usize) -> Self {
+        self.tool_line_limits.insert(tool_name.into(), lines);
+        self
+    }
+
+    /// Sets how many bytes of one tool's output the session retains: the form
+    /// events, hooks, and the model all see.
+    #[must_use]
+    pub const fn with_tool_output_retention_bytes(mut self, bytes: usize) -> Self {
+        self.tool_output_retention_bytes = bytes;
+        self
+    }
+
+    /// Sets how many bytes retained output may occupy once serialized as JSON,
+    /// which escaping can inflate well past the text's own length.
+    #[must_use]
+    pub const fn with_tool_output_serialized_bytes(mut self, bytes: usize) -> Self {
+        self.tool_output_serialized_bytes = bytes;
+        self
+    }
+
+    /// Sets whether to stop a session that is repeating itself.
+    #[must_use]
+    pub const fn with_loop_detection(mut self, enabled: bool) -> Self {
+        self.enable_loop_detection = enabled;
+        self
+    }
+
+    /// Sets how many recent turns loop detection compares.
+    #[must_use]
+    pub const fn with_loop_detection_window(mut self, turns: usize) -> Self {
+        self.loop_detection_window = turns;
+        self
+    }
+
+    /// Names the repository root, when the work has one. Prompt assembly and
+    /// tools read it; it is not a sandbox boundary.
+    #[must_use]
+    pub fn with_git_root(mut self, git_root: impl Into<String>) -> Self {
+        self.git_root = Some(git_root.into());
+        self
+    }
+
+    /// Adds instructions to the system prompt.
+    #[must_use]
+    pub fn with_user_instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.user_instructions = Some(instructions.into());
+        self
+    }
+
+    /// Names the files whose contents are loaded into the system prompt as
+    /// memory. Paths are explicit and resolved through the session's
+    /// environment; pebble looks in no conventional location.
+    #[must_use]
+    pub fn with_memory_files(mut self, files: impl IntoIterator<Item = String>) -> Self {
+        self.memory_files = files.into_iter().collect();
+        self
+    }
+
+    /// Names the directories searched for skills. Explicit, like
+    /// [`with_memory_files`](Self::with_memory_files).
+    #[must_use]
+    pub fn with_skill_dirs(mut self, dirs: impl IntoIterator<Item = String>) -> Self {
+        self.skill_dirs = dirs.into_iter().collect();
+        self
+    }
+
+    /// Sets what runs around each tool call.
+    #[must_use]
+    pub fn with_tool_hooks(mut self, hooks: Arc<dyn ToolHookCallback>) -> Self {
+        self.tool_hooks = Some(hooks);
+        self
+    }
+
+    /// Sets which tools may be advertised and run. Without one, every
+    /// registered tool is exposed.
+    #[must_use]
+    pub fn with_tool_access_policy(mut self, policy: Arc<dyn ToolAccessPolicy>) -> Self {
+        self.tool_access_policy = Some(policy);
+        self
+    }
+
+    /// Records the permission level the session started under, for an
+    /// application that builds its policy from pebble's table.
+    #[must_use]
+    pub const fn with_permission_level(mut self, level: PermissionLevel) -> Self {
+        self.permission_level = Some(level);
+        self
+    }
+
+    /// Sets whether approval-required tools are advertised, when a policy is
+    /// installed.
+    #[must_use]
+    pub const fn with_tool_exposure_mode(mut self, mode: ToolExposureMode) -> Self {
+        self.tool_exposure_mode = mode;
+        self
+    }
+
+    /// Sets whether history is summarized as it approaches the context window.
+    #[must_use]
+    pub const fn with_context_compaction(mut self, enabled: bool) -> Self {
+        self.enable_context_compaction = enabled;
+        self
+    }
+
+    /// Sets the share of the context window that triggers compaction.
+    #[must_use]
+    pub const fn with_compaction_threshold_percent(mut self, percent: usize) -> Self {
+        self.compaction_threshold_percent = percent;
+        self
+    }
+
+    /// Sets how many recent turns compaction leaves untouched.
+    #[must_use]
+    pub const fn with_compaction_preserve_turns(mut self, turns: usize) -> Self {
+        self.compaction_preserve_turns = turns;
+        self
+    }
+
+    /// Sets how long one prompt may take before the agent cancels it. The
+    /// agent stays open; the next prompt gets a fresh budget.
+    #[must_use]
+    pub const fn with_wall_clock_timeout(mut self, timeout: Duration) -> Self {
+        self.wall_clock_timeout = Some(timeout);
+        self
+    }
+
+    /// Sets how the session spaces the turn replays it owns.
+    ///
+    /// A stream that fails after the model produced visible output is replayed
+    /// by the session rather than by the client's retry middleware. This policy
+    /// decides the wait before each replay; its `max_attempts` bounds them.
+    #[must_use]
+    pub const fn with_turn_replay(mut self, policy: RetryPolicy) -> Self {
+        self.turn_replay = policy;
+        self
+    }
+
     /// What the installed policy says about one tool, or
     /// [`ToolAccess::Allowed`] when there is no policy.
     #[must_use]
-    pub fn tool_access_for(&self, tool_name: &str) -> ToolAccess {
+    pub(crate) fn tool_access_for(&self, tool_name: &str) -> ToolAccess {
         self.tool_access_policy
             .as_ref()
             .map_or(ToolAccess::Allowed, |policy| {
@@ -391,7 +568,8 @@ impl CodingAgentOptions {
 
     /// Whether one tool is advertised to the model.
     #[must_use]
-    pub fn exposes_tool(&self, tool_name: &str) -> bool {
+    #[cfg(test)]
+    pub(crate) fn exposes_tool(&self, tool_name: &str) -> bool {
         self.tool_access_policy.as_ref().is_none_or(|policy| {
             policy
                 .access_for_tool(tool_name)
@@ -404,7 +582,7 @@ impl CodingAgentOptions {
     /// The message is what the model reads in place of the call's output, so a
     /// model that calls a tool it was never shown learns why.
     #[must_use]
-    pub fn tool_access_denial_reason(&self, tool_name: &str) -> Option<String> {
+    pub(crate) fn tool_access_denial_reason(&self, tool_name: &str) -> Option<String> {
         self.tool_access_policy.as_ref()?;
         match self.tool_access_for(tool_name) {
             ToolAccess::Allowed => None,

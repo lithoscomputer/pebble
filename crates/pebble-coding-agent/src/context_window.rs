@@ -32,7 +32,7 @@ use crate::types::{
 
 /// The warning a snapshot carries once a skill has been expanded into the
 /// conversation.
-pub const ACTIVATED_SKILL_WARNING: &str = "activated_skill_context_counted_as_conversation";
+pub(crate) const ACTIVATED_SKILL_WARNING: &str = "activated_skill_context_counted_as_conversation";
 
 /// Everything one snapshot is measured from.
 ///
@@ -45,33 +45,33 @@ pub const ACTIVATED_SKILL_WARNING: &str = "activated_skill_context_counted_as_co
 /// so it is plainly constructible and a member added later is a breaking
 /// change.
 #[derive(Debug, Clone, Copy)]
-pub struct ContextWindowInput<'a> {
+pub(crate) struct ContextWindowInput<'a> {
     /// The request whose tokens are being counted.
-    pub request: &'a Request,
+    pub(crate) request: &'a Request,
     /// The tools the request advertises, with where each came from.
-    pub tools: &'a [ToolDefinitionWithSource],
+    pub(crate) tools: &'a [ToolDefinitionWithSource],
     /// The assembled system prompt, used to recognize the system message.
-    pub system_prompt: &'a str,
+    pub(crate) system_prompt: &'a str,
     /// What the memory files contribute to the system prompt, from
     /// [`memory_prompt_tokens`]. Computed once per session rather than here,
     /// because the memory never changes after initialization.
-    pub memory_tokens: u64,
+    pub(crate) memory_tokens: u64,
     /// What the skills section contributes to the system prompt, from
     /// [`skills_prompt_tokens`]. Fixed per session, like the memory.
-    pub skills_tokens: u64,
+    pub(crate) skills_tokens: u64,
     /// Whether a skill has been expanded into the conversation this session.
-    pub activated_skill_context_observed: bool,
+    pub(crate) activated_skill_context_observed: bool,
     /// The provider the request will be routed to.
-    pub provider: &'a str,
+    pub(crate) provider: &'a str,
     /// The catalog identifier of the model the request will be routed to.
-    pub model: &'a str,
+    pub(crate) model: &'a str,
     /// The model's context window, in tokens.
-    pub context_window_tokens: usize,
+    pub(crate) context_window_tokens: usize,
 }
 
 /// Measures a request locally, attributing every token to a category.
 #[must_use]
-pub fn build_local_snapshot(input: ContextWindowInput<'_>) -> ContextWindowSnapshot {
+pub(crate) fn build_local_snapshot(input: ContextWindowInput<'_>) -> ContextWindowSnapshot {
     let mut builder = BreakdownBuilder::default();
     let mut warnings = Vec::new();
 
@@ -106,7 +106,7 @@ pub fn build_local_snapshot(input: ContextWindowInput<'_>) -> ContextWindowSnaps
 /// would tell a reader that the number in front of them is uncertain when it is
 /// not.
 #[must_use]
-pub fn scaled_snapshot(
+pub(crate) fn scaled_snapshot(
     local: &ContextWindowSnapshot,
     input_tokens: u64,
     count_method: ContextWindowCountMethod,
@@ -141,7 +141,7 @@ pub fn scaled_snapshot(
 /// A response that reported no prompt tokens leaves the local snapshot alone,
 /// because zero is not a measurement.
 #[must_use]
-pub fn context_window_from_response_usage(
+pub(crate) fn context_window_from_response_usage(
     local: &ContextWindowSnapshot,
     usage: TokenUsage,
 ) -> ContextWindowSnapshot {
@@ -284,7 +284,7 @@ fn message_text_is(message: &Message, expected: &str) -> bool {
 /// every [`ContextWindowInput`], because the memory is fixed for the session's
 /// life.
 #[must_use]
-pub fn memory_prompt_tokens(memory: &[MemoryDocument]) -> u64 {
+pub(crate) fn memory_prompt_tokens(memory: &[MemoryDocument]) -> u64 {
     text_tokens(&memory_prompt_suffix(
         memory.iter().map(|document| document.content.as_str()),
     ))
@@ -294,7 +294,7 @@ pub fn memory_prompt_tokens(memory: &[MemoryDocument]) -> u64 {
 ///
 /// Fixed per session, like [`memory_prompt_tokens`].
 #[must_use]
-pub fn skills_prompt_tokens(skills: &[Skill], vocabulary: ToolVocabulary) -> u64 {
+pub(crate) fn skills_prompt_tokens(skills: &[Skill], vocabulary: ToolVocabulary) -> u64 {
     text_tokens(&skills_prompt_suffix(skills, vocabulary))
 }
 

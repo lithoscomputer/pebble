@@ -1,10 +1,13 @@
-//! Durable coding events and the event delivery pipeline.
+//! Durable coding events, the sink that records them, and retry observation.
+//!
+//! Every event a coding agent publishes is a [`CodingAgentEvent`]: a numbered
+//! envelope around one [`CodingEvent`]. An application records them through an
+//! [`EventSink`] and watches them live through
+//! [`CodingAgent::subscribe`](crate::CodingAgent::subscribe). The serialized
+//! form of both is public API.
 
 pub use crate::error::{ErrorData, ErrorKind};
-pub use crate::event::{
-    DEFAULT_EVENT_CAPACITY, Emitter, EventCapacity, EventOptions, EventPump, EventSink,
-    EventSinkError, OutputCaptureStats, SessionBoundEmitter,
-};
+pub use crate::event::{DEFAULT_EVENT_CAPACITY, EventCapacity, EventSink, EventSinkError};
 pub use crate::reasoning::ReasoningOutput;
 pub use crate::runtime::RetryEventObserver;
 pub use crate::types::{

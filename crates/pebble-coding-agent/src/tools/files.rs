@@ -1,8 +1,9 @@
 //! Reading and changing files.
 //!
-//! Every one of these acts through [`Environment`](crate::Environment), so a
-//! session working in a container edits the container's files and a session
-//! working on this machine edits these.
+//! Every one of these acts through
+//! [`Environment`](crate::environment::Environment), so a session working in a
+//! container edits the container's files and a session working on this machine
+//! edits these.
 
 use std::fmt::Write as _;
 use std::sync::Arc;

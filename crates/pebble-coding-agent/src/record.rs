@@ -168,9 +168,9 @@ pub enum RecordMigrationError {
 
 /// One stored conversation turn.
 ///
-/// The mirror of [`crate::resources::Message`]. The two forms hold the same
-/// facts: [`crate::resources::Message::to_stored_message`] writes one and
-/// [`crate::resources::Message::from_stored_message`] reads it back, keeping
+/// The mirror of [`crate::state::Message`]. The two forms hold the same
+/// facts: [`crate::state::Message::to_stored_message`] writes one and
+/// [`crate::state::Message::from_stored_message`] reads it back, keeping
 /// every field. Timestamps are the one place the serialized form is coarser
 /// than the turn it came from, because they are written with millisecond
 /// precision.

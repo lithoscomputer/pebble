@@ -15,7 +15,7 @@ use lithos_llm::types::{ToolCall, ToolResult};
 use serde_json::Value;
 
 use crate::tool::{NativeTool, canonical_tool_name};
-use crate::tools::{PatchOperation, parse_apply_patch};
+use crate::tools::apply_patch::{PatchOperation, parse_apply_patch};
 
 /// What a session did to one file.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -30,41 +30,41 @@ struct FileOps {
 /// Paths are kept in sorted order, so the rendered section is stable between
 /// prompts that did the same work.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct FileTracker {
+pub(crate) struct FileTracker {
     files: BTreeMap<String, FileOps>,
 }
 
 impl FileTracker {
     /// Records that a file was read.
-    pub fn record_read(&mut self, path: &str) {
+    pub(crate) fn record_read(&mut self, path: &str) {
         self.files.entry(path.to_owned()).or_default().read = true;
     }
 
     /// Records that a file was written whole.
-    pub fn record_write(&mut self, path: &str) {
+    pub(crate) fn record_write(&mut self, path: &str) {
         self.files.entry(path.to_owned()).or_default().written = true;
     }
 
     /// Records that a file was edited in place.
-    pub fn record_edit(&mut self, path: &str) {
+    pub(crate) fn record_edit(&mut self, path: &str) {
         self.files.entry(path.to_owned()).or_default().edited = true;
     }
 
     /// Whether no file has been touched.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.files.is_empty()
     }
 
     /// How many distinct files have been touched.
     #[must_use]
-    pub fn file_count(&self) -> usize {
+    pub(crate) fn file_count(&self) -> usize {
         self.files.len()
     }
 
     /// The tracked files as one Markdown list, one line per path.
     ///
-    /// ```
+    /// ```ignore
     /// # use pebble_coding_agent::resources::FileTracker;
     /// let mut tracker = FileTracker::default();
     /// tracker.record_read("src/lib.rs");
@@ -72,7 +72,7 @@ impl FileTracker {
     /// assert_eq!(tracker.render(), "- src/lib.rs (read, edited)\n");
     /// ```
     #[must_use]
-    pub fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         let mut output = String::new();
         for (path, ops) in &self.files {
             let mut labels = Vec::new();
@@ -95,7 +95,11 @@ impl FileTracker {
     /// Calls and results are paired in order, which is the order
     /// [`ToolDispatch`](crate::tools::ToolDispatch) answers them in. A call
     /// whose result reports an error is skipped: the file was not touched.
-    pub fn record_from_tool_calls(&mut self, tool_calls: &[ToolCall], results: &[ToolResult]) {
+    pub(crate) fn record_from_tool_calls(
+        &mut self,
+        tool_calls: &[ToolCall],
+        results: &[ToolResult],
+    ) {
         for (call, result) in tool_calls.iter().zip(results) {
             if result.is_error {
                 continue;

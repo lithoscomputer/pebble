@@ -8,13 +8,14 @@
 use std::sync::{Arc, Mutex};
 
 use lithos_llm::types::{Request, Role};
+use pebble_coding_agent::environment::Environment;
 use pebble_coding_agent::extensions::{
     SystemPromptContext, SystemPromptDecision, SystemPromptTransform,
 };
 use pebble_coding_agent::test_support::{
     MockEnvironment, ScriptedCall, message_text, scripted_client, text_response,
 };
-use pebble_coding_agent::{CodingAgent, CodingAgentOptions, Environment, ShutdownReason};
+use pebble_coding_agent::{CodingAgent, CodingAgentOptions, ShutdownReason};
 
 /// What an Ask Fabro persona says first.
 const ASK_FABRO: &str = "You are Ask Fabro. Answer questions about this repository; do not change \
@@ -217,11 +218,9 @@ async fn the_transform_is_shown_what_was_loaded_as_memory_and_skills() {
     round_with(
         Some(Arc::clone(&transform) as Arc<dyn SystemPromptTransform>),
         environment,
-        CodingAgentOptions {
-            memory_files: vec!["/work/AGENTS.md".to_owned()],
-            skill_dirs: vec!["/skills".to_owned()],
-            ..CodingAgentOptions::default()
-        },
+        CodingAgentOptions::default()
+            .with_memory_files(["/work/AGENTS.md".to_owned()])
+            .with_skill_dirs(["/skills".to_owned()]),
     )
     .await;
 

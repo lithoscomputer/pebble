@@ -50,7 +50,7 @@ fn apply_patch_lark_grammar_definition() -> String {
 
 /// One line inside a hunk.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Change {
+pub(crate) enum Change {
     /// A line the patch expects to find and takes out.
     Remove(String),
     /// A line the patch puts in.
@@ -61,22 +61,22 @@ pub enum Change {
 
 /// One contiguous change to a file.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Hunk {
+pub(crate) struct Hunk {
     /// What the `@@` line named, or empty for a bare `@@`.
     ///
     /// A non-empty anchor is searched for first, and the hunk is matched below
     /// wherever it was found.
-    pub context_line: String,
+    pub(crate) context_line: String,
     /// The lines this hunk expects, takes out, and puts in.
-    pub changes:      Vec<Change>,
+    pub(crate) changes:      Vec<Change>,
     /// Whether the hunk was marked `*** End of File`, which pins it to the end
     /// of the file rather than the first place it matches.
-    pub end_of_file:  bool,
+    pub(crate) end_of_file:  bool,
 }
 
 /// One file operation a patch asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PatchOperation {
+pub(crate) enum PatchOperation {
     /// Write a whole new file. An existing file at the path is overwritten,
     /// which is what Codex does.
     Add {
@@ -129,7 +129,7 @@ fn extract_context_line(line: &str) -> String {
 /// text is not a patch: the envelope is missing, a hunk holds a line with no
 /// `+`, `-`, or space prefix, or an `Add`/`Update` block is empty. The model
 /// repairs every one of those by sending a different patch.
-pub fn parse_apply_patch(text: &str) -> Result<Vec<PatchOperation>, ToolError> {
+pub(crate) fn parse_apply_patch(text: &str) -> Result<Vec<PatchOperation>, ToolError> {
     let lines: Vec<&str> = text.trim().lines().collect();
     let lines = patch_lines_with_valid_boundaries(&lines)?;
     let mut ops = Vec::new();
@@ -323,7 +323,7 @@ fn check_patch_boundaries_strict(lines: &[&str]) -> Result<(), ToolError> {
 /// because the model repairs those by reading the file and sending a different
 /// patch. A failure of the environment itself keeps the kind the environment
 /// reported.
-pub async fn apply_patch_operations(
+pub(crate) async fn apply_patch_operations(
     ops: &[PatchOperation],
     env: &dyn Environment,
 ) -> Result<String, ToolError> {

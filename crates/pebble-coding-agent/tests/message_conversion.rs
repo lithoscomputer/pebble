@@ -14,7 +14,7 @@ use lithos_llm::types::{
     ContentPart, Message as LlmMessage, ReasoningContent, Role, ToolCall, ToolCallKind, ToolResult,
 };
 use pebble_coding_agent::events::TokenUsage;
-use pebble_coding_agent::resources::{History, Message};
+use pebble_coding_agent::state::{History, Message};
 use serde_json::json;
 
 fn moment() -> SystemTime {

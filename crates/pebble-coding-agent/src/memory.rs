@@ -23,7 +23,7 @@ use crate::error::{Error, InterruptReason, Result};
 use crate::types::MemoryFileSummary;
 
 /// The total bytes of memory one session loads.
-pub const MEMORY_BUDGET_BYTES: usize = 32_768;
+pub(crate) const MEMORY_BUDGET_BYTES: usize = 32_768;
 
 /// What replaces the text the budget could not fit.
 const TRUNCATION_MARKER: &str = "[Project instructions truncated at 32KB]";
@@ -35,23 +35,23 @@ const TRUNCATION_MARKER: &str = "[Project instructions truncated at 32KB]";
 /// [`MemoryLoaded`](crate::events::CodingEvent::MemoryLoaded) event, which
 /// deliberately carries the description and never the text.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MemoryDocument {
+pub(crate) struct MemoryDocument {
     /// The path the file was read from.
-    pub path:         String,
+    pub(crate) path:         String,
     /// The text loaded into the system prompt, already cut to the budget.
-    pub content:      String,
+    pub(crate) content:      String,
     /// The file's full size, in bytes.
-    pub byte_count:   usize,
+    pub(crate) byte_count:   usize,
     /// How many bytes of it were loaded.
-    pub loaded_bytes: usize,
+    pub(crate) loaded_bytes: usize,
     /// Whether the budget cut the file short.
-    pub truncated:    bool,
+    pub(crate) truncated:    bool,
 }
 
 impl MemoryDocument {
     /// The description of this file that the event stream carries.
     #[must_use]
-    pub fn to_summary(&self) -> MemoryFileSummary {
+    pub(crate) fn to_summary(&self) -> MemoryFileSummary {
         MemoryFileSummary {
             path:         self.path.clone(),
             byte_count:   self.byte_count,
@@ -75,7 +75,7 @@ impl MemoryDocument {
 ///
 /// Returns [`Error::Interrupted`] when `cancel` fires, which is checked around
 /// every read.
-pub async fn load_memory(
+pub(crate) async fn load_memory(
     env: &dyn Environment,
     paths: &[String],
     cancel: &CancellationToken,

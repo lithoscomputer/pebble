@@ -23,7 +23,7 @@ const TURN_THRESHOLD: usize = 10;
 /// [`maybe_task_reminder`] recognizes an earlier reminder by comparing a system
 /// turn's trimmed text to this, so the text is part of the module's behavior
 /// rather than decoration.
-pub const TASK_REMINDER_TEXT: &str = "\
+pub(crate) const TASK_REMINDER_TEXT: &str = "\
 <system-reminder>
 TaskCreate and TaskUpdate are available but have not been used in the last 10 assistant turns. For multi-step work, create tasks with TaskCreate and keep progress current with TaskUpdate.
 </system-reminder>";
@@ -34,13 +34,16 @@ TaskCreate and TaskUpdate are available but have not been used in the last 10 as
 /// the model sees them. Both task tools must be there: a reminder to use a tool
 /// that is not registered would send the model after something it cannot call.
 ///
-/// ```
+/// ```ignore
 /// # use pebble_coding_agent::resources::{History, maybe_task_reminder};
 /// let history = History::default();
 /// assert!(maybe_task_reminder(&history, &["TaskCreate", "TaskUpdate"]).is_none());
 /// ```
 #[must_use]
-pub fn maybe_task_reminder(history: &History, available_tool_names: &[&str]) -> Option<String> {
+pub(crate) fn maybe_task_reminder(
+    history: &History,
+    available_tool_names: &[&str],
+) -> Option<String> {
     if !task_tools_available(available_tool_names) {
         return None;
     }

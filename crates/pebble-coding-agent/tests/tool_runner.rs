@@ -8,13 +8,14 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use lithos_llm::types::{ContentPart, ToolCall, ToolDefinition, ToolResult};
+use pebble_coding_agent::CodingAgentOptions;
+use pebble_coding_agent::environment::Environment;
 use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent};
 use pebble_coding_agent::test_support::MockEnvironment;
 use pebble_coding_agent::tools::{
     CodingToolSet, RegisteredTool, ToolAccess, ToolAccessPolicy, ToolApprovalAdapter, ToolError,
     ToolErrorKind, ToolExposureMode, ToolHookCallback, ToolHookDecision, ToolRunner, ToolSource,
 };
-use pebble_coding_agent::{CodingAgentOptions, Environment};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
@@ -235,11 +236,12 @@ async fn a_runner_reads_and_writes_through_the_environment_and_reports_each_call
 
 #[tokio::test]
 async fn a_runner_applies_the_policy_a_session_would() {
-    let (runner, log) = runner_with(mock_environment(), CodingAgentOptions {
-        tool_access_policy: Some(Arc::new(Denying("shell"))),
-        tool_exposure_mode: ToolExposureMode::IncludeRequiresApproval,
-        ..CodingAgentOptions::default()
-    });
+    let (runner, log) = runner_with(
+        mock_environment(),
+        CodingAgentOptions::default()
+            .with_tool_access_policy(Arc::new(Denying("shell")))
+            .with_tool_exposure_mode(ToolExposureMode::IncludeRequiresApproval),
+    );
 
     let result = runner
         .run(
@@ -260,10 +262,11 @@ async fn a_runner_applies_the_policy_a_session_would() {
 #[tokio::test]
 async fn a_runner_calls_the_hooks_a_session_would() {
     let hooks = Arc::new(HookLog::default());
-    let (runner, _log) = runner_with(mock_environment(), CodingAgentOptions {
-        tool_hooks: Some(Arc::clone(&hooks) as Arc<dyn ToolHookCallback>),
-        ..CodingAgentOptions::default()
-    });
+    let (runner, _log) = runner_with(
+        mock_environment(),
+        CodingAgentOptions::default()
+            .with_tool_hooks(Arc::clone(&hooks) as Arc<dyn ToolHookCallback>),
+    );
 
     let ok = runner
         .run(
@@ -298,12 +301,12 @@ async fn a_runner_calls_the_hooks_a_session_would() {
 
 #[tokio::test]
 async fn a_hook_that_blocks_a_call_answers_it_with_the_reason() {
-    let (runner, _log) = runner_with(mock_environment(), CodingAgentOptions {
-        tool_hooks: Some(Arc::new(ToolApprovalAdapter(Arc::new(
+    let (runner, _log) = runner_with(
+        mock_environment(),
+        CodingAgentOptions::default().with_tool_hooks(Arc::new(ToolApprovalAdapter(Arc::new(
             |name, _arguments| Err(format!("{name} is not allowed from a hook")),
         )))),
-        ..CodingAgentOptions::default()
-    });
+    );
 
     let result = runner
         .run(
@@ -333,10 +336,7 @@ async fn a_runner_bounds_output_like_a_session() {
         CodingToolSet::core().with_tool(big),
         mock_environment() as Arc<dyn Environment>,
     )
-    .options(CodingAgentOptions {
-        tool_output_retention_bytes: 4_096,
-        ..CodingAgentOptions::default()
-    })
+    .options(CodingAgentOptions::default().with_tool_output_retention_bytes(4_096))
     .on_event(move |event| {
         recorder
             .0
@@ -377,7 +377,7 @@ async fn an_unknown_tool_and_a_cancelled_call_are_both_answered() {
         ToolDefinition::function("waits", "Waits until cancelled", json!({})),
         Arc::new(|_arguments, context| {
             Box::pin(async move {
-                context.cancel.cancelled().await;
+                context.cancel().cancelled().await;
                 Err(ToolError::cancelled("Cancelled"))
             })
         }),

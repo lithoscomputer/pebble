@@ -6,17 +6,21 @@
 //! agent, [`CodingAgent::prompt`] to process one prompt, and
 //! [`CodingAgent::shutdown`] to close its owned work.
 //!
-//! Pebble keeps its root API small. Durable event types are in [`events`]. Tool
-//! contracts and built-in tools are in [`tools`]. Durable state is in
-//! [`resources`]. Optional application services are in [`extensions`], and
-//! subagent construction is in [`subagents`].
+//! Pebble keeps its root API small, with one public path for each supported
+//! concept. The environment a session acts through is in [`environment`].
+//! Durable event types and the sink that records them are in [`events`]. Tool
+//! contracts, built-in tools, and the standalone tool runner are in [`tools`].
+//! Durable state is in [`state`]. Optional application services — human input,
+//! search, redaction, the prompt transform — are in [`extensions`], and
+//! subagent configuration is in [`subagents`]. The runtime underneath is not
+//! public.
 
 mod char_boundary;
 mod coding_agent;
 mod compaction;
 mod config;
 mod context_window;
-mod environment;
+pub mod environment;
 mod error;
 mod event;
 pub mod events;
@@ -32,10 +36,10 @@ mod prompt_transform;
 mod reasoning;
 mod record;
 mod redact;
-pub mod resources;
 mod runtime;
 mod search;
 mod skills;
+pub mod state;
 mod subagent;
 pub mod subagents;
 mod task_reminder;
@@ -63,10 +67,5 @@ pub use self::coding_agent::{
     SteeringMessage, SteeringOutcome,
 };
 pub use self::config::CodingAgentOptions;
-pub use self::environment::{
-    CallerEnvPolicy, DEFAULT_EXEC_OUTPUT_TAIL_BYTES, DirEntry, EnvResult, Environment,
-    EnvironmentError, EnvironmentErrorKind, ExecOutcome, ExecRequest, ExecResult, GrepOptions,
-    LocalEnvironment, format_lines_numbered,
-};
-pub use self::error::{Error, InterruptReason, Result};
+pub use self::error::{CompactionError, Error, InterruptReason, Result};
 pub use self::runtime::SteeringLease;

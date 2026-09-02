@@ -15,13 +15,16 @@ mod registry;
 mod runner;
 
 pub use self::error::ToolError;
-pub(crate) use self::execution::result_text;
-pub use self::execution::{ToolDispatch, validate_tool_args};
-pub use self::native::{NativeTool, ToolVocabulary};
-pub use self::permissions::{canonical_tool_name, known_tool_category, tool_category};
+pub(crate) use self::execution::{ToolDispatch, result_text};
+pub(crate) use self::native::{NativeTool, ToolVocabulary};
+pub use self::permissions::canonical_tool_name;
+#[cfg(test)]
+pub(crate) use self::permissions::{known_tool_category, tool_category};
 pub use self::registry::{
-    CodingEventEmitter, RegisteredTool, StaticEnvProvider, ToolContext, ToolDefinitionWithSource,
-    ToolEnvProvider, ToolExecutor, ToolRegistry,
+    CodingEventEmitter, RegisteredTool, StaticEnvProvider, ToolContext, ToolEnvProvider,
+    ToolExecutor,
 };
-pub(crate) use self::registry::{optional_usize_arg, required_str};
+pub(crate) use self::registry::{
+    ToolDefinitionWithSource, ToolRegistry, optional_usize_arg, required_str,
+};
 pub use self::runner::{CodingToolSet, ToolEventCallback, ToolRunner};

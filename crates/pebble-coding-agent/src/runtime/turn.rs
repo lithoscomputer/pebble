@@ -13,7 +13,7 @@ use lithos_llm::types::{
     ToolCall, ToolResult,
 };
 use pebble_agent as agent;
-use pebble_agent::advanced::{ToolRoundContext, ToolRoundExecutor};
+use pebble_agent::integration::{ToolRoundContext, ToolRoundExecutor};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 

@@ -150,7 +150,7 @@ pub enum CallerEnvPolicy {
 /// than the filtered one.
 ///
 /// ```no_run
-/// use pebble_coding_agent::{Environment, LocalEnvironment};
+/// use pebble_coding_agent::environment::{Environment, LocalEnvironment};
 ///
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// let environment = LocalEnvironment::new("/work/project");

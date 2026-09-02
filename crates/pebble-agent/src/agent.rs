@@ -14,10 +14,10 @@ use lithos_llm::types::{
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::advanced::{StreamObserver, StreamOutcome, stream_response};
 use crate::control::{AgentControlHandle, Control};
 use crate::error::{AgentBuildError, AgentError, Result};
 use crate::event::{AgentEvent, EventHub, EventProjection, FirstOutputKind};
+use crate::integration::{StreamObserver, StreamOutcome, stream_response};
 use crate::model::ModelService;
 use crate::tool::{
     BeforeToolCall, Tool, ToolAccess, ToolAccessContext, ToolAccessPolicy, ToolCallContext,

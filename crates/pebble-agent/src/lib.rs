@@ -69,8 +69,14 @@ pub use self::turn::{
     TurnBoundaryAction, TurnBoundaryContext, TurnBoundaryError, TurnBoundaryHooks, TurnContext,
 };
 
-/// Lower-level turn primitives for specialized agent layers.
-pub mod advanced {
+/// The small specialization interface a layer built on this crate uses.
+///
+/// `pebble-coding-agent` is that layer. It observes the response stream as it
+/// arrives, executes complete tool rounds with its own policy and events, and
+/// validates tool arguments the way the generic loop does. Nothing here is
+/// needed to run an [`Agent`] directly, and the surface stays this small on
+/// purpose: it is the contract between the two crates, not a second API.
+pub mod integration {
     pub use crate::stream::{StreamObserver, StreamOutcome, stream_response};
     pub use crate::tool::{ToolRoundContext, ToolRoundExecutor};
     pub use crate::validation::{ToolArgumentsError, validate_tool_arguments};

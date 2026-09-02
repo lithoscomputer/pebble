@@ -33,7 +33,7 @@ use crate::types::AgentProfileKind;
 
 /// The context window pebble assumes for a model the catalog says nothing
 /// about.
-pub const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 200_000;
+pub(crate) const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 200_000;
 
 /// What a system prompt says about where the session is working.
 ///
@@ -48,8 +48,8 @@ pub struct EnvContext {
     /// Where the session's tools act.
     pub working_directory:  String,
     /// The operating system family, as
-    /// [`Environment::platform`](crate::Environment::platform) names it:
-    /// `darwin`, `linux`, `windows`, or `unknown`.
+    /// [`Environment::platform`](crate::environment::Environment::platform)
+    /// names it: `darwin`, `linux`, `windows`, or `unknown`.
     pub platform:           String,
     /// The operating system version, as the host reports it.
     pub os_version:         String,
@@ -104,10 +104,10 @@ impl EnvContext {
 /// profile with no subagent story of its own inherits.
 #[derive(Clone, Default)]
 #[non_exhaustive]
-pub struct SubagentSupport {
+pub(crate) struct SubagentSupport {
     /// How deep in the session tree the session being built sits, counting the
     /// root as zero.
-    pub depth:             usize,
+    pub(crate) depth:      usize,
     /// The supervisor this session's children run under, when the application
     /// configured subagents at all.
     pub(crate) supervisor: Option<SubagentSupervisor>,
@@ -149,19 +149,19 @@ impl SubagentSupport {
 /// profile carries no model facts at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct ModelFacts {
+pub(crate) struct ModelFacts {
     /// How many tokens the model's context window holds.
-    pub context_window_tokens: usize,
+    pub(crate) context_window_tokens: usize,
     /// The most tokens the model may produce in one response, when the catalog
     /// says.
-    pub max_output_tokens:     Option<u64>,
+    pub(crate) max_output_tokens:     Option<u64>,
     /// Whether the model spends output tokens on reasoning without being asked
     /// to.
     ///
     /// A provider's output limit covers reasoning and visible text together, so
     /// a budget sized for the text alone can be spent entirely on thinking and
     /// return an empty response. Compaction adds headroom where this is set.
-    pub reasons_by_default:    bool,
+    pub(crate) reasons_by_default:    bool,
 }
 
 impl ModelFacts {
@@ -179,7 +179,8 @@ impl ModelFacts {
     /// # let _ = facts;
     /// ```
     #[must_use]
-    pub fn new() -> Self {
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -197,7 +198,7 @@ impl ModelFacts {
     /// [`CodingAgentBuilder`](crate::CodingAgentBuilder) applies
     /// on top of this.
     #[must_use]
-    pub fn from_catalog_model(model: &CatalogModel) -> Self {
+    pub(crate) fn from_catalog_model(model: &CatalogModel) -> Self {
         let capabilities = model.capabilities();
         let reasons_by_default = capabilities.reasoning && capabilities.reasoning_effort_levels;
         model.limits().map_or(
@@ -215,21 +216,23 @@ impl ModelFacts {
 
     /// The same facts, with the context window set.
     #[must_use]
-    pub fn with_context_window_tokens(mut self, tokens: usize) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_context_window_tokens(mut self, tokens: usize) -> Self {
         self.context_window_tokens = tokens;
         self
     }
 
     /// The same facts, with the output limit set.
     #[must_use]
-    pub fn with_max_output_tokens(mut self, tokens: Option<u64>) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_max_output_tokens(mut self, tokens: Option<u64>) -> Self {
         self.max_output_tokens = tokens;
         self
     }
 
     /// The same facts, saying whether the model reasons without being asked to.
     #[must_use]
-    pub fn with_reasons_by_default(mut self, reasons_by_default: bool) -> Self {
+    pub(crate) fn with_reasons_by_default(mut self, reasons_by_default: bool) -> Self {
         self.reasons_by_default = reasons_by_default;
         self
     }
@@ -257,7 +260,7 @@ impl Default for ModelFacts {
 /// Everything here is asked once, while a session is being built. A profile is
 /// then shared and read-only, so implementations must be cheap to call and must
 /// answer the same way every time.
-pub trait AgentProfile: Send + Sync {
+pub(crate) trait AgentProfile: Send + Sync {
     /// Which harness this profile implements.
     fn profile_kind(&self) -> AgentProfileKind;
 

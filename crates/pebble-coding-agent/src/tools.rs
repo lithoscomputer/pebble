@@ -6,10 +6,11 @@
 //! and the registry decides what the model sees them called, so the same
 //! `read_file` here is `Read` to a model that expects that name.
 //!
-//! Every one of them acts through [`Environment`](crate::Environment) — no
-//! tool touches a file or starts a process itself — which is what lets a
-//! session work inside a container, on a remote workspace, or against a test
-//! double without any of them knowing.
+//! Every one of them acts through
+//! [`Environment`](crate::environment::Environment) — no tool touches a file or
+//! starts a process itself — which is what lets a session work inside a
+//! container, on a remote workspace, or against a test double without any of
+//! them knowing.
 //!
 //! What a tool answers with is the model's to read, so the strings here are
 //! part of pebble's contract: the schemas, the descriptions, the rendered
@@ -31,9 +32,7 @@ pub(crate) mod todo;
 pub(crate) mod web;
 pub(crate) mod web_search;
 
-pub use self::apply_patch::{
-    Change, Hunk, PatchOperation, apply_patch_operations, make_apply_patch_tool, parse_apply_patch,
-};
+pub use self::apply_patch::make_apply_patch_tool;
 pub use self::files::{
     make_edit_file_tool, make_read_file_tool, make_read_many_files_tool, make_write_file_tool,
 };
@@ -43,7 +42,6 @@ pub use self::question::{
 };
 pub use self::search::{grep_result_path, make_glob_tool, make_grep_tool, make_list_dir_tool};
 pub use self::shell::{make_shell_tool, make_shell_tool_with_options};
-pub use self::skill::{make_use_skill_tool, make_use_skill_tool_for_vocabulary};
 pub use self::todo::{
     TodoRuntime, make_task_create_tool, make_task_get_tool, make_task_list_tool,
     make_task_update_tool, make_todo_list_tool, make_update_plan_tool,
@@ -54,15 +52,10 @@ pub use crate::config::{
     NativeToolOptions, ToolAccess, ToolAccessPolicy, ToolApprovalAdapter, ToolApprovalFn,
     ToolExposureMode, ToolHookCallback, ToolHookDecision,
 };
+pub use crate::event::OutputCaptureStats;
 pub use crate::tool::{
-    CodingEventEmitter, CodingToolSet, NativeTool, RegisteredTool, StaticEnvProvider, ToolContext,
-    ToolDefinitionWithSource, ToolDispatch, ToolEnvProvider, ToolError, ToolEventCallback,
-    ToolExecutor, ToolRegistry, ToolRunner, ToolVocabulary, canonical_tool_name,
-    known_tool_category, tool_category, validate_tool_args,
-};
-pub use crate::truncation::{
-    DEFAULT_TOOL_OUTPUT_RETENTION_BYTES, DEFAULT_TOOL_OUTPUT_SERIALIZED_BYTES, OutputBudgets,
-    ToolOutputLimits, TruncationMode, truncate_lines, truncate_output, truncate_tool_output,
+    CodingEventEmitter, CodingToolSet, RegisteredTool, StaticEnvProvider, ToolContext,
+    ToolEnvProvider, ToolError, ToolEventCallback, ToolExecutor, ToolRunner, canonical_tool_name,
 };
 pub use crate::types::{PermissionLevel, ToolCategory, ToolErrorKind, ToolSource, ToolSummary};
 

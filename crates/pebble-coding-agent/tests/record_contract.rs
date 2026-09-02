@@ -13,7 +13,7 @@ use lithos_llm::types::{
     ContentPart, Message as LlmMessage, ReasoningContent, Role, ToolCall, ToolCallKind, ToolResult,
 };
 use pebble_coding_agent::events::TokenUsage;
-use pebble_coding_agent::resources::{
+use pebble_coding_agent::state::{
     History, Message, SESSION_RECORD_FORMAT_VERSION, SessionRecord, StoredMessage,
 };
 use serde_json::json;

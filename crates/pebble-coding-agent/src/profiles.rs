@@ -1,6 +1,6 @@
 //! The harnesses pebble ships.
 //!
-//! Each module here implements [`AgentProfile`](crate::resources::AgentProfile)
+//! Each module here implements [`AgentProfile`](crate::state::AgentProfile)
 //! for one model family: the tools that family was trained to call, the names
 //! it expects them under, and a checked-in system prompt written the way it was
 //! trained to read one. A session never names a profile — it names a model, and
@@ -297,7 +297,7 @@ pub(crate) fn skills_prompt_suffix(skills: &[Skill], vocabulary: ToolVocabulary)
 /// template and nothing more.
 ///
 /// `vocabulary` is the profile's own — every caller passes
-/// [`AgentProfile::tool_vocabulary`](crate::resources::AgentProfile::tool_vocabulary) — so
+/// [`AgentProfile::tool_vocabulary`](crate::state::AgentProfile::tool_vocabulary) — so
 /// the skills section names the skill tool the way the registry will register
 /// it. Fabro set this on the template instead, where it could disagree with the
 /// registry the same profile built.

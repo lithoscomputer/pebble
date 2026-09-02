@@ -64,10 +64,8 @@ use crate::tool::{
     NativeTool, RegisteredTool, StaticEnvProvider, ToolDefinitionWithSource, ToolEnvProvider,
     ToolRegistry,
 };
-use crate::tools::{
-    WebFetchSummarizer, make_question_tool, make_use_skill_tool_for_vocabulary,
-    make_web_search_tool,
-};
+use crate::tools::skill::make_use_skill_tool_for_vocabulary;
+use crate::tools::{WebFetchSummarizer, make_question_tool, make_web_search_tool};
 #[cfg(test)]
 use crate::types::PermissionLevel;
 use crate::types::{

@@ -89,36 +89,85 @@ impl ToolEnvProvider for StaticEnvProvider {
 /// absent, and tools that need them say so rather than assuming a session.
 ///
 /// New members appear here as tools gain capabilities, so build a context with
-/// [`new`](Self::new) and the `with_*` methods rather than a struct literal.
-#[non_exhaustive]
+/// [`new`](Self::new) and the `with_*` methods rather than a struct literal,
+/// and read it through its accessors.
 pub struct ToolContext {
     /// Where the tool's work lands.
-    pub env:                  Arc<dyn Environment>,
+    pub(crate) env:                  Arc<dyn Environment>,
     /// Fires when this call should stop. Composed from the session's terminal
     /// cancellation and the current model turn's interrupt, so a tool that
     /// watches it observes both.
-    ///
-    /// Watching it is the tool's own responsibility, and the session waits for
-    /// the answer either way: a cancelled call is never dropped, because a call
-    /// with no result is a conversation the provider will refuse. A tool that
-    /// ignores this token therefore holds its turn — and the prompt ending it
-    /// — open until it returns, so long work must watch it and answer.
-    pub cancel:               CancellationToken,
+    pub(crate) cancel:               CancellationToken,
     /// Extra environment variables for a command this call runs.
-    pub tool_env_provider:    Option<Arc<dyn ToolEnvProvider>>,
+    pub(crate) tool_env_provider:    Option<Arc<dyn ToolEnvProvider>>,
     /// The session that called the tool.
-    pub session_id:           Option<String>,
+    pub(crate) session_id:           Option<String>,
+    /// The root of the session tree this call belongs to.
+    pub(crate) root_session_id:      Option<String>,
+    /// The model-native identifier of this call.
+    pub(crate) tool_call_id:         Option<String>,
+    /// Where the tool publishes events.
+    pub(crate) coding_event_emitter: Option<Arc<dyn CodingEventEmitter>>,
+    /// Where the tool asks the person a question.
+    pub(crate) human_input:          Option<Arc<dyn HumanInputProvider>>,
+    /// What strips secrets out of text the tool publishes.
+    pub(crate) redactor:             Arc<dyn Redactor>,
+}
+
+impl ToolContext {
+    /// Where the tool's work lands.
+    #[must_use]
+    pub const fn env(&self) -> &Arc<dyn Environment> {
+        &self.env
+    }
+
+    /// Fires when this call should stop.
+    ///
+    /// Composed from the session's terminal cancellation and the current model
+    /// turn's interrupt, so a tool that watches it observes both. Watching it
+    /// is the tool's own responsibility, and the session waits for the answer
+    /// either way: a cancelled call is never dropped, because a call with no
+    /// result is a conversation the provider will refuse. A tool that ignores
+    /// this token therefore holds its turn — and the prompt ending it — open
+    /// until it returns, so long work must watch it and answer.
+    #[must_use]
+    pub const fn cancel(&self) -> &CancellationToken {
+        &self.cancel
+    }
+
+    /// Where a command this call runs takes extra environment variables from.
+    #[must_use]
+    pub const fn tool_env_provider(&self) -> Option<&Arc<dyn ToolEnvProvider>> {
+        self.tool_env_provider.as_ref()
+    }
+
+    /// The session that called the tool, when the call runs inside one.
+    #[must_use]
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
+
     /// The root of the session tree this call belongs to. Equal to
     /// [`session_id`](Self::session_id) in a root session; a child inherits
     /// its parent's root.
-    pub root_session_id:      Option<String>,
+    #[must_use]
+    pub fn root_session_id(&self) -> Option<&str> {
+        self.root_session_id.as_deref()
+    }
+
     /// The model-native identifier of this call.
-    pub tool_call_id:         Option<String>,
-    /// Where the tool publishes events.
-    pub coding_event_emitter: Option<Arc<dyn CodingEventEmitter>>,
+    #[must_use]
+    pub fn tool_call_id(&self) -> Option<&str> {
+        self.tool_call_id.as_deref()
+    }
+
     /// Where the tool asks the person a question. Absent in child sessions and
     /// wherever the application installed no provider.
-    pub human_input:          Option<Arc<dyn HumanInputProvider>>,
+    #[must_use]
+    pub const fn human_input(&self) -> Option<&Arc<dyn HumanInputProvider>> {
+        self.human_input.as_ref()
+    }
+
     /// What strips secrets out of text the tool publishes.
     ///
     /// Only output leaving the session through an event goes through it — the
@@ -126,10 +175,11 @@ pub struct ToolContext {
     /// which is the same text the model would have read from the terminal.
     /// [`NoRedaction`](crate::extensions::NoRedaction) unless the application
     /// installed one.
-    pub redactor:             Arc<dyn Redactor>,
-}
+    #[must_use]
+    pub const fn redactor(&self) -> &Arc<dyn Redactor> {
+        &self.redactor
+    }
 
-impl ToolContext {
     /// A context that has an environment and nothing else.
     #[must_use]
     pub fn new(env: Arc<dyn Environment>) -> Self {
@@ -264,18 +314,30 @@ pub type ToolExecutor = Arc<
 pub struct RegisteredTool {
     /// What the model is told about the tool. The registry may rename it on
     /// insert; see [`ToolRegistry::register`].
-    pub definition: ToolDefinition,
+    pub(crate) definition: ToolDefinition,
     /// What runs when the model calls it.
-    pub executor:   ToolExecutor,
+    pub(crate) executor:   ToolExecutor,
     /// Where the tool came from.
-    pub source:     ToolSource,
+    pub(crate) source:     ToolSource,
     /// Whether a child session may be given this tool.
-    inheritable:    bool,
+    inheritable:           bool,
     /// Whether the tool parks a prompt on a person's answer.
-    human_input:    bool,
+    human_input:           bool,
 }
 
 impl RegisteredTool {
+    /// What the model is told about the tool.
+    #[must_use]
+    pub const fn definition(&self) -> &ToolDefinition {
+        &self.definition
+    }
+
+    /// Where the tool came from.
+    #[must_use]
+    pub const fn source(&self) -> &ToolSource {
+        &self.source
+    }
+
     /// Pairs a definition with what runs, as an application tool.
     ///
     /// The tool is root-only until
@@ -366,11 +428,11 @@ impl RegisteredTool {
 
 /// One registered tool's advertised half.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ToolDefinitionWithSource {
+pub(crate) struct ToolDefinitionWithSource {
     /// What the model is told about the tool.
-    pub definition: ToolDefinition,
+    pub(crate) definition: ToolDefinition,
     /// Where the tool came from.
-    pub source:     ToolSource,
+    pub(crate) source:     ToolSource,
 }
 
 impl ToolDefinitionWithSource {
@@ -380,7 +442,7 @@ impl ToolDefinitionWithSource {
     /// and belongs to no observer. `invoked` is `false`, because registration
     /// is not a call; a consumer reducing the event stream flips it.
     #[must_use]
-    pub fn to_tool_summary(&self) -> ToolSummary {
+    pub(crate) fn to_tool_summary(&self) -> ToolSummary {
         ToolSummary {
             name:        self.definition.name.clone(),
             description: self.definition.description.clone(),
@@ -399,7 +461,7 @@ impl ToolDefinitionWithSource {
 /// Registration is therefore a setup activity: nothing is added or removed
 /// while a prompt is in flight.
 #[derive(Clone)]
-pub struct ToolRegistry {
+pub(crate) struct ToolRegistry {
     tools:      HashMap<String, RegisteredTool>,
     /// The naming scheme applied to built-in tools as they are registered.
     ///
@@ -412,13 +474,13 @@ pub struct ToolRegistry {
 impl ToolRegistry {
     /// An empty registry speaking pebble's own tool names.
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_vocabulary(ToolVocabulary::Canonical)
     }
 
     /// An empty registry that exposes built-in tools under `vocabulary`.
     #[must_use]
-    pub fn with_vocabulary(vocabulary: ToolVocabulary) -> Self {
+    pub(crate) fn with_vocabulary(vocabulary: ToolVocabulary) -> Self {
         Self {
             tools: HashMap::new(),
             vocabulary,
@@ -427,7 +489,7 @@ impl ToolRegistry {
 
     /// The naming scheme this registry applies.
     #[must_use]
-    pub fn vocabulary(&self) -> ToolVocabulary {
+    pub(crate) fn vocabulary(&self) -> ToolVocabulary {
         self.vocabulary
     }
 
@@ -441,7 +503,7 @@ impl ToolRegistry {
     ///
     /// The tool is keyed by the name it ends up exposed under, and the last
     /// registration of a name wins.
-    pub fn register(&mut self, mut tool: RegisteredTool) {
+    pub(crate) fn register(&mut self, mut tool: RegisteredTool) {
         let native = match &tool.source {
             ToolSource::Native => NativeTool::from_canonical_name(&tool.definition.name),
             ToolSource::Skill if tool.definition.name == NativeTool::UseSkill.canonical_name() => {
@@ -461,19 +523,19 @@ impl ToolRegistry {
 
     /// The tool exposed under `name`.
     #[must_use]
-    pub fn get(&self, name: &str) -> Option<&RegisteredTool> {
+    pub(crate) fn get(&self, name: &str) -> Option<&RegisteredTool> {
         self.tools.get(name)
     }
 
     /// A built-in tool by identity, whatever vocabulary it is exposed under.
     #[must_use]
-    pub fn get_native(&self, tool: NativeTool) -> Option<&RegisteredTool> {
+    pub(crate) fn get_native(&self, tool: NativeTool) -> Option<&RegisteredTool> {
         self.tools.get(tool.name(self.vocabulary))
     }
 
     /// Every registered tool's definition, in no particular order.
     #[must_use]
-    pub fn definitions(&self) -> Vec<ToolDefinition> {
+    pub(crate) fn definitions(&self) -> Vec<ToolDefinition> {
         self.tools
             .values()
             .map(|tool| tool.definition.clone())
@@ -482,7 +544,7 @@ impl ToolRegistry {
 
     /// Every registered tool's definition and origin, in no particular order.
     #[must_use]
-    pub fn definitions_with_source(&self) -> Vec<ToolDefinitionWithSource> {
+    pub(crate) fn definitions_with_source(&self) -> Vec<ToolDefinitionWithSource> {
         // With no policy the exposure mode is never consulted.
         self.definitions_with_source_for_policy(None, ToolExposureMode::AutoApprovedOnly)
     }
@@ -491,7 +553,8 @@ impl ToolRegistry {
     ///
     /// No policy exposes everything.
     #[must_use]
-    pub fn definitions_for_policy(
+    #[cfg(test)]
+    pub(crate) fn definitions_for_policy(
         &self,
         policy: Option<&dyn ToolAccessPolicy>,
         exposure_mode: ToolExposureMode,
@@ -509,7 +572,7 @@ impl ToolRegistry {
     /// canonical names resolves them itself. See
     /// [`canonical_tool_name`](super::permissions::canonical_tool_name).
     #[must_use]
-    pub fn definitions_with_source_for_policy(
+    pub(crate) fn definitions_with_source_for_policy(
         &self,
         policy: Option<&dyn ToolAccessPolicy>,
         exposure_mode: ToolExposureMode,
@@ -533,7 +596,7 @@ impl ToolRegistry {
     /// The names every registered tool is exposed under, in no particular
     /// order.
     #[must_use]
-    pub fn names(&self) -> Vec<String> {
+    pub(crate) fn names(&self) -> Vec<String> {
         self.tools.keys().cloned().collect()
     }
 }

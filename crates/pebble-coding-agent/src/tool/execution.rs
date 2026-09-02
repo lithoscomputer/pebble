@@ -28,7 +28,7 @@ use std::time::Instant;
 use futures_util::future::join_all;
 use lithos_llm::types::{ContentPart, ToolCall, ToolCallKind, ToolDefinitionKind, ToolResult};
 use pebble_agent as agent;
-use pebble_agent::advanced::{ToolRoundContext, validate_tool_arguments};
+use pebble_agent::integration::{ToolRoundContext, validate_tool_arguments};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -69,7 +69,7 @@ const CANCELLED: &str = "Cancelled";
 /// round it belongs to. Construct it with [`new`](Self::new) and add the
 /// optional seams with the `with_*` methods.
 #[derive(Clone, Copy)]
-pub struct ToolDispatch<'a> {
+pub(crate) struct ToolDispatch<'a> {
     registry:          &'a ToolRegistry,
     env:               &'a Arc<dyn Environment>,
     config:            &'a CodingAgentOptions,
@@ -88,7 +88,7 @@ impl<'a> ToolDispatch<'a> {
     /// session passes the root of its tree, which is how a root-only tool
     /// knows it is running somewhere it should not.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         registry: &'a ToolRegistry,
         env: &'a Arc<dyn Environment>,
         config: &'a CodingAgentOptions,
@@ -111,7 +111,7 @@ impl<'a> ToolDispatch<'a> {
 
     /// Sets where a call's extra environment variables come from.
     #[must_use]
-    pub fn with_tool_env_provider(mut self, provider: &'a Arc<dyn ToolEnvProvider>) -> Self {
+    pub(crate) fn with_tool_env_provider(mut self, provider: &'a Arc<dyn ToolEnvProvider>) -> Self {
         self.tool_env_provider = Some(provider);
         self
     }
@@ -121,7 +121,7 @@ impl<'a> ToolDispatch<'a> {
     /// Absent in a child session and wherever the application installed no
     /// provider, which is what makes a question tool report that it cannot ask.
     #[must_use]
-    pub fn with_human_input(mut self, provider: &'a Arc<dyn HumanInputProvider>) -> Self {
+    pub(crate) fn with_human_input(mut self, provider: &'a Arc<dyn HumanInputProvider>) -> Self {
         self.human_input = Some(provider);
         self
     }
@@ -131,7 +131,7 @@ impl<'a> ToolDispatch<'a> {
     /// Without one, process output reaches the event stream exactly as the
     /// process wrote it.
     #[must_use]
-    pub fn with_redactor(mut self, redactor: &'a Arc<dyn Redactor>) -> Self {
+    pub(crate) fn with_redactor(mut self, redactor: &'a Arc<dyn Redactor>) -> Self {
         self.redactor = Some(redactor);
         self
     }
@@ -143,7 +143,8 @@ impl<'a> ToolDispatch<'a> {
     /// question runs alone. A call that finds `cancel` already fired is
     /// answered without being started, so the round still pairs a result with
     /// every call.
-    pub async fn execute(
+    #[cfg(test)]
+    pub(crate) async fn execute(
         &self,
         calls: &[ToolCall],
         parallel: bool,
@@ -185,7 +186,11 @@ impl<'a> ToolDispatch<'a> {
     }
 
     /// Answers one call, publishing the same events a round would.
-    pub async fn execute_one(&self, call: &ToolCall, cancel: CancellationToken) -> ToolResult {
+    pub(crate) async fn execute_one(
+        &self,
+        call: &ToolCall,
+        cancel: CancellationToken,
+    ) -> ToolResult {
         self.execute_one_with_agent_context(call, cancel, None)
             .await
     }
@@ -544,7 +549,10 @@ struct Retained {
 /// Returns a [`ToolError`] of kind
 /// [`InvalidArguments`](ToolErrorKind::InvalidArguments) naming every problem
 /// found, so a model can fix them all in one retry.
-pub fn validate_tool_args(kind: &ToolDefinitionKind, arguments: &Value) -> Result<(), ToolError> {
+pub(crate) fn validate_tool_args(
+    kind: &ToolDefinitionKind,
+    arguments: &Value,
+) -> Result<(), ToolError> {
     validate_tool_arguments(kind, arguments)
         .map_err(|error| ToolError::invalid_arguments(error.to_string()))
 }

@@ -282,7 +282,7 @@ fn sanitize_exec_output(text: &str) -> String {
 /// added later keeps compiling:
 ///
 /// ```
-/// use pebble_coding_agent::ExecRequest;
+/// use pebble_coding_agent::environment::ExecRequest;
 ///
 /// let request = ExecRequest {
 ///     timeout_ms: Some(30_000),
@@ -390,7 +390,7 @@ pub struct GrepOptions {
 /// `limit` the maximum number of lines.
 ///
 /// ```
-/// use pebble_coding_agent::format_lines_numbered;
+/// use pebble_coding_agent::environment::format_lines_numbered;
 ///
 /// assert_eq!(
 ///     format_lines_numbered("hello\nworld", None, None),

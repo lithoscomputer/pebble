@@ -228,7 +228,7 @@ mod tests {
     #[test]
     fn a_tool_registered_later_also_gets_a_kimi_code_name() {
         use crate::skills::Skill;
-        use crate::tools::make_use_skill_tool_for_vocabulary;
+        use crate::tools::skill::make_use_skill_tool_for_vocabulary;
 
         let mut registry = registry(&profile(false));
         registry.register(make_use_skill_tool_for_vocabulary(

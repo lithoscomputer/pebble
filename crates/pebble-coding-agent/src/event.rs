@@ -183,7 +183,7 @@ impl Default for EventSequence {
 /// A plain configuration record: name the fields that differ and take the rest
 /// from [`Default`].
 ///
-/// ```
+/// ```ignore
 /// # use pebble_coding_agent::events::{EventCapacity, EventOptions};
 /// let options = EventOptions {
 ///     capacity: EventCapacity::new(64),
@@ -191,22 +191,22 @@ impl Default for EventSequence {
 /// };
 /// ```
 #[derive(Clone, Default)]
-pub struct EventOptions {
+pub(crate) struct EventOptions {
     /// How many events the broadcast channel buffers for live subscribers.
     ///
     /// A subscriber that falls further behind than this observes
     /// `RecvError::Lagged`.
-    pub capacity: EventCapacity,
+    pub(crate) capacity: EventCapacity,
 
     /// The durable recorder, when the application configured one.
-    pub sink: Option<Arc<dyn EventSink>>,
+    pub(crate) sink: Option<Arc<dyn EventSink>>,
 
     /// The last sequence number a previous prompt of this session published.
     ///
     /// Zero for a new session;
-    /// [`crate::resources::SessionRecord::last_event_seq`] for a
+    /// [`crate::state::SessionRecord::last_event_seq`] for a
     /// resumed one.
-    pub resume_after_seq: u64,
+    pub(crate) resume_after_seq: u64,
 }
 
 impl fmt::Debug for EventOptions {
@@ -264,7 +264,7 @@ impl From<usize> for EventCapacity {
 /// closed — a tool task unwinding long after a session shut down changes
 /// nothing either way.
 #[derive(Clone, Debug)]
-pub struct Emitter {
+pub(crate) struct Emitter {
     outbox:    mpsc::UnboundedSender<Queued>,
     /// A weak handle to the broadcast side, upgraded only for the moment
     /// [`Emitter::subscribe`] takes to hand out a receiver.
@@ -284,7 +284,7 @@ type Queued = Option<CodingAgentEvent>;
 
 impl Emitter {
     /// Publishes an event this session produced.
-    pub fn emit(&self, session_id: impl Into<String>, event: CodingEvent) {
+    pub(crate) fn emit(&self, session_id: impl Into<String>, event: CodingEvent) {
         self.emit_with_tool_call_id(session_id, event, None);
     }
 
@@ -292,7 +292,7 @@ impl Emitter {
     ///
     /// The event is traced as it is queued, so the tracing order is the order
     /// producers emitted in rather than the published order.
-    pub fn emit_with_tool_call_id(
+    pub(crate) fn emit_with_tool_call_id(
         &self,
         session_id: impl Into<String>,
         event: CodingEvent,
@@ -315,7 +315,7 @@ impl Emitter {
     /// The child's `session_id`, `parent_session_id`, and timestamp pass
     /// through untouched; only the sequence number is reassigned, because a
     /// forwarded event takes its place in the parent's stream.
-    pub fn forward(&self, event: CodingAgentEvent) {
+    pub(crate) fn forward(&self, event: CodingAgentEvent) {
         self.queue(event);
     }
 
@@ -330,7 +330,7 @@ impl Emitter {
     /// receiver that is closed from its first read, which is what a stream
     /// nothing will ever publish to looks like.
     #[must_use]
-    pub fn subscribe(&self) -> broadcast::Receiver<CodingAgentEvent> {
+    pub(crate) fn subscribe(&self) -> broadcast::Receiver<CodingAgentEvent> {
         match self.published.upgrade() {
             Some(published) => published.subscribe(),
             None => ended_stream(),
@@ -350,13 +350,14 @@ impl Emitter {
     /// and after a sink refusal, or an emit into a stopped pipeline, the
     /// number names an event that was never published.
     #[must_use]
-    pub fn last_seq(&self) -> u64 {
+    pub(crate) fn last_seq(&self) -> u64 {
         self.sequence.last_reserved()
     }
 
     /// Whether the pump has stopped, so nothing further will be published.
     #[must_use]
-    pub fn is_closed(&self) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_closed(&self) -> bool {
         self.outbox.is_closed()
     }
 
@@ -405,7 +406,7 @@ fn ended_stream() -> broadcast::Receiver<CodingAgentEvent> {
 /// [`EventPump::run`] returns — every subscriber drains what it holds and then
 /// observes `RecvError::Closed`.
 #[must_use = "a pipeline publishes nothing until its pump runs"]
-pub struct EventPump {
+pub(crate) struct EventPump {
     inbox:     mpsc::UnboundedReceiver<Queued>,
     published: broadcast::Sender<CodingAgentEvent>,
     sequence:  Arc<EventSequence>,
@@ -430,7 +431,7 @@ impl EventPump {
     /// The [`Emitter`] is cloned to every producer; the pump is driven once.
     /// The pump keeps the sender and the emitter takes a weak handle, so the
     /// live stream lasts exactly as long as the pump does.
-    pub fn new(options: EventOptions) -> (Emitter, Self) {
+    pub(crate) fn new(options: EventOptions) -> (Emitter, Self) {
         let EventOptions {
             capacity,
             sink,
@@ -459,7 +460,7 @@ impl EventPump {
     /// Returns [`crate::Error::EventSink`] as soon as the sink refuses an
     /// event. The refused event, and anything still queued, is not published,
     /// because the prompt is over.
-    pub async fn run(mut self) -> Result<()> {
+    pub(crate) async fn run(mut self) -> Result<()> {
         while let Some(message) = self.inbox.recv().await {
             let Some(event) = message else {
                 break;
@@ -523,7 +524,7 @@ impl OutputCaptureStats {
 /// a tool never has to know either, and it carries the side channel a tool
 /// uses to report how much output it produced.
 #[derive(Clone, Debug)]
-pub struct SessionBoundEmitter {
+pub(crate) struct SessionBoundEmitter {
     emitter:      Emitter,
     session_id:   String,
     tool_call_id: Option<String>,
@@ -533,7 +534,7 @@ pub struct SessionBoundEmitter {
 impl SessionBoundEmitter {
     /// Binds an emitter to one session and, when there is one, one tool call.
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         emitter: Emitter,
         session_id: impl Into<String>,
         tool_call_id: Option<String>,
@@ -547,7 +548,7 @@ impl SessionBoundEmitter {
     }
 
     /// Publishes an event stamped with the bound identities.
-    pub fn emit(&self, event: CodingEvent) {
+    pub(crate) fn emit(&self, event: CodingEvent) {
         self.emitter.emit_with_tool_call_id(
             self.session_id.clone(),
             event,
@@ -559,7 +560,7 @@ impl SessionBoundEmitter {
     ///
     /// The last report wins; the execution layer drains it once the tool
     /// returns.
-    pub fn record_tool_output_stats(&self, stats: OutputCaptureStats) {
+    pub(crate) fn record_tool_output_stats(&self, stats: OutputCaptureStats) {
         *self
             .output_stats
             .lock()
@@ -567,7 +568,7 @@ impl SessionBoundEmitter {
     }
 
     /// Takes the reported output counts, leaving none behind.
-    pub fn take_tool_output_stats(&self) -> Option<OutputCaptureStats> {
+    pub(crate) fn take_tool_output_stats(&self) -> Option<OutputCaptureStats> {
         self.output_stats
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -576,13 +577,15 @@ impl SessionBoundEmitter {
 
     /// The session this view is bound to.
     #[must_use]
-    pub fn session_id(&self) -> &str {
+    #[cfg(test)]
+    pub(crate) fn session_id(&self) -> &str {
         &self.session_id
     }
 
     /// The tool call this view is bound to, when it is bound to one.
     #[must_use]
-    pub fn tool_call_id(&self) -> Option<&str> {
+    #[cfg(test)]
+    pub(crate) fn tool_call_id(&self) -> Option<&str> {
         self.tool_call_id.as_deref()
     }
 }

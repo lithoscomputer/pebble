@@ -29,7 +29,7 @@ use crate::types::ToolCategory;
 /// family, and the names it produces are what reach the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
-pub enum ToolVocabulary {
+pub(crate) enum ToolVocabulary {
     /// Pebble's own names, which are also the canonical identities the rest of
     /// the crate reasons about.
     #[default]
@@ -47,13 +47,15 @@ impl ToolVocabulary {
     ///
     /// A slice rather than an array, so a vocabulary added later does not
     /// change this constant's type.
-    pub const ALL: &'static [Self] = &[Self::Canonical, Self::Claude5, Self::KimiCode, Self::Codex];
+    #[cfg(test)]
+    pub(crate) const ALL: &'static [Self] =
+        &[Self::Canonical, Self::Claude5, Self::KimiCode, Self::Codex];
 }
 
 /// A tool pebble implements itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
-pub enum NativeTool {
+pub(crate) enum NativeTool {
     /// Reads one file.
     ReadFile,
     /// Reads several files in one call.
@@ -117,7 +119,7 @@ impl NativeTool {
     ///
     /// A slice rather than an array, so a tool added later does not change
     /// this constant's type.
-    pub const ALL: &'static [Self] = &[
+    pub(crate) const ALL: &'static [Self] = &[
         Self::ReadFile,
         Self::ReadManyFiles,
         Self::WriteFile,
@@ -150,7 +152,7 @@ impl NativeTool {
 
     /// The canonical name: how pebble refers to this tool internally.
     #[must_use]
-    pub const fn canonical_name(self) -> &'static str {
+    pub(crate) const fn canonical_name(self) -> &'static str {
         match self {
             Self::ReadFile => "read_file",
             Self::ReadManyFiles => "read_many_files",
@@ -191,7 +193,7 @@ impl NativeTool {
     /// [`from_any_name`](Self::from_any_name) resolves these; the vocabulary
     /// tables in [`name`](Self::name) decide which one a session exposes.
     #[must_use]
-    pub const fn aliases(self) -> &'static [&'static str] {
+    pub(crate) const fn aliases(self) -> &'static [&'static str] {
         match self {
             Self::ReadFile => &["Read"],
             Self::WriteFile => &["Write"],
@@ -217,7 +219,7 @@ impl NativeTool {
     /// so an unrelated extension named `Read` is not silently treated as
     /// pebble's file reader.
     #[must_use]
-    pub fn from_canonical_name(name: &str) -> Option<Self> {
+    pub(crate) fn from_canonical_name(name: &str) -> Option<Self> {
         Self::ALL
             .iter()
             .copied()
@@ -228,7 +230,7 @@ impl NativeTool {
     ///
     /// A tool with no counterpart in the vocabulary keeps its canonical name.
     #[must_use]
-    pub const fn name(self, vocabulary: ToolVocabulary) -> &'static str {
+    pub(crate) const fn name(self, vocabulary: ToolVocabulary) -> &'static str {
         match vocabulary {
             ToolVocabulary::Canonical => self.canonical_name(),
             ToolVocabulary::Claude5 => match self {
@@ -290,7 +292,7 @@ impl NativeTool {
     /// Returns `None` for MCP, skill, and application-registered tools, whose
     /// names are not drawn from this set.
     #[must_use]
-    pub fn from_any_name(name: &str) -> Option<Self> {
+    pub(crate) fn from_any_name(name: &str) -> Option<Self> {
         Self::ALL
             .iter()
             .copied()
@@ -356,7 +358,7 @@ impl NativeTool {
     /// [`ToolCategory::Shell`], requiring approval, while a tool summary
     /// reports [`ToolCategory::Other`].
     #[must_use]
-    pub const fn category(self) -> Option<ToolCategory> {
+    pub(crate) const fn category(self) -> Option<ToolCategory> {
         match self {
             Self::ReadFile | Self::ReadManyFiles | Self::Grep | Self::Glob | Self::ListDir => {
                 Some(ToolCategory::Read)

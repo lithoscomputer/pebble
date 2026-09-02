@@ -28,28 +28,28 @@ use crate::event::OutputCaptureStats;
 use crate::tool::NativeTool;
 
 /// Bytes of one tool's output a session retains by default.
-pub const DEFAULT_TOOL_OUTPUT_RETENTION_BYTES: usize = 1024 * 1024;
+pub(crate) const DEFAULT_TOOL_OUTPUT_RETENTION_BYTES: usize = 1024 * 1024;
 
 /// Bytes one tool's output may occupy once serialized as JSON, by default.
 ///
 /// Half of the 3 MiB body a fabro run event allows, leaving the other half as
 /// headroom for the rest of the envelope. Pebble does not impose that envelope
 /// itself; the value is the field-tested default an application can change.
-pub const DEFAULT_TOOL_OUTPUT_SERIALIZED_BYTES: usize = 1_572_864;
+pub(crate) const DEFAULT_TOOL_OUTPUT_SERIALIZED_BYTES: usize = 1_572_864;
 
 /// How much of one tool's output a session retains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct OutputBudgets {
+pub(crate) struct OutputBudgets {
     /// Bytes of text kept, notice included.
-    pub retained_bytes:   usize,
+    pub(crate) retained_bytes:   usize,
     /// Bytes the kept text may occupy once serialized as JSON.
-    pub serialized_bytes: usize,
+    pub(crate) serialized_bytes: usize,
 }
 
 impl OutputBudgets {
     /// Budgets with the given byte counts.
     #[must_use]
-    pub const fn new(retained_bytes: usize, serialized_bytes: usize) -> Self {
+    pub(crate) const fn new(retained_bytes: usize, serialized_bytes: usize) -> Self {
         Self {
             retained_bytes,
             serialized_bytes,
@@ -68,7 +68,7 @@ impl Default for OutputBudgets {
 
 /// Which end of an over-long output survives.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum TruncationMode {
+pub(crate) enum TruncationMode {
     /// Keep the start and the end, dropping the middle. The default, because
     /// most tool output explains itself at both ends.
     #[default]
@@ -282,7 +282,7 @@ fn render_truncated_segments(
 /// Output that already fits is returned unchanged; anything else carries the
 /// truncation notice.
 #[must_use]
-pub fn truncate_output(output: &str, max_chars: usize, mode: TruncationMode) -> String {
+pub(crate) fn truncate_output(output: &str, max_chars: usize, mode: TruncationMode) -> String {
     let Some((head_end, tail_start)) = split_head_tail(output, max_chars) else {
         return output.to_owned();
     };
@@ -311,7 +311,7 @@ pub fn truncate_output(output: &str, max_chars: usize, mode: TruncationMode) -> 
 ///
 /// Output that already fits is returned unchanged.
 #[must_use]
-pub fn truncate_lines(output: &str, max_lines: usize) -> String {
+pub(crate) fn truncate_lines(output: &str, max_lines: usize) -> String {
     let lines: Vec<&str> = output.lines().collect();
     if lines.len() <= max_lines {
         return output.to_owned();
@@ -338,13 +338,13 @@ pub fn truncate_lines(output: &str, max_lines: usize) -> String {
 
 /// How much of one tool's output history keeps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ToolOutputLimits {
+pub(crate) struct ToolOutputLimits {
     /// The byte budget, or `None` to keep every character.
-    pub max_chars: Option<usize>,
+    pub(crate) max_chars: Option<usize>,
     /// The line budget, or `None` to keep every line.
-    pub max_lines: Option<usize>,
+    pub(crate) max_lines: Option<usize>,
     /// Which end survives the byte budget.
-    pub mode:      TruncationMode,
+    pub(crate) mode:      TruncationMode,
 }
 
 impl ToolOutputLimits {
@@ -354,7 +354,7 @@ impl ToolOutputLimits {
     /// a new built-in tool state its answer. A tool pebble does not know keeps
     /// its whole output.
     #[must_use]
-    pub fn defaults_for(canonical_tool_name: &str) -> Self {
+    pub(crate) fn defaults_for(canonical_tool_name: &str) -> Self {
         match NativeTool::from_canonical_name(canonical_tool_name) {
             Some(tool) => tool.default_output_limits(),
             None => Self {
@@ -372,7 +372,7 @@ impl ToolOutputLimits {
     /// falls back to [`defaults_for`](Self::defaults_for). Configuring
     /// `"shell"` therefore also covers a profile that exposes it as `"Bash"`.
     #[must_use]
-    pub fn resolve(
+    pub(crate) fn resolve(
         tool_name: &str,
         canonical_tool_name: &str,
         char_overrides: &HashMap<String, usize>,
@@ -402,7 +402,7 @@ impl ToolOutputLimits {
 
 /// Cuts one tool's output to its limits: characters first, then lines.
 #[must_use]
-pub fn truncate_tool_output(output: &str, limits: ToolOutputLimits) -> String {
+pub(crate) fn truncate_tool_output(output: &str, limits: ToolOutputLimits) -> String {
     let after_chars = match limits.max_chars {
         Some(limit) => truncate_output(output, limit, limits.mode),
         None => output.to_owned(),
