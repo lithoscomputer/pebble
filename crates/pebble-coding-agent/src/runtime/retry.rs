@@ -205,7 +205,7 @@ mod tests {
             other => panic!("expected a retry event, got {other:?}"),
         }
 
-        emitter.close();
+        emitter.close().await.unwrap();
         pump.await
             .expect("the pump joins")
             .expect("no sink failure");
@@ -228,7 +228,7 @@ mod tests {
         ));
         assert!(matches!(events.try_recv(), Err(TryRecvError::Empty)));
 
-        emitter.close();
+        emitter.close().await.unwrap();
         pump.await
             .expect("the pump joins")
             .expect("no sink failure");

@@ -7,7 +7,10 @@
 //! form of both is public API.
 
 pub use crate::error::{ErrorData, ErrorKind};
-pub use crate::event::{DEFAULT_EVENT_CAPACITY, EventCapacity, EventSink, EventSinkError};
+pub use crate::event::{
+    DEFAULT_EVENT_CAPACITY, DEFAULT_EVENT_SINK_TIMEOUT, EventCapacity, EventSink, EventSinkError,
+    EventSinkTimeout,
+};
 pub use crate::reasoning::ReasoningOutput;
 pub use crate::runtime::RetryEventObserver;
 pub use crate::types::{

@@ -169,6 +169,16 @@ pub enum Error {
     /// cannot record what it did stops instead of continuing untracked.
     #[error("recording a session event")]
     EventSink(#[from] EventSinkError),
+
+    /// Producers filled the bounded event queue before the sink caught up.
+    ///
+    /// The event that did not fit was not recorded, so the session stops
+    /// instead of continuing with an incomplete stream.
+    #[error("event queue reached its capacity of {capacity}")]
+    EventQueueFull {
+        /// The configured queue capacity.
+        capacity: usize,
+    },
 }
 
 impl Error {
@@ -185,7 +195,7 @@ impl Error {
             Self::ToolExecution(_) => ErrorKind::ToolExecution,
             Self::Interrupted(_) => ErrorKind::Interrupted,
             Self::Task { .. } => ErrorKind::Task,
-            Self::EventSink(_) => ErrorKind::EventSink,
+            Self::EventSink(_) | Self::EventQueueFull { .. } => ErrorKind::EventStream,
         }
     }
 
@@ -205,7 +215,8 @@ impl Error {
             | Self::ToolExecution(_)
             | Self::Interrupted(_)
             | Self::Task { .. }
-            | Self::EventSink(_) => None,
+            | Self::EventSink(_)
+            | Self::EventQueueFull { .. } => None,
         }
     }
 }
@@ -239,8 +250,8 @@ pub enum ErrorKind {
     Interrupted,
     /// A background task stopped before it completed its work.
     Task,
-    /// The configured event sink refused an event.
-    EventSink,
+    /// The durable event stream failed.
+    EventStream,
 }
 
 /// A cloneable, serializable projection of an [`Error`].
@@ -554,6 +565,14 @@ mod tests {
             (
                 Error::Interrupted(InterruptReason::Cancelled),
                 ErrorKind::Interrupted,
+            ),
+            (
+                Error::EventSink(EventSinkError::new("write failed")),
+                ErrorKind::EventStream,
+            ),
+            (
+                Error::EventQueueFull { capacity: 4 },
+                ErrorKind::EventStream,
             ),
         ];
         for (error, kind) in cases {

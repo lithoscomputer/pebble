@@ -44,7 +44,7 @@ use crate::config::CodingAgentOptions;
 use crate::context_window::{memory_prompt_tokens, skills_prompt_tokens};
 use crate::environment::{Environment, ExecRequest};
 use crate::error::{Error, ErrorData, InterruptReason, Result, TaskKind};
-use crate::event::{Emitter, EventCapacity, EventOptions, EventPump, EventSink};
+use crate::event::{Emitter, EventCapacity, EventOptions, EventPump, EventSink, EventSinkTimeout};
 use crate::file_tracker::FileTracker;
 use crate::history::History;
 use crate::human_input::HumanInputProvider;
@@ -300,9 +300,15 @@ impl CodingRuntimeBuilder {
         self
     }
 
-    /// Sets how many events the live stream buffers for each subscriber.
+    /// Sets the pending event queue and live subscription capacity.
     pub(crate) fn event_capacity(mut self, capacity: impl Into<EventCapacity>) -> Self {
         self.events.capacity = capacity.into();
+        self
+    }
+
+    /// Sets the longest one durable sink write may take.
+    pub(crate) fn event_sink_timeout(mut self, timeout: impl Into<EventSinkTimeout>) -> Self {
+        self.events.sink_timeout = timeout.into();
         self
     }
 
@@ -884,11 +890,12 @@ impl CodingRuntime {
     /// Publishes [`SessionStarted`](CodingEvent::SessionStarted) and nothing
     /// else: no memory was loaded and no skills were discovered, because the
     /// warm state already carried what they produce.
-    pub(crate) fn start_from_warm_state(&mut self) {
+    pub(crate) async fn start_from_warm_state(&mut self) -> Result<()> {
         self.emit(CodingEvent::SessionStarted {
             provider: Some(self.provider.clone()),
             model:    Some(self.model.clone()),
         });
+        self.flush_events().await.map(|_| ())
     }
 
     /// Everything a successor in this process needs to carry on without
@@ -915,17 +922,16 @@ impl CodingRuntime {
     /// can be read back in shape; the tree itself is the application's to
     /// rebuild, because a child's supervisor is not stored.
     ///
-    /// A record can be taken at any time, including mid-prompt as a crash
-    /// checkpoint: the event numbering it stores covers every event emitted
-    /// before the call, whether or not the pipeline has published it yet, so a
-    /// session resumed from the record never reuses a number.
+    /// The record stores the last sequence accepted by the event sink. Public
+    /// callers take records between prompts, after the prompt's event barrier
+    /// has committed its complete history.
     pub(crate) fn to_record(&self) -> SessionRecord {
         let mut record = SessionRecord::new(self.id.clone());
         record.parent_session_id.clone_from(&self.parent_session_id);
         record.provider = Some(self.provider.clone());
         record.model = Some(self.model.clone());
         record.created_at = self.created_at;
-        record.last_event_seq = self.emitter.last_seq();
+        record.last_event_seq = self.emitter.committed_seq();
         record.messages = self.conversation().history.to_stored_messages();
         record
     }
@@ -1056,7 +1062,7 @@ impl CodingRuntime {
             None => default_prompt,
         };
 
-        Ok(())
+        self.flush_events().await.map(|_| ())
     }
 
     /// Gathers what the system prompt says about where the session is working.
@@ -1476,10 +1482,9 @@ impl CodingRuntime {
             }
         } else {
             self.state.transition(CodingAgentState::Idle);
-            // A sink that refused an event during this prompt is this prompt's
-            // failure, even where the loop got to a boundary too late to
-            // notice it.
-            if let Err(error) = self.check_pump().await {
+            // `ProcessingEnd` is the prompt's durability barrier. The prompt
+            // cannot finish before it and every earlier event reach the sink.
+            if let Err(error) = self.flush_events().await {
                 task_failure = task_failure.or(Some(error));
             }
         }
@@ -1565,8 +1570,27 @@ impl CodingRuntime {
         let _ = self.agent_control.close();
         self.ended = true;
         self.emit(CodingEvent::SessionEnded);
-        self.join_pump().await?;
+        let flushed = self.flush_events().await;
+        let joined = self.join_pump().await;
+        flushed?;
+        joined?;
         Ok(true)
+    }
+
+    /// Waits until every event currently queued has reached the durable sink.
+    pub(crate) async fn flush_events(&mut self) -> Result<u64> {
+        match self.emitter.flush().await {
+            Ok(seq) => Ok(seq),
+            Err(failure) => {
+                self.state.transition(CodingAgentState::Closed);
+                Err(failure.into_runtime_error())
+            }
+        }
+    }
+
+    /// The highest event sequence accepted by the durable sink.
+    pub(crate) fn committed_event_seq(&self) -> u64 {
+        self.emitter.committed_seq()
     }
 
     /// Publishes everything queued, then joins the pump.
@@ -1574,7 +1598,7 @@ impl CodingRuntime {
         let Some(pump) = self.pump.take() else {
             return Ok(());
         };
-        self.emitter.close();
+        let _ = self.emitter.close().await;
         match pump.await {
             Ok(result) => result,
             Err(source) => Err(Error::Task {
@@ -1598,6 +1622,10 @@ impl CodingRuntime {
     /// prompt that found it, and [`Error::SessionClosed`] from every call
     /// after.
     async fn check_pump(&mut self) -> Result<()> {
+        if let Some(failure) = self.emitter.failure() {
+            self.state.transition(CodingAgentState::Closed);
+            return Err(failure.into_runtime_error());
+        }
         let Some(pump) = self.pump.as_ref() else {
             return Ok(());
         };
@@ -2215,16 +2243,12 @@ mod tests {
             .build()
             .expect("the session builds");
 
-        // The pump stops on the first event it is given, which the loop
-        // notices at its next round boundary.
-        let first = session.prompt("do a thing").await;
-        yield_now().await;
-        let second = session.prompt("do another thing").await;
-        let ((Err(failure), _) | (Ok(_), Err(failure))) = (first, second) else {
-            panic!("a refusing sink must stop the prompt");
-        };
+        let failure = session
+            .prompt("do a thing")
+            .await
+            .expect_err("the prompt waits for its sink failure");
 
-        assert_eq!(failure.kind(), ErrorKind::EventSink);
+        assert_eq!(failure.kind(), ErrorKind::EventStream);
         assert!(
             ErrorData::from(&failure)
                 .message
@@ -2242,23 +2266,13 @@ mod tests {
             .expect("the session builds");
         let mut events = session.subscribe();
 
-        // The failure surfaces at whichever checkpoint first finds the pump
-        // stopped, which is the end of the first prompt or the start of the
-        // second.
-        let mut failure = None;
-        for _ in 0..2 {
-            match session.prompt("do a thing").await {
-                Ok(_) => yield_now().await,
-                Err(error) => {
-                    failure = Some(error);
-                    break;
-                }
-            }
-        }
+        let failure = session
+            .prompt("do a thing")
+            .await
+            .expect_err("the current prompt reports the sink failure");
         let calls_before = provider.call_count();
 
-        let failure = failure.expect("a refusing sink stops a prompt");
-        assert_eq!(failure.kind(), ErrorKind::EventSink);
+        assert_eq!(failure.kind(), ErrorKind::EventStream);
         assert_eq!(
             session.state(),
             CodingAgentState::Closed,

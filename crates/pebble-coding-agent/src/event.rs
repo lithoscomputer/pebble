@@ -3,9 +3,10 @@
 //! One session owns one pipeline. Every producer — the turn loop, a running
 //! tool, the retry observer, a subagent forwarding its child stream — holds a
 //! cheap [`Emitter`] clone and calls [`Emitter::emit`] from ordinary
-//! synchronous code, which queues the event and returns. The session drives
-//! one [`EventPump`], and the pump alone publishes: it stamps each event with
-//! the next per-session sequence number, hands it to the configured
+//! synchronous code, which queues the event and returns. The queue is bounded;
+//! filling it stops the stream rather than discarding an event. The session
+//! drives one [`EventPump`], and the pump alone publishes: it stamps each
+//! event with the next per-session sequence number, hands it to the configured
 //! [`EventSink`] and waits for that to succeed, and only then broadcasts it to
 //! live subscribers.
 //!
@@ -31,29 +32,35 @@
 use std::error::Error as StdError;
 use std::fmt;
 use std::result::Result as StdResult;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::types::{CodingAgentEvent, CodingEvent};
 
 /// The broadcast capacity a pipeline uses when the caller names none.
 pub const DEFAULT_EVENT_CAPACITY: usize = 1024;
 
+/// The longest the event pump waits for one sink write by default.
+pub const DEFAULT_EVENT_SINK_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// A durable recorder of one session's event stream.
 ///
-/// Implementors receive every published event exactly once, in sequence order,
-/// and the pump waits for each call to return before the event reaches live
-/// subscribers. A slow sink therefore slows the whole session, and a failing
-/// sink stops it: the pump returns [`crate::Error::EventSink`] and publishes
-/// nothing further, and the session it belongs to closes rather than run on
-/// with nothing recording it.
+/// Implementors receive events in sequence order, and the pump waits for each
+/// call to return before the event reaches live subscribers. A slow sink puts
+/// pressure on the bounded event queue, and a failing sink stops it: the pump
+/// returns [`crate::Error::EventSink`] and publishes nothing further, and the
+/// session it belongs to closes rather than run on with nothing recording it.
 ///
-/// Implementations must be cheap enough to run on the session's critical path
+/// A process can stop after a sink commits an event but before it returns.
+/// Implementations must therefore treat `(session_id, seq)` as an idempotency
+/// key. They must also be cheap enough to run on the session's critical path
 /// and must not call back into the session that owns them.
 #[async_trait]
 pub trait EventSink: Send + Sync {
@@ -69,10 +76,10 @@ pub trait EventSink: Send + Sync {
 /// The message is rendered into [`crate::events::ErrorData`] on the way to
 /// consumers, so keep it free of credentials and provider payloads. An optional
 /// source is retained for logging and is not projected.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct EventSinkError {
     message: String,
-    source:  Option<Box<dyn StdError + Send + Sync>>,
+    source:  Option<Arc<dyn StdError + Send + Sync>>,
 }
 
 impl EventSinkError {
@@ -87,7 +94,7 @@ impl EventSinkError {
     /// Attaches the underlying failure, which is kept for logging only.
     #[must_use]
     pub fn with_source(mut self, source: impl Into<Box<dyn StdError + Send + Sync>>) -> Self {
-        self.source = Some(source.into());
+        self.source = Some(Arc::from(source.into()));
         self
     }
 
@@ -108,11 +115,11 @@ impl StdError for EventSinkError {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         self.source
             .as_ref()
-            .map(|source| &**source as &(dyn StdError + 'static))
+            .map(|source| source.as_ref() as &(dyn StdError + 'static))
     }
 }
 
-/// The monotonic sequence numbers stamped on one session's events.
+/// The monotonic sequence numbers committed on one stream.
 ///
 /// Numbering starts at 1, so a `seq` of 0 means an event was built but never
 /// published. A resumed session continues where the stored record left off, so
@@ -121,54 +128,39 @@ impl StdError for EventSinkError {
 /// Crate-private: no public signature takes or returns one. The numbers
 /// themselves reach an application through
 /// [`CodingAgentEvent::seq`](crate::events::CodingAgentEvent::seq),
-/// [`Emitter::last_seq`], and [`EventOptions::resume_after_seq`].
+/// [`Emitter::committed_seq`], and [`EventOptions::resume_after_seq`].
 #[derive(Debug)]
 pub(crate) struct EventSequence {
-    stamped:  AtomicU64,
-    reserved: AtomicU64,
+    committed: AtomicU64,
 }
 
 impl EventSequence {
     /// Starts a fresh session's numbering, so the first event is 1.
     pub(crate) const fn new() -> Self {
         Self {
-            stamped:  AtomicU64::new(0),
-            reserved: AtomicU64::new(0),
+            committed: AtomicU64::new(0),
         }
     }
 
     /// Continues numbering after the last event a previous prompt published.
     pub(crate) const fn resuming_after(last_seq: u64) -> Self {
         Self {
-            stamped:  AtomicU64::new(last_seq),
-            reserved: AtomicU64::new(last_seq),
+            committed: AtomicU64::new(last_seq),
         }
     }
 
-    /// Claims the number one newly queued event will be published with.
-    ///
-    /// An emitter claims the number as it queues; the pump stamps it as it
-    /// publishes. The two counters run in step, one event apart at a time, and
-    /// the claim is what a stored record has to cover: an event waiting in the
-    /// queue is already numbered in every sense that matters to a session
-    /// resumed from that record.
-    pub(crate) fn reserve(&self) {
-        self.reserved.fetch_add(1, Ordering::Relaxed);
+    /// Records that the sink accepted `seq`.
+    pub(crate) fn commit(&self, seq: u64) {
+        self.committed.store(seq, Ordering::Release);
     }
 
-    /// Takes the next sequence number for an event being published.
-    pub(crate) fn assign(&self) -> u64 {
-        self.stamped
-            .fetch_add(1, Ordering::Relaxed)
-            .saturating_add(1)
-    }
-
-    /// The highest number any event queued so far can be published with.
+    /// The highest number the sink accepted.
     ///
-    /// Read from outside the publishing task this is a snapshot: another
-    /// producer may claim the next number before the caller acts on it.
-    pub(crate) fn last_reserved(&self) -> u64 {
-        self.reserved.load(Ordering::Relaxed)
+    /// Read from outside the publishing task this is a snapshot. Use
+    /// [`Emitter::flush`] when the caller needs a durability boundary before
+    /// reading it.
+    pub(crate) fn committed(&self) -> u64 {
+        self.committed.load(Ordering::Acquire)
     }
 }
 
@@ -201,6 +193,9 @@ pub(crate) struct EventOptions {
     /// The durable recorder, when the application configured one.
     pub(crate) sink: Option<Arc<dyn EventSink>>,
 
+    /// The longest one call to [`EventSink::record`] may take.
+    pub(crate) sink_timeout: EventSinkTimeout,
+
     /// The last sequence number a previous prompt of this session published.
     ///
     /// Zero for a new session;
@@ -215,20 +210,22 @@ impl fmt::Debug for EventOptions {
             .debug_struct("EventOptions")
             .field("capacity", &self.capacity)
             .field("sink", &self.sink.as_ref().map(|_| "<sink>"))
+            .field("sink_timeout", &self.sink_timeout)
             .field("resume_after_seq", &self.resume_after_seq)
             .finish()
     }
 }
 
-/// How many events a pipeline buffers for live subscribers.
+/// How many pending events and live events a pipeline buffers.
 ///
-/// Defaults to [`DEFAULT_EVENT_CAPACITY`]; a capacity of zero is raised to one
-/// because a tokio broadcast channel rejects an empty buffer.
+/// The event pump applies this limit to its producer queue and to each live
+/// subscription. Defaults to [`DEFAULT_EVENT_CAPACITY`]; a capacity of zero is
+/// raised to one because Tokio channels reject an empty buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EventCapacity(usize);
 
 impl EventCapacity {
-    /// Buffers `events` for each live subscriber.
+    /// Buffers `events` in the producer queue and for each live subscriber.
     #[must_use]
     pub const fn new(events: usize) -> Self {
         Self(if events == 0 { 1 } else { events })
@@ -253,11 +250,100 @@ impl From<usize> for EventCapacity {
     }
 }
 
+/// How long the event pump waits for one durable sink write.
+///
+/// Defaults to [`DEFAULT_EVENT_SINK_TIMEOUT`]. A zero duration is valid and is
+/// useful when a caller wants any pending sink operation to fail immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventSinkTimeout(Duration);
+
+impl EventSinkTimeout {
+    /// Limits one sink write to `duration`.
+    #[must_use]
+    pub const fn new(duration: Duration) -> Self {
+        Self(duration)
+    }
+
+    /// The configured duration.
+    #[must_use]
+    pub const fn get(self) -> Duration {
+        self.0
+    }
+}
+
+impl Default for EventSinkTimeout {
+    fn default() -> Self {
+        Self(DEFAULT_EVENT_SINK_TIMEOUT)
+    }
+}
+
+impl From<Duration> for EventSinkTimeout {
+    fn from(duration: Duration) -> Self {
+        Self::new(duration)
+    }
+}
+
+/// Why one event pipeline stopped before a normal close.
+#[derive(Clone, Debug)]
+pub(crate) enum EventPipelineError {
+    /// The application sink refused an event or did not finish in time.
+    Sink(EventSinkError),
+    /// A synchronous producer found the bounded queue full.
+    QueueFull { capacity: usize },
+    /// The pump stopped without recording a more specific failure.
+    Stopped,
+}
+
+impl EventPipelineError {
+    pub(crate) fn into_runtime_error(self) -> Error {
+        match self {
+            Self::Sink(error) => Error::EventSink(error),
+            Self::QueueFull { capacity } => Error::EventQueueFull { capacity },
+            Self::Stopped => {
+                Error::InvalidState("the event pipeline stopped unexpectedly".to_owned())
+            }
+        }
+    }
+}
+
+/// Failure and close state shared by every producer and the pump.
+#[derive(Debug)]
+struct EventPipelineState {
+    failure: Mutex<Option<EventPipelineError>>,
+    failed:  CancellationToken,
+    closing: AtomicBool,
+}
+
+impl EventPipelineState {
+    fn new() -> Self {
+        Self {
+            failure: Mutex::new(None),
+            failed:  CancellationToken::new(),
+            closing: AtomicBool::new(false),
+        }
+    }
+
+    fn fail(&self, failure: EventPipelineError) {
+        let mut stored = self.failure.lock().unwrap_or_else(PoisonError::into_inner);
+        if stored.is_none() {
+            *stored = Some(failure);
+            self.failed.cancel();
+        }
+    }
+
+    fn failure(&self) -> Option<EventPipelineError> {
+        self.failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
 /// The publishing handle every event producer holds.
 ///
 /// Cloning is cheap and every clone feeds the same pipeline. Emitting is
-/// synchronous and never blocks: the event is queued and the owning
-/// [`EventPump`] publishes it.
+/// synchronous and never blocks. Filling the bounded queue fails the whole
+/// pipeline, so an event is never dropped while the session continues.
 ///
 /// An emitter holds no half of the pipeline open. Once the pump has stopped,
 /// emitting from a clone that outlived it is inert and the live stream is
@@ -265,7 +351,7 @@ impl From<usize> for EventCapacity {
 /// nothing either way.
 #[derive(Clone, Debug)]
 pub(crate) struct Emitter {
-    outbox:    mpsc::UnboundedSender<Queued>,
+    outbox:    mpsc::Sender<Queued>,
     /// A weak handle to the broadcast side, upgraded only for the moment
     /// [`Emitter::subscribe`] takes to hand out a receiver.
     ///
@@ -273,14 +359,19 @@ pub(crate) struct Emitter {
     /// when the pump is joined rather than when the last emitter is dropped.
     published: broadcast::WeakSender<CodingAgentEvent>,
     sequence:  Arc<EventSequence>,
+    state:     Arc<EventPipelineState>,
 }
 
 /// One item on the queue between the emitters and the pump.
 ///
-/// `None` is the stop signal a session sends at shutdown, so the pump can be
-/// joined without waiting for every [`Emitter`] clone to be dropped. Anything
-/// queued before it is still published.
-type Queued = Option<CodingAgentEvent>;
+/// A flush is a barrier: the pump answers it only after every event ahead of it
+/// has reached the sink. `Close` ends the pump after the same ordered drain.
+#[derive(Debug)]
+enum Queued {
+    Event(Box<CodingAgentEvent>),
+    Flush(oneshot::Sender<u64>),
+    Close,
+}
 
 impl Emitter {
     /// Publishes an event this session produced.
@@ -337,28 +428,61 @@ impl Emitter {
         }
     }
 
-    /// The highest sequence number this session has claimed for an event.
-    ///
-    /// Every event emitted so far will be published with this number or a
-    /// lower one, including events still queued, so a record storing it names
-    /// a point the live stream has passed rather than one it is about to
-    /// reach.
-    ///
-    /// This is a snapshot taken from outside the publishing task, so another
-    /// producer may claim the next number before the caller acts on it. It
-    /// counts claims, not delivery: an event still in the queue is counted,
-    /// and after a sink refusal, or an emit into a stopped pipeline, the
-    /// number names an event that was never published.
+    /// The highest sequence number the sink has accepted.
     #[must_use]
-    pub(crate) fn last_seq(&self) -> u64 {
-        self.sequence.last_reserved()
+    pub(crate) fn committed_seq(&self) -> u64 {
+        self.sequence.committed()
+    }
+
+    /// The failure that stopped this pipeline, when it has one.
+    pub(crate) fn failure(&self) -> Option<EventPipelineError> {
+        self.state.failure()
+    }
+
+    /// Waits until every event queued before this call has reached the sink.
+    ///
+    /// The returned number is the last committed sequence at that barrier.
+    /// Sending the barrier waits for space in the bounded queue, which applies
+    /// backpressure at every runtime operation boundary.
+    pub(crate) async fn flush(&self) -> StdResult<u64, EventPipelineError> {
+        if let Some(failure) = self.state.failure() {
+            return Err(failure);
+        }
+        if self.state.closing.load(Ordering::Acquire) {
+            return Ok(self.committed_seq());
+        }
+
+        let (reply, received) = oneshot::channel();
+        let send = self.outbox.send(Queued::Flush(reply));
+        tokio::pin!(send);
+        tokio::select! {
+            biased;
+            () = self.state.failed.cancelled() => {
+                return Err(self.state.failure().unwrap_or(EventPipelineError::Stopped));
+            }
+            result = &mut send => {
+                if result.is_err() {
+                    return Err(self.state.failure().unwrap_or(EventPipelineError::Stopped));
+                }
+            }
+        }
+
+        tokio::select! {
+            biased;
+            () = self.state.failed.cancelled() => {
+                Err(self.state.failure().unwrap_or(EventPipelineError::Stopped))
+            }
+            result = received => {
+                result.map_err(|_| self.state.failure().unwrap_or(EventPipelineError::Stopped))
+            }
+        }
     }
 
     /// Whether the pump has stopped, so nothing further will be published.
     #[must_use]
     #[cfg(test)]
     pub(crate) fn is_closed(&self) -> bool {
-        self.outbox.is_closed()
+        self.outbox.is_closed() || self.state.closing.load(Ordering::Acquire)
     }
 
     /// Stops the pump once everything already queued has been published.
@@ -366,8 +490,21 @@ impl Emitter {
     /// The session sends this at shutdown so it can join the pump task without
     /// having to drop every emitter clone first. Events queued afterwards are
     /// discarded, which is what emitting into a session that has ended means.
-    pub(crate) fn close(&self) {
-        let _ = self.outbox.send(None);
+    pub(crate) async fn close(&self) -> StdResult<(), EventPipelineError> {
+        if self.state.closing.swap(true, Ordering::AcqRel) {
+            return self.state.failure().map_or(Ok(()), Err);
+        }
+        let send = self.outbox.send(Queued::Close);
+        tokio::pin!(send);
+        tokio::select! {
+            biased;
+            () = self.state.failed.cancelled() => {
+                Err(self.state.failure().unwrap_or(EventPipelineError::Stopped))
+            }
+            result = &mut send => {
+                result.map_err(|_| self.state.failure().unwrap_or(EventPipelineError::Stopped))
+            }
+        }
     }
 
     /// Queues an event, dropping it when the pump has already stopped.
@@ -375,12 +512,25 @@ impl Emitter {
     /// A session that has shut down still holds emitter clones — a tool task
     /// unwinding, say — and emitting from one must not panic.
     ///
-    /// The number is claimed before the event is queued, so a record taken
-    /// from another task never names a number the pump is still about to
-    /// stamp.
+    /// The pump assigns a sequence number only after it takes the event from
+    /// this queue. A record therefore never claims an event the sink has not
+    /// accepted.
     fn queue(&self, event: CodingAgentEvent) {
-        self.sequence.reserve();
-        let _ = self.outbox.send(Some(event));
+        if self.state.closing.load(Ordering::Acquire) {
+            return;
+        }
+        match self.outbox.try_send(Queued::Event(Box::new(event))) {
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.state.fail(EventPipelineError::QueueFull {
+                    capacity: self.outbox.max_capacity(),
+                });
+            }
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {
+                // A sink or task failure records its cause before the receiver
+                // closes. A normal close deliberately makes late emitters
+                // inert.
+            }
+        }
     }
 }
 
@@ -407,10 +557,13 @@ fn ended_stream() -> broadcast::Receiver<CodingAgentEvent> {
 /// observes `RecvError::Closed`.
 #[must_use = "a pipeline publishes nothing until its pump runs"]
 pub(crate) struct EventPump {
-    inbox:     mpsc::UnboundedReceiver<Queued>,
-    published: broadcast::Sender<CodingAgentEvent>,
-    sequence:  Arc<EventSequence>,
-    sink:      Option<Arc<dyn EventSink>>,
+    inbox:        mpsc::Receiver<Queued>,
+    published:    broadcast::Sender<CodingAgentEvent>,
+    sequence:     Arc<EventSequence>,
+    state:        Arc<EventPipelineState>,
+    sink:         Option<Arc<dyn EventSink>>,
+    sink_timeout: EventSinkTimeout,
+    next_seq:     u64,
 }
 
 impl fmt::Debug for EventPump {
@@ -420,7 +573,10 @@ impl fmt::Debug for EventPump {
             .field("inbox", &self.inbox)
             .field("published", &self.published)
             .field("sequence", &self.sequence)
+            .field("state", &self.state)
             .field("sink", &self.sink.as_ref().map(|_| "<sink>"))
+            .field("sink_timeout", &self.sink_timeout)
+            .field("next_seq", &self.next_seq)
             .finish()
     }
 }
@@ -435,21 +591,27 @@ impl EventPump {
         let EventOptions {
             capacity,
             sink,
+            sink_timeout,
             resume_after_seq,
         } = options;
-        let (outbox, inbox) = mpsc::unbounded_channel();
+        let (outbox, inbox) = mpsc::channel(capacity.get());
         let (published, _) = broadcast::channel(capacity.get());
         let sequence = Arc::new(EventSequence::resuming_after(resume_after_seq));
+        let state = Arc::new(EventPipelineState::new());
         let emitter = Emitter {
             outbox,
             published: published.downgrade(),
             sequence: Arc::clone(&sequence),
+            state: Arc::clone(&state),
         };
         let pump = Self {
             inbox,
             published,
             sequence,
+            state,
             sink,
+            sink_timeout,
+            next_seq: resume_after_seq,
         };
         (emitter, pump)
     }
@@ -461,20 +623,46 @@ impl EventPump {
     /// event. The refused event, and anything still queued, is not published,
     /// because the prompt is over.
     pub(crate) async fn run(mut self) -> Result<()> {
-        while let Some(message) = self.inbox.recv().await {
-            let Some(event) = message else {
-                break;
+        loop {
+            let message = tokio::select! {
+                biased;
+                () = self.state.failed.cancelled() => {
+                    let failure = self.state.failure().unwrap_or(EventPipelineError::Stopped);
+                    return Err(failure.into_runtime_error());
+                }
+                message = self.inbox.recv() => message,
             };
-            self.publish(event).await?;
+            match message {
+                Some(Queued::Event(event)) => self.publish(*event).await?,
+                Some(Queued::Flush(reply)) => {
+                    let _ = reply.send(self.sequence.committed());
+                }
+                Some(Queued::Close) | None => break,
+            }
         }
         Ok(())
     }
 
     async fn publish(&mut self, mut event: CodingAgentEvent) -> Result<()> {
-        event.seq = self.sequence.assign();
+        let seq = self.next_seq.saturating_add(1);
+        event.seq = seq;
         if let Some(sink) = self.sink.as_ref() {
-            sink.record(&event).await?;
+            let recorded = timeout(self.sink_timeout.get(), sink.record(&event)).await;
+            let failure = match recorded {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(EventPipelineError::Sink(error)),
+                Err(_) => Some(EventPipelineError::Sink(EventSinkError::new(format!(
+                    "event sink timed out after {:?}",
+                    self.sink_timeout.get()
+                )))),
+            };
+            if let Some(failure) = failure {
+                self.state.fail(failure.clone());
+                return Err(failure.into_runtime_error());
+            }
         }
+        self.next_seq = seq;
+        self.sequence.commit(seq);
         // Having no live subscriber is the normal case, not a failure.
         let _ = self.published.send(event);
         Ok(())
@@ -592,10 +780,13 @@ impl SessionBoundEmitter {
 
 #[cfg(test)]
 mod tests {
+    use std::future::pending;
     use std::io;
 
+    use tokio::sync::Notify;
     use tokio::sync::broadcast::error::{RecvError, TryRecvError};
     use tokio::task::{JoinHandle, yield_now};
+    use tokio::time::sleep;
 
     use super::*;
     use crate::error::{ErrorData, ErrorKind};
@@ -633,6 +824,31 @@ mod tests {
             }
             recorded.push(event.clone());
             Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct BlockingSink {
+        started: Notify,
+        release: Notify,
+    }
+
+    #[async_trait]
+    impl EventSink for BlockingSink {
+        async fn record(&self, _event: &CodingAgentEvent) -> StdResult<(), EventSinkError> {
+            self.started.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct StalledSink;
+
+    #[async_trait]
+    impl EventSink for StalledSink {
+        async fn record(&self, _event: &CodingAgentEvent) -> StdResult<(), EventSinkError> {
+            pending().await
         }
     }
 
@@ -759,7 +975,8 @@ mod tests {
             seen.push(receiver.recv().await.unwrap().seq);
         }
         assert_eq!(seen, vec![1, 2, 3]);
-        assert_eq!(emitter.last_seq(), 3);
+        assert_eq!(emitter.flush().await.unwrap(), 3);
+        assert_eq!(emitter.committed_seq(), 3);
     }
 
     #[tokio::test]
@@ -795,6 +1012,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn flush_waits_until_the_sink_commits_every_prior_event() {
+        let sink = Arc::new(BlockingSink::default());
+        let (emitter, _pump) = spawn_pipeline(EventOptions {
+            sink: Some(Arc::clone(&sink) as Arc<dyn EventSink>),
+            ..EventOptions::default()
+        });
+
+        emitter.emit("ses_1", CodingEvent::LoopDetected);
+        sink.started.notified().await;
+        assert_eq!(emitter.committed_seq(), 0);
+
+        let flushing = emitter.flush();
+        tokio::pin!(flushing);
+        assert!(
+            timeout(Duration::from_millis(10), &mut flushing)
+                .await
+                .is_err(),
+            "the barrier stays pending while the sink write is pending"
+        );
+        sink.release.notify_one();
+
+        assert_eq!(flushing.await.unwrap(), 1);
+        assert_eq!(emitter.committed_seq(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_sink_write_that_exceeds_its_timeout_stops_the_pipeline() {
+        let (emitter, pump) = spawn_pipeline(EventOptions {
+            sink: Some(Arc::new(StalledSink)),
+            sink_timeout: EventSinkTimeout::new(Duration::from_millis(10)),
+            ..EventOptions::default()
+        });
+        let mut receiver = emitter.subscribe();
+
+        emitter.emit("ses_1", CodingEvent::LoopDetected);
+
+        let error = pump.await.unwrap().expect_err("the sink write times out");
+        assert_eq!(error.kind(), ErrorKind::EventStream);
+        assert!(ErrorData::from(&error).message.contains("timed out"));
+        assert_eq!(emitter.committed_seq(), 0);
+        assert!(matches!(receiver.recv().await, Err(RecvError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn filling_the_bounded_queue_stops_instead_of_dropping_an_event() {
+        let sink = Arc::new(BlockingSink::default());
+        let (emitter, pump) = spawn_pipeline(EventOptions {
+            capacity: EventCapacity::new(1),
+            sink: Some(Arc::clone(&sink) as Arc<dyn EventSink>),
+            ..EventOptions::default()
+        });
+
+        emitter.emit("ses_1", CodingEvent::LoopDetected);
+        sink.started.notified().await;
+        emitter.emit("ses_1", CodingEvent::LoopDetected);
+        emitter.emit("ses_1", CodingEvent::LoopDetected);
+
+        assert!(matches!(
+            emitter.flush().await,
+            Err(EventPipelineError::QueueFull { capacity: 1 })
+        ));
+        sink.release.notify_one();
+        let error = pump.await.unwrap().expect_err("queue overflow is fatal");
+        assert!(matches!(error, Error::EventQueueFull { capacity: 1 }));
+        assert_eq!(emitter.committed_seq(), 1);
+
+        // Give Tokio a scheduling point so this test also catches a pump that
+        // accidentally keeps draining after it reports the overflow.
+        sleep(Duration::from_millis(1)).await;
+        assert!(emitter.is_closed());
+    }
+
+    #[tokio::test]
     async fn a_sink_failure_stops_the_prompt_and_withholds_the_event() {
         let sink = Arc::new(RecordingSink::failing_at(1));
         let (emitter, pump) = spawn_pipeline(EventOptions {
@@ -807,7 +1097,7 @@ mod tests {
         emitter.emit("ses_1", CodingEvent::UserInput { text: "two".into() });
 
         let error = pump.await.unwrap().expect_err("the sink refused an event");
-        assert_eq!(error.kind(), ErrorKind::EventSink);
+        assert_eq!(error.kind(), ErrorKind::EventStream);
         assert_eq!(error.to_string(), "recording a session event");
         assert!(ErrorData::from(&error).message.contains("disk is full"));
 
@@ -829,6 +1119,7 @@ mod tests {
 
         for _ in 0..4 {
             emitter.emit("ses_1", CodingEvent::LoopDetected);
+            yield_now().await;
         }
         // Let the pump drain the queue before the subscriber reads.
         yield_now().await;
@@ -848,6 +1139,10 @@ mod tests {
     fn a_zero_capacity_is_raised_to_one() {
         assert_eq!(EventCapacity::new(0).get(), 1);
         assert_eq!(EventCapacity::default().get(), DEFAULT_EVENT_CAPACITY);
+        assert_eq!(
+            EventSinkTimeout::default().get(),
+            DEFAULT_EVENT_SINK_TIMEOUT
+        );
     }
 
     #[tokio::test]
@@ -859,7 +1154,7 @@ mod tests {
         });
 
         emitter.emit("ses_1", CodingEvent::UserInput { text: "one".into() });
-        emitter.close();
+        emitter.close().await.unwrap();
         emitter.emit("ses_1", CodingEvent::UserInput { text: "two".into() });
 
         pump.await.unwrap().unwrap();
@@ -879,7 +1174,7 @@ mod tests {
         let held = emitter.clone();
 
         emitter.emit("ses_1", CodingEvent::LoopDetected);
-        emitter.close();
+        emitter.close().await.unwrap();
         pump.await.unwrap().unwrap();
 
         assert_eq!(
@@ -974,36 +1269,21 @@ mod tests {
     }
 
     #[test]
-    fn sequence_assignment_is_shared_across_handles() {
+    fn committed_sequence_is_shared_across_handles() {
         let sequence = Arc::new(EventSequence::new());
         let shared = Arc::clone(&sequence);
 
-        let first = sequence.assign();
-        let second = shared.assign();
+        sequence.commit(1);
+        let first = shared.committed();
+        shared.commit(2);
+        let second = sequence.committed();
 
         assert_eq!((first, second), (1, 2));
-        assert_eq!(EventSequence::resuming_after(7).assign(), 8);
-    }
-
-    #[test]
-    fn a_claimed_number_is_the_one_the_pump_stamps() {
-        let sequence = EventSequence::resuming_after(7);
-
-        sequence.reserve();
-        sequence.reserve();
-
-        assert_eq!(sequence.last_reserved(), 9);
-        assert_eq!(sequence.assign(), 8);
-        assert_eq!(sequence.assign(), 9);
-        assert_eq!(
-            sequence.last_reserved(),
-            9,
-            "the claims and the stamps meet once the queue is drained"
-        );
+        assert_eq!(EventSequence::resuming_after(7).committed(), 7);
     }
 
     #[tokio::test]
-    async fn last_seq_counts_events_the_pump_has_not_reached() {
+    async fn committed_seq_excludes_events_the_pump_has_not_reached() {
         // Nothing drives this pump until the assertions are made, so every
         // event is still queued.
         let (emitter, pump) = EventPump::new(EventOptions::default());
@@ -1014,17 +1294,17 @@ mod tests {
         }
 
         assert_eq!(
-            emitter.last_seq(),
-            3,
-            "a queued event has already claimed its number"
+            emitter.committed_seq(),
+            0,
+            "queued events are not durable yet"
         );
 
-        emitter.close();
+        emitter.close().await.unwrap();
         pump.run().await.unwrap();
         let published: Vec<u64> = (0..3)
             .map(|_| receiver.try_recv().expect("the event is published").seq)
             .collect();
         assert_eq!(published, vec![1, 2, 3]);
-        assert_eq!(emitter.last_seq(), 3);
+        assert_eq!(emitter.committed_seq(), 3);
     }
 }

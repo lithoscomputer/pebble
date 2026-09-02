@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::config::CodingAgentOptions;
 use crate::environment::Environment;
 use crate::error::{Error, InterruptReason};
-use crate::event::{EventCapacity, EventSink};
+use crate::event::{EventCapacity, EventSink, EventSinkTimeout};
 use crate::history::History;
 use crate::human_input::HumanInputProvider;
 use crate::prompt_transform::SystemPromptTransform;
@@ -357,9 +357,15 @@ impl CodingAgentBuilder {
         self
     }
 
-    /// Sets the capacity of each live event subscription.
+    /// Sets the pending event queue and live subscription capacity.
     pub fn event_capacity(mut self, capacity: impl Into<EventCapacity>) -> Self {
         self.inner = self.inner.event_capacity(capacity);
+        self
+    }
+
+    /// Sets the longest one call to the durable event sink may take.
+    pub fn event_sink_timeout(mut self, timeout: impl Into<EventSinkTimeout>) -> Self {
+        self.inner = self.inner.event_sink_timeout(timeout);
         self
     }
 
@@ -402,7 +408,12 @@ impl CodingAgentBuilder {
             }
             Some(ResumeSource::Export(state)) => {
                 let mut inner = CodingRuntime::from_warm_state(state, self.inner)?;
-                inner.start_from_warm_state();
+                if let Err(source) = inner.start_from_warm_state().await {
+                    let _ = inner.shutdown(ShutdownReason::Error).await;
+                    return Err(CodingAgentBuildError::Initialization {
+                        source: Box::new(source),
+                    });
+                }
                 inner
             }
             None => {
@@ -915,6 +926,20 @@ impl CodingAgent {
         self.inner.subscribe()
     }
 
+    /// Waits until every event currently queued has reached the durable sink.
+    ///
+    /// The returned value is the highest committed sequence number at this
+    /// barrier. A sink failure closes the agent and is returned here.
+    pub async fn flush_events(&mut self) -> Result<u64, Error> {
+        self.inner.flush_events().await
+    }
+
+    /// The highest event sequence accepted by the durable sink.
+    #[must_use]
+    pub fn committed_event_seq(&self) -> u64 {
+        self.inner.committed_event_seq()
+    }
+
     /// Returns a handle that can steer, follow up, abort, or await a prompt.
     #[must_use]
     pub fn control_handle(&self) -> CodingAgentControlHandle {
@@ -983,8 +1008,9 @@ impl CodingAgent {
 
     /// Captures the durable session state.
     ///
-    /// The record can be taken between prompts or during a prompt as a crash
-    /// checkpoint. Restore it with [`CodingAgent::resume`].
+    /// Take records between prompts, after the prompt's event barrier has
+    /// committed the same conversation. Restore one with
+    /// [`CodingAgent::resume`].
     #[must_use]
     pub fn to_record(&self) -> SessionRecord {
         self.inner.to_record()
@@ -1010,18 +1036,23 @@ impl CodingAgent {
 
 #[cfg(test)]
 mod tests {
+    use std::result::Result as StdResult;
+
+    use async_trait::async_trait;
     use lithos_llm::types::ToolDefinition;
     use serde_json::json;
     use tokio::sync::Notify;
     use tokio::time::timeout;
 
     use super::*;
+    use crate::error::ErrorKind;
+    use crate::event::EventSinkError;
     use crate::runtime::testing::{blocking_tool, drained, wait_for_event};
     use crate::test_support::{
         MockEnvironment, ScriptedCall, scripted_client, text_delta_events, text_response,
         tool_call_response,
     };
-    use crate::types::{CodingEvent, ToolSource};
+    use crate::types::{CodingAgentEvent, CodingEvent, ToolSource};
 
     /// How long a test waits for a prompt another task has to unblock.
     const PATIENCE: Duration = Duration::from_secs(5);
@@ -1092,6 +1123,30 @@ mod tests {
             .shutdown(ShutdownReason::Completed)
             .await
             .expect("the session shuts down");
+    }
+
+    struct RefusingSink;
+
+    #[async_trait]
+    impl EventSink for RefusingSink {
+        async fn record(&self, _event: &CodingAgentEvent) -> StdResult<(), EventSinkError> {
+            Err(EventSinkError::new("the event store is unavailable"))
+        }
+    }
+
+    #[tokio::test]
+    async fn build_waits_for_initialization_events_to_be_recorded() {
+        let (client, _provider) = scripted_client(Vec::new());
+        let result = CodingAgent::builder(client, Arc::new(MockEnvironment::linux()))
+            .model("test/model")
+            .event_sink(Arc::new(RefusingSink))
+            .build()
+            .await;
+
+        let Err(CodingAgentBuildError::Initialization { source }) = result else {
+            panic!("a sink failure during initialization must fail the build");
+        };
+        assert_eq!(source.kind(), ErrorKind::EventStream);
     }
 
     #[tokio::test]
