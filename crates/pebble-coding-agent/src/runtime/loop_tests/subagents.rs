@@ -318,7 +318,7 @@ async fn control_interrupt_during_subagent_wait_closes_child_and_resumes_after_s
             matches!(event, CodingEvent::RoundInterrupted { generation: 1 })
         })
         .await;
-        assert!(controller.is_waiting_for_steer());
+        assert!(controller.is_parked());
         controller.steer("resume after interrupt", None);
     });
 
@@ -335,7 +335,7 @@ async fn control_interrupt_during_subagent_wait_closes_child_and_resumes_after_s
         supervisor.status(BLOCKED_AGENT),
         Some(SubagentStatus::Closed)
     ));
-    assert!(!control.is_waiting_for_steer());
+    assert!(!control.is_parked());
 
     let published = drained(&mut recorded).await;
     assert_eq!(

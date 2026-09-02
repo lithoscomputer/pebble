@@ -14,10 +14,10 @@ use lithos_llm::types::{
 };
 use pebble_agent as agent;
 use pebble_agent::integration::{ToolRoundContext, ToolRoundExecutor};
-use tokio::sync::Notify;
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use super::control::SteeringItem;
+use super::control::{SessionControlHandle, actor_from_attribution};
 use super::retry::RetryEventBridge;
 use super::{CodingRuntime, PromptTotals};
 use crate::compaction::{CompactionRequest, check_context_usage, compact_context};
@@ -74,8 +74,7 @@ pub(super) struct CodingAgentBridge {
     root_session_id:   String,
     memory_tokens:     u64,
     skills_tokens:     u64,
-    control_state:     Arc<Mutex<super::control::ControlState>>,
-    control_notify:    Arc<Notify>,
+    control:           SessionControlHandle,
     /// The token that ends the prompt in progress. A child of the runtime's
     /// terminal token, so it also fires when the session is shut down, and set
     /// afresh by [`begin_prompt`](Self::begin_prompt) for every prompt.
@@ -128,8 +127,7 @@ impl CodingAgentBridge {
             root_session_id:   runtime.root_session_id.clone(),
             memory_tokens:     runtime.memory_tokens,
             skills_tokens:     runtime.skills_tokens,
-            control_state:     Arc::clone(&runtime.control_state),
-            control_notify:    Arc::clone(&runtime.control_notify),
+            control:           runtime.control_handle(),
             prompt_cancel:     Arc::new(Mutex::new(runtime.cancel_token.clone())),
             followup_queue:    Arc::clone(&runtime.followup_queue),
             subagents:         runtime.subagents.clone(),
@@ -207,46 +205,8 @@ impl CodingAgentBridge {
     }
 
     fn settle_interrupts(&self) {
-        let generations = {
-            let mut control = self
-                .control_state
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let first = control.settled_interrupt_generation.saturating_add(1);
-            let last = control.interrupt_generation;
-            control.settled_interrupt_generation = last;
-            if first <= last {
-                (first..=last).collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            }
-        };
-        for generation in generations {
+        for generation in self.control.settle_interrupts() {
             self.emit(CodingEvent::RoundInterrupted { generation });
-        }
-    }
-
-    async fn wait_for_steer_if_needed(&self, cancel: &CancellationToken) {
-        let prompt_cancel = self.prompt_cancel();
-        loop {
-            let notified = self.control_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let should_wait = {
-                let control = self
-                    .control_state
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                control.waiting_for_steer && control.queue.is_empty()
-            };
-            if !should_wait {
-                return;
-            }
-            tokio::select! {
-                () = prompt_cancel.cancelled() => return,
-                () = cancel.cancelled() => return,
-                () = notified => {}
-            }
         }
     }
 
@@ -350,27 +310,17 @@ impl CodingAgentBridge {
         self.emit(CodingEvent::UserInput { text });
     }
 
-    fn commit_steering(&self, message: &LlmMessage) {
+    fn commit_steering(&self, message: &LlmMessage, attribution: Option<&Value>) {
         self.settle_interrupts();
-        let queued = self
-            .control_state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .queue
-            .pop_front();
-        let fallback = message_text(message);
-        let timestamp = SystemTime::now();
+        let text = message_text(message);
+        let actor = actor_from_attribution(attribution);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        match queued.unwrap_or_else(|| SteeringItem::steering(fallback)) {
-            SteeringItem::Steering { text, actor } => {
-                state.history.push(Message::Steering {
-                    content: text.clone(),
-                    timestamp,
-                });
-                drop(state);
-                self.emit(CodingEvent::SteeringInjected { text, actor });
-            }
-        }
+        state.history.push(Message::Steering {
+            content:   text.clone(),
+            timestamp: SystemTime::now(),
+        });
+        drop(state);
+        self.emit(CodingEvent::SteeringInjected { text, actor });
     }
 
     fn commit_assistant(&self, response: &Response) {
@@ -451,7 +401,10 @@ impl agent::EventProjection for CodingAgentBridge {
     fn project(&self, event: &agent::AgentEvent) {
         match event {
             agent::AgentEvent::UserMessage { message } => self.commit_user_message(message),
-            agent::AgentEvent::SteeringMessage { message } => self.commit_steering(message),
+            agent::AgentEvent::SteeringMessage {
+                message,
+                attribution,
+            } => self.commit_steering(message, attribution.as_ref()),
             agent::AgentEvent::ModelRequestStarted { request, .. } => {
                 let local = self.measure_request(request);
                 let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -672,7 +625,6 @@ impl agent::TurnBoundaryHooks for CodingAgentBridge {
         cancel: &CancellationToken,
     ) -> StdResult<(), agent::TurnBoundaryError> {
         self.settle_interrupts();
-        self.wait_for_steer_if_needed(cancel).await;
         if cancel.is_cancelled() || self.prompt_cancel().is_cancelled() {
             return Ok(());
         }
@@ -703,25 +655,19 @@ impl agent::TurnBoundaryHooks for CodingAgentBridge {
         // The completion close-door race. A steer may be queued right now, or a
         // steering lease may be held by an external source that is about to
         // send one. Anything queued sends the loop around again to drain it; an
-        // open lease parks the prompt until the last lease drops. Both the
-        // check and the park read the shared control state under its lock, so a
-        // steer arriving mid-decision is never lost between the two.
+        // open lease parks the prompt until the last lease drops. The wake-up
+        // is registered before either is read, so a steer or a release that
+        // lands mid-decision is never lost between the two.
         let prompt_cancel = self.prompt_cancel();
         loop {
-            let notified = self.control_notify.notified();
+            let notified = self.control.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            let parked = {
-                let control = self
-                    .control_state
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                if !control.queue.is_empty() {
-                    return Ok(agent::TurnBoundaryAction::Continue);
-                }
-                control.steering_leases > 0
-            };
+            if self.control.pending_steering() > 0 {
+                return Ok(agent::TurnBoundaryAction::Continue);
+            }
+            let parked = self.control.steering_lease_count() > 0;
             if !parked || cancel.is_cancelled() || prompt_cancel.is_cancelled() {
                 break;
             }
@@ -845,11 +791,9 @@ impl CodingRuntime {
             .take()
             .ok_or_else(|| Error::InvalidState("the coding agent was not built".to_owned()))?;
 
-        self.install_agent_control(agent.control_handle());
         let result = agent
             .prompt_with_cancellation(expanded.text, prompt_cancel)
             .await;
-        self.clear_agent_control();
         self.coding_agent = Some(agent);
         bridge.restore_runtime(self);
         if let Some(error) = bridge.take_boundary_error() {
@@ -903,6 +847,7 @@ impl CodingRuntime {
             .system_prompt(self.system_prompt.clone())
             .messages(messages)
             .tool_provider(bridge.clone())
+            .control_handle(self.agent_control.clone())
             .tool_access_policy(bridge.clone())
             .tool_call_hooks(bridge.clone())
             .tool_round_executor(bridge.clone())
@@ -915,27 +860,6 @@ impl CodingRuntime {
         self.coding_bridge = Some(bridge);
         self.coding_agent = Some(agent);
         Ok(())
-    }
-
-    fn install_agent_control(&self, agent: pebble_agent::AgentControlHandle) {
-        let control = self
-            .control_state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        for item in &control.queue {
-            agent.enqueue_steering(item.text().to_owned());
-        }
-        *self
-            .active_agent_control
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(agent);
-    }
-
-    fn clear_agent_control(&self) {
-        *self
-            .active_agent_control
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = None;
     }
 
     /// Expands a `/name` reference in the input, where one is allowed.

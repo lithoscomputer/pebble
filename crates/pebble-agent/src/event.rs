@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use lithos_llm::types::{ErrorData, Message, Request, Response, ToolCall, ToolResult};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::broadcast;
 
 /// The first model output observed in one stream attempt.
@@ -42,7 +43,9 @@ pub enum AgentEvent {
     /// Steering was committed before the next model turn.
     SteeringMessage {
         /// The committed message.
-        message: Message,
+        message:     Message,
+        /// The attribution the queued message carried, if any.
+        attribution: Option<Value>,
     },
     /// A model request is about to open.
     ModelRequestStarted {

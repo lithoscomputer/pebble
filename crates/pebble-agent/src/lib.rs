@@ -56,7 +56,7 @@ pub use self::agent::{
     Agent, AgentBuilder, AgentConfig, AgentSnapshot, AgentState, PromptOutcome, ToolExecution,
     UserMessage,
 };
-pub use self::control::AgentControlHandle;
+pub use self::control::{AgentControlHandle, QueueOutcome};
 pub use self::error::{AgentBuildError, AgentError, Result};
 pub use self::event::{AgentEvent, EventProjection, FirstOutputKind};
 pub use self::model::ModelService;

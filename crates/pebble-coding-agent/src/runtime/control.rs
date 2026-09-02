@@ -1,63 +1,25 @@
 //! Steering a coding agent that is already running.
 //!
-//! The public [`CodingAgentControlHandle`](crate::CodingAgentControlHandle)
-//! uses this internal handle to queue input and interrupt the current model
-//! turn. The coding bridge commits the queued message and its durable event at
-//! the next turn boundary.
+//! The steering queue itself belongs to the generic agent: every message a
+//! coding agent is steered with goes straight into
+//! [`AgentControlHandle`]'s queue, carrying its author as an attribution the
+//! bridge reads back when the message is committed. What this module adds is
+//! the coding layer's own bookkeeping around that queue — the exactly-once
+//! interrupt ledger and the completion leases — and the public
+//! [`CodingAgentControlHandle`](crate::CodingAgentControlHandle) drives both
+//! through [`SessionControlHandle`].
 
-use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use pebble_agent::AgentControlHandle;
+use pebble_agent::{AgentControlHandle, QueueOutcome, UserMessage};
+use serde_json::Value;
 use tokio::sync::Notify;
+use tokio::sync::futures::Notified;
 
 use crate::types::Actor;
 
-/// One queued item waiting for the next round boundary.
-///
-/// Steering stays visibly separate from the user's conversation turns and
-/// publishes [`SteeringInjected`](crate::events::CodingEvent::SteeringInjected).
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub(crate) enum SteeringItem {
-    /// Guidance for the assistant, kept distinct from the user's own turns.
-    Steering {
-        /// What to tell the assistant.
-        text:  String,
-        /// Who wrote it, when the application tracks that.
-        actor: Option<Actor>,
-    },
-}
-
-impl SteeringItem {
-    /// A steer with no named author.
-    #[must_use]
-    pub(crate) fn steering(text: impl Into<String>) -> Self {
-        Self::Steering {
-            text:  text.into(),
-            actor: None,
-        }
-    }
-
-    /// The text this item commits.
-    #[must_use]
-    pub(crate) fn text(&self) -> &str {
-        match self {
-            Self::Steering { text, .. } => text,
-        }
-    }
-
-    /// The text and author this item carries.
-    #[must_use]
-    pub(crate) fn into_parts(self) -> (String, Option<Actor>) {
-        match self {
-            Self::Steering { text, actor } => (text, actor),
-        }
-    }
-}
-
-/// Coding metadata shared by the control plane and the agent bridge.
+/// The coding layer's bookkeeping around the generic agent's steering queue.
 ///
 /// The two generation counters are the exactly-once interrupt ledger: every
 /// gesture raises `interrupt_generation`, and the loop raises
@@ -73,12 +35,10 @@ impl SteeringItem {
 /// its way cannot lose the close-door race. The last lease to drop wakes the
 /// parked prompt and lets it finish.
 #[derive(Debug, Default)]
-pub(crate) struct ControlState {
-    pub(crate) queue: VecDeque<SteeringItem>,
-    pub(crate) waiting_for_steer: bool,
-    pub(crate) interrupt_generation: u64,
-    pub(crate) settled_interrupt_generation: u64,
-    pub(crate) steering_leases: usize,
+pub(crate) struct InterruptLedger {
+    interrupt_generation:         u64,
+    settled_interrupt_generation: u64,
+    steering_leases:              usize,
 }
 
 /// A prompt-scoped hold that keeps natural completion parked.
@@ -116,73 +76,140 @@ impl Drop for SteeringLease {
 }
 
 /// The internal handle that steers and interrupts a running coding agent.
+///
+/// Cheap to clone. The agent handle inside is the one the session's generic
+/// agent is bound to, created before the agent exists so control can be handed
+/// out from the moment the session is built.
 #[derive(Clone, Debug)]
 pub(crate) struct SessionControlHandle {
-    control:      Arc<Mutex<ControlState>>,
-    notify:       Arc<Notify>,
-    active_agent: Arc<Mutex<Option<AgentControlHandle>>>,
-}
-
-impl Default for SessionControlHandle {
-    fn default() -> Self {
-        Self::new()
-    }
+    agent:  AgentControlHandle,
+    ledger: Arc<Mutex<InterruptLedger>>,
+    notify: Arc<Notify>,
 }
 
 impl SessionControlHandle {
-    /// A handle attached to no session.
+    /// A handle over an agent that does not exist yet.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn new() -> Self {
-        Self {
-            control:      Arc::new(Mutex::new(ControlState::default())),
-            notify:       Arc::new(Notify::new()),
-            active_agent: Arc::new(Mutex::new(None)),
-        }
+        Self::attached(
+            AgentControlHandle::detached(),
+            Arc::default(),
+            Arc::default(),
+        )
     }
 
     /// Builds the handle that shares one session's control state.
     pub(crate) fn attached(
-        control: Arc<Mutex<ControlState>>,
+        agent: AgentControlHandle,
+        ledger: Arc<Mutex<InterruptLedger>>,
         notify: Arc<Notify>,
-        active_agent: Arc<Mutex<Option<AgentControlHandle>>>,
     ) -> Self {
         Self {
-            control,
+            agent,
+            ledger,
             notify,
-            active_agent,
         }
     }
 
-    /// Queues guidance for the next round, and wakes a parked session.
+    /// Queues steering for the next round boundary without interrupting the
+    /// round in progress.
+    ///
+    /// `capacity` bounds the queue; a full queue evicts its oldest message and
+    /// the outcome carries it. Wakes a prompt parked on a completion lease so
+    /// it drains the queue.
+    pub(crate) fn queue_steering(
+        &self,
+        text: impl Into<String>,
+        actor: Option<Actor>,
+        capacity: Option<usize>,
+    ) -> QueueOutcome {
+        let message = steering_message(text, actor);
+        let outcome = match capacity {
+            Some(capacity) => self.agent.enqueue_steering_bounded(message, capacity),
+            None if self.agent.enqueue_steering(message) => QueueOutcome::Queued,
+            None => QueueOutcome::Closed,
+        };
+        self.notify.notify_waiters();
+        outcome
+    }
+
+    /// Interrupts the round in progress and queues `text` as what replaces it.
+    ///
+    /// The generic agent cancels the round and queues the message under one
+    /// lock, so the loop can never observe the interrupt with an empty queue.
+    /// The gesture is counted here only while a prompt is running: with nothing
+    /// running there is no round to interrupt, and the message simply opens the
+    /// next prompt.
+    pub(crate) fn steer_now(
+        &self,
+        text: impl Into<String>,
+        actor: Option<Actor>,
+        capacity: Option<usize>,
+    ) -> QueueOutcome {
+        if self.agent.is_running() {
+            self.raise_generation();
+        }
+        let message = steering_message(text, actor);
+        let outcome = match capacity {
+            Some(capacity) => self.agent.steer_bounded(message, capacity),
+            None if self.agent.steer(message) => QueueOutcome::Queued,
+            None => QueueOutcome::Closed,
+        };
+        self.notify.notify_waiters();
+        outcome
+    }
+
+    /// Abandons the current round without saying what comes next.
+    ///
+    /// The prompt parks at its next boundary until a steer arrives, and the
+    /// gesture is counted so exactly one
+    /// [`RoundInterrupted`](crate::events::CodingEvent::RoundInterrupted) is
+    /// published for it. Answers whether a prompt was running to interrupt.
+    pub(crate) fn interrupt(&self) -> bool {
+        if !self.agent.interrupt() {
+            return false;
+        }
+        self.raise_generation();
+        true
+    }
+
+    /// Counts a gesture whose round cancellation was lost, so the announcement
+    /// it is owed is still published.
     #[cfg(test)]
-    pub(crate) fn steer(&self, text: impl Into<String>, actor: Option<Actor>) {
-        self.enqueue(SteeringItem::Steering {
-            text: text.into(),
-            actor,
-        });
+    pub(crate) fn record_interrupt_without_a_round(&self) {
+        self.raise_generation();
+    }
+
+    /// The generations raised since the last settlement, oldest first, and
+    /// marks them settled.
+    pub(crate) fn settle_interrupts(&self) -> Vec<u64> {
+        let mut ledger = self.lock();
+        let first = ledger.settled_interrupt_generation.saturating_add(1);
+        let last = ledger.interrupt_generation;
+        ledger.settled_interrupt_generation = last;
+        if first <= last {
+            (first..=last).collect()
+        } else {
+            Vec::new()
+        }
     }
 
     /// Takes one prompt-scoped hold on natural completion.
-    ///
-    /// While any hold is outstanding, a prompt that reaches a plain answer
-    /// parks rather than completing, so an external steering source about to
-    /// send a steer cannot lose the close-door race. Balance every call with
-    /// [`release_steering_lease`](Self::release_steering_lease).
     pub(crate) fn acquire_steering_lease(&self) {
-        let mut control = self.lock();
-        control.steering_leases = control.steering_leases.saturating_add(1);
+        let mut ledger = self.lock();
+        ledger.steering_leases = ledger.steering_leases.saturating_add(1);
     }
 
     /// Releases one hold taken by
-    /// [`acquire_steering_lease`](Self::acquire_steering_lease).
-    ///
-    /// The call that drops the count to zero wakes a prompt parked at its
-    /// completion boundary so it can finish.
+    /// [`acquire_steering_lease`](Self::acquire_steering_lease). The call that
+    /// drops the count to zero wakes a prompt parked at its completion
+    /// boundary.
     pub(crate) fn release_steering_lease(&self) {
         let woke = {
-            let mut control = self.lock();
-            control.steering_leases = control.steering_leases.saturating_sub(1);
-            control.steering_leases == 0
+            let mut ledger = self.lock();
+            ledger.steering_leases = ledger.steering_leases.saturating_sub(1);
+            ledger.steering_leases == 0
         };
         if woke {
             self.notify.notify_waiters();
@@ -191,215 +218,66 @@ impl SessionControlHandle {
 
     /// How many completion holds are outstanding.
     #[must_use]
-    #[cfg(test)]
     pub(crate) fn steering_lease_count(&self) -> usize {
         self.lock().steering_leases
     }
 
-    /// Abandons the current round.
-    ///
-    /// With nothing queued the session parks at the next round boundary and
-    /// waits for a steer, so an operator can stop a prompt mid-thought and
-    /// decide what to say afterwards. The gesture is counted, so the
-    /// session publishes exactly one
-    /// [`RoundInterrupted`](crate::events::CodingEvent::RoundInterrupted) for
-    /// it.
-    ///
-    /// No author is taken, because nothing records one: an interrupt is
-    /// announced as a generation, not as something somebody said. Where the
-    /// author matters, [`interrupt_then_steer`](Self::interrupt_then_steer)
-    /// carries it on the steer.
-    pub(crate) fn interrupt(&self) {
-        {
-            let mut control = self.lock();
-            control.interrupt_generation = control.interrupt_generation.saturating_add(1);
-            if control.queue.is_empty() {
-                control.waiting_for_steer = true;
-            }
-        }
-        let _ = self.with_active_agent(AgentControlHandle::interrupt);
-        self.notify.notify_waiters();
+    /// How many steering messages wait for the next round boundary.
+    #[must_use]
+    pub(crate) fn pending_steering(&self) -> usize {
+        self.agent.pending_steering()
     }
 
-    /// Abandons the current round and delivers `text` as its replacement.
+    /// Whether the prompt is parked after an interrupt, waiting for a steer.
+    #[must_use]
+    pub(crate) fn is_parked(&self) -> bool {
+        self.agent.is_paused()
+    }
+
+    /// A wake-up that fires when steering is queued or the last lease drops.
+    ///
+    /// Register it before reading the queue or the lease count, the way the
+    /// bridge's completion park does, so a change that lands in between is not
+    /// missed.
+    pub(crate) fn notified(&self) -> Notified<'_> {
+        self.notify.notified()
+    }
+
+    /// Queues steering with no bound, for the crate's own tests.
+    #[cfg(test)]
+    pub(crate) fn steer(&self, text: impl Into<String>, actor: Option<Actor>) {
+        let _ = self.queue_steering(text, actor, None);
+    }
+
+    /// Interrupts and steers with no bound, for the crate's own tests.
     #[cfg(test)]
     pub(crate) fn interrupt_then_steer(&self, text: impl Into<String>, actor: Option<Actor>) {
-        self.interrupt_then_enqueue(SteeringItem::Steering {
-            text: text.into(),
-            actor,
-        });
+        let _ = self.steer_now(text, actor, None);
     }
 
-    /// Parks the session at the next round boundary without cancelling the
-    /// round it is in.
-    ///
-    /// An external coordinator uses this to claim the session before it
-    /// finishes, so a steer it is about to send cannot arrive too late.
-    #[cfg(test)]
-    pub(crate) fn park_for_steer(&self) {
-        let mut control = self.lock();
-        if control.queue.is_empty() {
-            control.waiting_for_steer = true;
-        }
-        drop(control);
-        let _ = self.with_active_agent(AgentControlHandle::park_for_steer);
+    fn raise_generation(&self) {
+        let mut ledger = self.lock();
+        ledger.interrupt_generation = ledger.interrupt_generation.saturating_add(1);
     }
 
-    /// Queues one item for the next round.
-    #[cfg(test)]
-    pub(crate) fn enqueue(&self, item: SteeringItem) {
-        let text = item.text().to_owned();
-        let was_waiting = {
-            let mut control = self.lock();
-            let was_waiting = control.waiting_for_steer;
-            control.waiting_for_steer = false;
-            control.queue.push_back(item);
-            was_waiting
-        };
-        self.deliver_to_active_agent(text, was_waiting);
-        self.notify.notify_waiters();
+    fn lock(&self) -> MutexGuard<'_, InterruptLedger> {
+        self.ledger.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
 
-    /// Queues one item, dropping the oldest to stay within `cap`.
-    ///
-    /// Answers with whatever was evicted, so a caller can report what the
-    /// session will never see.
-    #[must_use]
-    pub(crate) fn enqueue_bounded(&self, item: SteeringItem, cap: usize) -> Option<SteeringItem> {
-        let text = item.text().to_owned();
-        let (evicted, was_waiting) = {
-            let mut control = self.lock();
-            let evicted = (control.queue.len() >= cap)
-                .then(|| control.queue.pop_front())
-                .flatten();
-            let was_waiting = control.waiting_for_steer;
-            control.waiting_for_steer = false;
-            control.queue.push_back(item);
-            (evicted, was_waiting)
-        };
-        self.deliver_to_active_agent(text, was_waiting);
-        self.notify.notify_waiters();
-        evicted
+/// A steering message for the generic agent's queue, carrying its author as
+/// an attribution the bridge reads back when the message is committed.
+pub(crate) fn steering_message(text: impl Into<String>, actor: Option<Actor>) -> UserMessage {
+    let message = UserMessage::text(text);
+    match actor.and_then(|actor| serde_json::to_value(actor).ok()) {
+        Some(attribution) => message.with_attribution(attribution),
+        None => message,
     }
+}
 
-    /// Queues one item only while the queue is under `cap`, answering whether
-    /// it was taken.
-    ///
-    /// The opposite trade to [`enqueue_bounded`](Self::enqueue_bounded): what
-    /// is already queued is kept and the new item is refused.
-    #[must_use]
-    #[cfg(test)]
-    pub(crate) fn try_enqueue_bounded(&self, item: SteeringItem, cap: usize) -> bool {
-        let text = item.text().to_owned();
-        let was_waiting = {
-            let mut control = self.lock();
-            if control.queue.len() >= cap {
-                return false;
-            }
-            control.queue.push_back(item);
-            let was_waiting = control.waiting_for_steer;
-            control.waiting_for_steer = false;
-            was_waiting
-        };
-        self.deliver_to_active_agent(text, was_waiting);
-        self.notify.notify_waiters();
-        true
-    }
-
-    /// Abandons the current round and queues one item within `cap`, in one
-    /// step.
-    ///
-    /// Counting the interrupt and queueing its replacement happen under one
-    /// lock, so the session can never observe the interrupt with the queue
-    /// still empty and park when a steer was already on its way.
-    #[must_use]
-    pub(crate) fn interrupt_then_enqueue_bounded(
-        &self,
-        item: SteeringItem,
-        cap: usize,
-    ) -> Option<SteeringItem> {
-        let text = item.text().to_owned();
-        let evicted = {
-            let mut control = self.lock();
-            let evicted = (control.queue.len() >= cap)
-                .then(|| control.queue.pop_front())
-                .flatten();
-            control.interrupt_generation = control.interrupt_generation.saturating_add(1);
-            control.queue.push_back(item);
-            control.waiting_for_steer = false;
-            evicted
-        };
-        let _ = self.with_active_agent(|agent| agent.steer(text));
-        self.notify.notify_waiters();
-        evicted
-    }
-
-    /// Whether nothing is queued.
-    #[must_use]
-    #[cfg(test)]
-    pub(crate) fn queue_is_empty(&self) -> bool {
-        self.lock().queue.is_empty()
-    }
-
-    /// Whether the session still has control work to do: something queued, or
-    /// a park waiting to be filled.
-    #[must_use]
-    #[cfg(test)]
-    pub(crate) fn has_pending_control_work(&self) -> bool {
-        let control = self.lock();
-        !control.queue.is_empty() || control.waiting_for_steer
-    }
-
-    /// Whether the session is parked waiting for a steer.
-    #[must_use]
-    pub(crate) fn is_waiting_for_steer(&self) -> bool {
-        self.lock().waiting_for_steer
-    }
-
-    /// How many items are queued.
-    ///
-    /// For diagnostics. A caller enforcing a bound wants
-    /// [`enqueue_bounded`](Self::enqueue_bounded), which decides under the same
-    /// lock it counts with.
-    #[must_use]
-    pub(crate) fn queue_len(&self) -> usize {
-        self.lock().queue.len()
-    }
-
-    #[cfg(test)]
-    fn interrupt_then_enqueue(&self, item: SteeringItem) {
-        let text = item.text().to_owned();
-        {
-            let mut control = self.lock();
-            control.interrupt_generation = control.interrupt_generation.saturating_add(1);
-            control.queue.push_back(item);
-            control.waiting_for_steer = false;
-        }
-        let _ = self.with_active_agent(|agent| agent.steer(text));
-        self.notify.notify_waiters();
-    }
-
-    fn deliver_to_active_agent(&self, text: String, interrupt: bool) {
-        let _ = self.with_active_agent(|agent| {
-            if interrupt {
-                agent.steer(text)
-            } else {
-                agent.enqueue_steering(text)
-            }
-        });
-    }
-
-    fn with_active_agent(&self, use_agent: impl FnOnce(&AgentControlHandle) -> bool) -> bool {
-        self.active_agent
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .is_some_and(use_agent)
-    }
-
-    fn lock(&self) -> MutexGuard<'_, ControlState> {
-        self.control.lock().unwrap_or_else(PoisonError::into_inner)
-    }
+/// The author a queued steering message named, if it named one.
+pub(crate) fn actor_from_attribution(attribution: Option<&Value>) -> Option<Actor> {
+    attribution.and_then(|value| serde_json::from_value(value.clone()).ok())
 }
 
 #[cfg(test)]
@@ -411,104 +289,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_steer_queues_and_names_its_author() {
+    fn a_steer_reaches_the_agents_queue_with_its_author() {
         let handle = SessionControlHandle::new();
 
-        handle.steer("also update the changelog", Some(Actor::System));
+        let outcome = handle.queue_steering("also update the changelog", Some(Actor::System), None);
 
-        assert_eq!(handle.queue_len(), 1);
-        assert!(!handle.queue_is_empty());
-        assert!(handle.has_pending_control_work());
-        assert!(!handle.is_waiting_for_steer());
+        assert_eq!(outcome, QueueOutcome::Queued);
+        assert_eq!(handle.pending_steering(), 1);
+        assert!(!handle.is_parked());
     }
 
     #[test]
-    fn a_pure_interrupt_parks_without_queueing_text() {
-        let handle = SessionControlHandle::new();
+    fn an_author_survives_the_round_trip_through_an_attribution() {
+        let actor = Actor::User {
+            id:           Some("u_1".into()),
+            display_name: Some("Ada".into()),
+        };
 
-        handle.interrupt();
-        handle.interrupt();
+        let message = steering_message("hello", Some(actor.clone()));
 
-        assert!(handle.is_waiting_for_steer());
-        assert!(handle.queue_is_empty());
-        assert!(handle.has_pending_control_work());
+        assert_eq!(message.text_content(), "hello");
+        assert_eq!(actor_from_attribution(message.attribution()), Some(actor));
+        assert_eq!(actor_from_attribution(None), None);
     }
 
     #[test]
-    fn every_interrupt_gesture_raises_a_generation() {
+    fn an_interrupt_with_nothing_running_raises_no_generation() {
         let handle = SessionControlHandle::new();
 
-        handle.interrupt();
-        handle.interrupt_then_steer("stop now", None);
-
-        let control = handle.lock();
-        assert_eq!(control.interrupt_generation, 2);
-        assert_eq!(control.settled_interrupt_generation, 0);
+        assert!(!handle.interrupt());
+        assert!(handle.settle_interrupts().is_empty());
     }
 
     #[test]
-    fn a_steer_clears_a_park() {
+    fn raised_generations_settle_once_in_order() {
         let handle = SessionControlHandle::new();
-        handle.interrupt();
+        handle.record_interrupt_without_a_round();
+        handle.record_interrupt_without_a_round();
 
-        handle.steer("carry on", None);
-
-        assert!(!handle.is_waiting_for_steer());
-        assert_eq!(handle.queue_len(), 1);
+        assert_eq!(handle.settle_interrupts(), [1, 2]);
+        assert!(
+            handle.settle_interrupts().is_empty(),
+            "nothing is owed twice"
+        );
     }
 
     #[test]
-    fn parking_claims_a_session() {
+    fn a_bounded_steer_reports_what_it_evicted() {
         let handle = SessionControlHandle::new();
+        let _ = handle.queue_steering("first", None, Some(1));
 
-        handle.park_for_steer();
+        let outcome = handle.queue_steering("second", Some(Actor::System), Some(1));
 
-        assert!(handle.is_waiting_for_steer());
-    }
-
-    #[test]
-    fn parking_does_nothing_while_work_is_queued() {
-        let handle = SessionControlHandle::new();
-        handle.steer("first", None);
-
-        handle.park_for_steer();
-
-        assert!(!handle.is_waiting_for_steer());
-    }
-
-    #[test]
-    fn a_bounded_enqueue_evicts_the_oldest() {
-        let handle = SessionControlHandle::new();
-        handle.enqueue(SteeringItem::steering("first"));
-        handle.enqueue(SteeringItem::steering("second"));
-
-        let evicted = handle.enqueue_bounded(SteeringItem::steering("third"), 2);
-
-        assert_eq!(evicted.as_ref().map(SteeringItem::text), Some("first"));
-        assert_eq!(handle.queue_len(), 2);
-    }
-
-    #[test]
-    fn a_try_enqueue_refuses_instead_of_evicting() {
-        let handle = SessionControlHandle::new();
-        handle.enqueue(SteeringItem::steering("first"));
-
-        assert!(!handle.try_enqueue_bounded(SteeringItem::steering("second"), 1));
-        assert_eq!(handle.queue_len(), 1);
-        assert!(handle.try_enqueue_bounded(SteeringItem::steering("second"), 2));
-        assert_eq!(handle.queue_len(), 2);
-    }
-
-    #[test]
-    fn an_interrupting_bounded_enqueue_does_both_at_once() {
-        let handle = SessionControlHandle::new();
-        handle.enqueue(SteeringItem::steering("first"));
-
-        let evicted = handle.interrupt_then_enqueue_bounded(SteeringItem::steering("second"), 1);
-
-        assert_eq!(evicted.as_ref().map(SteeringItem::text), Some("first"));
-        assert_eq!(handle.lock().interrupt_generation, 1);
-        assert!(!handle.is_waiting_for_steer());
+        let QueueOutcome::Evicted(evicted) = outcome else {
+            panic!("the bound evicts the oldest message");
+        };
+        assert_eq!(evicted.text_content(), "first");
+        assert_eq!(handle.pending_steering(), 1);
     }
 
     #[test]
@@ -529,7 +366,7 @@ mod tests {
     async fn dropping_the_last_lease_wakes_a_waiter_that_registered_first() {
         let handle = SessionControlHandle::new();
         let lease = SteeringLease::acquire(handle.clone());
-        let mut notified = std::pin::pin!(handle.notify.notified());
+        let mut notified = std::pin::pin!(handle.notified());
         notified.as_mut().enable();
 
         drop(lease);
@@ -542,9 +379,9 @@ mod tests {
     #[tokio::test]
     async fn a_queued_steer_wakes_a_waiter_that_registered_first() {
         let handle = SessionControlHandle::new();
-        let mut notified = std::pin::pin!(handle.notify.notified());
+        let mut notified = std::pin::pin!(handle.notified());
         // Registering before the queue is read is what makes the wait immune
-        // to a steer that lands in between; the loop's park does the same.
+        // to a steer that lands in between; the bridge's park does the same.
         notified.as_mut().enable();
 
         handle.steer("wake up", None);

@@ -32,9 +32,9 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use self::control::ControlState;
+use self::control::InterruptLedger;
 pub use self::control::SteeringLease;
-pub(crate) use self::control::{SessionControlHandle, SteeringItem};
+pub(crate) use self::control::{SessionControlHandle, actor_from_attribution};
 pub use self::retry::RetryEventObserver;
 use self::turn::CodingAgentBridge;
 pub(crate) use crate::coding_agent::{
@@ -508,9 +508,9 @@ impl CodingRuntimeBuilder {
             human_input: self.human_input,
             tool_env_provider: self.tool_env_provider,
             redactor: self.redactor,
-            control_state: Arc::new(Mutex::new(ControlState::default())),
+            agent_control: AgentControlHandle::detached(),
+            ledger: Arc::new(Mutex::new(InterruptLedger::default())),
             control_notify: Arc::new(Notify::new()),
-            active_agent_control: Arc::new(Mutex::new(None)),
             followup_queue: Arc::new(Mutex::new(VecDeque::new())),
             cancel_token: CancellationToken::new(),
             interrupt_reason: Arc::new(Mutex::new(None)),
@@ -708,9 +708,12 @@ pub(crate) struct CodingRuntime {
     tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
     /// What strips secrets out of the process output this session publishes.
     redactor: Arc<dyn Redactor>,
-    control_state: Arc<Mutex<ControlState>>,
+    /// The control the generic agent is bound to when it is built, so a
+    /// handle can be given out before the first prompt creates the agent.
+    agent_control: AgentControlHandle,
+    /// The exactly-once interrupt ledger and the completion leases.
+    ledger: Arc<Mutex<InterruptLedger>>,
     control_notify: Arc<Notify>,
-    active_agent_control: Arc<Mutex<Option<AgentControlHandle>>>,
     followup_queue: Arc<Mutex<VecDeque<String>>>,
     /// Ends the whole prompt. Distinct from the round token, which ends one
     /// turn.
@@ -1234,9 +1237,9 @@ impl CodingRuntime {
     /// A handle that steers and interrupts this session from elsewhere.
     pub(crate) fn control_handle(&self) -> SessionControlHandle {
         SessionControlHandle::attached(
-            Arc::clone(&self.control_state),
+            self.agent_control.clone(),
+            Arc::clone(&self.ledger),
             Arc::clone(&self.control_notify),
-            Arc::clone(&self.active_agent_control),
         )
     }
 
@@ -1984,18 +1987,25 @@ mod tests {
 
     #[tokio::test]
     async fn an_interrupt_is_announced_once_and_its_steer_follows_it() {
-        let mut session = session();
+        let (mut session, provider) = TestSession::answering(vec![
+            ScriptedCall::PendingOpen,
+            ScriptedCall::response(text_response("done")),
+        ]);
         let mut events = session.subscribe();
-        // Two gestures before the loop ever runs: one round to settle, two
+        // Two gestures against one hanging round: one round to settle, two
         // generations to announce.
         let handle = session.control_handle();
-        handle.interrupt();
-        handle.interrupt_then_steer("do this instead", None);
+        let controller = tokio::spawn(async move {
+            provider.wait_for_call().await;
+            assert!(handle.interrupt());
+            handle.interrupt_then_steer("do this instead", None);
+        });
 
-        session
-            .prompt("do a thing")
+        timeout(Duration::from_secs(5), session.prompt("do a thing"))
             .await
+            .expect("the steer unblocks the hanging call")
             .expect("the prompt succeeds");
+        controller.await.expect("the controller finishes");
 
         let published = settled(&mut session, &mut events).await;
         let interrupts: Vec<u64> = published

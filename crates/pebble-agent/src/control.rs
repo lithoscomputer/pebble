@@ -20,7 +20,7 @@ struct ControlState {
     running:       bool,
     closed:        bool,
     paused:        bool,
-    steering:      VecDeque<Message>,
+    steering:      VecDeque<UserMessage>,
     follow_up:     VecDeque<Message>,
     prompt_cancel: CancellationToken,
     round_cancel:  CancellationToken,
@@ -70,7 +70,7 @@ impl Control {
         self.resume.notify_waiters();
     }
 
-    pub(crate) fn begin_round(&self) -> (CancellationToken, Vec<Message>) {
+    pub(crate) fn begin_round(&self) -> (CancellationToken, Vec<UserMessage>) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.round_cancel = CancellationToken::new();
         let cancel = state.round_cancel.clone();
@@ -142,8 +142,36 @@ impl Control {
     }
 }
 
+/// What the control did with a message it was asked to queue.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum QueueOutcome {
+    /// The message is queued.
+    Queued,
+    /// The message is queued, and the queue was at its bound: this older
+    /// message was dropped to make room and the agent will never see it.
+    Evicted(UserMessage),
+    /// The agent is closed and nothing was queued.
+    Closed,
+}
+
+impl QueueOutcome {
+    /// Whether the message was queued, with or without an eviction.
+    #[must_use]
+    pub const fn is_queued(&self) -> bool {
+        matches!(self, Self::Queued | Self::Evicted(_))
+    }
+}
+
 /// Controls an agent while another task awaits
 /// [`Agent::prompt`](crate::Agent::prompt).
+///
+/// A handle can exist before the agent does:
+/// [`detached`](Self::detached) creates one that
+/// [`AgentBuilder::control_handle`](crate::AgentBuilder::control_handle) later
+/// binds to an agent, so a layer built on this crate can hand out control
+/// before it has built the loop the control drives. Steering queued on a
+/// detached handle is applied by the first prompt after it is bound.
 #[derive(Clone)]
 pub struct AgentControlHandle {
     control: Arc<Control>,
@@ -154,38 +182,77 @@ impl AgentControlHandle {
         Self { control }
     }
 
+    /// A handle bound to no agent yet.
+    #[must_use]
+    pub fn detached() -> Self {
+        Self::new(Control::new())
+    }
+
+    pub(crate) fn control(&self) -> Arc<Control> {
+        Arc::clone(&self.control)
+    }
+
     /// Queues steering for the next model turn and interrupts the current one.
     ///
     /// Returns `false` when the agent is closed. Steering queued while idle is
     /// applied after the next prompt's user message.
     pub fn steer(&self, message: impl Into<UserMessage>) -> bool {
-        self.queue_steering(message.into(), true)
+        self.queue_steering(message.into(), true, None).is_queued()
     }
 
     /// Queues steering for the next model turn without interrupting this one.
     ///
     /// Returns `false` when the agent is closed.
     pub fn enqueue_steering(&self, message: impl Into<UserMessage>) -> bool {
-        self.queue_steering(message.into(), false)
+        self.queue_steering(message.into(), false, None).is_queued()
     }
 
-    fn queue_steering(&self, message: UserMessage, interrupt: bool) -> bool {
+    /// Queues steering and interrupts the current turn, keeping at most
+    /// `capacity` messages queued.
+    ///
+    /// A full queue drops its oldest message to make room, and the outcome
+    /// carries what was dropped. The interrupt and the enqueue happen under one
+    /// lock, so the loop can never observe the interrupt with the queue still
+    /// empty.
+    pub fn steer_bounded(&self, message: impl Into<UserMessage>, capacity: usize) -> QueueOutcome {
+        self.queue_steering(message.into(), true, Some(capacity))
+    }
+
+    /// Queues steering without interrupting, keeping at most `capacity`
+    /// messages queued.
+    pub fn enqueue_steering_bounded(
+        &self,
+        message: impl Into<UserMessage>,
+        capacity: usize,
+    ) -> QueueOutcome {
+        self.queue_steering(message.into(), false, Some(capacity))
+    }
+
+    fn queue_steering(
+        &self,
+        message: UserMessage,
+        interrupt: bool,
+        capacity: Option<usize>,
+    ) -> QueueOutcome {
         let mut state = self
             .control
             .state
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if state.closed {
-            return false;
+            return QueueOutcome::Closed;
         }
-        state.steering.push_back(message.into_message());
+        let evicted = capacity
+            .filter(|capacity| state.steering.len() >= *capacity)
+            .and_then(|_| state.steering.pop_front());
+        state.steering.push_back(message);
         state.paused = false;
         if interrupt && state.running {
             state.round_cancel.cancel();
         }
         drop(state);
         self.control.resume.notify_waiters();
-        true
+        evicted.map_or(QueueOutcome::Queued, QueueOutcome::Evicted)
     }
 
     /// Queues input to process after the current prompt reaches an answer.
@@ -278,6 +345,23 @@ impl AgentControlHandle {
     pub fn is_closed(&self) -> bool {
         self.control.is_closed()
     }
+
+    /// Whether the prompt is parked after an interrupt, waiting for steering.
+    #[must_use]
+    pub fn is_paused(&self) -> bool {
+        self.control.is_paused()
+    }
+
+    /// How many steering messages wait for the next turn boundary.
+    #[must_use]
+    pub fn pending_steering(&self) -> usize {
+        self.control
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .steering
+            .len()
+    }
 }
 
 impl fmt::Debug for AgentControlHandle {
@@ -286,6 +370,59 @@ impl fmt::Debug for AgentControlHandle {
             .debug_struct("AgentControlHandle")
             .field("running", &self.is_running())
             .field("closed", &self.is_closed())
+            .field("paused", &self.is_paused())
+            .field("pending_steering", &self.pending_steering())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_bounded_queue_evicts_its_oldest_message() {
+        let handle = AgentControlHandle::detached();
+
+        assert_eq!(
+            handle.enqueue_steering_bounded("first", 2),
+            QueueOutcome::Queued
+        );
+        assert_eq!(
+            handle.enqueue_steering_bounded("second", 2),
+            QueueOutcome::Queued
+        );
+        let outcome = handle.enqueue_steering_bounded("third", 2);
+
+        assert_eq!(outcome, QueueOutcome::Evicted(UserMessage::text("first")));
+        assert!(outcome.is_queued());
+        assert_eq!(handle.pending_steering(), 2);
+    }
+
+    #[test]
+    fn a_detached_handle_queues_but_cannot_interrupt() {
+        let handle = AgentControlHandle::detached();
+
+        assert!(handle.steer("later"));
+        assert!(!handle.interrupt(), "nothing is running to interrupt");
+        assert!(!handle.is_paused());
+        assert_eq!(handle.pending_steering(), 1);
+    }
+
+    #[test]
+    fn attribution_rides_along_with_a_queued_message() {
+        let handle = AgentControlHandle::detached();
+        let message = UserMessage::text("with a byline").with_attribution(serde_json::json!({
+            "kind": "system"
+        }));
+
+        handle.enqueue_steering(message.clone());
+        let (_, drained) = handle.control.begin_round();
+
+        assert_eq!(drained, vec![message]);
+        assert_eq!(
+            drained[0].attribution(),
+            Some(&serde_json::json!({"kind": "system"}))
+        );
     }
 }

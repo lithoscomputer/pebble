@@ -9,6 +9,7 @@ use lithos_llm::Client;
 use lithos_llm::catalog::MetadataError;
 use lithos_llm::resolver::ModelSelectionError;
 use lithos_llm::types::{ReasoningEffort, RequestBuildError, Speed};
+use pebble_agent::{QueueOutcome, UserMessage};
 use tokio::sync::{Notify, broadcast};
 use tokio_util::sync::CancellationToken;
 
@@ -22,8 +23,8 @@ use crate::prompt_transform::SystemPromptTransform;
 use crate::record::SessionRecord;
 use crate::redact::Redactor;
 use crate::runtime::{
-    CodingRuntime, CodingRuntimeBuilder, InterruptReasonHandle, SessionControlHandle, SteeringItem,
-    SteeringLease, WarmState,
+    CodingRuntime, CodingRuntimeBuilder, InterruptReasonHandle, SessionControlHandle,
+    SteeringLease, WarmState, actor_from_attribution,
 };
 use crate::search::SearchProvider;
 use crate::subagent::{ChildAgentSpec, SubagentOptions};
@@ -529,16 +530,13 @@ impl SteeringMessage {
         self.actor.as_ref()
     }
 
-    fn into_item(self) -> SteeringItem {
-        SteeringItem::Steering {
-            text:  self.text,
-            actor: self.actor,
+    /// The message the generic agent evicted from its queue, read back as it
+    /// was given.
+    fn from_user_message(message: &UserMessage) -> Self {
+        Self {
+            text:  message.text_content(),
+            actor: actor_from_attribution(message.attribution()),
         }
-    }
-
-    fn from_item(item: SteeringItem) -> Self {
-        let (text, actor) = item.into_parts();
-        Self { text, actor }
     }
 }
 
@@ -575,10 +573,16 @@ impl SteeringOutcome {
         matches!(self, Self::Accepted | Self::Evicted(_))
     }
 
-    fn from_eviction(evicted: Option<SteeringItem>) -> Self {
-        evicted.map_or(Self::Accepted, |item| {
-            Self::Evicted(SteeringMessage::from_item(item))
-        })
+    fn from_queue(outcome: QueueOutcome) -> Self {
+        match outcome {
+            QueueOutcome::Queued => Self::Accepted,
+            QueueOutcome::Evicted(message) => {
+                Self::Evicted(SteeringMessage::from_user_message(&message))
+            }
+            // The generic agent's outcome may grow; anything else means the
+            // message was not queued.
+            QueueOutcome::Closed | _ => Self::Closed,
+        }
     }
 }
 
@@ -659,11 +663,12 @@ impl CodingAgentControlHandle {
         if self.is_closed() {
             return SteeringOutcome::Closed;
         }
-        let evicted = self
-            .control
-            .session
-            .enqueue_bounded(message.into().into_item(), Self::STEERING_QUEUE_CAPACITY);
-        SteeringOutcome::from_eviction(evicted)
+        let message = message.into();
+        SteeringOutcome::from_queue(self.control.session.queue_steering(
+            message.text,
+            message.actor,
+            Some(Self::STEERING_QUEUE_CAPACITY),
+        ))
     }
 
     /// Interrupts the round in progress and queues `message` as what replaces
@@ -678,17 +683,18 @@ impl CodingAgentControlHandle {
         if state.closed {
             return SteeringOutcome::Closed;
         }
-        let item = message.into().into_item();
-        let evicted = if state.running {
+        let message = message.into();
+        let capacity = Some(Self::STEERING_QUEUE_CAPACITY);
+        let outcome = if state.running {
             self.control
                 .session
-                .interrupt_then_enqueue_bounded(item, Self::STEERING_QUEUE_CAPACITY)
+                .steer_now(message.text, message.actor, capacity)
         } else {
             self.control
                 .session
-                .enqueue_bounded(item, Self::STEERING_QUEUE_CAPACITY)
+                .queue_steering(message.text, message.actor, capacity)
         };
-        SteeringOutcome::from_eviction(evicted)
+        SteeringOutcome::from_queue(outcome)
     }
 
     /// Interrupts the round in progress without saying what comes next.
@@ -702,8 +708,7 @@ impl CodingAgentControlHandle {
         if !state.running || state.closed {
             return false;
         }
-        self.control.session.interrupt();
-        true
+        self.control.session.interrupt()
     }
 
     /// Holds natural completion open while an external steering source is
@@ -792,8 +797,8 @@ impl CodingAgentControlHandle {
         ControlSnapshot {
             running:            state.running,
             closed:             state.closed,
-            parked:             self.control.session.is_waiting_for_steer(),
-            pending_steering:   self.control.session.queue_len(),
+            parked:             self.control.session.is_parked(),
+            pending_steering:   self.control.session.pending_steering(),
             pending_follow_ups: self
                 .control
                 .follow_up

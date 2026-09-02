@@ -11,6 +11,7 @@ use lithos_llm::types::{
     ContentPart, Error as LlmError, Message, ReasoningEffort, Request, Response, Role, Speed,
     ToolCall, ToolChoice, ToolResult,
 };
+use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -31,9 +32,15 @@ use crate::validation::validate_tool_arguments;
 const DEFAULT_EVENT_CAPACITY: usize = 256;
 
 /// A user message accepted by [`Agent::prompt`], steering, or follow-up.
+///
+/// A message may carry an attribution: an opaque value the layer that queued
+/// it reads back when the message is committed, which this crate never
+/// interprets and never sends to the model. A coding layer uses it to say who
+/// wrote a steering message.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UserMessage {
-    content: Vec<ContentPart>,
+    content:     Vec<ContentPart>,
+    attribution: Option<Value>,
 }
 
 impl UserMessage {
@@ -41,7 +48,8 @@ impl UserMessage {
     #[must_use]
     pub fn new(content: impl IntoIterator<Item = ContentPart>) -> Self {
         Self {
-            content: content.into_iter().collect(),
+            content:     content.into_iter().collect(),
+            attribution: None,
         }
     }
 
@@ -51,10 +59,36 @@ impl UserMessage {
         Self::new([ContentPart::Text { text: text.into() }])
     }
 
+    /// Attaches an opaque attribution, reported back on the message's
+    /// [`SteeringMessage`](AgentEvent::SteeringMessage) event.
+    #[must_use]
+    pub fn with_attribution(mut self, attribution: Value) -> Self {
+        self.attribution = Some(attribution);
+        self
+    }
+
     /// The message content.
     #[must_use]
     pub fn content(&self) -> &[ContentPart] {
         &self.content
+    }
+
+    /// The attribution attached to the message, if any.
+    #[must_use]
+    pub const fn attribution(&self) -> Option<&Value> {
+        self.attribution.as_ref()
+    }
+
+    /// The readable text in the message.
+    #[must_use]
+    pub fn text_content(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     pub(crate) fn into_message(self) -> Message {
@@ -133,6 +167,7 @@ pub struct AgentBuilder {
     turn_hooks:       Option<Arc<dyn TurnBoundaryHooks>>,
     event_projection: Option<Arc<dyn EventProjection>>,
     config:           AgentConfig,
+    control:          Option<AgentControlHandle>,
 }
 
 impl AgentBuilder {
@@ -150,7 +185,18 @@ impl AgentBuilder {
             turn_hooks:       None,
             event_projection: None,
             config:           AgentConfig::default(),
+            control:          None,
         }
+    }
+
+    /// Binds the agent to a control handle created before it, with
+    /// [`AgentControlHandle::detached`].
+    ///
+    /// Steering already queued on the handle is applied by the agent's first
+    /// prompt. Without this, the agent creates its own control.
+    pub fn control_handle(mut self, handle: AgentControlHandle) -> Self {
+        self.control = Some(handle);
+        self
     }
 
     /// Sets the system prompt sent before conversation history.
@@ -251,7 +297,9 @@ impl AgentBuilder {
             turn_hooks: self.turn_hooks,
             config: self.config,
             events,
-            control: Control::new(),
+            control: self
+                .control
+                .map_or_else(Control::new, |handle| handle.control()),
         })
     }
 }
@@ -541,8 +589,13 @@ impl Agent {
 
                 let (round_cancel, steering) = self.control.begin_round();
                 for steering in steering {
-                    self.messages.push(steering.clone());
-                    self.emit(AgentEvent::SteeringMessage { message: steering });
+                    let attribution = steering.attribution().cloned();
+                    let message = steering.into_message();
+                    self.messages.push(message.clone());
+                    self.emit(AgentEvent::SteeringMessage {
+                        message,
+                        attribution,
+                    });
                 }
                 if let Some(hooks) = self.turn_hooks.clone() {
                     let context =

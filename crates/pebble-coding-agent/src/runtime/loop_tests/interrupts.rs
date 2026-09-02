@@ -75,55 +75,51 @@ async fn a_steer_is_announced_with_its_text() {
 }
 
 #[tokio::test]
-async fn a_bare_interrupt_parks_the_session_until_a_steer_arrives() {
+async fn an_interrupt_with_nothing_running_does_nothing() {
+    // There is no round to abandon, so nothing is counted and nothing parks:
+    // the next prompt runs as if the gesture had never been made.
     let (mut session, _provider) = TestSession::answering(answers("OK"));
     let mut events = session.subscribe();
     let handle = session.control_handle();
-    handle.interrupt();
 
-    let waker = handle.clone();
-    let steering = tokio::spawn(async move {
-        sleep(Duration::from_millis(10)).await;
-        waker.steer("resume now", None);
-    });
-    timeout(PATIENCE, session.prompt("start"))
-        .await
-        .expect("the parked session wakes when steering arrives")
-        .expect("the prompt succeeds");
-    steering.await.expect("the steering task finishes");
+    assert!(!handle.interrupt(), "there is no round to interrupt");
+    session.prompt("start").await.expect("the prompt succeeds");
 
-    assert!(matches!(
-        &session.history().turns()[1],
-        Message::Steering { content, .. } if content == "resume now"
-    ));
-    assert!(!handle.is_waiting_for_steer());
+    assert_eq!(session.history().turns().len(), 2, "input and answer");
+    assert!(!handle.is_parked());
     let published = settled(&mut session, &mut events).await;
-    let generations: Vec<u64> = published
-        .iter()
-        .filter_map(|event| match event {
-            CodingEvent::RoundInterrupted { generation } => Some(*generation),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(generations, [1], "one gesture, one announcement");
+    assert_eq!(
+        count(&published, |event| matches!(
+            event,
+            CodingEvent::RoundInterrupted { .. }
+        )),
+        0,
+        "no gesture, no announcement"
+    );
 }
 
 #[tokio::test]
 async fn an_interrupt_that_lands_while_the_session_is_parked_is_announced_too() {
     // The hardest of the exactly-once cases: the second gesture arrives after
     // the first has settled and the session is already waiting for a steer.
-    let (mut session, provider) = TestSession::answering(answers("resumed"));
+    let (mut session, provider) = TestSession::answering(vec![
+        ScriptedCall::PendingOpen,
+        ScriptedCall::response(text_response("resumed")),
+    ]);
     let control = session.control_handle();
     let mut controller_events = session.subscribe();
     let mut recorded = session.subscribe();
-    control.interrupt();
+    let waiting = Arc::clone(&provider);
 
     let controller = tokio::spawn(async move {
+        waiting.wait_for_call().await;
+        assert!(control.interrupt());
         wait_for_event(&mut controller_events, |event| {
             matches!(event, CodingEvent::RoundInterrupted { generation: 1 })
         })
         .await;
-        control.interrupt();
+        assert!(control.is_parked());
+        assert!(control.interrupt(), "a parked prompt is still running");
         control.steer("carry on", None);
     });
 
@@ -148,8 +144,8 @@ async fn an_interrupt_that_lands_while_the_session_is_parked_is_announced_too() 
     );
     assert_eq!(
         provider.call_count(),
-        1,
-        "a round abandoned before it opened costs no model call"
+        2,
+        "the abandoned call and the one that resumed"
     );
     assert!(matches!(
         &session.history().turns()[1],
@@ -166,13 +162,7 @@ async fn a_gesture_whose_round_cancel_was_lost_is_still_announced() {
     // break the exactly-once promise.
     let (mut session, _provider) = TestSession::answering(answers("OK"));
     let mut events = session.subscribe();
-    {
-        let mut control = session
-            .control_state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        control.interrupt_generation = control.interrupt_generation.saturating_add(1);
-    }
+    session.control_handle().record_interrupt_without_a_round();
 
     session.prompt("start").await.expect("the prompt succeeds");
 
@@ -189,14 +179,25 @@ async fn a_gesture_whose_round_cancel_was_lost_is_still_announced() {
 
 #[tokio::test]
 async fn an_interrupt_settles_before_the_steer_that_replaces_it() {
-    let (mut session, _provider) = TestSession::answering(answers("OK"));
+    let (mut session, provider) = TestSession::answering(vec![
+        ScriptedCall::PendingOpen,
+        ScriptedCall::response(text_response("OK")),
+    ]);
     let mut events = session.subscribe();
     let handle = session.control_handle();
-    handle.interrupt_then_steer("stop now", None);
+    let steerer = handle.clone();
+    let controller = tokio::spawn(async move {
+        provider.wait_for_call().await;
+        steerer.interrupt_then_steer("stop now", None);
+    });
 
-    session.prompt("start").await.expect("the prompt succeeds");
+    timeout(PATIENCE, session.prompt("start"))
+        .await
+        .expect("the steer unblocks the hanging call")
+        .expect("the prompt succeeds");
+    controller.await.expect("the controller finishes");
 
-    assert!(!handle.is_waiting_for_steer());
+    assert!(!handle.is_parked());
     let published = settled(&mut session, &mut events).await;
     let settled_at = position(&published, |event| {
         matches!(event, CodingEvent::RoundInterrupted { generation: 1 })
@@ -227,7 +228,7 @@ async fn an_interrupt_while_the_model_is_thinking_settles_once() {
             matches!(event, CodingEvent::RoundInterrupted { generation: 1 })
         })
         .await;
-        assert!(control.is_waiting_for_steer());
+        assert!(control.is_parked());
         control.steer("resume inference", None);
         control
     });
@@ -239,7 +240,7 @@ async fn an_interrupt_while_the_model_is_thinking_settles_once() {
     let control = controller.await.expect("the controller finishes");
 
     assert_eq!(provider.call_count(), 2, "the round was asked again");
-    assert!(!control.is_waiting_for_steer());
+    assert!(!control.is_parked());
     let published = settled(&mut session, &mut recorded).await;
     assert_eq!(
         count(&published, |event| matches!(
