@@ -567,6 +567,9 @@ impl ControlSnapshot {
     }
 
     /// Whether the prompt is parked after an interrupt, waiting for a steer.
+    ///
+    /// Never `true` while [`pending_steering`](Self::pending_steering) is
+    /// above zero: queued steering is what a park waits for.
     #[must_use]
     pub const fn is_parked(&self) -> bool {
         self.parked
@@ -658,7 +661,10 @@ impl CodingAgentControlHandle {
     /// The prompt abandons its round, publishes one
     /// [`RoundInterrupted`](crate::events::CodingEvent::RoundInterrupted), and
     /// parks at the next boundary until a steer arrives or the prompt is
-    /// cancelled. Returns whether a prompt was running to interrupt.
+    /// cancelled. With steering already queued the prompt does not park: the
+    /// queued message opens the next round, so a steer followed by an
+    /// interrupt needs no second gesture. Returns whether a prompt was running
+    /// to interrupt.
     pub fn interrupt(&self) -> bool {
         if !self.is_running() || self.is_closed() {
             return false;
@@ -1276,6 +1282,62 @@ mod tests {
         controller.await.expect("the controller finishes");
 
         assert_eq!(outcome.text(), Some("DONE"));
+        let published = drained(&mut recorded).await;
+        assert_eq!(
+            published
+                .iter()
+                .filter(|event| matches!(event, CodingEvent::RoundInterrupted { .. }))
+                .count(),
+            1,
+            "one gesture is announced once"
+        );
+        assert!(!agent.control_handle().snapshot().is_parked());
+        agent
+            .shutdown(ShutdownReason::Completed)
+            .await
+            .expect("the agent shuts down");
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_with_steering_queued_never_reports_a_parked_snapshot() {
+        let mut agent = agent_with(
+            vec![
+                ScriptedCall::response(tool_call_response("slow_tool", "call_1", json!({}))),
+                ScriptedCall::response(text_response("steered")),
+            ],
+            [blocking_tool("slow_tool")],
+        )
+        .await;
+        let control = agent.control_handle();
+        let mut watched = agent.subscribe();
+        let mut recorded = agent.subscribe();
+
+        let controller = tokio::spawn(async move {
+            wait_for_event(&mut watched, |event| {
+                matches!(event, CodingEvent::ToolCallStarted { .. })
+            })
+            .await;
+            assert_eq!(
+                control.queue_steering("change course"),
+                SteeringOutcome::Accepted
+            );
+            assert!(control.interrupt(), "a prompt was running to interrupt");
+            let snapshot = control.snapshot();
+            assert!(
+                !snapshot.is_parked(),
+                "queued steering keeps the prompt from parking: {snapshot:?}"
+            );
+            assert_eq!(snapshot.pending_steering(), 1);
+        });
+
+        let outcome = timeout(PATIENCE, agent.prompt("start"))
+            .await
+            .expect("the queued steer resumes the prompt without a second gesture")
+            .expect("the prompt succeeds");
+        controller.await.expect("the controller finishes");
+
+        assert_eq!(outcome.text(), Some("steered"));
+        assert_eq!(steering_texts(&agent), ["change course"]);
         let published = drained(&mut recorded).await;
         assert_eq!(
             published

@@ -26,6 +26,19 @@ struct ControlState {
     round_cancel:  CancellationToken,
 }
 
+impl ControlState {
+    /// Whether the prompt waits at its next turn boundary for steering.
+    ///
+    /// A park only holds while the steering queue is empty. `interrupt` and
+    /// `park_for_steer` never set `paused` with steering queued, and queueing
+    /// steering clears it, so the queue check is the same guard fabro places
+    /// at its wait point: steering that is already queued is the answer the
+    /// park was waiting for.
+    fn is_parked(&self) -> bool {
+        self.paused && self.steering.is_empty()
+    }
+}
+
 impl Control {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -125,7 +138,7 @@ impl Control {
         self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .paused
+            .is_parked()
     }
 
     pub(crate) async fn wait_until_resumed(&self, cancel: &CancellationToken) -> bool {
@@ -292,6 +305,12 @@ impl AgentControlHandle {
 
     /// Interrupts the current turn and waits for steering before another.
     ///
+    /// The round is cancelled either way. With no steering queued the prompt
+    /// parks at its next turn boundary until a steer arrives. With steering
+    /// already queued the prompt does not park: the queued steering opens the
+    /// next turn on its own, so a steer followed by an interrupt needs no
+    /// second gesture.
+    ///
     /// Returns whether a prompt was running.
     pub fn interrupt(&self) -> bool {
         let mut state = self
@@ -302,12 +321,17 @@ impl AgentControlHandle {
         if !state.running {
             return false;
         }
-        state.paused = true;
+        if state.steering.is_empty() {
+            state.paused = true;
+        }
         state.round_cancel.cancel();
         true
     }
 
     /// Claims the next turn boundary for steering without interrupting now.
+    ///
+    /// With steering already queued there is nothing to claim: the queued
+    /// steering opens the next turn and the prompt does not park.
     ///
     /// Returns whether a prompt was running.
     pub fn park_for_steer(&self) -> bool {
@@ -319,7 +343,9 @@ impl AgentControlHandle {
         if !state.running {
             return false;
         }
-        state.paused = true;
+        if state.steering.is_empty() {
+            state.paused = true;
+        }
         true
     }
 
@@ -358,6 +384,9 @@ impl AgentControlHandle {
     }
 
     /// Whether the prompt is parked after an interrupt, waiting for steering.
+    ///
+    /// Never `true` while [`pending_steering`](Self::pending_steering) is
+    /// above zero: queued steering is what a park waits for.
     #[must_use]
     pub fn is_paused(&self) -> bool {
         self.control.is_paused()
@@ -418,6 +447,37 @@ mod tests {
         assert!(!handle.interrupt(), "nothing is running to interrupt");
         assert!(!handle.is_paused());
         assert_eq!(handle.pending_steering(), 1);
+    }
+
+    #[test]
+    fn a_park_never_holds_while_steering_is_queued() {
+        let handle = AgentControlHandle::detached();
+        let _prompt_cancel = handle
+            .control
+            .begin_prompt(None)
+            .expect("an open control starts a prompt");
+
+        assert!(handle.interrupt());
+        assert!(handle.is_paused(), "a bare interrupt parks");
+        assert!(handle.enqueue_steering("change course"));
+        assert!(!handle.is_paused(), "queued steering releases the park");
+
+        assert!(handle.park_for_steer());
+        assert!(
+            !handle.is_paused(),
+            "a park claimed with steering queued does not hold"
+        );
+        assert!(handle.interrupt());
+        assert!(
+            !handle.is_paused(),
+            "an interrupt with steering queued does not park"
+        );
+        assert_eq!(handle.pending_steering(), 1);
+
+        let (_, drained) = handle.control.begin_round();
+        assert_eq!(drained.len(), 1);
+        assert!(handle.park_for_steer());
+        assert!(handle.is_paused(), "an empty queue parks again");
     }
 
     #[test]

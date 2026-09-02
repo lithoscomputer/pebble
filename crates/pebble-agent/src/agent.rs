@@ -1100,8 +1100,14 @@ mod tests {
     use lithos_llm::middleware::CallContext;
     use lithos_llm::types::{ResponseStream, StreamEvent};
     use serde_json::json;
+    use tokio::sync::Notify;
+    use tokio::time::timeout;
 
     use super::*;
+    use crate::tool::ToolError;
+
+    /// How long a test waits for a prompt another task has to unblock.
+    const PATIENCE: Duration = Duration::from_secs(5);
 
     struct ScriptedModel {
         responses: Mutex<VecDeque<Response>>,
@@ -1167,6 +1173,63 @@ mod tests {
         response([ContentPart::Text {
             text: text.to_owned(),
         }])
+    }
+
+    /// A tool that says when it starts and then waits for the test to release
+    /// it or for its round to be cancelled.
+    fn parking_tool(reached: Arc<Notify>, release: Arc<Notify>) -> Tool {
+        Tool::function(
+            "park",
+            "Waits for the test",
+            json!({"type": "object"}),
+            move |context, _arguments| {
+                let reached = Arc::clone(&reached);
+                let release = Arc::clone(&release);
+                async move {
+                    reached.notify_one();
+                    tokio::select! {
+                        () = release.notified() => Ok("released".into()),
+                        () = context.cancellation().cancelled() => {
+                            Err(ToolError::new("cancelled"))
+                        }
+                    }
+                }
+            },
+        )
+    }
+
+    /// An agent whose first turn calls the parking tool and whose second
+    /// answers `steered`, with the notifiers the test drives the tool through.
+    fn parking_agent() -> (Agent, Arc<Notify>, Arc<Notify>) {
+        let calls_tool = response([ContentPart::ToolCall(ToolCall::function(
+            "call_1",
+            "park",
+            json!({}),
+        ))]);
+        let reached = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let agent = Agent::builder(
+            ScriptedModel::new([calls_tool, text_response("steered")]),
+            "test/model",
+        )
+        .tools([parking_tool(Arc::clone(&reached), Arc::clone(&release))])
+        .build()
+        .expect("the agent builds");
+        (agent, reached, release)
+    }
+
+    /// Everything the receiver already holds.
+    fn drained(receiver: &mut broadcast::Receiver<AgentEvent>) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = receiver.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    /// Where the first event matching `matcher` was published.
+    fn position(events: &[AgentEvent], matcher: impl Fn(&AgentEvent) -> bool) -> Option<usize> {
+        events.iter().position(matcher)
     }
 
     struct RecordingToolHooks {
@@ -1658,6 +1721,169 @@ mod tests {
             error,
             AgentBuildError::DuplicateTool { ref name } if name == "same"
         ));
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_with_steering_queued_delivers_the_steer_without_parking() {
+        let (mut agent, reached, _release) = parking_agent();
+        let control = agent.control_handle();
+        let mut events = agent.subscribe();
+
+        let controller = tokio::spawn(async move {
+            reached.notified().await;
+            assert!(control.enqueue_steering("change course"));
+            assert!(control.interrupt(), "a prompt was running to interrupt");
+            assert!(
+                !control.is_paused(),
+                "queued steering keeps the prompt from parking"
+            );
+            assert_eq!(control.pending_steering(), 1);
+        });
+
+        let outcome = timeout(PATIENCE, agent.prompt("start"))
+            .await
+            .expect("the queued steer resumes the prompt without a second gesture")
+            .expect("the prompt succeeds");
+        controller.await.expect("the controller finishes");
+
+        assert_eq!(outcome.text(), "steered");
+        assert_eq!(outcome.turn_count(), 2);
+        let events = drained(&mut events);
+        let interrupted = position(&events, |event| {
+            matches!(event, AgentEvent::TurnInterrupted)
+        })
+        .expect("the round was interrupted");
+        let steered = position(&events, |event| {
+            matches!(event, AgentEvent::SteeringMessage { .. })
+        })
+        .expect("the steer was delivered");
+        assert!(
+            interrupted < steered,
+            "the steer opens the turn after the interrupted one"
+        );
+        assert_eq!(agent.messages().len(), 5);
+        assert_eq!(agent.messages()[3].role(), Role::User);
+        assert!(!agent.control_handle().is_paused());
+    }
+
+    #[tokio::test]
+    async fn parking_for_steer_with_steering_queued_does_not_hang_the_prompt() {
+        let (mut agent, reached, release) = parking_agent();
+        let control = agent.control_handle();
+        let mut events = agent.subscribe();
+
+        let controller = tokio::spawn(async move {
+            reached.notified().await;
+            assert!(control.enqueue_steering("change course"));
+            assert!(control.park_for_steer(), "a prompt was running to park");
+            assert!(
+                !control.is_paused(),
+                "queued steering is what a park waits for"
+            );
+            assert_eq!(control.pending_steering(), 1);
+            release.notify_one();
+        });
+
+        let outcome = timeout(PATIENCE, agent.prompt("start"))
+            .await
+            .expect("the queued steer resumes the prompt without a second gesture")
+            .expect("the prompt succeeds");
+        controller.await.expect("the controller finishes");
+
+        assert_eq!(outcome.text(), "steered");
+        assert_eq!(outcome.turn_count(), 2);
+        let events = drained(&mut events);
+        assert!(
+            position(&events, |event| matches!(
+                event,
+                AgentEvent::TurnInterrupted
+            ))
+            .is_none(),
+            "a park interrupts nothing"
+        );
+        assert!(
+            position(&events, |event| matches!(
+                event,
+                AgentEvent::SteeringMessage { .. }
+            ))
+            .is_some(),
+            "the steer was delivered"
+        );
+        assert_eq!(agent.messages().len(), 5);
+        assert!(matches!(
+            &agent.messages()[2].content()[0],
+            ContentPart::ToolResult(result) if !result.is_error
+        ));
+        assert!(!agent.control_handle().is_paused());
+    }
+
+    #[tokio::test]
+    async fn a_bare_interrupt_parks_until_steering_arrives() {
+        let (mut agent, reached, _release) = parking_agent();
+        let control = agent.control_handle();
+        let mut events = agent.subscribe();
+
+        let controller = tokio::spawn(async move {
+            reached.notified().await;
+            assert!(control.interrupt(), "a prompt was running to interrupt");
+            assert!(control.is_paused(), "a bare interrupt parks");
+            assert!(control.enqueue_steering("change course"));
+            assert!(!control.is_paused(), "the steer releases the park");
+        });
+
+        let outcome = timeout(PATIENCE, agent.prompt("start"))
+            .await
+            .expect("the later steer resumes the parked prompt")
+            .expect("the prompt succeeds");
+        controller.await.expect("the controller finishes");
+
+        assert_eq!(outcome.text(), "steered");
+        let events = drained(&mut events);
+        let interrupted = position(&events, |event| {
+            matches!(event, AgentEvent::TurnInterrupted)
+        })
+        .expect("the round was interrupted");
+        let steered = position(&events, |event| {
+            matches!(event, AgentEvent::SteeringMessage { .. })
+        })
+        .expect("the steer was delivered");
+        assert!(interrupted < steered);
+        assert!(!agent.control_handle().is_paused());
+    }
+
+    #[tokio::test]
+    async fn steer_interrupts_and_delivers_in_one_gesture() {
+        let (mut agent, reached, _release) = parking_agent();
+        let control = agent.control_handle();
+        let mut events = agent.subscribe();
+
+        let controller = tokio::spawn(async move {
+            reached.notified().await;
+            assert!(control.steer("change course"));
+            assert!(!control.is_paused(), "an atomic steer never parks");
+            assert_eq!(control.pending_steering(), 1);
+        });
+
+        let outcome = timeout(PATIENCE, agent.prompt("start"))
+            .await
+            .expect("the steer resumes the prompt")
+            .expect("the prompt succeeds");
+        controller.await.expect("the controller finishes");
+
+        assert_eq!(outcome.text(), "steered");
+        assert_eq!(outcome.turn_count(), 2);
+        let events = drained(&mut events);
+        let interrupted = position(&events, |event| {
+            matches!(event, AgentEvent::TurnInterrupted)
+        })
+        .expect("the round was interrupted");
+        let steered = position(&events, |event| {
+            matches!(event, AgentEvent::SteeringMessage { .. })
+        })
+        .expect("the steer was delivered");
+        assert!(interrupted < steered);
+        assert_eq!(agent.messages().len(), 5);
+        assert!(!agent.control_handle().is_paused());
     }
 
     #[tokio::test]
