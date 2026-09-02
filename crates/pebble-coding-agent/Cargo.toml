@@ -13,7 +13,15 @@ test-util = []
 [dependencies]
 async-trait.workspace = true
 futures-util.workspace = true
-lithos-llm = { path = "../../../lithos-llm" }
+lithos-llm = { workspace = true, features = [
+  "runtime",
+  "builtin-catalog",
+  "openai",
+  "anthropic",
+  "gemini",
+  "openai-compatible",
+  "environment-credentials",
+] }
 pebble-agent = { path = "../pebble-agent" }
 serde.workspace = true
 serde_json.workspace = true

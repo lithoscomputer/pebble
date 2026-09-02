@@ -9,7 +9,7 @@ description = "Provider-neutral agent loop for Pebble"
 [dependencies]
 async-trait.workspace = true
 futures-util.workspace = true
-lithos-llm = { path = "../../../lithos-llm", default-features = false, features = ["runtime"] }
+lithos-llm = { workspace = true, features = ["runtime"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

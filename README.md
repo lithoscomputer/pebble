@@ -235,8 +235,9 @@ with the event held as raw JSON, then parse the payload on its own.
 
 ## Setup
 
-Pebble depends on `lithos-llm` through a path dependency. Clone `lithos-llm`
-as a sibling directory of this repository first.
+Pebble depends on `lithos-llm` as a git dependency pinned to one commit. The
+repository is private and fetched over ssh, so load an ssh key that can read
+it first.
 
 Install the locked tools and prepare the repository:
 
@@ -257,5 +258,5 @@ mise run check   # the complete routine gate
 See [DEVELOPING.md](DEVELOPING.md) for the complete development workflow.
 
 Routine and nightly checks run on macOS arm64, Linux x86_64, and Linux arm64.
-GitHub cannot run them yet, because the workflows do not check out the
-`lithos-llm` path dependency. See [DEVELOPING.md](DEVELOPING.md).
+GitHub cannot run them yet, because the runners have no key for the private
+`lithos-llm` repository. See [DEVELOPING.md](DEVELOPING.md).

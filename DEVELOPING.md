@@ -10,14 +10,17 @@ unit tests beside it, and the contract tests in
 
 ## Setup
 
-Pebble is a library crate. It depends on `lithos-llm` through a path
-dependency, so clone `lithos-llm` as a sibling directory of this repository:
+Pebble is a library crate. It depends on `lithos-llm` as a git dependency
+pinned to one commit (`rev`) in the workspace `Cargo.toml`. The repository is
+private and is fetched over ssh, so an ssh key with read access to
+`lithoscomputer/lithos-llm` must be loaded. `.cargo/config.toml` sets
+`net.git-fetch-with-cli` so Cargo uses the git CLI and your ssh agent.
 
-```text
-parent/
-├── lithos-llm/
-└── pebble/
-```
+To move the pin: push the lithos-llm commit (a branch under review is fine),
+change `rev` in `Cargo.toml` to the full sha, run `cargo update lithos-llm`,
+and commit `Cargo.toml` and `Cargo.lock` together. When the lithos-llm change
+merges, re-pin to the merge commit the same way. Do not use a `[patch]`
+section; the pinned sha is the single source of truth.
 
 Install [Mise](https://mise.jdx.dev/), then install the locked tools and prepare
 the pinned Rust Style Guide:
@@ -109,10 +112,9 @@ each night. Both workflows test these native platforms:
 - Linux arm64.
 
 The workflows check out only this repository. They cannot build until the
-`lithos-llm` path dependency is available on the runner, because `lithos-llm`
-is a separate private repository. Both workflows fail at manifest load until a
-second checkout step is added, or the dependency changes form. Verify changes
-locally with `mise run check` in the meantime.
+runner holds an ssh key that can read the private `lithos-llm` repository, so
+both fail at dependency fetch until a deploy key or token is configured.
+Verify changes locally with `mise run check` in the meantime.
 
 ## Cargo.lock policy
 
