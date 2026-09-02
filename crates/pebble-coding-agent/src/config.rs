@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use lithos_llm::middleware::RetryPolicy;
 use lithos_llm::types::{ReasoningEffort, Speed};
+use pebble_agent::AgentConfig;
 use serde_json::Value;
 
 use crate::truncation::{
@@ -293,13 +294,14 @@ pub struct CodingAgentOptions {
     /// default of four allows the three replays Pebble is willing to spend on
     /// one turn.
     ///
-    /// The default schedule waits one second before the first replay, doubles
-    /// the wait for each replay after that, and caps a wait at sixty seconds.
-    /// Each wait is jittered: it lands between half of the computed wait and
-    /// the whole of it, so the three replays together take between about 3.5
-    /// and 7 seconds. That outlasts a provider blip of a few seconds, which the
-    /// 100 millisecond schedule of [`RetryPolicy::exponential`] does not. A
-    /// `Retry-After` from the provider replaces the computed wait.
+    /// The default schedule is [`AgentConfig`]'s: one second before the first
+    /// replay, doubling for each replay after that, and capped at sixty
+    /// seconds. Each wait is jittered: it lands between half of the computed
+    /// wait and the whole of it, so the three replays together take between
+    /// about 3.5 and 7 seconds. That outlasts a provider blip of a few seconds,
+    /// which the 100 millisecond schedule of [`RetryPolicy::exponential`] does
+    /// not. A `Retry-After` from the provider replaces the computed wait; one
+    /// longer than sixty seconds ends the replays instead.
     ///
     /// The type is reexported as
     /// [`lithos_llm::middleware::RetryPolicy`].
@@ -377,28 +379,10 @@ impl Default for CodingAgentOptions {
             compaction_threshold_percent: 80,
             compaction_preserve_turns: 6,
             wall_clock_timeout: None,
-            turn_replay: RetryPolicy::exponential()
-                .initial_delay(DEFAULT_REPLAY_INITIAL_DELAY)
-                .max_delay(DEFAULT_REPLAY_MAX_DELAY)
-                .jitter(true)
-                .max_attempts(DEFAULT_RETRY_ATTEMPTS),
+            turn_replay: AgentConfig::default().turn_replay,
         }
     }
 }
-
-/// How many attempts the default [`CodingAgentOptions::turn_replay`] allows.
-///
-/// One opening attempt plus the three replays a session will spend on a turn
-/// whose stream broke after it had already shown output.
-const DEFAULT_RETRY_ATTEMPTS: u32 = 4;
-
-/// The wait before the first replay under the default
-/// [`CodingAgentOptions::turn_replay`]. Each later wait doubles the one before.
-const DEFAULT_REPLAY_INITIAL_DELAY: Duration = Duration::from_secs(1);
-
-/// The longest computed wait between replays under the default
-/// [`CodingAgentOptions::turn_replay`].
-const DEFAULT_REPLAY_MAX_DELAY: Duration = Duration::from_secs(60);
 
 impl CodingAgentOptions {
     /// Sets how hard the model should think, where the provider offers a
@@ -632,6 +616,12 @@ mod tests {
 
     use super::*;
 
+    /// A dropped connection, which the client may repeat.
+    fn dropped_stream() -> LlmError {
+        LlmError::new(LlmErrorKind::Network, "connection reset")
+            .with_retry(RetryClassification::Safe)
+    }
+
     struct StaticToolPolicy(ToolAccess);
 
     impl ToolAccessPolicy for StaticToolPolicy {
@@ -696,33 +686,31 @@ mod tests {
 
     #[test]
     fn the_default_turn_replay_allows_the_replays_a_turn_is_worth() {
+        // One opening attempt plus the three replays a session spends on a
+        // turn whose stream broke after it had already shown output.
         let config = CodingAgentOptions::default();
-        let error = LlmError::new(LlmErrorKind::Network, "connection reset")
-            .with_retry(RetryClassification::Safe);
+        let error = dropped_stream();
 
-        for attempt in 1..DEFAULT_RETRY_ATTEMPTS {
+        for attempt in 1..4 {
             assert!(
                 config.turn_replay.next_delay(attempt, &error).is_some(),
                 "attempt {attempt} should still be replayed"
             );
         }
         assert!(
-            config
-                .turn_replay
-                .next_delay(DEFAULT_RETRY_ATTEMPTS, &error)
-                .is_none(),
+            config.turn_replay.next_delay(4, &error).is_none(),
             "the fourth failure spends the budget"
         );
     }
 
     #[test]
     fn the_default_turn_replay_waits_seconds_not_milliseconds() {
-        // Fabro's schedule: one second, doubling, jittered. Jitter lands each
-        // wait between half of the computed delay and the whole of it, so the
-        // three replays together outlast a provider blip of a few seconds.
+        // The schedule pebble-agent defines and this layer reuses: one second,
+        // doubling, jittered. Jitter lands each wait between half of the
+        // computed delay and the whole of it, so the three replays together
+        // outlast a provider blip of a few seconds.
         let config = CodingAgentOptions::default();
-        let error = LlmError::new(LlmErrorKind::Network, "connection reset")
-            .with_retry(RetryClassification::Safe);
+        let error = dropped_stream();
         let expected = [
             (1, Duration::from_millis(500), Duration::from_secs(1)),
             (2, Duration::from_secs(1), Duration::from_secs(2)),
@@ -748,11 +736,9 @@ mod tests {
         let policy = CodingAgentOptions::default()
             .turn_replay
             .max_attempts(u32::MAX);
-        let error = LlmError::new(LlmErrorKind::Network, "connection reset")
-            .with_retry(RetryClassification::Safe);
 
         let delay = policy
-            .next_delay(20, &error)
+            .next_delay(20, &dropped_stream())
             .expect("a replay is still allowed");
         assert!(
             (Duration::from_secs(30)..=Duration::from_secs(60)).contains(&delay),
