@@ -26,10 +26,11 @@ use crate::types::ToolErrorKind;
 #[error("{message}")]
 #[non_exhaustive]
 pub struct ToolError {
-    kind:    ToolErrorKind,
-    message: String,
+    kind:              ToolErrorKind,
+    message:           String,
+    causes_in_message: bool,
     #[source]
-    source:  Option<Box<dyn StdError + Send + Sync + 'static>>,
+    source:            Option<Box<dyn StdError + Send + Sync + 'static>>,
 }
 
 impl ToolError {
@@ -39,6 +40,7 @@ impl ToolError {
         Self {
             kind,
             message: message.into(),
+            causes_in_message: false,
             source: None,
         }
     }
@@ -53,6 +55,29 @@ impl ToolError {
         Self {
             kind,
             message: message.into(),
+            causes_in_message: false,
+            source: Some(Box::new(source)),
+        }
+    }
+
+    /// Builds an error whose model-facing message includes the source chain.
+    #[must_use]
+    pub(crate) fn with_rendered_source(
+        kind: ToolErrorKind,
+        context: impl Into<String>,
+        source: impl StdError + Send + Sync + 'static,
+    ) -> Self {
+        let mut message = context.into();
+        let _ = write!(message, ": {source}");
+        let mut current = source.source();
+        while let Some(cause) = current {
+            let _ = write!(message, ": {cause}");
+            current = cause.source();
+        }
+        Self {
+            kind,
+            message,
+            causes_in_message: true,
             source: Some(Box::new(source)),
         }
     }
@@ -72,6 +97,22 @@ impl ToolError {
         Self {
             kind,
             message: message.into(),
+            causes_in_message: false,
+            source: Some(source),
+        }
+    }
+
+    /// Builds an error whose message already renders all of `source`'s chain.
+    #[must_use]
+    fn with_rendered_boxed_source(
+        kind: ToolErrorKind,
+        message: impl Into<String>,
+        source: Box<dyn StdError + Send + Sync + 'static>,
+    ) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            causes_in_message: true,
             source: Some(source),
         }
     }
@@ -136,6 +177,9 @@ impl ToolError {
     #[must_use]
     pub fn detail(&self) -> String {
         let mut rendered = self.message.clone();
+        if self.causes_in_message {
+            return rendered;
+        }
         let mut current = StdError::source(self);
         while let Some(cause) = current {
             let _ = write!(rendered, "\n  caused by: {cause}");
@@ -152,11 +196,11 @@ impl From<EnvironmentError> for ToolError {
     /// [`detail`](EnvironmentError::detail): its message plus one `caused by`
     /// line per cause, so `Permission denied` and `No such file or directory`
     /// read differently. The environment error's own cause is carried on as
-    /// the source, rather than the whole error, so [`detail`](Self::detail)
-    /// does not repeat the message as its own first cause; it does repeat the
-    /// cause line, because the message carries it too. Only the kind is
-    /// translated: an operation the environment does not offer is
-    /// [`Unavailable`](ToolErrorKind::Unavailable), an argument it rejected is
+    /// the source, rather than the whole error. [`detail`](Self::detail) knows
+    /// that the message already contains this chain, so it does not repeat the
+    /// causes. Only the kind is translated: an operation the environment does
+    /// not offer is [`Unavailable`](ToolErrorKind::Unavailable), an
+    /// argument it rejected is
     /// [`InvalidArguments`](ToolErrorKind::InvalidArguments), and everything
     /// else is a failure of the running tool.
     fn from(error: EnvironmentError) -> Self {
@@ -167,7 +211,7 @@ impl From<EnvironmentError> for ToolError {
         };
         let message = error.detail();
         match error.into_source() {
-            Some(source) => Self::with_boxed_source(kind, message, source),
+            Some(source) => Self::with_rendered_boxed_source(kind, message, source),
             None => Self::new(kind, message),
         }
     }
@@ -229,6 +273,22 @@ mod tests {
     }
 
     #[test]
+    fn a_rendered_source_is_kept_without_repeating_it_in_detail() {
+        let error = ToolError::with_rendered_source(
+            ToolErrorKind::Execution,
+            "Failed to start the operation",
+            Cause,
+        );
+
+        assert_eq!(
+            error.message(),
+            "Failed to start the operation: disk is full"
+        );
+        assert_eq!(error.detail(), error.message());
+        assert!(StdError::source(&error).is_some());
+    }
+
+    #[test]
     fn an_environment_io_cause_is_part_of_the_model_facing_message() {
         let refused = io::Error::new(
             ErrorKind::PermissionDenied,
@@ -248,11 +308,8 @@ mod tests {
     }
 
     /// The source is the environment error's own cause, not the environment
-    /// error: its message is already the tool error's message, and a log would
-    /// otherwise read it twice. The cause line itself does appear twice in
-    /// `detail()`, once inside the message and once as the source; that is
-    /// accepted, not wanted, and is the price of keeping a source for logs
-    /// while the model reads the cause in the message.
+    /// error. The model-facing message already contains the full cause chain,
+    /// and `detail()` does not render that chain a second time.
     #[test]
     fn an_environment_failure_is_not_repeated_as_its_own_first_cause() {
         let error = ToolError::from(EnvironmentError::with_source(
@@ -271,7 +328,7 @@ mod tests {
         );
         assert_eq!(
             error.detail(),
-            "Failed to write /work/out.txt\n  caused by: disk is full\n  caused by: disk is full"
+            "Failed to write /work/out.txt\n  caused by: disk is full"
         );
     }
 

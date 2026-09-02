@@ -43,7 +43,7 @@ pub(crate) use crate::coding_agent::{
 use crate::config::CodingAgentOptions;
 use crate::context_window::{memory_prompt_tokens, skills_prompt_tokens};
 use crate::environment::{Environment, ExecRequest};
-use crate::error::{Error, ErrorData, InterruptReason, Result};
+use crate::error::{Error, ErrorData, InterruptReason, Result, TaskKind};
 use crate::event::{Emitter, EventCapacity, EventOptions, EventPump, EventSink};
 use crate::file_tracker::FileTracker;
 use crate::history::History;
@@ -1488,7 +1488,7 @@ impl CodingRuntime {
             // The prompt's own failure is the story; a task that also failed on
             // the way out is reported rather than returned.
             (Err(error), Some(task)) => {
-                warn!(%task, "A session task failed while the prompt was already failing");
+                warn!(error = ?task, "A session task failed while the prompt was already failing");
                 Err(error)
             }
             (Err(error), None) => Err(error),
@@ -1538,7 +1538,7 @@ impl CodingRuntime {
     /// # Errors
     ///
     /// Returns [`Error::EventSink`] when the configured sink had refused an
-    /// event, and [`Error::InvalidState`] when a task the session owned failed
+    /// event, and [`Error::Task`] when a task the session owned failed
     /// outright. The session is closed either way.
     #[tracing::instrument(
         name = "coding_session_shutdown",
@@ -1577,9 +1577,10 @@ impl CodingRuntime {
         self.emitter.close();
         match pump.await {
             Ok(result) => result,
-            Err(error) => Err(Error::InvalidState(format!(
-                "the event pump task failed: {error}"
-            ))),
+            Err(source) => Err(Error::Task {
+                task: TaskKind::EventPump,
+                source,
+            }),
         }
     }
 
@@ -1773,11 +1774,10 @@ struct WallClockTimer {
 async fn stop_wall_clock_timer(timer: Option<WallClockTimer>) -> Option<Error> {
     let timer = timer?;
     timer.stop.cancel();
-    timer
-        .task
-        .await
-        .err()
-        .map(|error| Error::InvalidState(format!("the wall-clock timer task failed: {error}")))
+    timer.task.await.err().map(|source| Error::Task {
+        task: TaskKind::WallClockTimer,
+        source,
+    })
 }
 
 /// Stops a step that a cancelled session should not take.
@@ -2225,7 +2225,11 @@ mod tests {
         };
 
         assert_eq!(failure.kind(), ErrorKind::EventSink);
-        assert!(failure.to_string().contains("the disk is full"));
+        assert!(
+            ErrorData::from(&failure)
+                .message
+                .contains("the disk is full")
+        );
     }
 
     #[tokio::test]

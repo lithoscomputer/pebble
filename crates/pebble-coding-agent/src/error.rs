@@ -8,7 +8,7 @@
 //! payloads.
 
 use std::error::Error as StdError;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::result::Result as StdResult;
 
 use lithos_llm::types::{
@@ -16,8 +16,10 @@ use lithos_llm::types::{
     RetryClassification,
 };
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinError;
 
 use crate::event::EventSinkError;
+use crate::skills::SkillExpansionError;
 
 /// Why a prompt was interrupted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -53,11 +55,11 @@ impl fmt::Display for InterruptReason {
 pub enum CompactionError {
     /// The summarization request could not be built, which a session with an
     /// unusable model selector runs into before any call is made.
-    #[error("summary request could not be built: {0}")]
+    #[error("building the summary request")]
     Request(#[source] RequestBuildError),
 
     /// The summarization request to the model failed.
-    #[error("summary request failed: {0}")]
+    #[error("calling the model for a summary")]
     Llm(#[source] LlmError),
 
     /// The model returned a summary that was empty once trimmed. History is
@@ -72,6 +74,36 @@ pub enum CompactionError {
     },
 }
 
+/// The background task that stopped before its work was complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum TaskKind {
+    /// The task that sends buffered events to the configured sink.
+    EventPump,
+    /// The task that enforces a prompt's wall-clock limit.
+    WallClockTimer,
+    /// The task that runs a child agent session.
+    SubagentSession,
+}
+
+impl TaskKind {
+    /// The human-readable name used in error messages.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EventPump => "event pump",
+            Self::WallClockTimer => "wall-clock timer",
+            Self::SubagentSession => "subagent session",
+        }
+    }
+}
+
+impl fmt::Display for TaskKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// A pebble runtime failure.
 ///
 /// Variants are branch-oriented: callers recover differently from a closed
@@ -79,20 +111,31 @@ pub enum CompactionError {
 /// [`lithos_llm::types::Error`] is retained as a source for logging;
 /// [`ErrorData`] is the shape that reaches consumers over the event stream.
 ///
-/// A variant that keeps a source also renders that source in its own message.
-/// The projection carries [`ErrorData::message`] as a single self-contained
-/// line, which is what most consumers display, and the price of that is a
-/// repeated innermost message for anyone who walks the chain as well.
+/// A variant that keeps a source adds only its own context. The projection
+/// renders the complete chain into [`ErrorData::message`] so durable events
+/// and logs retain the provider or dependency's free-text message.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     /// The model layer failed.
-    #[error("LLM error: {0}")]
+    #[error("calling the model")]
     Llm(#[from] LlmError),
 
     /// History compaction failed.
-    #[error("context compaction failed: {0}")]
+    #[error("compacting conversation history")]
     Compaction(#[from] CompactionError),
+
+    /// The provider-neutral agent loop failed outside a model call.
+    #[error("processing the agent prompt")]
+    Agent(#[source] pebble_agent::AgentError),
+
+    /// The provider-neutral agent loop could not be built.
+    #[error("building the agent loop")]
+    AgentBuild(#[source] pebble_agent::AgentBuildError),
+
+    /// A `/name` skill reference in user input was invalid.
+    #[error("expanding a skill reference")]
+    SkillExpansion(#[from] SkillExpansionError),
 
     /// The session has been shut down.
     #[error("session is closed")]
@@ -110,11 +153,21 @@ pub enum Error {
     #[error("interrupted: {0}")]
     Interrupted(InterruptReason),
 
+    /// A background task stopped before it completed its work.
+    #[error("{task} task failed")]
+    Task {
+        /// The work assigned to the task.
+        task:   TaskKind,
+        /// Why Tokio stopped the task.
+        #[source]
+        source: JoinError,
+    },
+
     /// The configured [`crate::events::EventSink`] refused an event.
     ///
     /// The event stream is the durable record of a prompt, so a session that
     /// cannot record what it did stops instead of continuing untracked.
-    #[error("event sink failed: {0}")]
+    #[error("recording a session event")]
     EventSink(#[from] EventSinkError),
 }
 
@@ -125,10 +178,13 @@ impl Error {
         match self {
             Self::Llm(_) => ErrorKind::Llm,
             Self::Compaction(_) => ErrorKind::Compaction,
+            Self::Agent(_) | Self::AgentBuild(_) => ErrorKind::Agent,
+            Self::SkillExpansion(_) => ErrorKind::InvalidInput,
             Self::SessionClosed => ErrorKind::SessionClosed,
             Self::InvalidState(_) => ErrorKind::InvalidState,
             Self::ToolExecution(_) => ErrorKind::ToolExecution,
             Self::Interrupted(_) => ErrorKind::Interrupted,
+            Self::Task { .. } => ErrorKind::Task,
             Self::EventSink(_) => ErrorKind::EventSink,
         }
     }
@@ -141,10 +197,14 @@ impl Error {
             Self::Compaction(
                 CompactionError::EmptySummary { .. } | CompactionError::Request(_),
             )
+            | Self::Agent(_)
+            | Self::AgentBuild(_)
+            | Self::SkillExpansion(_)
             | Self::SessionClosed
             | Self::InvalidState(_)
             | Self::ToolExecution(_)
             | Self::Interrupted(_)
+            | Self::Task { .. }
             | Self::EventSink(_) => None,
         }
     }
@@ -165,6 +225,10 @@ pub enum ErrorKind {
     Llm,
     /// History compaction failed.
     Compaction,
+    /// The provider-neutral agent loop failed.
+    Agent,
+    /// User input was invalid.
+    InvalidInput,
     /// The session has been shut down.
     SessionClosed,
     /// The session was asked to do something its current state forbids.
@@ -173,6 +237,8 @@ pub enum ErrorKind {
     ToolExecution,
     /// The prompt was interrupted before it finished.
     Interrupted,
+    /// A background task stopped before it completed its work.
+    Task,
     /// The configured event sink refused an event.
     EventSink,
 }
@@ -284,13 +350,24 @@ impl ErrorData {
 
 impl From<&Error> for ErrorData {
     fn from(error: &Error) -> Self {
-        let mut data = Self::new(error.kind(), error.to_string());
+        let mut data = Self::new(error.kind(), render_error(error));
         data.source_chain = source_chain(error);
         if let Some(llm) = error.llm_source() {
             data.fill_from_llm(llm);
         }
         data
     }
+}
+
+/// Renders `error` and each source once on one line.
+fn render_error(error: &(dyn StdError + 'static)) -> String {
+    let mut rendered = error.to_string();
+    let mut current = error.source();
+    while let Some(cause) = current {
+        let _ = write!(rendered, ": {cause}");
+        current = cause.source();
+    }
+    rendered
 }
 
 impl From<&LlmError> for ErrorData {
@@ -335,6 +412,7 @@ fn source_chain(error: &(dyn StdError + 'static)) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::future::pending;
     use std::time::Duration;
 
     use lithos_llm::catalog::ProviderId;
@@ -358,7 +436,10 @@ mod tests {
     fn agent_error_from_llm_error() {
         let error = Error::from(network_error());
         assert!(matches!(error, Error::Llm(_)));
-        assert!(error.to_string().contains("connection refused"));
+        assert_eq!(error.to_string(), "calling the model");
+
+        let data = ErrorData::from(&error);
+        assert_eq!(data.message, "calling the model: connection refused");
     }
 
     #[test]
@@ -384,9 +465,10 @@ mod tests {
         let error = Error::Compaction(CompactionError::EmptySummary {
             summarized_turn_count: 3,
         });
+        assert_eq!(error.to_string(), "compacting conversation history");
         assert_eq!(
-            error.to_string(),
-            "context compaction failed: generated summary was empty after trimming; \
+            ErrorData::from(&error).message,
+            "compacting conversation history: generated summary was empty after trimming; \
              refused to replace 3 turns and left history intact"
         );
     }
@@ -428,6 +510,22 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn task_error_preserves_the_join_failure() {
+        let task = tokio::spawn(pending::<()>());
+        task.abort();
+        let source = task.await.expect_err("the task was cancelled");
+        let error = Error::Task {
+            task: TaskKind::EventPump,
+            source,
+        };
+
+        assert_eq!(error.kind(), ErrorKind::Task);
+        assert_eq!(error.to_string(), "event pump task failed");
+        assert!(StdError::source(&error).is_some());
+        assert!(ErrorData::from(&error).message.contains("was cancelled"));
+    }
+
     #[test]
     fn every_variant_maps_to_its_kind() {
         let cases = [
@@ -437,6 +535,18 @@ mod tests {
                     summarized_turn_count: 1,
                 }),
                 ErrorKind::Compaction,
+            ),
+            (
+                Error::Agent(pebble_agent::AgentError::Closed),
+                ErrorKind::Agent,
+            ),
+            (
+                Error::AgentBuild(pebble_agent::AgentBuildError::EmptyModel),
+                ErrorKind::Agent,
+            ),
+            (
+                Error::SkillExpansion(SkillExpansionError::MultipleReferences),
+                ErrorKind::InvalidInput,
             ),
             (Error::SessionClosed, ErrorKind::SessionClosed),
             (Error::InvalidState("x".into()), ErrorKind::InvalidState),
@@ -475,7 +585,10 @@ mod tests {
         assert_eq!(data.kind, ErrorKind::Compaction);
         assert_eq!(data.llm_kind, Some(LlmErrorKind::RateLimit));
         assert_eq!(data.provider.as_deref(), Some("openai"));
-        assert!(data.message.starts_with("context compaction failed:"));
+        assert_eq!(
+            data.message,
+            "compacting conversation history: calling the model for a summary: too fast"
+        );
     }
 
     #[test]

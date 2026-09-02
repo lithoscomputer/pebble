@@ -208,11 +208,7 @@ impl From<HumanInputError> for ToolError {
     /// The question tool reports a failed channel as a failed call, keeping
     /// the failure as the cause.
     fn from(error: HumanInputError) -> Self {
-        Self::with_source(
-            ToolErrorKind::Execution,
-            format!("Could not ask the user: {}", error.message()),
-            error,
-        )
+        Self::with_rendered_source(ToolErrorKind::Execution, "Could not ask the user", error)
     }
 }
 

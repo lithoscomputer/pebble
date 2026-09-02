@@ -80,7 +80,7 @@ pub enum CodingAgentBuildError {
     MissingEnvironment,
 
     /// The selector names no model the client can reach.
-    #[error("model selector `{selector}` resolves to no available model: {source}")]
+    #[error("resolving model selector `{selector}`")]
     ModelSelection {
         /// The selector the application gave.
         selector: String,
@@ -91,7 +91,7 @@ pub enum CodingAgentBuildError {
 
     /// The request pebble resolves the selector with could not be built, which
     /// an empty or blank selector runs into.
-    #[error("model selector `{selector}` is not usable: {source}")]
+    #[error("building a request for model selector `{selector}`")]
     Selector {
         /// The selector the application gave.
         selector: String,
@@ -111,7 +111,7 @@ pub enum CodingAgentBuildError {
     },
 
     /// The `pebble` metadata is present but not shaped as pebble reads it.
-    #[error("the `pebble` catalog metadata for model {model} could not be read: {source}")]
+    #[error("reading the `pebble` catalog metadata for model {model}")]
     InvalidProfileMetadata {
         /// The model that was resolved.
         model:  String,
@@ -151,7 +151,7 @@ pub enum CodingAgentBuildError {
 
     /// The exact route the record names is not one this client can reach, so
     /// the session is not resumed on a different one.
-    #[error("the recorded route {provider}/{model} is not available to this client: {source}")]
+    #[error("resolving the recorded route {provider}/{model}")]
     RecordedRouteUnavailable {
         /// The provider the record names.
         provider: String,

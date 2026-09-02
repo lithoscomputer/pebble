@@ -189,6 +189,17 @@ impl CodingAgentBridge {
             .take()
     }
 
+    /// Keeps a typed coding-layer failure while the generic loop receives its
+    /// boundary representation.
+    fn record_boundary_error(&self, error: Error) -> agent::TurnBoundaryError {
+        let message = ErrorData::from(&error).message;
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .boundary_error = Some(error);
+        agent::TurnBoundaryError::new(message)
+    }
+
     fn emit(&self, event: CodingEvent) {
         self.emitter.emit(self.session_id.clone(), event);
     }
@@ -709,9 +720,8 @@ impl agent::TurnBoundaryHooks for CodingAgentBridge {
                     skill_name: None,
                 }
             } else {
-                expand_skill(&self.skills, &followup).map_err(|error| {
-                    agent::TurnBoundaryError::new(format!("expanding follow-up input: {error}"))
-                })?
+                expand_skill(&self.skills, &followup)
+                    .map_err(|source| self.record_boundary_error(Error::SkillExpansion(source)))?
             };
             if let Some(name) = expanded.skill_name {
                 self.state
@@ -734,14 +744,7 @@ impl agent::TurnBoundaryHooks for CodingAgentBridge {
         match supervisor.next_parent_notification_turn(cancel).await {
             Ok(Some(turn)) => Ok(agent::TurnBoundaryAction::ContinueWith(turn.into())),
             Ok(None) => Ok(agent::TurnBoundaryAction::Complete),
-            Err(error) => {
-                let message = error.to_string();
-                self.state
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .boundary_error = Some(error);
-                Err(agent::TurnBoundaryError::new(message))
-            }
+            Err(error) => Err(self.record_boundary_error(error)),
         }
     }
 }
@@ -836,9 +839,7 @@ impl CodingRuntime {
             Err(agent::AgentError::Model { source }) => Err(self.emit_llm_error(source)),
             Err(error) => {
                 self.check_pump().await?;
-                Err(Error::InvalidState(format!(
-                    "the coding agent could not process the prompt: {error}"
-                )))
+                Err(Error::Agent(error))
             }
         }
     }
@@ -882,7 +883,7 @@ impl CodingRuntime {
             .event_projection(bridge.clone())
             .config(config)
             .build()
-            .map_err(|error| Error::InvalidState(format!("building the coding agent: {error}")))?;
+            .map_err(Error::AgentBuild)?;
 
         self.coding_bridge = Some(bridge);
         self.coding_agent = Some(agent);
@@ -897,7 +898,7 @@ impl CodingRuntime {
                 skill_name: None,
             });
         }
-        expand_skill(&self.skills, input).map_err(|error| Error::InvalidState(error.to_string()))
+        expand_skill(&self.skills, input).map_err(Error::SkillExpansion)
     }
 
     /// The most tokens the model may produce in one turn.

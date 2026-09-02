@@ -217,7 +217,11 @@ async fn a_stream_that_never_finishes_fails_once_its_replays_are_spent() {
         matches!(&error, Error::Llm(inner) if inner.kind() == LlmErrorKind::StreamDecode),
         "{error:?}"
     );
-    assert!(error.to_string().contains("after every replay"));
+    assert!(
+        ErrorData::from(&error)
+            .message
+            .contains("after every replay")
+    );
     assert_eq!(provider.call_count(), 4, "one attempt and three replays");
     assert_eq!(
         session.history().turns().len(),

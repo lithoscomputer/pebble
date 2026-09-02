@@ -21,6 +21,7 @@ use async_trait::async_trait;
 
 use super::*;
 use crate::environment::{Environment, ExecResult};
+use crate::error::ErrorKind;
 use crate::redact::Redactor;
 use crate::runtime::testing::{TestProfile, builder};
 use crate::search::{SearchError, SearchProvider, SearchRequest, SearchResult};
@@ -333,6 +334,45 @@ async fn a_session_with_no_skills_advertises_no_way_to_load_one() {
             .iter()
             .any(|tool| tool.definition.name == "use_skill")
     );
+}
+
+#[tokio::test]
+async fn an_unknown_slash_skill_is_an_invalid_input_error() {
+    let (mut session, provider) = session_with_a_skill(answers("unused"));
+    session.initialize().await.expect("initialization succeeds");
+
+    let error = session
+        .prompt("/missing do this")
+        .await
+        .expect_err("the input names no discovered skill");
+
+    assert!(matches!(error, Error::SkillExpansion(_)), "{error:?}");
+    let data = ErrorData::from(&error);
+    assert_eq!(data.kind, ErrorKind::InvalidInput);
+    assert_eq!(
+        data.message,
+        "expanding a skill reference: Unknown skill: /missing"
+    );
+    assert_eq!(
+        provider.call_count(),
+        0,
+        "invalid input makes no model call"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_slash_skill_in_a_follow_up_keeps_its_typed_error() {
+    let (mut session, _provider) = session_with_a_skill(answers("first"));
+    session.initialize().await.expect("initialization succeeds");
+    session.follow_up("/missing do this");
+
+    let error = session
+        .prompt("start")
+        .await
+        .expect_err("the follow-up names no discovered skill");
+
+    assert!(matches!(error, Error::SkillExpansion(_)), "{error:?}");
+    assert_eq!(ErrorData::from(&error).kind, ErrorKind::InvalidInput);
 }
 
 #[tokio::test]

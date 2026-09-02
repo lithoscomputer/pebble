@@ -51,7 +51,7 @@ use tracing::warn;
 pub(crate) use self::tools::{subagent_tools, tree_position};
 use crate::config::CodingAgentOptions;
 use crate::environment::Environment;
-use crate::error::{Error, ErrorData, ErrorKind, InterruptReason, Result};
+use crate::error::{Error, ErrorData, ErrorKind, InterruptReason, Result, TaskKind};
 use crate::event::EventCapacity;
 use crate::profile::AgentProfile;
 use crate::redact::Redactor;
@@ -991,9 +991,10 @@ fn spawn_runner_monitor(runner_task: JoinHandle<()>, handle: SubagentHandle) -> 
         let Some(generation) = handle.current_generation() else {
             return;
         };
-        let task_result = Err(Error::InvalidState(format!(
-            "Agent task failed to join: {error}"
-        )));
+        let task_result = Err(Error::Task {
+            task:   TaskKind::SubagentSession,
+            source: error,
+        });
         handle.commit_turn_result(generation, &task_result, false);
     })
 }
@@ -1130,9 +1131,9 @@ impl SubagentSupervisor {
             child_depth,
         )
         .map_err(|error| {
-            ToolError::with_source(
+            ToolError::with_rendered_source(
                 ToolErrorKind::Execution,
-                format!("Could not start a subagent session: {error}"),
+                "Could not start a subagent session",
                 error,
             )
         })?;
@@ -1328,9 +1329,11 @@ impl SubagentSupervisor {
                         .clone()
                         .try_reserve_owned()
                         .map_err(|error| {
-                            ToolError::execution(format!(
-                                "Agent {agent_id} could not start another turn: {error}"
-                            ))
+                            ToolError::with_rendered_source(
+                                ToolErrorKind::Execution,
+                                format!("Agent {agent_id} could not start another turn"),
+                                error,
+                            )
                         })?;
                     let generation = agent.generation.checked_add(1).ok_or_else(|| {
                         ToolError::execution(format!(
@@ -1840,9 +1843,10 @@ impl SubagentSupervisor {
             let _ = monitor_start_rx.await;
             let task_result = match child_task.await {
                 Ok(result) => result,
-                Err(error) => Err(Error::InvalidState(format!(
-                    "Agent task failed to join: {error}"
-                ))),
+                Err(source) => Err(Error::Task {
+                    task: TaskKind::SubagentSession,
+                    source,
+                }),
             };
             handle.commit_turn_result(INITIAL_SUBAGENT_GENERATION, &task_result, false);
         });

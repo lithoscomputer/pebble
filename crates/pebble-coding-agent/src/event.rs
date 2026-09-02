@@ -598,7 +598,7 @@ mod tests {
     use tokio::task::{JoinHandle, yield_now};
 
     use super::*;
-    use crate::error::ErrorKind;
+    use crate::error::{ErrorData, ErrorKind};
 
     /// Records every event it is handed, and can be told to fail once it has
     /// seen a given number of them.
@@ -808,7 +808,8 @@ mod tests {
 
         let error = pump.await.unwrap().expect_err("the sink refused an event");
         assert_eq!(error.kind(), ErrorKind::EventSink);
-        assert!(error.to_string().contains("disk is full"));
+        assert_eq!(error.to_string(), "recording a session event");
+        assert!(ErrorData::from(&error).message.contains("disk is full"));
 
         assert_eq!(receiver.recv().await.unwrap().seq, 1);
         assert!(

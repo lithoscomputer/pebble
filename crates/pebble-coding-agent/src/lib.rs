@@ -67,5 +67,6 @@ pub use self::coding_agent::{
     SteeringMessage, SteeringOutcome,
 };
 pub use self::config::CodingAgentOptions;
-pub use self::error::{CompactionError, Error, InterruptReason, Result};
+pub use self::error::{CompactionError, Error, InterruptReason, Result, TaskKind};
 pub use self::runtime::SteeringLease;
+pub use self::skills::SkillExpansionError;

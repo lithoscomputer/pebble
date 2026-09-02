@@ -75,7 +75,7 @@ pub(crate) enum SkillParseError {
 /// Why a `/name` reference could not be expanded.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
-pub(crate) enum SkillExpansionError {
+pub enum SkillExpansionError {
     /// The input named more than one skill. One input runs one skill.
     #[error("Only one skill reference per input is allowed")]
     MultipleReferences,
