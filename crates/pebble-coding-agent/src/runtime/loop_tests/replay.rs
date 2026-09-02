@@ -10,7 +10,10 @@
 use std::time::Duration;
 
 use lithos_llm::middleware::RetryPolicy;
-use lithos_llm::types::{ContentPart, FinishReason, RetryClassification, StreamEvent, ToolCall};
+use lithos_llm::types::{
+    ContentPart, FinishReason, ReasoningContent, Response, RetryClassification, StreamEvent,
+    ToolCall,
+};
 use tokio::time::timeout;
 
 use super::*;
@@ -785,6 +788,93 @@ async fn only_the_replayed_turn_contributes_reasoning() {
         "final summary",
         "final trace",
     ))]);
+}
+
+/// A response shaped the way the lithos OpenAI Responses codec now decodes a
+/// `reasoning` output item: the whole item stays in the opaque
+/// `openai.reasoning` part, and a `Reasoning` part exists only when the item
+/// carries `content[]` text.
+fn responses_reasoning_response(text: &str, item: serde_json::Value) -> Response {
+    let mut response = text_response(text);
+    let mut content = Vec::new();
+    if let Some(trace) = item
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.get("text").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        })
+        .filter(|trace| !trace.is_empty())
+    {
+        content.push(ContentPart::Reasoning(ReasoningContent {
+            text:             trace,
+            signature:        None,
+            signature_origin: None,
+            redacted:         false,
+        }));
+    }
+    content.push(ContentPart::opaque("openai.reasoning", item));
+    content.extend(response.content);
+    response.content = content;
+    response
+}
+
+#[tokio::test]
+async fn a_responses_item_with_only_summary_blocks_reports_a_summary_and_no_trace() {
+    let (mut session, _provider) =
+        TestSession::answering(vec![ScriptedCall::response(responses_reasoning_response(
+            "4.",
+            json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "gAAAAA",
+                "summary": [
+                    {"type": "summary_text", "text": "A"},
+                    {"type": "summary_text", "text": "B"},
+                ],
+            }),
+        ))]);
+    let mut events = session.subscribe();
+
+    session
+        .prompt("What is 2+2?")
+        .await
+        .expect("the prompt succeeds");
+
+    let published = settled(&mut session, &mut events).await;
+    let reasoning = reasoning_of(&published);
+    assert_eq!(reasoning, [Some(ReasoningOutput::from_summary("A\n\nB"))]);
+    let value = serde_json::to_value(&reasoning[0]).expect("serializes");
+    assert_eq!(value, json!({"summary": "A\n\nB"}));
+}
+
+#[tokio::test]
+async fn a_responses_item_with_reasoning_text_reports_it_once_as_the_trace() {
+    let (mut session, _provider) =
+        TestSession::answering(vec![ScriptedCall::response(responses_reasoning_response(
+            "4.",
+            json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{"type": "summary_text", "text": "A"}],
+                "content": [{"type": "reasoning_text", "text": "step one"}],
+            }),
+        ))]);
+    let mut events = session.subscribe();
+
+    session
+        .prompt("What is 2+2?")
+        .await
+        .expect("the prompt succeeds");
+
+    let published = settled(&mut session, &mut events).await;
+    let reasoning = reasoning_of(&published);
+    assert_eq!(reasoning, [Some(ReasoningOutput::new("A", "step one"))]);
+    let value = serde_json::to_value(&reasoning[0]).expect("serializes");
+    assert_eq!(value, json!({"summary": "A", "trace": "step one"}));
 }
 
 // --- The inference bracket ---

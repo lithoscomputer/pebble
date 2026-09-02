@@ -351,6 +351,45 @@ mod tests {
     }
 
     #[test]
+    fn responses_item_with_only_summary_blocks_produces_no_trace() {
+        // What the lithos OpenAI Responses codec decodes for a `reasoning`
+        // item with two `summary_text` blocks and no `content[]`: the opaque
+        // item alone, with no `Reasoning` part built from the summaries.
+        let output = ReasoningOutput::from_content(&[openai_reasoning(json!({
+            "type": "reasoning",
+            "id": "rs_1",
+            "encrypted_content": "gAAAAA",
+            "summary": [
+                {"type": "summary_text", "text": "A"},
+                {"type": "summary_text", "text": "B"},
+            ],
+        }))])
+        .expect("readable reasoning");
+        assert_eq!(output, ReasoningOutput::from_summary("A\n\nB"));
+        assert_eq!(
+            serde_json::to_value(&output).expect("serializes"),
+            json!({"summary": "A\n\nB"})
+        );
+    }
+
+    #[test]
+    fn responses_item_with_reasoning_text_is_not_duplicated_by_its_reasoning_part() {
+        // The codec pairs a `Reasoning` part holding exactly the `content[]`
+        // text with the opaque item that also carries it.
+        let output = ReasoningOutput::from_content(&[
+            reasoning("step one"),
+            openai_reasoning(json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "summary": [{"type": "summary_text", "text": "A"}],
+                "content": [{"type": "reasoning_text", "text": "step one"}],
+            })),
+        ])
+        .expect("readable reasoning");
+        assert_eq!(output, ReasoningOutput::new("A", "step one"));
+    }
+
+    #[test]
     fn unknown_responses_content_types_remain_opaque() {
         assert!(
             ReasoningOutput::from_content(&[openai_reasoning(json!({
