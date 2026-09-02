@@ -484,6 +484,7 @@ impl CodingRuntimeBuilder {
 
         let (emitter, pump) = EventPump::new(self.events);
         let pump = tokio::spawn(pump.run());
+        let state = StateMachine::new(emitter.clone(), id.clone());
 
         let session = CodingRuntime {
             root_session_id,
@@ -494,7 +495,7 @@ impl CodingRuntimeBuilder {
             conversation: Arc::new(Mutex::new(ConversationState::new(History::default()))),
             emitter,
             pump: Some(pump),
-            state: CodingAgentState::Idle,
+            state,
             ended: false,
             client: self.client,
             profile,
@@ -686,7 +687,9 @@ pub(crate) struct CodingRuntime {
     emitter:           Emitter,
     /// The event pump, until [`CodingRuntime::shutdown`] joins it.
     pump:              Option<JoinHandle<Result<()>>>,
-    state:             CodingAgentState,
+    /// What the session is doing, shared with the bridge that runs the tool
+    /// round.
+    state:             StateMachine,
     ended:             bool,
     client:            Client,
     profile:           Arc<dyn AgentProfile>,
@@ -742,7 +745,7 @@ impl fmt::Debug for CodingRuntime {
             .field("provider", &self.provider)
             .field("model", &self.model)
             .field("profile", &self.profile.profile_kind())
-            .field("state", &self.state)
+            .field("state", &self.state.current())
             .field("ended", &self.ended)
             .field("turns", &self.conversation().history.len())
             .finish_non_exhaustive()
@@ -1185,8 +1188,15 @@ impl CodingRuntime {
     }
 
     /// What the session is doing right now.
-    pub(crate) const fn state(&self) -> CodingAgentState {
-        self.state
+    pub(crate) fn state(&self) -> CodingAgentState {
+        self.state.current()
+    }
+
+    /// The state machine itself, for a test that reads it while a prompt has
+    /// the session borrowed.
+    #[cfg(test)]
+    pub(crate) fn state_machine(&self) -> StateMachine {
+        self.state.clone()
     }
 
     /// A snapshot of the conversation so far.
@@ -1412,7 +1422,7 @@ impl CodingRuntime {
         cancel: Option<&CancellationToken>,
     ) -> Result<Option<String>> {
         self.conversation().totals = PromptTotals::default();
-        if self.state == CodingAgentState::Closed {
+        if self.state.current() == CodingAgentState::Closed {
             return Err(Error::SessionClosed);
         }
 
@@ -1434,14 +1444,14 @@ impl CodingRuntime {
         // the start of the next prompt keeps a reason a watchdog records just
         // before it cancels, and still stops one prompt's reason reaching the
         // next.
-        if self.state != CodingAgentState::Closed {
+        if self.state.current() != CodingAgentState::Closed {
             *self
                 .interrupt_reason
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner) = None;
         }
 
-        if self.state == CodingAgentState::Closed {
+        if self.state.current() == CodingAgentState::Closed {
             let reason = if self.cancel_token.is_cancelled() {
                 ShutdownReason::Cancelled
             } else {
@@ -1451,7 +1461,7 @@ impl CodingRuntime {
                 task_failure = task_failure.or(Some(error));
             }
         } else {
-            self.transition(CodingAgentState::Idle);
+            self.state.transition(CodingAgentState::Idle);
             // A sink that refused an event during this prompt is this prompt's
             // failure, even where the loop got to a boundary too late to
             // notice it.
@@ -1524,7 +1534,7 @@ impl CodingRuntime {
             self.set_interrupt_reason(InterruptReason::Cancelled);
             self.cancel_token.cancel();
         }
-        self.transition(CodingAgentState::Closed);
+        self.state.transition(CodingAgentState::Closed);
         if let Some(supervisor) = &self.subagents {
             supervisor.shutdown_all().await;
         }
@@ -1576,7 +1586,7 @@ impl CodingRuntime {
         }
         let outcome = self.join_pump().await;
         if outcome.is_err() {
-            self.transition(CodingAgentState::Closed);
+            self.state.transition(CodingAgentState::Closed);
         }
         outcome
     }
@@ -1640,9 +1650,38 @@ impl CodingRuntime {
             error: ErrorData::from(&error),
         });
         if credential_failure {
-            self.transition(CodingAgentState::Closed);
+            self.state.transition(CodingAgentState::Closed);
         }
         error
+    }
+}
+
+/// The session's state, and the one place it moves.
+///
+/// Shared between the runtime, which moves it at the edges of a prompt, and
+/// the bridge, which moves it into `Executing` around each tool round while
+/// the runtime is borrowed by the prompt in progress. Cheap to clone; every
+/// clone reads and moves the same state.
+#[derive(Clone, Debug)]
+pub(crate) struct StateMachine {
+    state:      Arc<Mutex<CodingAgentState>>,
+    emitter:    Emitter,
+    session_id: String,
+}
+
+impl StateMachine {
+    /// A session that starts idle.
+    fn new(emitter: Emitter, session_id: String) -> Self {
+        Self {
+            state: Arc::new(Mutex::new(CodingAgentState::Idle)),
+            emitter,
+            session_id,
+        }
+    }
+
+    /// What the session is doing right now.
+    pub(crate) fn current(&self) -> CodingAgentState {
+        *self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Moves the session's state machine, publishing the end of a processing
@@ -1651,8 +1690,9 @@ impl CodingRuntime {
     /// Valid moves: Idle or Executing to Thinking, Thinking to Executing or
     /// Idle, anything to Closed. Ending the session belongs to
     /// [`CodingRuntime::shutdown`], never here.
-    fn transition(&mut self, to: CodingAgentState) {
-        let from = self.state;
+    pub(super) fn transition(&self, to: CodingAgentState) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let from = *state;
         if from == to {
             return;
         }
@@ -1671,15 +1711,16 @@ impl CodingRuntime {
             "invalid session state transition: {from:?} -> {to:?}"
         );
 
+        *state = to;
+        drop(state);
         if matches!(
             from,
             CodingAgentState::Thinking | CodingAgentState::Executing
         ) && to == CodingAgentState::Idle
         {
-            self.emit(CodingEvent::ProcessingEnd);
+            self.emitter
+                .emit(self.session_id.clone(), CodingEvent::ProcessingEnd);
         }
-
-        self.state = to;
     }
 }
 
@@ -2215,6 +2256,40 @@ mod tests {
         assert!(
             events.try_recv().is_err(),
             "nothing reached a subscriber after the sink refused"
+        );
+    }
+
+    // --- The state machine ---
+
+    #[tokio::test]
+    async fn a_tool_round_moves_the_state_through_executing_and_back() {
+        // The moves the bridge makes around a tool round, in the order the loop
+        // makes them. A move the table does not allow panics in a debug build,
+        // so reaching the end is the assertion that the table allows them all.
+        let (mut session, _provider) = TestSession::answering(vec![]);
+        let mut events = session.subscribe();
+        let machine = session.state_machine();
+
+        machine.transition(CodingAgentState::Thinking);
+        machine.transition(CodingAgentState::Executing);
+        assert_eq!(
+            session.state(),
+            CodingAgentState::Executing,
+            "the session reads the state the bridge moved"
+        );
+        machine.transition(CodingAgentState::Thinking);
+        assert_eq!(session.state(), CodingAgentState::Thinking);
+        machine.transition(CodingAgentState::Idle);
+        assert_eq!(session.state(), CodingAgentState::Idle);
+
+        let published = settled(&mut session, &mut events).await;
+        assert_eq!(
+            published
+                .iter()
+                .filter(|event| matches!(event, CodingEvent::ProcessingEnd))
+                .count(),
+            1,
+            "returning to idle ends one processing cycle, and executing ends none"
         );
     }
 

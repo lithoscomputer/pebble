@@ -18,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::control::{SessionControlHandle, actor_from_attribution};
 use super::retry::RetryEventBridge;
-use super::{CodingRuntime, PromptTotals};
+use super::{CodingRuntime, PromptTotals, StateMachine};
 use crate::compaction::{CompactionRequest, check_context_usage, compact_context};
 use crate::config::{CodingAgentOptions, ToolHookDecision};
 use crate::context_window::{
@@ -74,6 +74,9 @@ pub(super) struct CodingAgentBridge {
     memory_tokens:     u64,
     skills_tokens:     u64,
     control:           SessionControlHandle,
+    /// The session's state, moved to `Executing` for the length of a tool
+    /// round and back to `Thinking` after it.
+    state_machine:     StateMachine,
     /// The token that ends the prompt in progress. A child of the runtime's
     /// terminal token, so it also fires when the session is shut down, and set
     /// afresh by [`begin_prompt`](Self::begin_prompt) for every prompt.
@@ -140,6 +143,7 @@ impl CodingAgentBridge {
             memory_tokens:     runtime.memory_tokens,
             skills_tokens:     runtime.skills_tokens,
             control:           runtime.control_handle(),
+            state_machine:     runtime.state.clone(),
             prompt_cancel:     Arc::new(Mutex::new(runtime.cancel_token.clone())),
             followup_queue:    Arc::clone(&runtime.followup_queue),
             subagents:         runtime.subagents.clone(),
@@ -590,8 +594,13 @@ impl ToolRoundExecutor for CodingAgentBridge {
         }
         dispatch = dispatch.with_redactor(&self.redactor);
 
+        // The round runs in `Executing` whether or not a token fires while it
+        // does: a cancelled call still answers, and the session is thinking
+        // again only once every answer is in hand.
+        self.state_machine.transition(CodingAgentState::Executing);
         let started = Instant::now();
         let results = dispatch.execute_agent_round(context, cancel).await;
+        self.state_machine.transition(CodingAgentState::Thinking);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.totals.timing.tool = state.totals.timing.tool.saturating_add(started.elapsed());
         if activated_a_skill(context.calls(), &results) {
@@ -768,11 +777,11 @@ impl CodingRuntime {
         skill_expansion: SkillExpansion,
         prompt_cancel: &CancellationToken,
     ) -> Result<Option<String>> {
-        if self.state == CodingAgentState::Closed {
+        if self.state.current() == CodingAgentState::Closed {
             return Err(Error::SessionClosed);
         }
         self.check_pump().await?;
-        self.transition(CodingAgentState::Thinking);
+        self.state.transition(CodingAgentState::Thinking);
 
         let expanded = self.expand_input(input, skill_expansion)?;
         if let Some(name) = &expanded.skill_name {

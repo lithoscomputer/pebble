@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use lithos_llm::types::{TokenCounts, ToolDefinition, ToolResult};
 use serde_json::json;
+use tokio::time::timeout;
 
 use super::testing::{
     TestSession, blocking_tool, count, drain, drained, echo_tool, failing_tool, noop_tool,
@@ -136,6 +137,118 @@ async fn a_follow_up_starts_another_cycle() {
     assert!(
         matches!(&turns[3], Message::Assistant { content, .. } if content == "Followup response")
     );
+}
+
+// --- The state machine ---
+
+/// A tool that records what state the session is in while it runs.
+///
+/// The session does not exist until it is built, and the tool has to be
+/// registered before then, so the probe is handed its state machine afterwards.
+fn state_probe(
+    machine: Arc<OnceLock<StateMachine>>,
+    seen: Arc<Mutex<Vec<CodingAgentState>>>,
+) -> RegisteredTool {
+    RegisteredTool::new(
+        ToolDefinition::function(
+            "probe_state",
+            "Records the session's state",
+            json!({"type": "object"}),
+        ),
+        Arc::new(move |_arguments, _context| {
+            let machine = Arc::clone(&machine);
+            let seen = Arc::clone(&seen);
+            Box::pin(async move {
+                let state = machine
+                    .get()
+                    .expect("the probe was handed its session")
+                    .current();
+                seen.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(state);
+                Ok("recorded".to_owned())
+            })
+        }),
+    )
+    .with_source(ToolSource::Native)
+}
+
+#[tokio::test]
+async fn a_session_is_executing_while_its_tools_run_and_thinking_between_rounds() {
+    // The probe reads the state from inside the tool round. The second model
+    // call never answers, so the state between rounds can be read while the
+    // prompt is still running; an interrupt then releases that call, and the
+    // steer that comes with it carries the prompt to its answer.
+    let machine: Arc<OnceLock<StateMachine>> = Arc::default();
+    let seen: Arc<Mutex<Vec<CodingAgentState>>> = Arc::default();
+    let (mut session, provider) = TestSession::new(vec![
+        ScriptedCall::response(tool_call_response("probe_state", "call_1", json!({}))),
+        ScriptedCall::PendingOpen,
+        ScriptedCall::response(text_response("done")),
+    ])
+    .tools([state_probe(Arc::clone(&machine), Arc::clone(&seen))])
+    .build();
+    machine
+        .set(session.state_machine())
+        .expect("the probe is handed its session once");
+    let control = session.control_handle();
+    let mut events = session.subscribe();
+    let mut recorded = session.subscribe();
+    let watcher = tokio::spawn(async move {
+        // The second request is the one that hangs: by the time it is
+        // announced, the tool round is over and the loop has begun a new one.
+        let requests = AtomicUsize::new(0);
+        wait_for_event(&mut events, |event| {
+            matches!(event, CodingEvent::LlmRequestStarted { .. })
+                && requests.fetch_add(1, Ordering::SeqCst) == 1
+        })
+        .await;
+        let between_rounds = machine
+            .get()
+            .expect("the probe was handed its session")
+            .current();
+        control.interrupt_then_steer("carry on", None);
+        between_rounds
+    });
+
+    let output = timeout(Duration::from_secs(1), session.prompt("probe"))
+        .await
+        .expect("the interrupt releases the hanging call")
+        .expect("the prompt succeeds");
+    let between_rounds = watcher.await.expect("the watcher finishes");
+
+    assert_eq!(output.as_deref(), Some("done"));
+    assert_eq!(provider.call_count(), 3);
+    assert_eq!(
+        *seen.lock().unwrap_or_else(PoisonError::into_inner),
+        vec![CodingAgentState::Executing],
+        "the tool ran with the session executing"
+    );
+    assert_eq!(
+        between_rounds,
+        CodingAgentState::Thinking,
+        "the session thinks again once its tools have answered"
+    );
+    assert_eq!(session.state(), CodingAgentState::Idle);
+
+    let published = settled(&mut session, &mut recorded).await;
+    assert_eq!(
+        count(&published, |event| matches!(
+            event,
+            CodingEvent::ProcessingEnd
+        )),
+        1,
+        "one processing cycle ended"
+    );
+    let completed = position(&published, |event| {
+        matches!(event, CodingEvent::ToolCallCompleted { .. })
+    })
+    .expect("the probe answered");
+    let ended = position(&published, |event| {
+        matches!(event, CodingEvent::ProcessingEnd)
+    })
+    .expect("the cycle ended");
+    assert!(completed < ended, "the cycle ends after the tool round");
 }
 
 // --- Invariant 1: every tool call gets a result ---

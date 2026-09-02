@@ -971,7 +971,7 @@ impl CodingAgent {
 
     /// The current agent state.
     #[must_use]
-    pub const fn state(&self) -> CodingAgentState {
+    pub fn state(&self) -> CodingAgentState {
         self.inner.state()
     }
 
