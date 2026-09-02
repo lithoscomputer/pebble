@@ -952,7 +952,8 @@ impl CodingEvent {
     /// Records this event on the tracing subscriber.
     ///
     /// Streaming noise logs nothing. Process output and subagent task prompts
-    /// are reported by size rather than content.
+    /// are reported by size rather than content. Consume-phase model retries
+    /// are logged by the shared stream loop instead of repeated here.
     pub fn trace(&self, session_id: &str) {
         use tracing::{debug, error, info, warn};
 
@@ -992,7 +993,7 @@ impl CodingEvent {
                 tool_call_count,
                 ..
             } => {
-                info!(
+                debug!(
                     session_id,
                     model = model.as_str(),
                     input_tokens = usage.input,
@@ -1010,7 +1011,7 @@ impl CodingEvent {
                 tool_call_id,
                 ..
             } => {
-                info!(
+                debug!(
                     session_id,
                     tool = tool_name.as_str(),
                     tool_call_id,
@@ -1027,7 +1028,7 @@ impl CodingEvent {
                 output_bytes_omitted,
                 ..
             } => {
-                info!(
+                debug!(
                     session_id,
                     tool = tool_name.as_str(),
                     tool_call_id,
@@ -1122,6 +1123,9 @@ impl CodingEvent {
                 error,
                 phase,
             } => {
+                if *phase == LlmRetryPhase::Consume {
+                    return;
+                }
                 warn!(
                     session_id,
                     provider,

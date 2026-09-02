@@ -987,7 +987,6 @@ impl CodingRuntime {
         });
 
         self.skills = skills?;
-        debug!(skill_count = self.skills.len(), "Skills discovered");
         self.emit(CodingEvent::SkillsDiscovered {
             profile,
             source_dirs: self.config.skill_dirs.clone(),

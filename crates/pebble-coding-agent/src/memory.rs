@@ -15,7 +15,7 @@
 use std::collections::HashSet;
 
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::char_boundary::floor_char_boundary;
 use crate::environment::Environment;
@@ -130,9 +130,6 @@ pub(crate) async fn load_memory(
             );
         }
     }
-
-    let total_bytes: usize = documents.iter().map(|document| document.loaded_bytes).sum();
-    info!(files = documents.len(), total_bytes, "Memory loaded");
 
     Ok(documents)
 }
