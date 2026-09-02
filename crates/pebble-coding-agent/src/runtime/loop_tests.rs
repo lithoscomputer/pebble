@@ -27,6 +27,7 @@ mod tools;
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use lithos_llm::types::{TokenCounts, ToolDefinition, ToolResult};
 use serde_json::json;

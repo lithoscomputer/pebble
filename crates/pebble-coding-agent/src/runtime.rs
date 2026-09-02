@@ -16,14 +16,13 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use lithos_llm::Client;
-use lithos_llm::catalog::{Metadata, MetadataError, ModelHandle};
-use lithos_llm::resolver::{ModelSelectionError, ResolvedRoute};
+use lithos_llm::catalog::{Metadata, ModelHandle};
+use lithos_llm::resolver::ResolvedRoute;
 use lithos_llm::types::{
-    Error as LlmError, ErrorKind as LlmErrorKind, ReasoningEffort, Request, RequestBuildError,
-    Speed,
+    Error as LlmError, ErrorKind as LlmErrorKind, ReasoningEffort, Request, Speed,
 };
 use pebble_agent::{Agent, AgentControlHandle};
 use serde::Deserialize;
@@ -33,11 +32,12 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-pub use self::control::CompletionCoordinator;
 use self::control::ControlState;
 pub(crate) use self::control::SessionControlHandle;
+pub use self::control::SteeringLease;
 pub use self::retry::RetryEventObserver;
 use self::turn::CodingAgentBridge;
+pub(crate) use crate::coding_agent::{CodingAgentBuildError, PromptTiming, ShutdownReason};
 use crate::config::CodingAgentOptions;
 use crate::context_window::{memory_prompt_tokens, skills_prompt_tokens};
 use crate::environment::{Environment, ExecRequest};
@@ -76,122 +76,12 @@ const METADATA_NAMESPACE: &str = "pebble";
 /// How long a probe run inside the environment may take.
 const PROBE_TIMEOUT_MS: u64 = 5_000;
 
-/// Why a coding agent is being shut down.
-///
-/// Recorded for the application's benefit; it never reaches the event stream,
-/// which reports the end of a session the same way whatever ended it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum ShutdownReason {
-    /// The work finished.
-    Completed,
-    /// Someone cancelled the prompt.
-    Cancelled,
-    /// The prompt failed.
-    Error,
-}
-
-/// Where one prompt spent its time.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct PromptTiming {
-    /// Time spent waiting on the model.
-    pub inference: Duration,
-    /// Time spent running tools.
-    pub tool:      Duration,
-}
-
 /// What one prompt accumulated across every input it processed.
 #[derive(Clone, Copy, Debug, Default)]
 struct PromptTotals {
     timing:          PromptTiming,
     usage:           TokenUsage,
     cost_usd_micros: Option<u64>,
-}
-
-/// A coding agent could not be built.
-///
-/// Every variant names something the application chose: a missing dependency, a
-/// selector that resolves to nothing, or a model whose catalog entry does not
-/// say which harness it expects.
-#[derive(Debug, thiserror::Error)]
-#[non_exhaustive]
-pub enum CodingAgentBuildError {
-    /// Resource discovery or system-prompt construction failed.
-    #[error("initializing the coding agent")]
-    Initialization {
-        /// The initialization failure.
-        #[source]
-        source: Box<Error>,
-    },
-
-    /// No model selector was given.
-    #[error("a coding agent needs a model selector")]
-    MissingModel,
-
-    /// No environment was given, so the tools would have nowhere to act.
-    #[error("a coding agent needs an environment for its tools to act through")]
-    MissingEnvironment,
-
-    /// The selector names no model the client can reach.
-    #[error("model selector `{selector}` resolves to no available model: {source}")]
-    ModelSelection {
-        /// The selector the application gave.
-        selector: String,
-        /// What the client's resolver said.
-        #[source]
-        source:   ModelSelectionError,
-    },
-
-    /// The request pebble resolves the selector with could not be built, which
-    /// an empty or blank selector runs into.
-    #[error("model selector `{selector}` is not usable: {source}")]
-    Selector {
-        /// The selector the application gave.
-        selector: String,
-        /// What request building said.
-        #[source]
-        source:   RequestBuildError,
-    },
-
-    /// Neither the model nor its provider says which harness the model expects.
-    #[error(
-        "model {model} names no agent profile: neither it nor its provider carries \
-         `metadata.pebble.profile`"
-    )]
-    MissingProfileMetadata {
-        /// The model that was resolved.
-        model: String,
-    },
-
-    /// The `pebble` metadata is present but not shaped as pebble reads it.
-    #[error("the `pebble` catalog metadata for model {model} could not be read: {source}")]
-    InvalidProfileMetadata {
-        /// The model that was resolved.
-        model:  String,
-        /// What reading the namespace said.
-        #[source]
-        source: MetadataError,
-    },
-
-    /// The catalog names a harness pebble does not know.
-    #[error("model {model} names agent profile `{profile}`, which pebble does not know")]
-    UnknownProfile {
-        /// The model that was resolved.
-        model:   String,
-        /// The identifier the catalog carried.
-        profile: String,
-    },
-
-    /// The stored record was written by a newer pebble.
-    #[error(
-        "session record format version {version} is newer than this build reads (up to {supported})"
-    )]
-    UnsupportedRecord {
-        /// The version the record declares.
-        version:   u32,
-        /// The newest version this build reads.
-        supported: u32,
-    },
 }
 
 /// The `pebble` namespace of a catalog entry.
@@ -593,7 +483,6 @@ impl CodingRuntimeBuilder {
             activated_skill_context_observed: false,
             file_tracker: FileTracker::default(),
             subagents: supervisor,
-            completion_coordinator: None,
             last_prompt: PromptTotals::default(),
             coding_agent: None,
             coding_bridge: None,
@@ -798,7 +687,6 @@ pub(crate) struct CodingRuntime {
     activated_skill_context_observed: bool,
     file_tracker: FileTracker,
     subagents: Option<SubagentSupervisor>,
-    completion_coordinator: Option<Arc<dyn CompletionCoordinator>>,
     last_prompt: PromptTotals,
     /// The provider-neutral conversation loop, created after initialization on
     /// the first prompt and retained for the rest of the session.
@@ -1186,16 +1074,11 @@ impl CodingRuntime {
         self.control_handle().steer(text, None);
     }
 
-    /// Installs the coordinator that decides whether a finished turn really
-    /// ends the prompt.
-    pub(crate) fn set_completion_coordinator(
-        &mut self,
-        coordinator: Arc<dyn CompletionCoordinator>,
-    ) {
-        self.completion_coordinator = Some(Arc::clone(&coordinator));
-        if let Some(bridge) = &self.coding_bridge {
-            bridge.set_completion_coordinator(coordinator);
-        }
+    /// Hands out a steering lease that parks natural completion while an
+    /// external steering source is attached.
+    #[cfg(test)]
+    pub(crate) fn steering_lease(&self) -> SteeringLease {
+        SteeringLease::acquire(self.control_handle())
     }
 
     /// Queues more input to process once the current input is finished.
@@ -1605,6 +1488,7 @@ fn is_iso_date(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::result::Result as StdResult;
+    use std::time::Duration;
 
     use async_trait::async_trait;
     use tokio::sync::broadcast::error::RecvError;

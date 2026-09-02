@@ -5,7 +5,6 @@ pub use crate::human_input::{
     QuestionOption,
 };
 pub use crate::redact::{NoRedaction, Redactor};
-pub use crate::runtime::CompletionCoordinator;
 pub use crate::search::{
     SearchError, SearchErrorKind, SearchProvider, SearchRequest, SearchResult,
 };

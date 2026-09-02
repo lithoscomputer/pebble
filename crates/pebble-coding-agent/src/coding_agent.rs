@@ -3,9 +3,12 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use lithos_llm::Client;
-use lithos_llm::types::{ReasoningEffort, Speed};
+use lithos_llm::catalog::MetadataError;
+use lithos_llm::resolver::ModelSelectionError;
+use lithos_llm::types::{ReasoningEffort, RequestBuildError, Speed};
 use tokio::sync::{Notify, broadcast};
 use tokio_util::sync::CancellationToken;
 
@@ -18,13 +21,122 @@ use crate::human_input::HumanInputProvider;
 use crate::record::SessionRecord;
 use crate::redact::Redactor;
 use crate::runtime::{
-    CodingAgentBuildError, CodingRuntime, CodingRuntimeBuilder, InterruptReasonHandle,
-    PromptTiming, SessionControlHandle, ShutdownReason,
+    CodingRuntime, CodingRuntimeBuilder, InterruptReasonHandle, SessionControlHandle, SteeringLease,
 };
 use crate::search::SearchProvider;
 use crate::subagent::{ChildAgentFactory, SubagentLimits};
 use crate::tool::{RegisteredTool, ToolEnvProvider};
 use crate::types::{CodingAgentEvent, CodingAgentState, Message, TokenUsage};
+
+/// Why a coding agent is being shut down.
+///
+/// Recorded for the application's benefit; it never reaches the event stream,
+/// which reports the end of a session the same way whatever ended it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ShutdownReason {
+    /// The work finished.
+    Completed,
+    /// Someone cancelled the prompt.
+    Cancelled,
+    /// The prompt failed.
+    Error,
+}
+
+/// Where one prompt spent its time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PromptTiming {
+    /// Time spent waiting on the model.
+    pub inference: Duration,
+    /// Time spent running tools.
+    pub tool:      Duration,
+}
+
+/// A coding agent could not be built.
+///
+/// Every variant names something the application chose: a missing dependency, a
+/// selector that resolves to nothing, or a model whose catalog entry does not
+/// say which harness it expects.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum CodingAgentBuildError {
+    /// Resource discovery or system-prompt construction failed.
+    #[error("initializing the coding agent")]
+    Initialization {
+        /// The initialization failure.
+        #[source]
+        source: Box<Error>,
+    },
+
+    /// No model selector was given.
+    #[error("a coding agent needs a model selector")]
+    MissingModel,
+
+    /// No environment was given, so the tools would have nowhere to act.
+    #[error("a coding agent needs an environment for its tools to act through")]
+    MissingEnvironment,
+
+    /// The selector names no model the client can reach.
+    #[error("model selector `{selector}` resolves to no available model: {source}")]
+    ModelSelection {
+        /// The selector the application gave.
+        selector: String,
+        /// What the client's resolver said.
+        #[source]
+        source:   ModelSelectionError,
+    },
+
+    /// The request pebble resolves the selector with could not be built, which
+    /// an empty or blank selector runs into.
+    #[error("model selector `{selector}` is not usable: {source}")]
+    Selector {
+        /// The selector the application gave.
+        selector: String,
+        /// What request building said.
+        #[source]
+        source:   RequestBuildError,
+    },
+
+    /// Neither the model nor its provider says which harness the model expects.
+    #[error(
+        "model {model} names no agent profile: neither it nor its provider carries \
+         `metadata.pebble.profile`"
+    )]
+    MissingProfileMetadata {
+        /// The model that was resolved.
+        model: String,
+    },
+
+    /// The `pebble` metadata is present but not shaped as pebble reads it.
+    #[error("the `pebble` catalog metadata for model {model} could not be read: {source}")]
+    InvalidProfileMetadata {
+        /// The model that was resolved.
+        model:  String,
+        /// What reading the namespace said.
+        #[source]
+        source: MetadataError,
+    },
+
+    /// The catalog names a harness pebble does not know.
+    #[error("model {model} names agent profile `{profile}`, which pebble does not know")]
+    UnknownProfile {
+        /// The model that was resolved.
+        model:   String,
+        /// The identifier the catalog carried.
+        profile: String,
+    },
+
+    /// The stored record was written by a newer pebble.
+    #[error(
+        "session record format version {version} is newer than this build reads (up to {supported})"
+    )]
+    UnsupportedRecord {
+        /// The version the record declares.
+        version:   u32,
+        /// The newest version this build reads.
+        supported: u32,
+    },
+}
 
 /// The completed result of one coding-agent prompt.
 #[derive(Clone, Debug, PartialEq)]
@@ -286,6 +398,19 @@ impl CodingAgentControlHandle {
             self.control.session.steer(message, None);
         }
         true
+    }
+
+    /// Holds natural completion open while an external steering source is
+    /// attached.
+    ///
+    /// While the returned [`SteeringLease`] is alive, a prompt that reaches a
+    /// plain answer parks rather than completing, so a steer the source is
+    /// about to send cannot lose the completion close-door race. Dropping the
+    /// final lease wakes a parked prompt and lets it complete. This is the
+    /// supported replacement for reaching into the drain, park, and generation
+    /// protocol directly.
+    pub fn hold_open_for_steering(&self) -> SteeringLease {
+        SteeringLease::acquire(self.control.session.clone())
     }
 
     /// Queues input to run after the current prompt reaches an answer.

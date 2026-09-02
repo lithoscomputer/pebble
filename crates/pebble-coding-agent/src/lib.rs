@@ -57,7 +57,8 @@ pub mod test_support;
 mod readme {}
 
 pub use self::coding_agent::{
-    CodingAgent, CodingAgentBuilder, CodingAgentControlHandle, PromptOutcome,
+    CodingAgent, CodingAgentBuildError, CodingAgentBuilder, CodingAgentControlHandle,
+    PromptOutcome, PromptTiming, ShutdownReason,
 };
 pub use self::config::CodingAgentOptions;
 pub use self::environment::{
@@ -66,4 +67,4 @@ pub use self::environment::{
     LocalEnvironment, format_lines_numbered,
 };
 pub use self::error::{Error, InterruptReason, Result};
-pub use self::runtime::{CodingAgentBuildError, PromptTiming, ShutdownReason};
+pub use self::runtime::SteeringLease;

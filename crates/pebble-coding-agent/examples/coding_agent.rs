@@ -212,8 +212,10 @@ fn workspace_path() -> PathBuf {
 /// a natural completion is not lost and is not injected either: it stays queued
 /// and opens the next prompt. `SteeringInjected` is what says it landed, so
 /// this task waits for that event and says so when it never comes. An
-/// application that needs the race closed rather than reported gives the
-/// session a `CompletionCoordinator`.
+/// application that needs the race closed rather than reported holds a
+/// [`SteeringLease`](pebble_coding_agent::SteeringLease) through
+/// [`CodingAgentControlHandle::hold_open_for_steering`], which parks natural
+/// completion until the lease drops.
 fn steer_once(
     mut events: broadcast::Receiver<CodingAgentEvent>,
     handle: CodingAgentControlHandle,

@@ -13,7 +13,6 @@
 //! last one stopped.
 
 use std::future::pending;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use lithos_llm::middleware::RetryPolicy;
@@ -541,37 +540,38 @@ async fn a_tool_that_ignores_its_cancellation_holds_the_round_open() {
     );
 }
 
+/// A steering lease parks natural completion, so a steer that arrives after
+/// the first answer still reaches the session and drives another round.
+///
+/// This is the close-door race the removed completion coordinator used to
+/// settle: an external steering source holds a lease across the prompt, so a
+/// plain answer parks instead of finishing. The source then steers and drops
+/// its lease, and the queued steer sends the loop around once more.
 #[tokio::test]
-async fn a_coordinator_can_send_the_loop_round_again() {
-    struct OnceCoordinator {
-        calls:  AtomicUsize,
-        handle: SessionControlHandle,
-    }
-
-    impl CompletionCoordinator for OnceCoordinator {
-        fn on_natural_completion(&self) -> bool {
-            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
-                // A steer that arrived as the first answer completed: queue it
-                // and ask for another round.
-                self.handle.steer("after-completion steer", None);
-                true
-            } else {
-                false
-            }
-        }
-    }
-
+async fn a_steering_lease_lets_a_late_steer_drive_another_round() {
     let (mut session, _provider) = TestSession::answering(vec![
         ScriptedCall::response(text_response("First reply")),
         ScriptedCall::response(text_response("Second reply, after steer")),
     ]);
     let handle = session.control_handle();
-    session.set_completion_coordinator(Arc::new(OnceCoordinator {
-        calls: AtomicUsize::new(0),
-        handle,
-    }));
+    let mut events = session.subscribe();
+    // Held across the whole prompt: the first answer parks rather than
+    // completing while this is alive.
+    let lease = session.steering_lease();
+
+    let steering = tokio::spawn(async move {
+        wait_for_event(&mut events, |event| {
+            matches!(event, CodingEvent::AssistantMessage { text, .. } if text == "First reply")
+        })
+        .await;
+        // Queue the steer, then drop the lease. The queued item makes the
+        // parked prompt run another round rather than complete.
+        handle.steer("after-completion steer", None);
+        drop(lease);
+    });
 
     session.prompt("hi").await.expect("the prompt succeeds");
+    steering.await.expect("the steering task finishes");
 
     let turns = session.history().turns();
     assert_eq!(turns.len(), 4, "input, answer, steer, answer");
@@ -582,6 +582,35 @@ async fn a_coordinator_can_send_the_loop_round_again() {
     assert!(
         matches!(&turns[3], Message::Assistant { content, .. } if content == "Second reply, after steer")
     );
+}
+
+/// Dropping the final steering lease with nothing queued wakes a parked prompt
+/// and lets it complete.
+#[tokio::test]
+async fn dropping_the_last_lease_wakes_a_parked_prompt() {
+    let (mut session, _provider) =
+        TestSession::answering(vec![ScriptedCall::response(text_response("only reply"))]);
+    let mut events = session.subscribe();
+    let lease = session.steering_lease();
+
+    let releaser = tokio::spawn(async move {
+        wait_for_event(&mut events, |event| {
+            matches!(event, CodingEvent::AssistantMessage { text, .. } if text == "only reply")
+        })
+        .await;
+        // Nothing queued: the prompt is parked purely on the lease, and
+        // dropping it must let the prompt finish.
+        drop(lease);
+    });
+
+    let answer = timeout(PATIENCE, session.prompt("hi"))
+        .await
+        .expect("dropping the lease lets the parked prompt complete")
+        .expect("the prompt succeeds");
+    releaser.await.expect("the releaser finishes");
+
+    assert_eq!(answer.as_deref(), Some("only reply"));
+    assert_eq!(session.history().turns().len(), 2, "input and answer");
 }
 
 // --- The wall clock ---

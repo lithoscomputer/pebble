@@ -58,7 +58,7 @@ use crate::event::EventCapacity;
 use crate::profile::AgentProfile;
 use crate::record::SessionRecord;
 use crate::redact::Redactor;
-use crate::runtime::{CodingAgentBuildError, CodingRuntime, CompletionCoordinator, ShutdownReason};
+use crate::runtime::{CodingAgentBuildError, CodingRuntime, ShutdownReason};
 use crate::search::SearchProvider;
 use crate::tool::{RegisteredTool, ToolDefinitionWithSource, ToolEnvProvider, ToolError};
 use crate::types::{
@@ -292,11 +292,6 @@ impl ChildAgent {
     /// Sets fixed environment variables for the child's tool calls.
     pub fn set_tool_env(&mut self, env: HashMap<String, String>) {
         self.inner.set_tool_env(env);
-    }
-
-    /// Installs the coordinator that settles the child's final-turn race.
-    pub fn set_completion_coordinator(&mut self, coordinator: Arc<dyn CompletionCoordinator>) {
-        self.inner.set_completion_coordinator(coordinator);
     }
 
     fn into_runtime(self) -> CodingRuntime {

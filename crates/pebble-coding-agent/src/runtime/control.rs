@@ -6,6 +6,7 @@
 //! the next turn boundary.
 
 use std::collections::VecDeque;
+use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use pebble_agent::AgentControlHandle;
@@ -57,30 +58,53 @@ impl SteeringItem {
 /// generation it has not settled yet. Several interrupts before the loop
 /// unwinds therefore produce one event each, never two for one gesture and
 /// never none.
+///
+/// `steering_leases` counts the prompt-scoped holds an external steering source
+/// keeps on natural completion. While the count is above zero, a prompt that
+/// reaches a plain answer parks instead of completing, so a steer already on
+/// its way cannot lose the close-door race. The last lease to drop wakes the
+/// parked prompt and lets it finish.
 #[derive(Debug, Default)]
 pub(crate) struct ControlState {
     pub(crate) queue: VecDeque<SteeringItem>,
     pub(crate) waiting_for_steer: bool,
     pub(crate) interrupt_generation: u64,
     pub(crate) settled_interrupt_generation: u64,
+    pub(crate) steering_leases: usize,
 }
 
-/// Decides whether a finished turn really ends the prompt.
+/// A prompt-scoped hold that keeps natural completion parked.
 ///
-/// A session that answers with no tool calls is done, unless something outside
-/// it knows a steer is about to arrive. An application that feeds steering from
-/// another task installs a coordinator so the race is decided by whoever owns
-/// the steering source rather than by timing.
-///
-/// The contract is the caller's to keep: once
-/// [`on_natural_completion`](Self::on_natural_completion) answers `false`, no
-/// further steer may reach the queue for this prompt, because the session is on
-/// its way out and would never drain it.
-pub trait CompletionCoordinator: Send + Sync {
-    /// Whether the session should run one more round.
-    ///
-    /// `true` sends the loop around again, which drains anything queued.
-    fn on_natural_completion(&self) -> bool;
+/// While a lease is alive, a prompt that reaches a plain answer waits instead
+/// of finishing, so an external steering source attached to the session cannot
+/// lose the completion close-door race. Dropping the last lease wakes the
+/// parked prompt and lets it complete. This is the supported replacement for
+/// reaching into the drain, park, and generation protocol directly.
+#[must_use = "the lease parks completion only while it is held"]
+pub struct SteeringLease {
+    control: SessionControlHandle,
+}
+
+impl SteeringLease {
+    /// Takes one hold on the session's completion.
+    pub(crate) fn acquire(control: SessionControlHandle) -> Self {
+        control.acquire_steering_lease();
+        Self { control }
+    }
+}
+
+impl fmt::Debug for SteeringLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SteeringLease")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for SteeringLease {
+    fn drop(&mut self) {
+        self.control.release_steering_lease();
+    }
 }
 
 /// The internal handle that steers and interrupts a running coding agent.
@@ -127,6 +151,40 @@ impl SessionControlHandle {
             text: text.into(),
             actor,
         });
+    }
+
+    /// Takes one prompt-scoped hold on natural completion.
+    ///
+    /// While any hold is outstanding, a prompt that reaches a plain answer
+    /// parks rather than completing, so an external steering source about to
+    /// send a steer cannot lose the close-door race. Balance every call with
+    /// [`release_steering_lease`](Self::release_steering_lease).
+    pub(crate) fn acquire_steering_lease(&self) {
+        let mut control = self.lock();
+        control.steering_leases = control.steering_leases.saturating_add(1);
+    }
+
+    /// Releases one hold taken by
+    /// [`acquire_steering_lease`](Self::acquire_steering_lease).
+    ///
+    /// The call that drops the count to zero wakes a prompt parked at its
+    /// completion boundary so it can finish.
+    pub(crate) fn release_steering_lease(&self) {
+        let woke = {
+            let mut control = self.lock();
+            control.steering_leases = control.steering_leases.saturating_sub(1);
+            control.steering_leases == 0
+        };
+        if woke {
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// How many completion holds are outstanding.
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn steering_lease_count(&self) -> usize {
+        self.lock().steering_leases
     }
 
     /// Abandons the current round.
@@ -444,6 +502,34 @@ mod tests {
         assert_eq!(evicted.as_ref().map(SteeringItem::text), Some("first"));
         assert_eq!(handle.lock().interrupt_generation, 1);
         assert!(!handle.is_waiting_for_steer());
+    }
+
+    #[test]
+    fn leases_are_counted_and_the_last_drop_clears_the_hold() {
+        let handle = SessionControlHandle::new();
+
+        let first = SteeringLease::acquire(handle.clone());
+        let second = SteeringLease::acquire(handle.clone());
+        assert_eq!(handle.steering_lease_count(), 2);
+
+        drop(first);
+        assert_eq!(handle.steering_lease_count(), 1, "one hold still parks");
+        drop(second);
+        assert_eq!(handle.steering_lease_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_lease_wakes_a_waiter_that_registered_first() {
+        let handle = SessionControlHandle::new();
+        let lease = SteeringLease::acquire(handle.clone());
+        let mut notified = std::pin::pin!(handle.notify.notified());
+        notified.as_mut().enable();
+
+        drop(lease);
+
+        timeout(Duration::from_secs(1), notified)
+            .await
+            .expect("the final release wakes a registered waiter");
     }
 
     #[tokio::test]

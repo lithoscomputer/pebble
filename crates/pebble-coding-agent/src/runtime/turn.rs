@@ -56,31 +56,30 @@ const LOOP_WARNING: &str = "WARNING: Loop detected. You appear to be repeating t
 
 #[derive(Clone)]
 pub(super) struct CodingAgentBridge {
-    state:                  Arc<Mutex<BridgeState>>,
-    client:                 lithos_llm::Client,
-    model_selector:         String,
-    model:                  String,
-    provider:               String,
-    system_prompt:          String,
-    facts:                  ModelFacts,
-    config:                 CodingAgentOptions,
-    registry:               ToolRegistry,
-    env:                    Arc<dyn Environment>,
-    human_input:            Option<Arc<dyn HumanInputProvider>>,
-    tool_env_provider:      Arc<Mutex<Option<Arc<dyn ToolEnvProvider>>>>,
-    redactor:               Arc<dyn Redactor>,
-    emitter:                Emitter,
-    session_id:             String,
-    root_session_id:        String,
-    memory_tokens:          u64,
-    skills_tokens:          u64,
-    control_state:          Arc<Mutex<super::control::ControlState>>,
-    control_notify:         Arc<Notify>,
-    terminal_cancel:        CancellationToken,
-    completion_coordinator: Arc<Mutex<Option<Arc<dyn super::CompletionCoordinator>>>>,
-    followup_queue:         Arc<Mutex<VecDeque<String>>>,
-    subagents:              Option<SubagentSupervisor>,
-    skills:                 Vec<Skill>,
+    state:             Arc<Mutex<BridgeState>>,
+    client:            lithos_llm::Client,
+    model_selector:    String,
+    model:             String,
+    provider:          String,
+    system_prompt:     String,
+    facts:             ModelFacts,
+    config:            CodingAgentOptions,
+    registry:          ToolRegistry,
+    env:               Arc<dyn Environment>,
+    human_input:       Option<Arc<dyn HumanInputProvider>>,
+    tool_env_provider: Arc<Mutex<Option<Arc<dyn ToolEnvProvider>>>>,
+    redactor:          Arc<dyn Redactor>,
+    emitter:           Emitter,
+    session_id:        String,
+    root_session_id:   String,
+    memory_tokens:     u64,
+    skills_tokens:     u64,
+    control_state:     Arc<Mutex<super::control::ControlState>>,
+    control_notify:    Arc<Notify>,
+    terminal_cancel:   CancellationToken,
+    followup_queue:    Arc<Mutex<VecDeque<String>>>,
+    subagents:         Option<SubagentSupervisor>,
+    skills:            Vec<Skill>,
 }
 
 struct BridgeState {
@@ -98,7 +97,7 @@ struct BridgeState {
 impl CodingAgentBridge {
     fn from_runtime(runtime: &mut CodingRuntime) -> Self {
         Self {
-            state:                  Arc::new(Mutex::new(BridgeState {
+            state:             Arc::new(Mutex::new(BridgeState {
                 history: mem::take(&mut runtime.history),
                 file_tracker: mem::take(&mut runtime.file_tracker),
                 totals: PromptTotals::default(),
@@ -109,30 +108,29 @@ impl CodingAgentBridge {
                 inference_start: None,
                 boundary_error: None,
             })),
-            client:                 runtime.client.clone(),
-            model_selector:         runtime.model_selector.clone(),
-            model:                  runtime.model.clone(),
-            provider:               runtime.provider.clone(),
-            system_prompt:          runtime.system_prompt.clone(),
-            facts:                  runtime.facts,
-            config:                 runtime.config.clone(),
-            registry:               runtime.registry.clone(),
-            env:                    Arc::clone(&runtime.env),
-            human_input:            runtime.human_input.clone(),
-            tool_env_provider:      Arc::new(Mutex::new(runtime.tool_env_provider.clone())),
-            redactor:               Arc::clone(&runtime.redactor),
-            emitter:                runtime.emitter.clone(),
-            session_id:             runtime.id.clone(),
-            root_session_id:        runtime.root_session_id.clone(),
-            memory_tokens:          runtime.memory_tokens,
-            skills_tokens:          runtime.skills_tokens,
-            control_state:          Arc::clone(&runtime.control_state),
-            control_notify:         Arc::clone(&runtime.control_notify),
-            terminal_cancel:        runtime.cancel_token.clone(),
-            completion_coordinator: Arc::new(Mutex::new(runtime.completion_coordinator.clone())),
-            followup_queue:         Arc::clone(&runtime.followup_queue),
-            subagents:              runtime.subagents.clone(),
-            skills:                 runtime.skills.clone(),
+            client:            runtime.client.clone(),
+            model_selector:    runtime.model_selector.clone(),
+            model:             runtime.model.clone(),
+            provider:          runtime.provider.clone(),
+            system_prompt:     runtime.system_prompt.clone(),
+            facts:             runtime.facts,
+            config:            runtime.config.clone(),
+            registry:          runtime.registry.clone(),
+            env:               Arc::clone(&runtime.env),
+            human_input:       runtime.human_input.clone(),
+            tool_env_provider: Arc::new(Mutex::new(runtime.tool_env_provider.clone())),
+            redactor:          Arc::clone(&runtime.redactor),
+            emitter:           runtime.emitter.clone(),
+            session_id:        runtime.id.clone(),
+            root_session_id:   runtime.root_session_id.clone(),
+            memory_tokens:     runtime.memory_tokens,
+            skills_tokens:     runtime.skills_tokens,
+            control_state:     Arc::clone(&runtime.control_state),
+            control_notify:    Arc::clone(&runtime.control_notify),
+            terminal_cancel:   runtime.cancel_token.clone(),
+            followup_queue:    Arc::clone(&runtime.followup_queue),
+            subagents:         runtime.subagents.clone(),
+            skills:            runtime.skills.clone(),
         }
     }
 
@@ -160,16 +158,6 @@ impl CodingAgentBridge {
             .tool_env_provider
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(provider);
-    }
-
-    pub(super) fn set_completion_coordinator(
-        &self,
-        coordinator: Arc<dyn super::CompletionCoordinator>,
-    ) {
-        *self
-            .completion_coordinator
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(coordinator);
     }
 
     fn take_boundary_error(&self) -> Option<Error> {
@@ -695,16 +683,35 @@ impl agent::TurnBoundaryHooks for CodingAgentBridge {
         _response: &Response,
         cancel: &CancellationToken,
     ) -> StdResult<agent::TurnBoundaryAction, agent::TurnBoundaryError> {
-        let completion_coordinator = self
-            .completion_coordinator
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        if completion_coordinator
-            .as_ref()
-            .is_some_and(|coordinator| coordinator.on_natural_completion())
-        {
-            return Ok(agent::TurnBoundaryAction::Continue);
+        // The completion close-door race. A steer may be queued right now, or a
+        // steering lease may be held by an external source that is about to
+        // send one. Anything queued sends the loop around again to drain it; an
+        // open lease parks the prompt until the last lease drops. Both the
+        // check and the park read the shared control state under its lock, so a
+        // steer arriving mid-decision is never lost between the two.
+        loop {
+            let notified = self.control_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let parked = {
+                let control = self
+                    .control_state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                if !control.queue.is_empty() {
+                    return Ok(agent::TurnBoundaryAction::Continue);
+                }
+                control.steering_leases > 0
+            };
+            if !parked || cancel.is_cancelled() || self.terminal_cancel.is_cancelled() {
+                break;
+            }
+            tokio::select! {
+                () = self.terminal_cancel.cancelled() => break,
+                () = cancel.cancelled() => break,
+                () = notified => {}
+            }
         }
 
         let followup = self
