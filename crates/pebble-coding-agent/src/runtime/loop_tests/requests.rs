@@ -1,42 +1,86 @@
 //! What the session asks the model for.
 //!
 //! One request per round, built from the system prompt, the conversation, and
-//! the tools the access policy leaves exposed. These tests read the requests
+//! the tools its middleware leaves exposed. These tests read the requests
 //! the scripted provider captured, which is the only place the session's own
 //! decisions about a round are visible.
 
 use lithos_llm::types::{Message as LlmMessage, ReasoningEffort, Request, Role};
+use pebble_agent::{
+    ToolCallNext, ToolCallRequest, ToolDescriptor, ToolMiddleware, ToolOutcome, ToolSystemError,
+};
 use serde_json::{Value, json};
 
 use super::super::testing::wait_for_event;
 use super::*;
-use crate::config::{
-    ToolAccess, ToolAccessPolicy, ToolApprovalAdapter, ToolExposureMode, ToolHookCallback,
-    ToolHookDecision,
-};
 use crate::task_reminder::TASK_REMINDER_TEXT;
 use crate::test_support::message_text;
-use crate::types::ToolErrorKind;
+use crate::tool::{
+    ApprovalDecision, PermissionMiddleware, ToolApprovalService, ToolPermission,
+    ToolPermissionPolicy,
+};
 
 /// A policy that answers from a table and denies whatever it does not know.
-struct NamedToolAccessPolicy {
-    decisions: Vec<(&'static str, ToolAccess)>,
+struct NamedToolPermissionPolicy {
+    decisions: Vec<(&'static str, ToolPermission)>,
 }
 
-impl NamedToolAccessPolicy {
-    /// The policy, ready to install on [`CodingAgentOptions`].
-    fn installed(decisions: Vec<(&'static str, ToolAccess)>) -> Arc<dyn ToolAccessPolicy> {
+impl NamedToolPermissionPolicy {
+    fn installed(decisions: Vec<(&'static str, ToolPermission)>) -> Arc<dyn ToolPermissionPolicy> {
         Arc::new(Self { decisions })
     }
 }
 
-impl ToolAccessPolicy for NamedToolAccessPolicy {
-    fn access_for_tool(&self, tool_name: &str) -> ToolAccess {
+impl ToolPermissionPolicy for NamedToolPermissionPolicy {
+    fn permission(&self, tool: &ToolDescriptor) -> ToolPermission {
         self.decisions
             .iter()
-            .find_map(|(name, access)| (*name == tool_name).then_some(*access))
-            .unwrap_or(ToolAccess::Denied)
+            .find_map(|(id, permission)| (id == &tool.id().as_str()).then(|| permission.clone()))
+            .unwrap_or_else(|| ToolPermission::Deny {
+                reason: "not allowed by the test policy".to_owned(),
+            })
     }
+}
+
+struct FixedApproval(ApprovalDecision);
+
+#[async_trait::async_trait]
+impl ToolApprovalService for FixedApproval {
+    async fn approve(
+        &self,
+        _request: &ToolCallRequest,
+    ) -> StdResult<ApprovalDecision, ToolSystemError> {
+        Ok(self.0.clone())
+    }
+}
+
+struct RecordingApproval {
+    captured: Arc<Mutex<Option<(String, Value)>>>,
+}
+
+#[async_trait::async_trait]
+impl ToolApprovalService for RecordingApproval {
+    async fn approve(
+        &self,
+        request: &ToolCallRequest,
+    ) -> StdResult<ApprovalDecision, ToolSystemError> {
+        *self.captured.lock().unwrap_or_else(PoisonError::into_inner) = Some((
+            request.call().name.clone(),
+            request.call().arguments.clone(),
+        ));
+        Ok(ApprovalDecision::Allow)
+    }
+}
+
+fn permission_middleware(
+    decisions: Vec<(&'static str, ToolPermission)>,
+    approval: Option<Arc<dyn ToolApprovalService>>,
+) -> Arc<dyn ToolMiddleware> {
+    let middleware = PermissionMiddleware::new(NamedToolPermissionPolicy::installed(decisions));
+    Arc::new(match approval {
+        Some(approval) => middleware.with_approval(approval),
+        None => middleware,
+    })
 }
 
 /// The names of the tools the request exposed.
@@ -116,14 +160,15 @@ async fn every_registered_tool_is_exposed_when_no_policy_says_otherwise() {
 async fn a_denied_tool_is_never_advertised() {
     let (mut session, provider) = TestSession::new(answers("captured"))
         .tools([noop_tool("read_file"), noop_tool("write_file")])
-        .options(CodingAgentOptions {
-            tool_access_policy: Some(NamedToolAccessPolicy::installed(vec![
-                ("read_file", ToolAccess::Allowed),
-                ("write_file", ToolAccess::Denied),
-            ])),
-            tool_exposure_mode: ToolExposureMode::IncludeRequiresApproval,
-            ..CodingAgentOptions::default()
-        })
+        .tool_middleware(permission_middleware(
+            vec![
+                ("read_file", ToolPermission::Allow),
+                ("write_file", ToolPermission::Deny {
+                    reason: "writes are disabled".to_owned(),
+                }),
+            ],
+            None,
+        ))
         .build();
 
     session.prompt("test").await.expect("the prompt succeeds");
@@ -134,17 +179,16 @@ async fn a_denied_tool_is_never_advertised() {
 }
 
 #[tokio::test]
-async fn an_approval_required_tool_is_advertised_where_the_mode_allows_it() {
+async fn an_approval_required_tool_is_advertised_when_approval_is_available() {
     let (mut session, provider) = TestSession::new(answers("captured"))
         .tools([noop_tool("read_file"), noop_tool("shell")])
-        .options(CodingAgentOptions {
-            tool_access_policy: Some(NamedToolAccessPolicy::installed(vec![
-                ("read_file", ToolAccess::Allowed),
-                ("shell", ToolAccess::RequiresApproval),
-            ])),
-            tool_exposure_mode: ToolExposureMode::IncludeRequiresApproval,
-            ..CodingAgentOptions::default()
-        })
+        .tool_middleware(permission_middleware(
+            vec![
+                ("read_file", ToolPermission::Allow),
+                ("shell", ToolPermission::RequireApproval),
+            ],
+            Some(Arc::new(FixedApproval(ApprovalDecision::Allow))),
+        ))
         .build();
 
     session.prompt("test").await.expect("the prompt succeeds");
@@ -154,36 +198,6 @@ async fn an_approval_required_tool_is_advertised_where_the_mode_allows_it() {
     let mut names = tool_names(request);
     names.sort_unstable();
     assert_eq!(names, ["read_file", "shell"]);
-}
-
-#[tokio::test]
-async fn the_tools_a_session_reports_are_the_tools_it_sends() {
-    let (session, _provider) = TestSession::new(answers("captured"))
-        .tools([
-            noop_tool("read_file"),
-            noop_tool("apply_patch"),
-            noop_tool("shell"),
-        ])
-        .options(CodingAgentOptions {
-            tool_access_policy: Some(NamedToolAccessPolicy::installed(vec![
-                ("read_file", ToolAccess::Allowed),
-                ("apply_patch", ToolAccess::RequiresApproval),
-                ("shell", ToolAccess::Denied),
-            ])),
-            tool_exposure_mode: ToolExposureMode::IncludeRequiresApproval,
-            ..CodingAgentOptions::default()
-        })
-        .build();
-
-    let tools = session.effective_tools();
-
-    let mut names: Vec<&str> = tools
-        .iter()
-        .map(|tool| tool.definition.name.as_str())
-        .collect();
-    names.sort_unstable();
-    assert_eq!(names, ["apply_patch", "read_file"]);
-    assert!(tools.iter().all(|tool| tool.source == ToolSource::Native));
 }
 
 #[tokio::test]
@@ -242,12 +256,12 @@ fn approval_calls() -> Vec<ScriptedCall> {
 async fn a_refused_call_answers_the_model_with_the_reason() {
     let (mut session, _provider) = TestSession::new(approval_calls())
         .tools([echo_tool()])
-        .options(CodingAgentOptions {
-            tool_hooks: Some(Arc::new(ToolApprovalAdapter(Arc::new(
-                |_name, _arguments| Err("denied by policy".to_owned()),
-            )))),
-            ..CodingAgentOptions::default()
-        })
+        .tool_middleware(permission_middleware(
+            vec![("echo", ToolPermission::RequireApproval)],
+            Some(Arc::new(FixedApproval(ApprovalDecision::Deny {
+                reason: "denied by policy".to_owned(),
+            }))),
+        ))
         .build();
     let mut events = session.subscribe();
 
@@ -281,12 +295,10 @@ async fn a_refused_call_answers_the_model_with_the_reason() {
 async fn an_approved_call_runs() {
     let (mut session, _provider) = TestSession::new(approval_calls())
         .tools([echo_tool()])
-        .options(CodingAgentOptions {
-            tool_hooks: Some(Arc::new(ToolApprovalAdapter(Arc::new(
-                |_name, _arguments| Ok(()),
-            )))),
-            ..CodingAgentOptions::default()
-        })
+        .tool_middleware(permission_middleware(
+            vec![("echo", ToolPermission::RequireApproval)],
+            Some(Arc::new(FixedApproval(ApprovalDecision::Allow))),
+        ))
         .build();
 
     session
@@ -312,16 +324,10 @@ async fn the_approval_hook_sees_the_call_the_model_asked_for() {
         ScriptedCall::response(text_response("Done")),
     ])
     .tools([echo_tool()])
-    .options(CodingAgentOptions {
-        tool_hooks: Some(Arc::new(ToolApprovalAdapter(Arc::new(
-            move |name, arguments| {
-                *recorder.lock().unwrap_or_else(PoisonError::into_inner) =
-                    Some((name.to_owned(), arguments.clone()));
-                Ok(())
-            },
-        )))),
-        ..CodingAgentOptions::default()
-    })
+    .tool_middleware(permission_middleware(
+        vec![("echo", ToolPermission::RequireApproval)],
+        Some(Arc::new(RecordingApproval { captured: recorder })),
+    ))
     .build();
 
     session
@@ -335,54 +341,45 @@ async fn the_approval_hook_sees_the_call_the_model_asked_for() {
     assert_eq!(arguments, &json!({"text": "world"}));
 }
 
-struct RecordingToolHooks {
+struct RecordingToolMiddleware {
     entries: Arc<Mutex<Vec<String>>>,
 }
 
 #[async_trait::async_trait]
-impl ToolHookCallback for RecordingToolHooks {
-    async fn pre_tool_use(&self, tool_name: &str, _tool_input: &Value) -> ToolHookDecision {
-        self.entries
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(format!("before {tool_name}"));
-        ToolHookDecision::Proceed
-    }
-
-    async fn post_tool_use(&self, tool_name: &str, tool_call_id: &str, tool_output: &str) {
-        self.entries
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(format!("after {tool_name} {tool_call_id} {tool_output}"));
-    }
-
-    async fn post_tool_use_failure(
+impl ToolMiddleware for RecordingToolMiddleware {
+    async fn call(
         &self,
-        tool_name: &str,
-        tool_call_id: &str,
-        error: &str,
-        error_kind: ToolErrorKind,
-    ) {
+        request: ToolCallRequest,
+        next: ToolCallNext<'_>,
+    ) -> StdResult<ToolOutcome, ToolSystemError> {
+        let name = request.call().name.clone();
+        let id = request.call().id.clone();
         self.entries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(format!(
-                "failed {tool_name} {tool_call_id} {error_kind:?} {error}"
-            ));
+            .push(format!("before {name}"));
+        let outcome = next.run(request).await?;
+        let status = match &outcome {
+            ToolOutcome::Success(_) => "success",
+            ToolOutcome::Failure { .. } => "failure",
+            _ => "unknown",
+        };
+        self.entries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(format!("after {name} {id} {status}"));
+        Ok(outcome)
     }
 }
 
 #[tokio::test]
-async fn coding_tool_hooks_bracket_the_agent_owned_round() {
+async fn tool_middleware_brackets_the_call() {
     let entries = Arc::new(Mutex::new(Vec::new()));
     let (mut session, _provider) = TestSession::new(approval_calls())
         .tools([echo_tool()])
-        .options(CodingAgentOptions {
-            tool_hooks: Some(Arc::new(RecordingToolHooks {
-                entries: Arc::clone(&entries),
-            })),
-            ..CodingAgentOptions::default()
-        })
+        .tool_middleware(Arc::new(RecordingToolMiddleware {
+            entries: Arc::clone(&entries),
+        }))
         .build();
 
     session
@@ -393,18 +390,14 @@ async fn coding_tool_hooks_bracket_the_agent_owned_round() {
     let recorded = entries.lock().unwrap_or_else(PoisonError::into_inner);
     assert_eq!(recorded.as_slice(), [
         "before echo",
-        "after echo call_1 echo: hello"
+        "after echo call_1 success"
     ]);
 }
 
 #[tokio::test]
-async fn a_session_with_no_hook_runs_the_call_unchecked() {
+async fn a_session_with_no_middleware_runs_the_call() {
     let (mut session, _provider) = TestSession::new(approval_calls())
         .tools([echo_tool()])
-        .options(CodingAgentOptions {
-            tool_hooks: None,
-            ..CodingAgentOptions::default()
-        })
         .build();
 
     session

@@ -1,13 +1,173 @@
-//! Resolving tool names to identities, and the permission ladder's
-//! auto-approval table.
-//!
-//! The session loop consults neither. It asks the
-//! [`ToolAccessPolicy`](crate::tools::ToolAccessPolicy) an application
-//! installed, and this module is what an application can build that policy out
-//! of when it wants pebble's own answer instead of its own.
+//! Tool identity and composable permission middleware.
+
+use std::fmt;
+use std::result::Result as StdResult;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use pebble_agent::{
+    ToolCallNext, ToolCallRequest, ToolCatalog, ToolDiscoveryContext, ToolDiscoveryNext,
+    ToolErrorKind, ToolMiddleware, ToolOutcome, ToolSystemError,
+};
 
 use super::native::NativeTool;
 use crate::types::{PermissionLevel, ToolCategory};
+
+/// What one permission policy requires for a tool.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ToolPermission {
+    /// The tool can be discovered and called without approval.
+    Allow,
+    /// The tool can be discovered only when an approval service is installed.
+    RequireApproval,
+    /// The tool is hidden and every attempted call is refused.
+    Deny {
+        /// The explanation returned to the model.
+        reason: String,
+    },
+}
+
+/// Classifies tools for one permission middleware layer.
+pub trait ToolPermissionPolicy: Send + Sync {
+    /// Returns the permission for one stable tool identity.
+    fn permission(&self, tool: &pebble_agent::ToolDescriptor) -> ToolPermission;
+}
+
+/// What an approval service decided for one call and its actual arguments.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ApprovalDecision {
+    /// Continue through the remaining middleware.
+    Allow,
+    /// Refuse this call.
+    Deny {
+        /// The explanation returned to the model.
+        reason: String,
+    },
+}
+
+/// Resolves human or application approval for a specific tool call.
+#[async_trait]
+pub trait ToolApprovalService: Send + Sync {
+    /// Approves or refuses a call after its arguments have been validated.
+    async fn approve(
+        &self,
+        request: &ToolCallRequest,
+    ) -> StdResult<ApprovalDecision, ToolSystemError>;
+}
+
+/// A permission layer that governs both discovery and invocation.
+pub struct PermissionMiddleware {
+    policy:   Arc<dyn ToolPermissionPolicy>,
+    approval: Option<Arc<dyn ToolApprovalService>>,
+}
+
+impl PermissionMiddleware {
+    /// Creates a permission layer with no approval path.
+    #[must_use]
+    pub fn new(policy: Arc<dyn ToolPermissionPolicy>) -> Self {
+        Self {
+            policy,
+            approval: None,
+        }
+    }
+
+    /// Sets the service for argument-sensitive or human approval.
+    #[must_use]
+    pub fn with_approval(mut self, approval: Arc<dyn ToolApprovalService>) -> Self {
+        self.approval = Some(approval);
+        self
+    }
+
+    fn permission(&self, tool: &pebble_agent::ToolDescriptor) -> ToolPermission {
+        self.policy.permission(tool)
+    }
+
+    fn is_visible(&self, tool: &pebble_agent::ToolDescriptor) -> bool {
+        match self.permission(tool) {
+            ToolPermission::Allow => true,
+            ToolPermission::RequireApproval => self.approval.is_some(),
+            ToolPermission::Deny { .. } => false,
+        }
+    }
+}
+
+#[async_trait]
+impl ToolMiddleware for PermissionMiddleware {
+    async fn discover(
+        &self,
+        context: ToolDiscoveryContext<'_>,
+        next: ToolDiscoveryNext<'_>,
+    ) -> StdResult<ToolCatalog, ToolSystemError> {
+        let mut catalog = next.run(context).await?;
+        catalog.retain(|tool| self.is_visible(tool));
+        Ok(catalog)
+    }
+
+    async fn call(
+        &self,
+        request: ToolCallRequest,
+        next: ToolCallNext<'_>,
+    ) -> StdResult<ToolOutcome, ToolSystemError> {
+        match self.permission(request.descriptor()) {
+            ToolPermission::Allow => next.run(request).await,
+            ToolPermission::Deny { reason } => {
+                Ok(ToolOutcome::failure(ToolErrorKind::Denied, reason))
+            }
+            ToolPermission::RequireApproval => {
+                let Some(approval) = &self.approval else {
+                    return Ok(ToolOutcome::failure(
+                        ToolErrorKind::Denied,
+                        format!(
+                            "{} requires approval, but no approval service is installed",
+                            request.call().name
+                        ),
+                    ));
+                };
+                match approval.approve(&request).await? {
+                    ApprovalDecision::Allow => next.run(request).await,
+                    ApprovalDecision::Deny { reason } => {
+                        Ok(ToolOutcome::failure(ToolErrorKind::Denied, reason))
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Debug for PermissionMiddleware {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PermissionMiddleware")
+            .field("has_approval", &self.approval.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A policy backed by Pebble's three built-in permission levels.
+#[derive(Clone, Copy, Debug)]
+pub struct PermissionLevelPolicy {
+    level: PermissionLevel,
+}
+
+impl PermissionLevelPolicy {
+    /// Uses `level` for every tool.
+    #[must_use]
+    pub const fn new(level: PermissionLevel) -> Self {
+        Self { level }
+    }
+}
+
+impl ToolPermissionPolicy for PermissionLevelPolicy {
+    fn permission(&self, tool: &pebble_agent::ToolDescriptor) -> ToolPermission {
+        if self.level.auto_approves_tool(tool.id().as_str()) {
+            ToolPermission::Allow
+        } else {
+            ToolPermission::RequireApproval
+        }
+    }
+}
 
 /// Resolves a tool name in any profile's vocabulary to the canonical name the
 /// rest of the crate reasons about.
@@ -86,7 +246,151 @@ impl PermissionLevel {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use lithos_llm::types::{ToolCall, ToolCallKind, ToolDefinition};
+    use pebble_agent::{ToolDescriptor, ToolId, ToolService, ToolSystem};
+    use serde_json::{Value, json};
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
+
+    struct FixedPolicy(ToolPermission);
+
+    impl ToolPermissionPolicy for FixedPolicy {
+        fn permission(&self, _tool: &ToolDescriptor) -> ToolPermission {
+            self.0.clone()
+        }
+    }
+
+    struct RecordingApproval {
+        arguments: Mutex<Vec<Value>>,
+    }
+
+    #[async_trait]
+    impl ToolApprovalService for RecordingApproval {
+        async fn approve(
+            &self,
+            request: &ToolCallRequest,
+        ) -> StdResult<ApprovalDecision, ToolSystemError> {
+            self.arguments
+                .lock()
+                .expect("the argument lock is healthy")
+                .push(request.call().arguments.clone());
+            Ok(ApprovalDecision::Allow)
+        }
+    }
+
+    struct CountingService {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ToolService for CountingService {
+        async fn discover(
+            &self,
+            _context: ToolDiscoveryContext<'_>,
+        ) -> StdResult<ToolCatalog, ToolSystemError> {
+            Ok(ToolCatalog::new([descriptor()]))
+        }
+
+        async fn call(&self, _request: ToolCallRequest) -> StdResult<ToolOutcome, ToolSystemError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutcome::success("ran".into()))
+        }
+    }
+
+    fn descriptor() -> ToolDescriptor {
+        ToolDescriptor::new(
+            ToolId::try_new("shell").expect("the identity is valid"),
+            ToolDefinition::function("shell", "Run a command", json!({})),
+        )
+    }
+
+    fn request(descriptor: ToolDescriptor) -> ToolCallRequest {
+        ToolCallRequest::new(
+            0,
+            ToolCall {
+                id:                "call_1".to_owned(),
+                name:              "shell".to_owned(),
+                arguments:         json!({"command": "cargo test"}),
+                kind:              ToolCallKind::Function,
+                raw_arguments:     None,
+                provider_metadata: BTreeMap::new(),
+            },
+            descriptor,
+            CancellationToken::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn approval_required_tools_need_an_approval_service() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let system = ToolSystem::new(Arc::new(CountingService {
+            calls: Arc::clone(&calls),
+        }))
+        .middleware(Arc::new(PermissionMiddleware::new(Arc::new(FixedPolicy(
+            ToolPermission::RequireApproval,
+        )))));
+        let messages = [];
+        let catalog = system
+            .discover(ToolDiscoveryContext::new("test/model", 0, &messages))
+            .await
+            .expect("discovery succeeds");
+
+        assert_eq!(catalog.visible_tools().count(), 0);
+        let outcome = system
+            .call(request(
+                catalog
+                    .find_by_name("shell")
+                    .expect("the hidden tool remains resolvable")
+                    .clone(),
+            ))
+            .await
+            .expect("the refusal succeeds");
+        assert!(matches!(outcome, ToolOutcome::Failure {
+            kind: ToolErrorKind::Denied,
+            ..
+        }));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn approval_sees_the_actual_call_arguments() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let approval = Arc::new(RecordingApproval {
+            arguments: Mutex::new(Vec::new()),
+        });
+        let system = ToolSystem::new(Arc::new(CountingService {
+            calls: Arc::clone(&calls),
+        }))
+        .middleware(Arc::new(
+            PermissionMiddleware::new(Arc::new(FixedPolicy(ToolPermission::RequireApproval)))
+                .with_approval(approval.clone()),
+        ));
+        let messages = [];
+        let catalog = system
+            .discover(ToolDiscoveryContext::new("test/model", 0, &messages))
+            .await
+            .expect("discovery succeeds");
+        let descriptor = catalog
+            .find_by_name("shell")
+            .expect("the tool is present")
+            .clone();
+
+        let outcome = system
+            .call(request(descriptor))
+            .await
+            .expect("the call succeeds");
+
+        assert!(matches!(outcome, ToolOutcome::Success(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*approval.arguments.lock().expect("the lock is healthy"), [
+            json!({"command": "cargo test"})
+        ]);
+    }
 
     #[test]
     fn canonical_names_pass_through() {

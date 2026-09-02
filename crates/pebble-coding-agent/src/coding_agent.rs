@@ -9,7 +9,7 @@ use lithos_llm::Client;
 use lithos_llm::catalog::MetadataError;
 use lithos_llm::resolver::ModelSelectionError;
 use lithos_llm::types::{ReasoningEffort, RequestBuildError, Speed};
-use pebble_agent::{QueueOutcome, UserMessage};
+use pebble_agent::{QueueOutcome, ToolMiddleware, UserMessage};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
@@ -298,6 +298,15 @@ impl CodingAgentBuilder {
         self
     }
 
+    /// Adds one tool middleware to this agent and its descendants.
+    ///
+    /// Middleware runs in installation order around tool calls. The first
+    /// middleware added here is the outermost application layer.
+    pub fn tool_middleware(mut self, middleware: Arc<dyn ToolMiddleware>) -> Self {
+        self.inner = self.inner.tool_middleware(middleware);
+        self
+    }
+
     /// Sets where the root session asks a person a question.
     pub fn human_input(mut self, provider: Arc<dyn HumanInputProvider>) -> Self {
         self.inner = self.inner.human_input(provider);
@@ -380,7 +389,7 @@ impl CodingAgentBuilder {
     /// Configures the subagents this agent may spawn.
     ///
     /// Pebble builds the children itself. A child acts through this agent's
-    /// environment, runs on its model under its tool access policy and hooks,
+    /// environment, runs on its model under the same tool middleware,
     /// writes events to this tree's shared stream, and inherits only the
     /// application tools marked
     /// [`allow_in_subagents`](RegisteredTool::allow_in_subagents) — never one

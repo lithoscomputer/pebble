@@ -1,6 +1,6 @@
 //! The coding layer that projects Pebble's durable behavior onto `Agent`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Instant, SystemTime};
@@ -12,7 +12,6 @@ use lithos_llm::types::{
     ToolCall, ToolResult,
 };
 use pebble_agent as agent;
-use pebble_agent::integration::{ToolRoundContext, ToolRoundExecutor};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -20,16 +19,16 @@ use super::control::{SessionControlHandle, actor_from_attribution};
 use super::retry::RetryEventBridge;
 use super::{CodingRuntime, PromptTotals, StateMachine};
 use crate::compaction::{CompactionRequest, check_context_usage, compact_context};
-use crate::config::{CodingAgentOptions, ToolHookDecision};
+use crate::config::CodingAgentOptions;
 use crate::context_window::{
     ContextWindowInput, build_local_snapshot, context_window_from_response_usage,
 };
 use crate::environment::Environment;
 use crate::error::{Error, ErrorData, InterruptReason, Result};
-use crate::event::Emitter;
+use crate::event::{Emitter, OutputCaptureStats};
 use crate::file_tracker::FileTracker;
 use crate::history::History;
-use crate::human_input::HumanInputProvider;
+use crate::human_input::{HumanInputProvider, is_question_tool};
 use crate::loop_detection::detect_loop;
 use crate::profile::ModelFacts;
 use crate::reasoning::ReasoningOutput;
@@ -67,6 +66,7 @@ pub(super) struct CodingAgentBridge {
     env:               Arc<dyn Environment>,
     human_input:       Option<Arc<dyn HumanInputProvider>>,
     tool_env_provider: Arc<Mutex<Option<Arc<dyn ToolEnvProvider>>>>,
+    tool_output_stats: Arc<Mutex<HashMap<String, OutputCaptureStats>>>,
     redactor:          Arc<dyn Redactor>,
     emitter:           Emitter,
     session_id:        String,
@@ -101,6 +101,7 @@ pub(super) struct ConversationState {
     pending_task_reminder: Option<Message>,
     local_context_window: Option<ContextWindowSnapshot>,
     inference_start: Option<Instant>,
+    tool_start: Option<Instant>,
     boundary_error: Option<Error>,
 }
 
@@ -116,6 +117,7 @@ impl ConversationState {
             pending_task_reminder: None,
             local_context_window: None,
             inference_start: None,
+            tool_start: None,
             boundary_error: None,
         }
     }
@@ -136,6 +138,7 @@ impl CodingAgentBridge {
             env:               Arc::clone(&runtime.env),
             human_input:       runtime.human_input.clone(),
             tool_env_provider: Arc::new(Mutex::new(runtime.tool_env_provider.clone())),
+            tool_output_stats: Arc::new(Mutex::new(HashMap::new())),
             redactor:          Arc::clone(&runtime.redactor),
             emitter:           runtime.emitter.clone(),
             session_id:        runtime.id.clone(),
@@ -156,12 +159,17 @@ impl CodingAgentBridge {
             .prompt_cancel
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = prompt_cancel;
+        self.tool_output_stats
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.totals = PromptTotals::default();
         state.compaction_failed = false;
         state.pending_task_reminder = None;
         state.local_context_window = None;
         state.inference_start = None;
+        state.tool_start = None;
         state.boundary_error = None;
     }
 
@@ -403,6 +411,38 @@ impl CodingAgentBridge {
         });
     }
 
+    fn commit_tool_results(&self, calls: &[ToolCall], results: &[ToolResult], cancelled: bool) {
+        self.state_machine.transition(CodingAgentState::Thinking);
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(started) = state.tool_start.take() {
+            state.totals.timing.tool = state.totals.timing.tool.saturating_add(started.elapsed());
+        }
+        if activated_a_skill(calls, results) {
+            state.activated_skill_context_observed = true;
+        }
+        state.file_tracker.record_from_tool_calls(calls, results);
+        state.history.push(Message::ToolResults {
+            results:   results.to_vec(),
+            timestamp: SystemTime::now(),
+        });
+
+        if cancelled || self.prompt_cancel().is_cancelled() {
+            return;
+        }
+        let loop_detected = self.config.enable_loop_detection
+            && detect_loop(&state.history, self.config.loop_detection_window);
+        if loop_detected {
+            state.history.push(Message::Steering {
+                content:   LOOP_WARNING.to_owned(),
+                timestamp: SystemTime::now(),
+            });
+        }
+        drop(state);
+        if loop_detected {
+            self.emit(CodingEvent::LoopDetected);
+        }
+    }
+
     fn measure_request(&self, request: &Request) -> ContextWindowSnapshot {
         let tools = self.effective_tools();
         let activated = self
@@ -483,6 +523,66 @@ impl agent::EventProjection for CodingAgentBridge {
                 });
             }
             agent::AgentEvent::AssistantMessage { response } => self.commit_assistant(response),
+            agent::AgentEvent::ToolStarted { call } => {
+                self.state_machine.transition(CodingAgentState::Executing);
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                state.tool_start.get_or_insert_with(Instant::now);
+                if self.registry.get(&call.name).is_none() {
+                    self.emitter.emit_with_tool_call_id(
+                        &self.session_id,
+                        CodingEvent::ToolCallStarted {
+                            tool_name:    call.name.clone(),
+                            tool_call_id: call.id.clone(),
+                            arguments:    call.arguments.clone(),
+                        },
+                        Some(call.id.clone()),
+                    );
+                }
+            }
+            agent::AgentEvent::ToolCompleted { result }
+                if result
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| self.registry.get(name).is_none()) =>
+            {
+                let text = result
+                    .content
+                    .iter()
+                    .find_map(|part| match part {
+                        ContentPart::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let stats = OutputCaptureStats::complete(text.len());
+                self.emitter.emit_with_tool_call_id(
+                    &self.session_id,
+                    CodingEvent::ToolCallOutputDelta {
+                        delta: text.clone(),
+                    },
+                    Some(result.tool_call_id.clone()),
+                );
+                self.emitter.emit_with_tool_call_id(
+                    &self.session_id,
+                    CodingEvent::ToolCallCompleted {
+                        tool_name:             result.name.clone().unwrap_or_default(),
+                        tool_call_id:          result.tool_call_id.clone(),
+                        output:                Value::String(text),
+                        is_error:              result.is_error,
+                        error_kind:            result
+                            .is_error
+                            .then_some(ToolErrorKind::Unavailable),
+                        output_bytes_observed: stats.observed_bytes,
+                        output_bytes_retained: stats.retained_bytes,
+                        output_bytes_omitted:  stats.omitted_bytes,
+                    },
+                    Some(result.tool_call_id.clone()),
+                );
+            }
+            agent::AgentEvent::ToolResultsCommitted {
+                calls,
+                results,
+                cancelled,
+            } => self.commit_tool_results(calls, results, *cancelled),
             agent::AgentEvent::TurnInterrupted => {
                 self.finish_inference();
                 self.state
@@ -496,103 +596,39 @@ impl agent::EventProjection for CodingAgentBridge {
     }
 }
 
-impl agent::ToolProvider for CodingAgentBridge {
-    fn tools_for_turn(&self, _context: agent::TurnContext<'_>) -> Vec<agent::Tool> {
-        let executor: Arc<dyn agent::ToolExecutor> = Arc::new(UnusedToolExecutor);
-        self.registry
+#[async_trait]
+impl agent::ToolService for CodingAgentBridge {
+    async fn discover(
+        &self,
+        _context: agent::ToolDiscoveryContext<'_>,
+    ) -> StdResult<agent::ToolCatalog, agent::ToolSystemError> {
+        let tools = self
+            .registry
             .definitions_with_source()
             .into_iter()
-            .map(|tool| agent::Tool::new(tool.definition, Arc::clone(&executor)))
-            .collect()
-    }
-}
-
-impl agent::ToolAccessPolicy for CodingAgentBridge {
-    fn access(&self, context: agent::ToolAccessContext<'_>) -> agent::ToolAccess {
-        self.config
-            .tool_access_denial_reason(&context.definition().name)
-            .map_or(agent::ToolAccess::Allowed, |reason| {
-                agent::ToolAccess::Denied { reason }
+            .map(|tool| {
+                let name = tool.definition.name.clone();
+                let id = agent::ToolId::try_new(canonical_tool_name(&name)).map_err(|source| {
+                    agent::ToolSystemError::with_source(
+                        format!("tool `{name}` has no stable identity"),
+                        source,
+                    )
+                })?;
+                let scheduling = if is_question_tool(&name) {
+                    agent::ToolScheduling::ExclusiveRound
+                } else {
+                    agent::ToolScheduling::Concurrent
+                };
+                Ok(agent::ToolDescriptor::new(id, tool.definition).with_scheduling(scheduling))
             })
-    }
-}
-
-#[async_trait]
-impl agent::ToolCallHooks for CodingAgentBridge {
-    async fn before_tool_call(
-        &self,
-        context: agent::ToolCallContext<'_>,
-        _cancel: &CancellationToken,
-    ) -> agent::BeforeToolCall {
-        let Some(hooks) = self.config.tool_hooks.as_ref() else {
-            return agent::BeforeToolCall::Proceed;
-        };
-        match hooks
-            .pre_tool_use(&context.call().name, &context.call().arguments)
-            .await
-        {
-            ToolHookDecision::Proceed => agent::BeforeToolCall::Proceed,
-            ToolHookDecision::Block { reason } => agent::BeforeToolCall::Block { reason },
-        }
+            .collect::<StdResult<Vec<_>, agent::ToolSystemError>>()?;
+        Ok(agent::ToolCatalog::new(tools))
     }
 
-    async fn after_tool_call(
+    async fn call(
         &self,
-        context: agent::ToolCallContext<'_>,
-        outcome: agent::ToolCallOutcome<'_>,
-        _cancel: &CancellationToken,
-    ) {
-        let Some(hooks) = self.config.tool_hooks.as_ref() else {
-            return;
-        };
-        let result = outcome.result();
-        let content = result
-            .content
-            .iter()
-            .find_map(|part| match part {
-                ContentPart::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .unwrap_or_default();
-        if result.is_error {
-            hooks
-                .post_tool_use_failure(
-                    &context.call().name,
-                    &context.call().id,
-                    content,
-                    outcome.error_kind().unwrap_or(ToolErrorKind::Execution),
-                )
-                .await;
-        } else {
-            hooks
-                .post_tool_use(&context.call().name, &context.call().id, content)
-                .await;
-        }
-    }
-}
-
-struct UnusedToolExecutor;
-
-#[async_trait]
-impl agent::ToolExecutor for UnusedToolExecutor {
-    async fn execute(
-        &self,
-        _context: agent::ToolContext,
-        _arguments: serde_json::Value,
-    ) -> StdResult<agent::ToolOutput, agent::ToolError> {
-        Err(agent::ToolError::new(
-            "coding tools must run through Pebble's round executor",
-        ))
-    }
-}
-
-#[async_trait]
-impl ToolRoundExecutor for CodingAgentBridge {
-    async fn execute_round(
-        &self,
-        context: ToolRoundContext<'_>,
-        cancel: &CancellationToken,
-    ) -> Vec<ToolResult> {
+        request: agent::ToolCallRequest,
+    ) -> StdResult<agent::ToolOutcome, agent::ToolSystemError> {
         let mut dispatch = ToolDispatch::new(
             &self.registry,
             &self.env,
@@ -613,46 +649,61 @@ impl ToolRoundExecutor for CodingAgentBridge {
             dispatch = dispatch.with_human_input(provider);
         }
         dispatch = dispatch.with_redactor(&self.redactor);
+        let call_id = request.call().id.clone();
+        let (outcome, stats) = dispatch.execute_terminal(request).await;
+        if let Some(stats) = stats {
+            self.tool_output_stats
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(call_id, stats);
+        }
+        Ok(outcome)
+    }
+}
 
-        // The round runs in `Executing` whether or not a token fires while it
-        // does: a cancelled call still answers, and the session is thinking
-        // again only once every answer is in hand.
-        self.state_machine.transition(CodingAgentState::Executing);
-        let started = Instant::now();
-        let results = dispatch.execute_agent_round(context, cancel).await;
-        self.state_machine.transition(CodingAgentState::Thinking);
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.totals.timing.tool = state.totals.timing.tool.saturating_add(started.elapsed());
-        if activated_a_skill(context.calls(), &results) {
-            state.activated_skill_context_observed = true;
+#[async_trait]
+impl agent::ToolMiddleware for CodingAgentBridge {
+    async fn discover(
+        &self,
+        context: agent::ToolDiscoveryContext<'_>,
+        next: agent::ToolDiscoveryNext<'_>,
+    ) -> StdResult<agent::ToolCatalog, agent::ToolSystemError> {
+        next.run(context).await
+    }
+
+    async fn call(
+        &self,
+        request: agent::ToolCallRequest,
+        next: agent::ToolCallNext<'_>,
+    ) -> StdResult<agent::ToolOutcome, agent::ToolSystemError> {
+        let call = request.call().clone();
+        let dispatch = ToolDispatch::new(
+            &self.registry,
+            &self.env,
+            &self.config,
+            &self.emitter,
+            &self.session_id,
+            &self.root_session_id,
+        )
+        .with_redactor(&self.redactor);
+        dispatch.begin_terminal(&call);
+        let outcome = next.run(request).await;
+        let previous = self
+            .tool_output_stats
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&call.id);
+        match outcome {
+            Ok(outcome) => Ok(dispatch.finish_terminal(&call, outcome, previous)),
+            Err(error) => {
+                let _ = dispatch.finish_terminal(
+                    &call,
+                    agent::ToolOutcome::failure(ToolErrorKind::Execution, error.message()),
+                    previous,
+                );
+                Err(error)
+            }
         }
-        state
-            .file_tracker
-            .record_from_tool_calls(context.calls(), &results);
-        state.history.push(Message::ToolResults {
-            results:   results.clone(),
-            timestamp: SystemTime::now(),
-        });
-        // A round somebody ended is not the model repeating itself. Its
-        // results are committed all the same, but a loop warning here would
-        // land in the conversation ahead of the steer that replaces the round,
-        // or in a prompt that is already over.
-        if cancel.is_cancelled() || self.prompt_cancel().is_cancelled() {
-            return results;
-        }
-        let loop_detected = self.config.enable_loop_detection
-            && detect_loop(&state.history, self.config.loop_detection_window);
-        if loop_detected {
-            state.history.push(Message::Steering {
-                content:   LOOP_WARNING.to_owned(),
-                timestamp: SystemTime::now(),
-            });
-        }
-        drop(state);
-        if loop_detected {
-            self.emit(CodingEvent::LoopDetected);
-        }
-        results
     }
 }
 
@@ -890,19 +941,19 @@ impl CodingRuntime {
             max_turn_replays: STREAM_CONSUME_RETRIES,
             ..agent::AgentConfig::default()
         };
-        let agent = agent::Agent::builder(model_service, self.model_selector.clone())
+        let mut builder = agent::Agent::builder(model_service, self.model_selector.clone())
             .system_prompt(self.system_prompt.clone())
             .messages(messages)
-            .tool_provider(bridge.clone())
+            .tool_service(bridge.clone())
+            .tool_middleware(bridge.clone())
             .control_handle(self.agent_control.clone())
-            .tool_access_policy(bridge.clone())
-            .tool_call_hooks(bridge.clone())
-            .tool_round_executor(bridge.clone())
             .turn_boundary_hooks(bridge.clone())
             .event_projection(bridge.clone())
-            .config(config)
-            .build()
-            .map_err(Error::AgentBuild)?;
+            .config(config);
+        for middleware in &self.tool_middleware {
+            builder = builder.tool_middleware(Arc::clone(middleware));
+        }
+        let agent = builder.build().map_err(Error::AgentBuild)?;
 
         self.coding_bridge = Some(bridge);
         self.coding_agent = Some(agent);

@@ -295,6 +295,9 @@ fn build_child(
             open_sessions: Arc::clone(&deps.open_sessions),
             observer: deps.observer.clone(),
         });
+    for middleware in &deps.tool_middleware {
+        builder = builder.tool_middleware(Arc::clone(middleware));
+    }
     if let Some(provider) = deps.tool_env_provider.as_ref() {
         builder = builder.tool_env_provider(Arc::clone(provider));
     }
@@ -317,6 +320,7 @@ pub(crate) struct ChildDeps {
     pub(crate) profile:           Arc<dyn AgentProfile>,
     pub(crate) environment:       Arc<dyn Environment>,
     pub(crate) tools:             Vec<RegisteredTool>,
+    pub(crate) tool_middleware:   Vec<Arc<dyn pebble_agent::ToolMiddleware>>,
     pub(crate) options:           CodingAgentOptions,
     pub(crate) tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
     /// What strips secrets out of what a child publishes. Inherited, because

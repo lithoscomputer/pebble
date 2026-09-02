@@ -348,7 +348,7 @@ async fn an_unknown_tool_still_answers_its_call() {
     assert_eq!(session.history().turns().len(), 4);
     let results = tool_results(&session, 2);
     assert!(results[0].is_error);
-    assert_eq!(result_text(&results[0]), "Unknown tool: nonexistent_tool");
+    assert_eq!(result_text(&results[0]), "unknown tool `nonexistent_tool`");
 }
 
 #[tokio::test]

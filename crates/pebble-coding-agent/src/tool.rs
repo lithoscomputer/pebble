@@ -17,7 +17,10 @@ mod runner;
 pub use self::error::ToolError;
 pub(crate) use self::execution::{ToolDispatch, result_text};
 pub(crate) use self::native::{NativeTool, ToolVocabulary};
-pub use self::permissions::canonical_tool_name;
+pub use self::permissions::{
+    ApprovalDecision, PermissionLevelPolicy, PermissionMiddleware, ToolApprovalService,
+    ToolPermission, ToolPermissionPolicy, canonical_tool_name,
+};
 #[cfg(test)]
 pub(crate) use self::permissions::{known_tool_category, tool_category};
 pub use self::registry::{

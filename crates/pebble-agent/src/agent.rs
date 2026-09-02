@@ -674,7 +674,7 @@ impl Agent {
                         if !calls.is_empty() {
                             let results =
                                 self.answer_calls_as_cancelled(turn, &calls, &tools).await;
-                            self.messages.push(tool_results_message(&results));
+                            self.commit_tool_results(&calls, results, true);
                         }
                         return Err(AgentError::TurnBoundary { source });
                     }
@@ -724,7 +724,8 @@ impl Agent {
                 let execution = self
                     .execute_tools(turn, &calls, &tools, prompt_cancel, &round_cancel)
                     .await;
-                self.messages.push(tool_results_message(&execution.results));
+                let cancelled = prompt_cancel.is_cancelled() || round_cancel.is_cancelled();
+                self.commit_tool_results(&calls, execution.results, cancelled);
 
                 if let Some(source) = execution.system_error {
                     return Err(AgentError::ToolSystem { source });
@@ -840,6 +841,20 @@ impl Agent {
         self.execute_tools(turn, calls, tools, &fired, &fired)
             .await
             .results
+    }
+
+    fn commit_tool_results(
+        &mut self,
+        calls: &[ToolCall],
+        results: Vec<ToolResult>,
+        cancelled: bool,
+    ) {
+        self.messages.push(tool_results_message(&results));
+        self.emit(AgentEvent::ToolResultsCommitted {
+            calls: calls.to_vec(),
+            results,
+            cancelled,
+        });
     }
 
     async fn execute_tools(

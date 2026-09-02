@@ -25,10 +25,11 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(test)]
 use futures_util::future::join_all;
 use lithos_llm::types::{ContentPart, ToolCall, ToolCallKind, ToolDefinitionKind, ToolResult};
 use pebble_agent as agent;
-use pebble_agent::integration::{ToolRoundContext, validate_tool_arguments};
+use pebble_agent::integration::validate_tool_arguments;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -41,7 +42,9 @@ use super::registry::{
 use crate::config::{CodingAgentOptions, ToolHookDecision};
 use crate::environment::Environment;
 use crate::event::{Emitter, OutputCaptureStats, SessionBoundEmitter};
-use crate::human_input::{HumanInputProvider, is_question_tool};
+use crate::human_input::HumanInputProvider;
+#[cfg(test)]
+use crate::human_input::is_question_tool;
 use crate::redact::Redactor;
 use crate::truncation::{
     OutputBudgets, ToolOutputLimits, preview_tool_output, serialized_json_bytes,
@@ -50,16 +53,19 @@ use crate::truncation::{
 use crate::types::{CodingEvent, ToolErrorKind};
 
 /// What a second human-question call in one round is told.
+#[cfg(test)]
 const ONE_QUESTION_PER_ROUND: &str = "Only one human-question tool call may be used in a tool \
                                       round. Combine all questions into a single questions[] \
                                       batch and call the question tool once.";
 
 /// What a call that shared a round with a human-question call is told.
+#[cfg(test)]
 const QUESTIONS_RUN_ALONE: &str = "This tool call was not executed because human-question tools \
                                    must run alone in a tool round. Retry non-question tools in a \
                                    later round after the user answers.";
 
 /// What a call that never started is told.
+#[cfg(test)]
 const CANCELLED: &str = "Cancelled";
 
 /// One session's tool dispatch: the registry, the environment, and everything
@@ -152,27 +158,15 @@ impl<'a> ToolDispatch<'a> {
         parallel: bool,
         cancel: &CancellationToken,
     ) -> Vec<ToolResult> {
-        self.execute_with_agent_context(calls, parallel, cancel, None)
-            .await
+        self.execute_round(calls, parallel, cancel).await
     }
 
-    /// Answers an agent-owned tool round through its resolved policy and
-    /// hooks.
-    pub(crate) async fn execute_agent_round(
-        &self,
-        context: ToolRoundContext<'_>,
-        cancel: &CancellationToken,
-    ) -> Vec<ToolResult> {
-        self.execute_with_agent_context(context.calls(), true, cancel, Some(context))
-            .await
-    }
-
-    async fn execute_with_agent_context(
+    #[cfg(test)]
+    async fn execute_round(
         &self,
         calls: &[ToolCall],
         parallel: bool,
         cancel: &CancellationToken,
-        agent_context: Option<ToolRoundContext<'_>>,
     ) -> Vec<ToolResult> {
         // A round that opens after its cancellation fired — the prompt was
         // ended while the turn was being committed — answers every call without
@@ -186,15 +180,13 @@ impl<'a> ToolDispatch<'a> {
         }
 
         if calls.iter().any(|call| is_question_tool(&call.name)) {
-            return self
-                .execute_question_round(calls, cancel, agent_context)
-                .await;
+            return self.execute_question_round(calls, cancel).await;
         }
 
         if parallel && calls.len() > 1 {
-            self.execute_parallel(calls, cancel, agent_context).await
+            self.execute_parallel(calls, cancel).await
         } else {
-            self.execute_sequential(calls, cancel, agent_context).await
+            self.execute_sequential(calls, cancel).await
         }
     }
 
@@ -204,8 +196,78 @@ impl<'a> ToolDispatch<'a> {
         call: &ToolCall,
         cancel: CancellationToken,
     ) -> ToolResult {
-        self.execute_one_with_agent_context(call, cancel, None)
-            .await
+        self.execute_one_with_policy(call, cancel, true).await
+    }
+
+    /// Runs one call after the shared agent middleware approved it.
+    pub(crate) async fn execute_terminal(
+        &self,
+        request: agent::ToolCallRequest,
+    ) -> (agent::ToolOutcome, Option<OutputCaptureStats>) {
+        let call = request.call().clone();
+        let executed = self
+            .run_tool(
+                &call,
+                self.registry.get(&call.name),
+                request.cancellation().clone(),
+            )
+            .await;
+        let outcome = if executed.result.is_error {
+            agent::ToolOutcome::failure(
+                executed.error_kind.unwrap_or(ToolErrorKind::Execution),
+                result_text(&executed.result).into_owned(),
+            )
+        } else {
+            agent::ToolOutcome::success(agent::ToolOutput::new(executed.result.content))
+        };
+        (outcome, executed.output_stats)
+    }
+
+    /// Publishes the start of a call entering the shared middleware stack.
+    pub(crate) fn begin_terminal(&self, call: &ToolCall) {
+        self.emit_started(call);
+    }
+
+    /// Applies coding output policy and publishes the final call result.
+    pub(crate) fn finish_terminal(
+        &self,
+        call: &ToolCall,
+        outcome: agent::ToolOutcome,
+        previous: Option<OutputCaptureStats>,
+    ) -> agent::ToolOutcome {
+        let (result, error_kind) = match outcome {
+            agent::ToolOutcome::Success(output) => (
+                ToolResult {
+                    tool_call_id: call.id.clone(),
+                    name:         Some(call.name.clone()),
+                    content:      output.content().to_vec(),
+                    is_error:     false,
+                },
+                None,
+            ),
+            agent::ToolOutcome::Failure { kind, message } => (
+                self.error_result(call, &ToolError::new(kind, message)),
+                Some(kind),
+            ),
+            _ => (
+                self.error_result(
+                    call,
+                    &ToolError::execution("the tool returned an unsupported outcome"),
+                ),
+                Some(ToolErrorKind::Execution),
+            ),
+        };
+        let retained = self.retain(result, previous);
+        self.emit_result(call, &retained.result, retained.output_stats, error_kind);
+        let result = self.truncate_for_history(retained.result, &call.name);
+        if result.is_error {
+            agent::ToolOutcome::failure(
+                error_kind.unwrap_or(ToolErrorKind::Execution),
+                result_text(&result).into_owned(),
+            )
+        } else {
+            agent::ToolOutcome::success(agent::ToolOutput::new(result.content))
+        }
     }
 
     #[tracing::instrument(
@@ -217,33 +279,22 @@ impl<'a> ToolDispatch<'a> {
             tool_call_id = %call.id
         )
     )]
-    async fn execute_one_with_agent_context(
+    async fn execute_one_with_policy(
         &self,
         call: &ToolCall,
         cancel: CancellationToken,
-        agent_context: Option<ToolRoundContext<'_>>,
+        apply_policy: bool,
     ) -> ToolResult {
         self.emit_started(call);
 
-        let denial_reason = match agent_context {
-            Some(context) => match context.access_for_call(call) {
-                agent::ToolAccess::Allowed => None,
-                agent::ToolAccess::Denied { reason } => Some(reason),
-                _ => Some(format!("{} tool denied by agent access policy", call.name)),
-            },
-            None => self.config.tool_access_denial_reason(&call.name),
-        };
+        let denial_reason = apply_policy
+            .then(|| self.config.tool_access_denial_reason(&call.name))
+            .flatten();
         if let Some(reason) = denial_reason {
             return self.finish_error(call, &ToolError::denied(reason));
         }
 
-        if let Some(context) = agent_context {
-            if let agent::BeforeToolCall::Block { reason } =
-                context.before_tool_call(call, &cancel).await
-            {
-                return self.finish_error(call, &ToolError::denied(reason));
-            }
-        } else if let Some(hooks) = self.config.tool_hooks.as_ref() {
+        if apply_policy && let Some(hooks) = self.config.tool_hooks.as_ref() {
             debug!(tool = %call.name, hook_event = "pre_tool_use", "Calling tool hook");
             let started = Instant::now();
             let decision = hooks.pre_tool_use(&call.name, &call.arguments).await;
@@ -270,11 +321,7 @@ impl<'a> ToolDispatch<'a> {
 
         self.emit_result(call, &result, retained.output_stats, error_kind);
 
-        if let Some(context) = agent_context {
-            context
-                .after_tool_call(call, &result, error_kind, &cancel)
-                .await;
-        } else if let Some(hooks) = self.config.tool_hooks.as_ref() {
+        if apply_policy && let Some(hooks) = self.config.tool_hooks.as_ref() {
             let content = result_text(&result);
             if result.is_error {
                 debug!(tool = %call.name, hook_event = "post_tool_use_failure", "Calling tool hook");
@@ -299,11 +346,11 @@ impl<'a> ToolDispatch<'a> {
         self.truncate_for_history(result, &call.name)
     }
 
+    #[cfg(test)]
     async fn execute_sequential(
         &self,
         calls: &[ToolCall],
         cancel: &CancellationToken,
-        agent_context: Option<ToolRoundContext<'_>>,
     ) -> Vec<ToolResult> {
         let mut results = Vec::with_capacity(calls.len());
         for call in calls {
@@ -312,22 +359,24 @@ impl<'a> ToolDispatch<'a> {
                 continue;
             }
             results.push(
-                self.execute_one_with_agent_context(call, cancel.child_token(), agent_context)
+                self.execute_one_with_policy(call, cancel.child_token(), true)
                     .await,
             );
         }
         results
     }
 
+    #[cfg(test)]
     async fn execute_parallel(
         &self,
         calls: &[ToolCall],
         cancel: &CancellationToken,
-        agent_context: Option<ToolRoundContext<'_>>,
     ) -> Vec<ToolResult> {
-        join_all(calls.iter().map(|call| {
-            self.execute_one_with_agent_context(call, cancel.child_token(), agent_context)
-        }))
+        join_all(
+            calls
+                .iter()
+                .map(|call| self.execute_one_with_policy(call, cancel.child_token(), true)),
+        )
         .await
     }
 
@@ -336,11 +385,11 @@ impl<'a> ToolDispatch<'a> {
     /// A question parks the prompt until a person answers, so running its peers
     /// would either race the answer or waste work the answer invalidates. Both
     /// refusals name what to do instead, and the results stay in call order.
+    #[cfg(test)]
     async fn execute_question_round(
         &self,
         calls: &[ToolCall],
         cancel: &CancellationToken,
-        agent_context: Option<ToolRoundContext<'_>>,
     ) -> Vec<ToolResult> {
         let first_question = calls.iter().position(|call| is_question_tool(&call.name));
         let mut results = Vec::with_capacity(calls.len());
@@ -352,7 +401,7 @@ impl<'a> ToolDispatch<'a> {
             }
 
             let result = if Some(index) == first_question {
-                self.execute_one_with_agent_context(call, cancel.child_token(), agent_context)
+                self.execute_one_with_policy(call, cancel.child_token(), true)
                     .await
             } else if is_question_tool(&call.name) {
                 self.refuse(call, &ToolError::denied(ONE_QUESTION_PER_ROUND))
@@ -443,11 +492,13 @@ impl<'a> ToolDispatch<'a> {
     }
 
     /// A call that was cancelled before it started.
+    #[cfg(test)]
     fn cancelled_result(&self, call: &ToolCall) -> ToolResult {
         self.error_result(call, &ToolError::cancelled(CANCELLED))
     }
 
     /// Publishes the started event this call never got, then refuses it.
+    #[cfg(test)]
     fn refuse(&self, call: &ToolCall, error: &ToolError) -> ToolResult {
         self.emit_started(call);
         self.finish_error(call, error)

@@ -24,7 +24,7 @@ use lithos_llm::resolver::ResolvedRoute;
 use lithos_llm::types::{
     Error as LlmError, ErrorKind as LlmErrorKind, ReasoningEffort, Request, Speed,
 };
-use pebble_agent::{Agent, AgentControlHandle};
+use pebble_agent::{Agent, AgentControlHandle, ToolMiddleware};
 use serde::Deserialize;
 use tokio::sync::{Notify, broadcast};
 use tokio::task::JoinHandle;
@@ -131,6 +131,7 @@ pub(crate) struct CodingRuntimeBuilder {
     model:                Option<String>,
     environment:          Option<Arc<dyn Environment>>,
     tools:                Vec<RegisteredTool>,
+    tool_middleware:      Vec<Arc<dyn ToolMiddleware>>,
     human_input:          Option<Arc<dyn HumanInputProvider>>,
     tool_env_provider:    Option<Arc<dyn ToolEnvProvider>>,
     redactor:             Arc<dyn Redactor>,
@@ -154,6 +155,7 @@ impl CodingRuntimeBuilder {
             model: None,
             environment: None,
             tools: Vec::new(),
+            tool_middleware: Vec::new(),
             human_input: None,
             tool_env_provider: None,
             redactor: Arc::new(NoRedaction),
@@ -212,6 +214,12 @@ impl CodingRuntimeBuilder {
     /// the name that model expects.
     pub(crate) fn tools(mut self, tools: impl IntoIterator<Item = RegisteredTool>) -> Self {
         self.tools.extend(tools);
+        self
+    }
+
+    /// Adds one tool middleware to this session and its descendants.
+    pub(crate) fn tool_middleware(mut self, middleware: Arc<dyn ToolMiddleware>) -> Self {
+        self.tool_middleware.push(middleware);
         self
     }
 
@@ -481,6 +489,7 @@ impl CodingRuntimeBuilder {
                 profile: Arc::clone(&profile),
                 environment: Arc::clone(&environment),
                 tools: self.tools,
+                tool_middleware: self.tool_middleware.clone(),
                 options: child_options(&self.options),
                 tool_env_provider: self.tool_env_provider.clone(),
                 redactor: Arc::clone(&self.redactor),
@@ -519,6 +528,7 @@ impl CodingRuntimeBuilder {
             facts,
             knowledge_cutoff: metadata.knowledge_cutoff.unwrap_or_default(),
             registry,
+            tool_middleware: self.tool_middleware,
             env: environment,
             human_input: self.human_input,
             tool_env_provider: self.tool_env_provider,
@@ -716,6 +726,7 @@ pub(crate) struct CodingRuntime {
     facts:             ModelFacts,
     knowledge_cutoff:  String,
     registry:          ToolRegistry,
+    tool_middleware:   Vec<Arc<dyn ToolMiddleware>>,
     env:               Arc<dyn Environment>,
     human_input:       Option<Arc<dyn HumanInputProvider>>,
     tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,

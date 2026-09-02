@@ -18,6 +18,7 @@ use lithos_llm::Client;
 use lithos_llm::client::ClientBuild;
 use lithos_llm::middleware::{ConcurrencyLimitMiddleware, RetryMiddleware, RetryPolicy};
 use lithos_llm::types::ToolDefinition;
+use pebble_agent::ToolMiddleware;
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 use tokio::task::yield_now;
@@ -104,6 +105,7 @@ pub(crate) struct TestSession {
     delay:           Duration,
     completions:     Vec<ScriptedCompletion>,
     tools:           Vec<RegisteredTool>,
+    tool_middleware: Vec<Arc<dyn ToolMiddleware>>,
     options:         CodingAgentOptions,
     model:           String,
     environment:     Option<Arc<dyn Environment>>,
@@ -125,6 +127,7 @@ impl TestSession {
             delay: Duration::ZERO,
             completions: Vec::new(),
             tools: Vec::new(),
+            tool_middleware: Vec::new(),
             options: CodingAgentOptions::default(),
             model: "test/model".to_owned(),
             environment: None,
@@ -190,6 +193,12 @@ impl TestSession {
     /// Registers tools on top of the profile's own.
     pub(crate) fn tools(mut self, tools: impl IntoIterator<Item = RegisteredTool>) -> Self {
         self.tools.extend(tools);
+        self
+    }
+
+    /// Adds one layer around tool discovery and calls.
+    pub(crate) fn tool_middleware(mut self, middleware: Arc<dyn ToolMiddleware>) -> Self {
+        self.tool_middleware.push(middleware);
         self
     }
 
@@ -264,6 +273,9 @@ impl TestSession {
             .environment(environment)
             .with_profile(TestProfile::with_tools(self.tools))
             .options(self.options);
+        for middleware in self.tool_middleware {
+            builder = builder.tool_middleware(middleware);
+        }
         if self.subagents {
             builder = builder.subagents(SubagentOptions::enabled().with_limits(self.limits));
         }
