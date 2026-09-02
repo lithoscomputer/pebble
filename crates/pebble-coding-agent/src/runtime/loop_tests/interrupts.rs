@@ -638,7 +638,22 @@ async fn a_prompt_that_outlasts_its_budget_ends_with_the_budget_as_its_reason() 
         matches!(error, Error::Interrupted(InterruptReason::WallClockTimeout)),
         "{error:?}"
     );
-    assert_eq!(session.state(), CodingAgentState::Closed);
+    // Running out of time is the prompt's failure, not the session's: the
+    // session is idle again, and the next prompt gets a fresh budget.
+    assert_eq!(session.state(), CodingAgentState::Idle);
+    assert!(
+        matches!(
+            session.history().turns().last(),
+            Some(Message::ToolResults { results, .. }) if results.len() == 1
+        ),
+        "the interrupted call still has its result: {:?}",
+        session.history().turns()
+    );
+    let answer = timeout(PATIENCE, session.prompt("Try again"))
+        .await
+        .expect("the next prompt runs")
+        .expect("the next prompt succeeds");
+    assert_eq!(answer.as_deref(), Some("Should not reach this"));
 }
 
 #[tokio::test]

@@ -33,8 +33,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use self::control::ControlState;
-pub(crate) use self::control::SessionControlHandle;
 pub use self::control::SteeringLease;
+pub(crate) use self::control::{SessionControlHandle, SteeringItem};
 pub use self::retry::RetryEventObserver;
 use self::turn::CodingAgentBridge;
 pub(crate) use crate::coding_agent::{CodingAgentBuildError, PromptTiming, ShutdownReason};
@@ -1209,15 +1209,54 @@ impl CodingRuntime {
     /// wall-clock time, [`Error::Llm`] when the model call failed for good, and
     /// [`Error::EventSink`] when the configured sink refused an event.
     pub(crate) async fn prompt(&mut self, input: &str) -> Result<Option<String>> {
+        self.prompt_with_cancellation(input, None).await
+    }
+
+    /// Processes one input until it completes or `cancel` fires.
+    ///
+    /// Cancelling `cancel` ends this prompt alone: the loop unwinds through its
+    /// checkpoints so every tool call still gets its result, the prompt reports
+    /// [`Error::Interrupted`], and the session returns to
+    /// [`Idle`](CodingAgentState::Idle) ready for its next prompt. Only a
+    /// shutdown closes the session.
+    ///
+    /// # Errors
+    ///
+    /// As [`prompt`](Self::prompt).
+    pub(crate) async fn prompt_with_cancellation(
+        &mut self,
+        input: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Option<String>> {
         self.last_prompt = PromptTotals::default();
         if self.state == CodingAgentState::Closed {
             return Err(Error::SessionClosed);
         }
 
-        let timer = self.start_wall_clock_timer();
-        let result = self.process_input(input, SkillExpansion::Apply).await;
+        // A child of the terminal token, so a shutdown ends the prompt too, and
+        // linked to the caller's token where one was given.
+        let prompt_cancel = self.cancel_token.child_token();
+        let link = cancel.map(|caller| link_cancellation(caller, &prompt_cancel));
 
+        let timer = self.start_wall_clock_timer(&prompt_cancel);
+        let result = self
+            .process_input(input, SkillExpansion::Apply, &prompt_cancel)
+            .await;
+
+        if let Some(link) = link {
+            link.abort();
+        }
         let mut task_failure = stop_wall_clock_timer(timer).await;
+        // The reason has been reported by now. Clearing it here rather than at
+        // the start of the next prompt keeps a reason a watchdog records just
+        // before it cancels, and still stops one prompt's reason reaching the
+        // next.
+        if self.state != CodingAgentState::Closed {
+            *self
+                .interrupt_reason
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = None;
+        }
 
         if self.state == CodingAgentState::Closed {
             let reason = if self.cancel_token.is_cancelled() {
@@ -1253,13 +1292,14 @@ impl CodingRuntime {
 
     /// Starts the task that ends a prompt which has taken too long.
     ///
-    /// The timer cancels the session rather than dropping the prompt, so the
-    /// loop unwinds through its own checkpoints and every tool call still
-    /// has its result recorded.
-    fn start_wall_clock_timer(&self) -> Option<WallClockTimer> {
+    /// The timer cancels the prompt rather than dropping it, so the loop
+    /// unwinds through its own checkpoints and every tool call still has its
+    /// result recorded. The session stays open: running out of time is the
+    /// prompt's failure, and the next prompt gets a fresh budget.
+    fn start_wall_clock_timer(&self, prompt_cancel: &CancellationToken) -> Option<WallClockTimer> {
         let duration = self.config.wall_clock_timeout?;
         let stop = CancellationToken::new();
-        let cancel = self.cancel_token.clone();
+        let cancel = prompt_cancel.clone();
         let reason = self.interrupt_reason_handle();
         let watched = stop.clone();
         let task = tokio::spawn(async move {
@@ -1353,6 +1393,19 @@ impl CodingRuntime {
         outcome
     }
 
+    /// Answers for a prompt the agent loop aborted.
+    ///
+    /// A terminal cancellation closes the session; anything else — the
+    /// caller's prompt token, or the wall clock — ends only this prompt, and
+    /// the session is left open for the next one.
+    pub(super) async fn prompt_aborted(&mut self) -> Error {
+        if self.cancel_token.is_cancelled() {
+            self.close_cancelled().await
+        } else {
+            self.interrupted_error()
+        }
+    }
+
     /// Closes a cancelled session and answers with the error the prompt ends
     /// on.
     async fn close_cancelled(&mut self) -> Error {
@@ -1440,6 +1493,26 @@ impl CodingRuntime {
 
         self.state = to;
     }
+}
+
+/// Cancels `prompt_cancel` when `caller` fires.
+///
+/// A token has one parent, and the prompt token's is the terminal token, so
+/// the caller's is joined in by a task instead. The task ends on its own once
+/// the prompt token fires for any reason, and the prompt aborts it when it
+/// finishes.
+fn link_cancellation(
+    caller: &CancellationToken,
+    prompt_cancel: &CancellationToken,
+) -> JoinHandle<()> {
+    let caller = caller.clone();
+    let prompt_cancel = prompt_cancel.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            () = caller.cancelled() => prompt_cancel.cancel(),
+            () = prompt_cancel.cancelled() => {}
+        }
+    })
 }
 
 /// The task watching one prompt's wall-clock budget.

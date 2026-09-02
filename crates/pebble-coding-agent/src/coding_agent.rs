@@ -21,12 +21,13 @@ use crate::human_input::HumanInputProvider;
 use crate::record::SessionRecord;
 use crate::redact::Redactor;
 use crate::runtime::{
-    CodingRuntime, CodingRuntimeBuilder, InterruptReasonHandle, SessionControlHandle, SteeringLease,
+    CodingRuntime, CodingRuntimeBuilder, InterruptReasonHandle, SessionControlHandle, SteeringItem,
+    SteeringLease,
 };
 use crate::search::SearchProvider;
 use crate::subagent::{ChildAgentFactory, SubagentLimits};
 use crate::tool::{RegisteredTool, ToolEnvProvider};
-use crate::types::{CodingAgentEvent, CodingAgentState, Message, TokenUsage};
+use crate::types::{Actor, CodingAgentEvent, CodingAgentState, Message, TokenUsage};
 
 /// Why a coding agent is being shut down.
 ///
@@ -369,10 +370,149 @@ impl CodingControl {
     }
 }
 
+/// Out-of-band input for a coding agent: what to say, and who said it.
+///
+/// Steering reaches the model as its own turn at the next round boundary and
+/// publishes [`SteeringInjected`](crate::events::CodingEvent::SteeringInjected)
+/// with the same author. A follow-up runs as ordinary user input once the
+/// current prompt reaches an answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SteeringMessage {
+    text:  String,
+    actor: Option<Actor>,
+}
+
+impl SteeringMessage {
+    /// A message with no named author.
+    #[must_use]
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text:  text.into(),
+            actor: None,
+        }
+    }
+
+    /// Names who wrote the message.
+    #[must_use]
+    pub fn with_actor(mut self, actor: Actor) -> Self {
+        self.actor = Some(actor);
+        self
+    }
+
+    /// What the message says.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Who wrote it, when the application said.
+    #[must_use]
+    pub const fn actor(&self) -> Option<&Actor> {
+        self.actor.as_ref()
+    }
+
+    fn into_item(self) -> SteeringItem {
+        SteeringItem::Steering {
+            text:  self.text,
+            actor: self.actor,
+        }
+    }
+
+    fn from_item(item: SteeringItem) -> Self {
+        let (text, actor) = item.into_parts();
+        Self { text, actor }
+    }
+}
+
+impl From<&str> for SteeringMessage {
+    fn from(text: &str) -> Self {
+        Self::new(text)
+    }
+}
+
+impl From<String> for SteeringMessage {
+    fn from(text: String) -> Self {
+        Self::new(text)
+    }
+}
+
+/// What the control handle did with one message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SteeringOutcome {
+    /// The message is queued.
+    Accepted,
+    /// The message is queued, and the queue was full: this older message was
+    /// dropped to make room and the agent will never see it. The application
+    /// decides whether that is worth reporting.
+    Evicted(SteeringMessage),
+    /// The agent is closed and nothing was queued.
+    Closed,
+}
+
+impl SteeringOutcome {
+    /// Whether the message was queued, with or without an eviction.
+    #[must_use]
+    pub const fn is_accepted(&self) -> bool {
+        matches!(self, Self::Accepted | Self::Evicted(_))
+    }
+
+    fn from_eviction(evicted: Option<SteeringItem>) -> Self {
+        evicted.map_or(Self::Accepted, |item| {
+            Self::Evicted(SteeringMessage::from_item(item))
+        })
+    }
+}
+
+/// A read-only view of a coding agent's control state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ControlSnapshot {
+    running:            bool,
+    closed:             bool,
+    parked:             bool,
+    pending_steering:   usize,
+    pending_follow_ups: usize,
+}
+
+impl ControlSnapshot {
+    /// Whether a prompt is running.
+    #[must_use]
+    pub const fn is_running(&self) -> bool {
+        self.running
+    }
+
+    /// Whether the agent is closed or is finishing an abort.
+    #[must_use]
+    pub const fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    /// Whether the prompt is parked after an interrupt, waiting for a steer.
+    #[must_use]
+    pub const fn is_parked(&self) -> bool {
+        self.parked
+    }
+
+    /// Steering messages queued for the next round boundary.
+    #[must_use]
+    pub const fn pending_steering(&self) -> usize {
+        self.pending_steering
+    }
+
+    /// Follow-ups queued to run after the current answer.
+    #[must_use]
+    pub const fn pending_follow_ups(&self) -> usize {
+        self.pending_follow_ups
+    }
+}
+
 /// Controls a coding agent while another task awaits its prompt.
 ///
 /// Cloning is cheap. Every clone steers, follows up, aborts, and observes the
-/// same agent.
+/// same agent. Every operation is safe to call from any task at any time,
+/// including from several handles at once: the queue and the interrupt ledger
+/// are updated under one lock, so two steers sent together both land and an
+/// interrupt is announced exactly once.
 #[derive(Clone)]
 pub struct CodingAgentControlHandle {
     control: Arc<CodingControl>,
@@ -383,20 +523,68 @@ impl CodingAgentControlHandle {
         Self { control }
     }
 
-    /// Queues steering for the next model turn and interrupts the current one.
+    /// How many steering messages wait for a round boundary before the oldest
+    /// is dropped.
     ///
-    /// Steering queued while idle is applied in the next prompt. Returns
-    /// `false` after the agent closes.
-    pub fn steer(&self, message: impl Into<String>) -> bool {
+    /// Pebble owns the bound and the rule: a full queue evicts its oldest
+    /// message, and the outcome carries what was evicted so the application
+    /// can report it. Follow-ups are not bounded; they run one at a time after
+    /// each answer and never race a round boundary.
+    pub const STEERING_QUEUE_CAPACITY: usize = 64;
+
+    /// Queues steering for the next round boundary without interrupting the
+    /// round in progress.
+    ///
+    /// The model finishes what it is doing and reads the message before its
+    /// next turn. Steering queued while idle opens the next prompt.
+    pub fn queue_steering(&self, message: impl Into<SteeringMessage>) -> SteeringOutcome {
+        if self.is_closed() {
+            return SteeringOutcome::Closed;
+        }
+        let evicted = self
+            .control
+            .session
+            .enqueue_bounded(message.into().into_item(), Self::STEERING_QUEUE_CAPACITY);
+        SteeringOutcome::from_eviction(evicted)
+    }
+
+    /// Interrupts the round in progress and queues `message` as what replaces
+    /// it, in one step.
+    ///
+    /// The interrupt and the enqueue happen under one lock, so the prompt can
+    /// never observe the interrupt with an empty queue and park when the steer
+    /// was already on its way. While no prompt is running this only queues, and
+    /// the message opens the next prompt.
+    pub fn steer_now(&self, message: impl Into<SteeringMessage>) -> SteeringOutcome {
         let state = self.control.state();
         if state.closed {
+            return SteeringOutcome::Closed;
+        }
+        let item = message.into().into_item();
+        let evicted = if state.running {
+            self.control
+                .session
+                .interrupt_then_enqueue_bounded(item, Self::STEERING_QUEUE_CAPACITY)
+        } else {
+            self.control
+                .session
+                .enqueue_bounded(item, Self::STEERING_QUEUE_CAPACITY)
+        };
+        SteeringOutcome::from_eviction(evicted)
+    }
+
+    /// Interrupts the round in progress without saying what comes next.
+    ///
+    /// The prompt abandons its round, publishes one
+    /// [`RoundInterrupted`](crate::events::CodingEvent::RoundInterrupted), and
+    /// parks at the next boundary until a steer arrives or the prompt is
+    /// cancelled. Returns whether a prompt was running to interrupt.
+    pub fn interrupt(&self) -> bool {
+        let state = self.control.state();
+        if !state.running || state.closed {
             return false;
         }
-        if state.running {
-            self.control.session.interrupt_then_steer(message, None);
-        } else {
-            self.control.session.steer(message, None);
-        }
+        self.control.session.interrupt();
         true
     }
 
@@ -413,24 +601,30 @@ impl CodingAgentControlHandle {
         SteeringLease::acquire(self.control.session.clone())
     }
 
-    /// Queues input to run after the current prompt reaches an answer.
+    /// Queues input to run as its own user turn once the current prompt
+    /// reaches an answer.
     ///
-    /// Returns `false` after the agent closes.
-    pub fn follow_up(&self, message: impl Into<String>) -> bool {
+    /// A follow-up is ordinary input, not steering: it does not interrupt
+    /// anything and is not bounded. The author is not recorded on the turn it
+    /// becomes.
+    pub fn queue_follow_up(&self, message: impl Into<SteeringMessage>) -> SteeringOutcome {
         if self.is_closed() {
-            return false;
+            return SteeringOutcome::Closed;
         }
         self.control
             .follow_up
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push_back(message.into());
-        true
+            .push_back(message.into().text);
+        SteeringOutcome::Accepted
     }
 
-    /// Aborts the active prompt and closes the agent.
+    /// Aborts the active prompt and closes the agent for good.
     ///
-    /// Returns whether a prompt was running.
+    /// This is the terminal gesture. To end one prompt and keep the agent,
+    /// cancel the token given to
+    /// [`CodingAgent::prompt_with_cancellation`] instead. Returns whether a
+    /// prompt was running.
     pub fn abort(&self) -> bool {
         {
             let mut state = self
@@ -472,6 +666,24 @@ impl CodingAgentControlHandle {
     pub fn is_closed(&self) -> bool {
         self.control.state().closed
     }
+
+    /// A read-only view of the agent's state and queued input.
+    #[must_use]
+    pub fn snapshot(&self) -> ControlSnapshot {
+        let state = self.control.state();
+        ControlSnapshot {
+            running:            state.running,
+            closed:             state.closed,
+            parked:             self.control.session.is_waiting_for_steer(),
+            pending_steering:   self.control.session.queue_len(),
+            pending_follow_ups: self
+                .control
+                .follow_up
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .len(),
+        }
+    }
 }
 
 impl fmt::Debug for CodingAgentControlHandle {
@@ -508,8 +720,36 @@ impl CodingAgent {
     /// [`Error::Interrupted`] after cancellation or timeout, and the
     /// applicable model, tool, compaction, or event failure otherwise.
     pub async fn prompt(&mut self, input: &str) -> Result<PromptOutcome, Error> {
+        self.prompt_inner(input, None).await
+    }
+
+    /// Processes one user prompt until it completes or `cancel` fires.
+    ///
+    /// Cancelling ends this prompt alone. The loop unwinds through its
+    /// checkpoints, so every tool call the model made still gets its result and
+    /// history stays paired; the prompt returns [`Error::Interrupted`] and the
+    /// agent returns to [`Idle`](CodingAgentState::Idle), ready for the next
+    /// prompt. Only [`shutdown`](Self::shutdown) or
+    /// [`abort`](CodingAgentControlHandle::abort) closes the agent.
+    ///
+    /// # Errors
+    ///
+    /// As [`prompt`](Self::prompt).
+    pub async fn prompt_with_cancellation(
+        &mut self,
+        input: &str,
+        cancel: &CancellationToken,
+    ) -> Result<PromptOutcome, Error> {
+        self.prompt_inner(input, Some(cancel)).await
+    }
+
+    async fn prompt_inner(
+        &mut self,
+        input: &str,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<PromptOutcome, Error> {
         self.control.begin_prompt();
-        let result = self.inner.prompt(input).await;
+        let result = self.inner.prompt_with_cancellation(input, cancel).await;
         self.control
             .finish_prompt(self.inner.state() == CodingAgentState::Closed);
         let text = result?;
@@ -542,17 +782,17 @@ impl CodingAgent {
         CodingAgentControlHandle::new(Arc::clone(&self.control))
     }
 
-    /// Queues steering and interrupts the current model turn.
-    pub fn steer(&self, text: impl Into<String>) -> bool {
-        self.control_handle().steer(text)
+    /// Interrupts the current round and queues `message` as what replaces it.
+    pub fn steer_now(&self, message: impl Into<SteeringMessage>) -> SteeringOutcome {
+        self.control_handle().steer_now(message)
     }
 
-    /// Queues input after the current prompt reaches an answer.
-    pub fn follow_up(&self, message: impl Into<String>) -> bool {
-        self.control_handle().follow_up(message)
+    /// Queues input to run after the current prompt reaches an answer.
+    pub fn queue_follow_up(&self, message: impl Into<SteeringMessage>) -> SteeringOutcome {
+        self.control_handle().queue_follow_up(message)
     }
 
-    /// Aborts the active prompt and closes this agent.
+    /// Aborts the active prompt and closes this agent for good.
     pub fn abort(&self) -> bool {
         self.control_handle().abort()
     }
@@ -621,8 +861,66 @@ impl CodingAgent {
 
 #[cfg(test)]
 mod tests {
+    use lithos_llm::types::ToolDefinition;
+    use serde_json::json;
+    use tokio::time::timeout;
+
     use super::*;
-    use crate::test_support::{MockEnvironment, ScriptedCall, scripted_client, text_response};
+    use crate::runtime::testing::{blocking_tool, drained, wait_for_event};
+    use crate::test_support::{
+        MockEnvironment, ScriptedCall, scripted_client, text_delta_events, text_response,
+        tool_call_response,
+    };
+    use crate::types::{CodingEvent, ToolSource};
+
+    /// How long a test waits for a prompt another task has to unblock.
+    const PATIENCE: Duration = Duration::from_secs(5);
+
+    /// A tool that says when it starts and waits for the test to let it finish.
+    fn checkpoint_tool(reached: Arc<Notify>, release: Arc<Notify>) -> RegisteredTool {
+        RegisteredTool {
+            definition: ToolDefinition::function(
+                "checkpoint",
+                "Waits for the test",
+                json!({"type": "object"}),
+            ),
+            executor:   Arc::new(move |_arguments, _context| {
+                let reached = Arc::clone(&reached);
+                let release = Arc::clone(&release);
+                Box::pin(async move {
+                    reached.notify_one();
+                    release.notified().await;
+                    Ok("ready".to_owned())
+                })
+            }),
+            source:     ToolSource::Native,
+        }
+    }
+
+    async fn agent_with(
+        calls: Vec<ScriptedCall>,
+        tools: impl IntoIterator<Item = RegisteredTool>,
+    ) -> CodingAgent {
+        let (client, _provider) = scripted_client(calls);
+        CodingAgent::builder(client, Arc::new(MockEnvironment::linux()))
+            .model("test/model")
+            .tools(tools)
+            .build()
+            .await
+            .expect("the coding agent builds and initializes")
+    }
+
+    fn steering_texts(agent: &CodingAgent) -> Vec<&str> {
+        agent
+            .history()
+            .turns()
+            .iter()
+            .filter_map(|turn| match turn {
+                Message::Steering { content, .. } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
 
     #[tokio::test]
     async fn build_returns_a_ready_session_and_prompt_returns_an_outcome() {
@@ -719,5 +1017,255 @@ mod tests {
             .shutdown(ShutdownReason::Completed)
             .await
             .expect("the resumed agent shuts down");
+    }
+
+    // --- Steering ---
+
+    #[tokio::test]
+    async fn two_handles_steering_at_once_both_land() {
+        let reached = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let mut agent = agent_with(
+            vec![
+                ScriptedCall::response(tool_call_response("checkpoint", "call_1", json!({}))),
+                ScriptedCall::response(text_response("done")),
+            ],
+            [checkpoint_tool(Arc::clone(&reached), Arc::clone(&release))],
+        )
+        .await;
+        let first = agent.control_handle();
+        let second = agent.control_handle();
+
+        let steering = tokio::spawn(async move {
+            reached.notified().await;
+            // Two steers from two handles with nothing between them. Both must
+            // be queued: the queue and the interrupt ledger share one lock.
+            let (one, two) =
+                tokio::join!(async { first.steer_now("from the first handle") }, async {
+                    second.steer_now(
+                        SteeringMessage::new("from the second handle").with_actor(Actor::System),
+                    )
+                },);
+            assert!(one.is_accepted());
+            assert!(two.is_accepted());
+            release.notify_one();
+        });
+
+        let outcome = timeout(PATIENCE, agent.prompt("start"))
+            .await
+            .expect("the prompt finishes")
+            .expect("the prompt succeeds");
+        steering.await.expect("the steering task finishes");
+
+        assert_eq!(outcome.text(), Some("done"));
+        let mut texts = steering_texts(&agent);
+        texts.sort_unstable();
+        assert_eq!(texts, ["from the first handle", "from the second handle"]);
+        agent
+            .shutdown(ShutdownReason::Completed)
+            .await
+            .expect("the agent shuts down");
+    }
+
+    #[tokio::test]
+    async fn a_full_steering_queue_evicts_the_oldest_and_reports_it() {
+        let mut agent = agent_with(vec![ScriptedCall::response(text_response("done"))], []).await;
+        let control = agent.control_handle();
+        let capacity = CodingAgentControlHandle::STEERING_QUEUE_CAPACITY;
+
+        for index in 0..capacity {
+            assert_eq!(
+                control.queue_steering(format!("steer {index}")),
+                SteeringOutcome::Accepted
+            );
+        }
+        let outcome =
+            control.queue_steering(SteeringMessage::new("one too many").with_actor(Actor::System));
+
+        assert_eq!(
+            outcome,
+            SteeringOutcome::Evicted(SteeringMessage::new("steer 0")),
+            "the oldest message makes room and comes back to the caller"
+        );
+        assert!(outcome.is_accepted());
+        let snapshot = control.snapshot();
+        assert_eq!(snapshot.pending_steering(), capacity);
+        assert!(!snapshot.is_running());
+        assert!(!snapshot.is_parked());
+        agent
+            .shutdown(ShutdownReason::Completed)
+            .await
+            .expect("the agent shuts down");
+    }
+
+    #[tokio::test]
+    async fn an_interrupt_from_the_handle_is_announced_exactly_once() {
+        let mut agent = agent_with(
+            vec![
+                ScriptedCall::EventsThenPending(text_delta_events("a long answer that")),
+                ScriptedCall::response(text_response("DONE")),
+            ],
+            [],
+        )
+        .await;
+        let control = agent.control_handle();
+        let mut watched = agent.subscribe();
+        let mut recorded = agent.subscribe();
+
+        let controller = tokio::spawn(async move {
+            wait_for_event(&mut watched, |event| {
+                matches!(event, CodingEvent::TextDelta { .. })
+            })
+            .await;
+            assert!(control.interrupt(), "a prompt was running to interrupt");
+            wait_for_event(&mut watched, |event| {
+                matches!(event, CodingEvent::RoundInterrupted { .. })
+            })
+            .await;
+            assert!(control.snapshot().is_parked(), "a bare interrupt parks");
+            assert_eq!(
+                control.queue_steering("say DONE"),
+                SteeringOutcome::Accepted
+            );
+        });
+
+        let outcome = timeout(PATIENCE, agent.prompt("describe everything"))
+            .await
+            .expect("the interrupt unblocks the hanging stream")
+            .expect("the prompt succeeds");
+        controller.await.expect("the controller finishes");
+
+        assert_eq!(outcome.text(), Some("DONE"));
+        let published = drained(&mut recorded).await;
+        assert_eq!(
+            published
+                .iter()
+                .filter(|event| matches!(event, CodingEvent::RoundInterrupted { .. }))
+                .count(),
+            1,
+            "one gesture is announced once"
+        );
+        assert!(!agent.control_handle().snapshot().is_parked());
+        agent
+            .shutdown(ShutdownReason::Completed)
+            .await
+            .expect("the agent shuts down");
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_runs_after_the_answer() {
+        let mut agent = agent_with(
+            vec![
+                ScriptedCall::response(text_response("first")),
+                ScriptedCall::response(text_response("second")),
+            ],
+            [],
+        )
+        .await;
+        let control = agent.control_handle();
+        assert_eq!(
+            control.queue_follow_up("and then this"),
+            SteeringOutcome::Accepted
+        );
+        assert_eq!(control.snapshot().pending_follow_ups(), 1);
+
+        let outcome = agent.prompt("start").await.expect("the prompt succeeds");
+
+        assert_eq!(outcome.text(), Some("second"));
+        assert_eq!(control.snapshot().pending_follow_ups(), 0);
+        assert!(matches!(
+            agent.history().turns(),
+            [
+                Message::User { .. },
+                Message::Assistant { .. },
+                Message::User { content, .. },
+                Message::Assistant { .. },
+            ] if content == "and then this"
+        ));
+        agent
+            .shutdown(ShutdownReason::Completed)
+            .await
+            .expect("the agent shuts down");
+    }
+
+    // --- Cancelling ---
+
+    #[tokio::test]
+    async fn cancelling_a_prompt_leaves_the_agent_idle_and_reusable() {
+        let mut agent = agent_with(
+            vec![
+                ScriptedCall::response(tool_call_response("slow_tool", "call_1", json!({}))),
+                ScriptedCall::response(text_response("second prompt done")),
+            ],
+            [blocking_tool("slow_tool")],
+        )
+        .await;
+        let control = agent.control_handle();
+        let mut watched = agent.subscribe();
+        let cancel = CancellationToken::new();
+        let canceller = cancel.clone();
+
+        let controller = tokio::spawn(async move {
+            wait_for_event(&mut watched, |event| {
+                matches!(event, CodingEvent::ToolCallStarted { .. })
+            })
+            .await;
+            canceller.cancel();
+        });
+
+        let error = timeout(PATIENCE, agent.prompt_with_cancellation("start", &cancel))
+            .await
+            .expect("cancellation unblocks the tool")
+            .expect_err("the prompt was cancelled");
+        controller.await.expect("the controller finishes");
+
+        assert!(
+            matches!(error, Error::Interrupted(InterruptReason::Cancelled)),
+            "{error:?}"
+        );
+        assert_eq!(agent.state(), CodingAgentState::Idle);
+        assert!(
+            !control.is_closed(),
+            "only shutdown or abort closes the agent"
+        );
+        assert!(!control.is_running());
+        assert!(
+            matches!(
+                agent.history().turns().last(),
+                Some(Message::ToolResults { results, .. })
+                    if results.len() == 1 && results[0].tool_call_id == "call_1"
+            ),
+            "the cancelled call still has its result: {:?}",
+            agent.history().turns()
+        );
+
+        let outcome = timeout(PATIENCE, agent.prompt("again"))
+            .await
+            .expect("the next prompt runs")
+            .expect("the next prompt succeeds");
+        assert_eq!(outcome.text(), Some("second prompt done"));
+        agent
+            .shutdown(ShutdownReason::Completed)
+            .await
+            .expect("the agent shuts down");
+    }
+
+    #[tokio::test]
+    async fn a_closed_agent_refuses_control_input() {
+        let mut agent = agent_with(vec![ScriptedCall::response(text_response("done"))], []).await;
+        let control = agent.control_handle();
+        agent
+            .shutdown(ShutdownReason::Completed)
+            .await
+            .expect("the agent shuts down");
+
+        assert_eq!(control.queue_steering("late"), SteeringOutcome::Closed);
+        assert_eq!(control.steer_now("late"), SteeringOutcome::Closed);
+        assert_eq!(control.queue_follow_up("late"), SteeringOutcome::Closed);
+        assert!(!control.interrupt());
+        assert!(!control.abort());
+        let snapshot = control.snapshot();
+        assert!(snapshot.is_closed());
+        assert_eq!(snapshot.pending_steering(), 0);
     }
 }

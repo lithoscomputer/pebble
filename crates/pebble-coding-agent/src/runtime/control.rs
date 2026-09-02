@@ -47,6 +47,14 @@ impl SteeringItem {
             Self::Steering { text, .. } => text,
         }
     }
+
+    /// The text and author this item carries.
+    #[must_use]
+    pub(crate) fn into_parts(self) -> (String, Option<Actor>) {
+        match self {
+            Self::Steering { text, actor } => (text, actor),
+        }
+    }
 }
 
 /// Coding metadata shared by the control plane and the agent bridge.
@@ -146,6 +154,7 @@ impl SessionControlHandle {
     }
 
     /// Queues guidance for the next round, and wakes a parked session.
+    #[cfg(test)]
     pub(crate) fn steer(&self, text: impl Into<String>, actor: Option<Actor>) {
         self.enqueue(SteeringItem::Steering {
             text: text.into(),
@@ -200,7 +209,6 @@ impl SessionControlHandle {
     /// announced as a generation, not as something somebody said. Where the
     /// author matters, [`interrupt_then_steer`](Self::interrupt_then_steer)
     /// carries it on the steer.
-    #[cfg(test)]
     pub(crate) fn interrupt(&self) {
         {
             let mut control = self.lock();
@@ -214,6 +222,7 @@ impl SessionControlHandle {
     }
 
     /// Abandons the current round and delivers `text` as its replacement.
+    #[cfg(test)]
     pub(crate) fn interrupt_then_steer(&self, text: impl Into<String>, actor: Option<Actor>) {
         self.interrupt_then_enqueue(SteeringItem::Steering {
             text: text.into(),
@@ -237,6 +246,7 @@ impl SessionControlHandle {
     }
 
     /// Queues one item for the next round.
+    #[cfg(test)]
     pub(crate) fn enqueue(&self, item: SteeringItem) {
         let text = item.text().to_owned();
         let was_waiting = {
@@ -255,7 +265,6 @@ impl SessionControlHandle {
     /// Answers with whatever was evicted, so a caller can report what the
     /// session will never see.
     #[must_use]
-    #[cfg(test)]
     pub(crate) fn enqueue_bounded(&self, item: SteeringItem, cap: usize) -> Option<SteeringItem> {
         let text = item.text().to_owned();
         let (evicted, was_waiting) = {
@@ -304,7 +313,6 @@ impl SessionControlHandle {
     /// lock, so the session can never observe the interrupt with the queue
     /// still empty and park when a steer was already on its way.
     #[must_use]
-    #[cfg(test)]
     pub(crate) fn interrupt_then_enqueue_bounded(
         &self,
         item: SteeringItem,
@@ -344,7 +352,6 @@ impl SessionControlHandle {
 
     /// Whether the session is parked waiting for a steer.
     #[must_use]
-    #[cfg(test)]
     pub(crate) fn is_waiting_for_steer(&self) -> bool {
         self.lock().waiting_for_steer
     }
@@ -355,11 +362,11 @@ impl SessionControlHandle {
     /// [`enqueue_bounded`](Self::enqueue_bounded), which decides under the same
     /// lock it counts with.
     #[must_use]
-    #[cfg(test)]
     pub(crate) fn queue_len(&self) -> usize {
         self.lock().queue.len()
     }
 
+    #[cfg(test)]
     fn interrupt_then_enqueue(&self, item: SteeringItem) {
         let text = item.text().to_owned();
         {

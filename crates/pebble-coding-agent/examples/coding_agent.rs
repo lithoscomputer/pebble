@@ -230,7 +230,7 @@ fn steer_once(
             eprintln!("[control] the prompt passed the point this was waiting for");
             return;
         }
-        handle.steer(STEER);
+        handle.steer_now(STEER);
         if !wait_for(&mut events, |event| {
             matches!(event, CodingEvent::SteeringInjected { .. })
         })
@@ -260,7 +260,7 @@ fn interrupt_once(
             eprintln!("[control] the prompt answered before it could be interrupted");
             return;
         }
-        handle.steer(REDIRECT);
+        handle.steer_now(REDIRECT);
     })
 }
 

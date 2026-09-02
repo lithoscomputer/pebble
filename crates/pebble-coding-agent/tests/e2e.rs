@@ -187,7 +187,7 @@ async fn a_steer_sent_while_a_tool_runs_arrives_as_the_next_turn() {
 
     let steering = tokio::spawn(async move {
         reached.notified().await;
-        assert!(control.steer("also write notes.md"));
+        assert!(control.steer_now("also write notes.md").is_accepted());
         release.notify_one();
     });
 
@@ -246,7 +246,11 @@ async fn an_interrupt_abandons_the_round_and_a_steer_resumes_it() {
             matches!(event, CodingEvent::TextDelta { .. })
         })
         .await;
-        assert!(control.steer("never mind — just say DONE"));
+        assert!(
+            control
+                .steer_now("never mind — just say DONE")
+                .is_accepted()
+        );
     });
 
     let outcome = timeout(PATIENCE, session.prompt("describe every file"))

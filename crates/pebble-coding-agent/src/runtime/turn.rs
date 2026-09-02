@@ -76,7 +76,10 @@ pub(super) struct CodingAgentBridge {
     skills_tokens:     u64,
     control_state:     Arc<Mutex<super::control::ControlState>>,
     control_notify:    Arc<Notify>,
-    terminal_cancel:   CancellationToken,
+    /// The token that ends the prompt in progress. A child of the runtime's
+    /// terminal token, so it also fires when the session is shut down, and set
+    /// afresh by [`begin_prompt`](Self::begin_prompt) for every prompt.
+    prompt_cancel:     Arc<Mutex<CancellationToken>>,
     followup_queue:    Arc<Mutex<VecDeque<String>>>,
     subagents:         Option<SubagentSupervisor>,
     skills:            Vec<Skill>,
@@ -127,14 +130,18 @@ impl CodingAgentBridge {
             skills_tokens:     runtime.skills_tokens,
             control_state:     Arc::clone(&runtime.control_state),
             control_notify:    Arc::clone(&runtime.control_notify),
-            terminal_cancel:   runtime.cancel_token.clone(),
+            prompt_cancel:     Arc::new(Mutex::new(runtime.cancel_token.clone())),
             followup_queue:    Arc::clone(&runtime.followup_queue),
             subagents:         runtime.subagents.clone(),
             skills:            runtime.skills.clone(),
         }
     }
 
-    fn begin_prompt(&self) {
+    fn begin_prompt(&self, prompt_cancel: CancellationToken) {
+        *self
+            .prompt_cancel
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = prompt_cancel;
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.totals = PromptTotals::default();
         state.compaction_failed = false;
@@ -158,6 +165,14 @@ impl CodingAgentBridge {
             .tool_env_provider
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(provider);
+    }
+
+    /// The token that ends the prompt in progress.
+    fn prompt_cancel(&self) -> CancellationToken {
+        self.prompt_cancel
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     fn take_boundary_error(&self) -> Option<Error> {
@@ -211,6 +226,7 @@ impl CodingAgentBridge {
     }
 
     async fn wait_for_steer_if_needed(&self, cancel: &CancellationToken) {
+        let prompt_cancel = self.prompt_cancel();
         loop {
             let notified = self.control_notify.notified();
             tokio::pin!(notified);
@@ -226,7 +242,7 @@ impl CodingAgentBridge {
                 return;
             }
             tokio::select! {
-                () = self.terminal_cancel.cancelled() => return,
+                () = prompt_cancel.cancelled() => return,
                 () = cancel.cancelled() => return,
                 () = notified => {}
             }
@@ -656,7 +672,7 @@ impl agent::TurnBoundaryHooks for CodingAgentBridge {
     ) -> StdResult<(), agent::TurnBoundaryError> {
         self.settle_interrupts();
         self.wait_for_steer_if_needed(cancel).await;
-        if cancel.is_cancelled() || self.terminal_cancel.is_cancelled() {
+        if cancel.is_cancelled() || self.prompt_cancel().is_cancelled() {
             return Ok(());
         }
 
@@ -689,6 +705,7 @@ impl agent::TurnBoundaryHooks for CodingAgentBridge {
         // open lease parks the prompt until the last lease drops. Both the
         // check and the park read the shared control state under its lock, so a
         // steer arriving mid-decision is never lost between the two.
+        let prompt_cancel = self.prompt_cancel();
         loop {
             let notified = self.control_notify.notified();
             tokio::pin!(notified);
@@ -704,11 +721,11 @@ impl agent::TurnBoundaryHooks for CodingAgentBridge {
                 }
                 control.steering_leases > 0
             };
-            if !parked || cancel.is_cancelled() || self.terminal_cancel.is_cancelled() {
+            if !parked || cancel.is_cancelled() || prompt_cancel.is_cancelled() {
                 break;
             }
             tokio::select! {
-                () = self.terminal_cancel.cancelled() => break,
+                () = prompt_cancel.cancelled() => break,
                 () = cancel.cancelled() => break,
                 () = notified => {}
             }
@@ -791,10 +808,15 @@ impl agent::ModelService for CodingModelService {
 
 impl CodingRuntime {
     /// Processes one input through the shared generic agent loop.
+    ///
+    /// `prompt_cancel` ends this prompt alone. It is a child of the runtime's
+    /// terminal token, so a shutdown ends the prompt too; the two are told
+    /// apart afterwards, because only the terminal one closes the session.
     pub(super) async fn process_input(
         &mut self,
         input: &str,
         skill_expansion: SkillExpansion,
+        prompt_cancel: &CancellationToken,
     ) -> Result<Option<String>> {
         if self.state == CodingAgentState::Closed {
             return Err(Error::SessionClosed);
@@ -816,7 +838,7 @@ impl CodingRuntime {
             .coding_bridge
             .clone()
             .ok_or_else(|| Error::InvalidState("the coding bridge was not built".to_owned()))?;
-        bridge.begin_prompt();
+        bridge.begin_prompt(prompt_cancel.clone());
         let mut agent = self
             .coding_agent
             .take()
@@ -824,7 +846,7 @@ impl CodingRuntime {
 
         self.install_agent_control(agent.control_handle());
         let result = agent
-            .prompt_with_cancellation(expanded.text, &self.cancel_token)
+            .prompt_with_cancellation(expanded.text, prompt_cancel)
             .await;
         self.clear_agent_control();
         self.coding_agent = Some(agent);
@@ -838,7 +860,7 @@ impl CodingRuntime {
                 let text = outcome.text();
                 Ok((!text.trim().is_empty()).then_some(text))
             }
-            Err(agent::AgentError::Aborted) => Err(self.close_cancelled().await),
+            Err(agent::AgentError::Aborted) => Err(self.prompt_aborted().await),
             Err(agent::AgentError::Model { source }) => Err(self.emit_llm_error(source)),
             Err(error) => {
                 self.check_pump().await?;
