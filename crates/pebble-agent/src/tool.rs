@@ -315,6 +315,11 @@ impl fmt::Debug for ToolRoundContext<'_> {
 /// [`ToolRoundContext::access_for_call`] and call the context's before and
 /// after hooks around every call it executes. The generic agent still commits
 /// the returned results before it observes cancellation.
+///
+/// A round may open with `cancel` already fired: the prompt was ended, or a
+/// turn boundary failed, after the assistant turn was committed. The executor
+/// must then answer every call as cancelled without starting one, because
+/// the paired conversation the agent leaves behind depends on those results.
 #[async_trait]
 pub trait ToolRoundExecutor: Send + Sync {
     /// Executes the round.

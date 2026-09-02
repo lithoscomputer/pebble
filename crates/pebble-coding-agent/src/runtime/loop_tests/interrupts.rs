@@ -796,7 +796,12 @@ async fn a_cancellation_during_compaction_answers_the_tool_call_before_ending_th
 
 /// The same window, reached by the wall clock: the budget runs out while the
 /// summarizing call is in flight.
-#[tokio::test]
+///
+/// The clock is paused, so it advances only when nothing can run: that is
+/// while the prompt waits on the gate, never during the turn that reaches
+/// it. The budget therefore runs out inside the window, however slow the
+/// machine, and the second prompt's fresh budget is never eaten by a wait.
+#[tokio::test(start_paused = true)]
 async fn a_budget_that_runs_out_during_compaction_answers_the_tool_call_before_ending_the_prompt() {
     let (mut session, provider, runs, gate) = compacting_after_a_tool_call(CodingAgentOptions {
         wall_clock_timeout: Some(Duration::from_millis(20)),
@@ -824,7 +829,12 @@ async fn a_budget_that_runs_out_during_compaction_answers_the_tool_call_before_e
         .await
         .expect("the budget ends the prompt")
         .expect_err("the prompt ran out of time");
-    controller.await.expect("the controller finishes");
+    // A controller still waiting on an event it missed fails the test rather
+    // than hanging it.
+    timeout(PATIENCE, controller)
+        .await
+        .expect("the controller saw the summarizing call start")
+        .expect("the controller finishes");
 
     assert!(
         matches!(error, Error::Interrupted(InterruptReason::WallClockTimeout)),
