@@ -148,7 +148,7 @@ Optional seams follow the same rule. Pebble ships no implementation and
 advertises no tool without one: an `extensions::HumanInputProvider` (no
 provider, no question tool), an `extensions::SearchProvider` (no provider, no
 `web_search`), an `extensions::Redactor` for process output, and a
-`subagents::ChildAgentFactory` for subagents.
+`subagents::SubagentOptions` for subagents.
 
 ## The generic agent API
 

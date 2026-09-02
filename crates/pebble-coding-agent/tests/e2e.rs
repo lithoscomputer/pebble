@@ -353,13 +353,13 @@ async fn agent_with(
 
 /// A tool that stops inside a round until the test lets it go.
 fn checkpoint_tool(reached: Arc<Notify>, release: Arc<Notify>) -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(
+        ToolDefinition::function(
             "checkpoint",
             "Waits for the test",
             json!({"type": "object"}),
         ),
-        executor:   Arc::new(move |_arguments, _context| {
+        Arc::new(move |_arguments, _context| {
             let reached = Arc::clone(&reached);
             let release = Arc::clone(&release);
             Box::pin(async move {
@@ -368,8 +368,8 @@ fn checkpoint_tool(reached: Arc<Notify>, release: Arc<Notify>) -> RegisteredTool
                 Ok("ready".to_owned())
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 /// Closes the session and reports every event it published.

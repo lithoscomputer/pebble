@@ -46,13 +46,13 @@ pub fn make_use_skill_tool_for_vocabulary(
     vocabulary: ToolVocabulary,
 ) -> RegisteredTool {
     let (name_parameter, parameters) = arguments_for(vocabulary);
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(
+        ToolDefinition::function(
             NativeTool::UseSkill.canonical_name(),
             USE_SKILL_DESCRIPTION,
             parameters,
         ),
-        executor:   Arc::new(move |args, ctx| {
+        Arc::new(move |args, ctx| {
             let skills = Arc::clone(&skills);
             Box::pin(async move {
                 let name = required_str(&args, name_parameter)?;
@@ -74,8 +74,8 @@ pub fn make_use_skill_tool_for_vocabulary(
                 ))
             })
         }),
-        source:     ToolSource::Skill,
-    }
+    )
+    .with_source(ToolSource::Skill)
 }
 
 /// The argument holding the skill's name, and the schema the model is shown.

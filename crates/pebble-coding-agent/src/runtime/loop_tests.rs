@@ -259,8 +259,8 @@ async fn a_tool_that_fails_still_answers_its_call() {
 
 #[tokio::test]
 async fn arguments_that_miss_the_schema_answer_with_a_validation_error() {
-    let strict = RegisteredTool {
-        definition: ToolDefinition::function(
+    let strict = RegisteredTool::new(
+        ToolDefinition::function(
             "strict_tool",
             "Tool with required params",
             json!({
@@ -269,11 +269,9 @@ async fn arguments_that_miss_the_schema_answer_with_a_validation_error() {
                 "required": ["text"],
             }),
         ),
-        executor:   Arc::new(|_arguments, _context| {
-            Box::pin(async { Ok("should not reach".to_owned()) })
-        }),
-        source:     ToolSource::Native,
-    };
+        Arc::new(|_arguments, _context| Box::pin(async { Ok("should not reach".to_owned()) })),
+    )
+    .with_source(ToolSource::Native);
     let (mut session, _provider) = TestSession::new(vec![
         ScriptedCall::response(tool_call_response("strict_tool", "call_1", json!({}))),
         ScriptedCall::response(text_response("Done")),
@@ -297,8 +295,8 @@ async fn arguments_that_miss_the_schema_answer_with_a_validation_error() {
 
 #[tokio::test]
 async fn arguments_that_match_the_schema_reach_the_tool() {
-    let strict = RegisteredTool {
-        definition: ToolDefinition::function(
+    let strict = RegisteredTool::new(
+        ToolDefinition::function(
             "strict_tool",
             "Tool with required params",
             json!({
@@ -307,11 +305,9 @@ async fn arguments_that_match_the_schema_reach_the_tool() {
                 "required": ["text"],
             }),
         ),
-        executor:   Arc::new(|_arguments, _context| {
-            Box::pin(async { Ok("tool executed".to_owned()) })
-        }),
-        source:     ToolSource::Native,
-    };
+        Arc::new(|_arguments, _context| Box::pin(async { Ok("tool executed".to_owned()) })),
+    )
+    .with_source(ToolSource::Native);
     let (mut session, _provider) = TestSession::new(vec![
         ScriptedCall::response(tool_call_response(
             "strict_tool",
@@ -368,21 +364,17 @@ async fn a_tool_that_ends_the_prompt_still_has_its_result_committed() {
     // interrupt — and learns the session's token once the session exists.
     let token: Arc<OnceLock<CancellationToken>> = Arc::new(OnceLock::new());
     let held = Arc::clone(&token);
-    let stopping = RegisteredTool {
-        definition: ToolDefinition::function(
-            "set_abort",
-            "Ends the prompt",
-            json!({"type": "object"}),
-        ),
-        executor:   Arc::new(move |_arguments, _context| {
+    let stopping = RegisteredTool::new(
+        ToolDefinition::function("set_abort", "Ends the prompt", json!({"type": "object"})),
+        Arc::new(move |_arguments, _context| {
             let held = Arc::clone(&held);
             Box::pin(async move {
                 held.get().expect("the session was built").cancel();
                 Ok("done".to_owned())
             })
         }),
-        source:     ToolSource::Native,
-    };
+    )
+    .with_source(ToolSource::Native);
     let (mut session, _provider) = TestSession::new(vec![
         ScriptedCall::response(tool_call_response("set_abort", "call_1", json!({}))),
         ScriptedCall::response(text_response("Should not reach this")),
@@ -484,20 +476,20 @@ async fn a_prompt_sums_the_cost_of_every_response() {
 
 #[tokio::test]
 async fn a_prompt_reports_where_it_spent_its_time() {
-    let slow_tool = RegisteredTool {
-        definition: ToolDefinition::function(
+    let slow_tool = RegisteredTool::new(
+        ToolDefinition::function(
             "slow_tool",
             "Sleeps before returning",
             json!({"type": "object"}),
         ),
-        executor:   Arc::new(|_arguments, _context| {
+        Arc::new(|_arguments, _context| {
             Box::pin(async {
                 sleep(Duration::from_millis(30)).await;
                 Ok("slept".to_owned())
             })
         }),
-        source:     ToolSource::Native,
-    };
+    )
+    .with_source(ToolSource::Native);
     let (mut session, _provider) = TestSession::new(vec![
         ScriptedCall::response(tool_call_response("slow_tool", "call_1", json!({}))),
         ScriptedCall::response(text_response("Done!")),
@@ -558,13 +550,13 @@ async fn every_tool_round_resolves_the_environment_again() {
 
     let seen = Arc::new(Mutex::new(Vec::new()));
     let recorder = Arc::clone(&seen);
-    let record_env = RegisteredTool {
-        definition: ToolDefinition::function(
+    let record_env = RegisteredTool::new(
+        ToolDefinition::function(
             "record_env",
             "Records resolved env",
             json!({"type": "object"}),
         ),
-        executor:   Arc::new(move |_arguments, context| {
+        Arc::new(move |_arguments, context| {
             let seen = Arc::clone(&recorder);
             Box::pin(async move {
                 let env = context.resolve_tool_env().await?.unwrap_or_default();
@@ -574,8 +566,8 @@ async fn every_tool_round_resolves_the_environment_again() {
                 Ok("recorded".to_owned())
             })
         }),
-        source:     ToolSource::Native,
-    };
+    )
+    .with_source(ToolSource::Native);
 
     let (mut session, _provider) = TestSession::new(vec![
         ScriptedCall::response(tool_call_response("record_env", "call_1", json!({}))),
@@ -802,13 +794,13 @@ impl Counter {
 async fn a_blocking_tool_is_cancelled_rather_than_dropped() {
     let runs = Arc::new(Counter::default());
     let counter = Arc::clone(&runs);
-    let watcher = RegisteredTool {
-        definition: ToolDefinition::function(
+    let watcher = RegisteredTool::new(
+        ToolDefinition::function(
             "watch",
             "Records that it ran, then waits",
             json!({"type": "object"}),
         ),
-        executor:   Arc::new(move |_arguments, context| {
+        Arc::new(move |_arguments, context| {
             let counter = Arc::clone(&counter);
             Box::pin(async move {
                 counter.bump();
@@ -816,8 +808,8 @@ async fn a_blocking_tool_is_cancelled_rather_than_dropped() {
                 Err(ToolError::cancelled("Cancelled"))
             })
         }),
-        source:     ToolSource::Native,
-    };
+    )
+    .with_source(ToolSource::Native);
     let (mut session, _provider) = TestSession::new(vec![ScriptedCall::response(
         tool_call_response("watch", "call_1", json!({})),
     )])

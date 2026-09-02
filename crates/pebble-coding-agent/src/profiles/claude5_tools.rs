@@ -83,8 +83,8 @@ pub(crate) fn make_edit_tool() -> RegisteredTool {
 pub(crate) fn make_bash_tool(options: &NativeToolOptions) -> RegisteredTool {
     let default_timeout_ms = options.default_command_timeout_ms;
     let max_timeout_ms = options.max_command_timeout_ms;
-    RegisteredTool {
-        definition: definition(
+    RegisteredTool::new(
+        definition(
             NativeTool::Shell,
             format!(
                 "Execute a Bash command in a fresh foreground non-login shell. Use this for \
@@ -118,7 +118,7 @@ pub(crate) fn make_bash_tool(options: &NativeToolOptions) -> RegisteredTool {
                 "additionalProperties": false
             }),
         ),
-        executor:   Arc::new(move |arguments, context| {
+        Arc::new(move |arguments, context| {
             Box::pin(async move {
                 let command = required_str(&arguments, "command")?;
                 let timeout_ms = arguments
@@ -129,8 +129,8 @@ pub(crate) fn make_bash_tool(options: &NativeToolOptions) -> RegisteredTool {
                 run_shell_command(&context, command, timeout_ms, None).await
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 /// `WebSearch`, which takes a query and nothing else.
@@ -214,8 +214,8 @@ fn format_agent_result(result: &SubagentResult) -> String {
 /// `Agent`: starts a child, in the background unless told otherwise.
 #[must_use]
 fn make_agent_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
-    RegisteredTool {
-        definition: definition(
+    RegisteredTool::new(
+        definition(
             NativeTool::BackgroundAgent,
             "Launch a child agent for an independent task. Agents run in the background by \
              default and notify the parent when they finish. Set run_in_background to false to \
@@ -240,7 +240,7 @@ fn make_agent_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
                 "additionalProperties": false
             }),
         ),
-        executor:   Arc::new(move |arguments, context| {
+        Arc::new(move |arguments, context| {
             let supervisor = supervisor.clone();
             Box::pin(async move {
                 let description = required_str(&arguments, "description")?;
@@ -271,8 +271,8 @@ fn make_agent_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
                 }
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 /// The value of an optional boolean argument.
@@ -298,8 +298,8 @@ fn optional_u64(arguments: &Value, key: &str, default: u64) -> Result<u64, ToolE
 /// `TaskOutput`: a background agent's status, or its final output.
 #[must_use]
 fn make_task_output_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
-    RegisteredTool {
-        definition: definition(
+    RegisteredTool::new(
+        definition(
             NativeTool::AgentOutput,
             "Get a background agent's current status or wait for its final output. Automatic \
              completion notifications make ordinary polling unnecessary.",
@@ -327,7 +327,7 @@ fn make_task_output_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
                 "additionalProperties": false
             }),
         ),
-        executor:   Arc::new(move |arguments, context| {
+        Arc::new(move |arguments, context| {
             let supervisor = supervisor.clone();
             Box::pin(async move {
                 let task_id = required_str(&arguments, "task_id")?;
@@ -377,15 +377,15 @@ fn make_task_output_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
                 }
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 /// `TaskStop`: closes a background agent.
 #[must_use]
 fn make_task_stop_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
-    RegisteredTool {
-        definition: definition(
+    RegisteredTool::new(
+        definition(
             NativeTool::StopAgent,
             "Stop a running or completed background agent by task ID.",
             json!({
@@ -400,7 +400,7 @@ fn make_task_stop_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
                 "additionalProperties": false
             }),
         ),
-        executor:   Arc::new(move |arguments, _context| {
+        Arc::new(move |arguments, _context| {
             let supervisor = supervisor.clone();
             Box::pin(async move {
                 let task_id = required_str(&arguments, "task_id")?;
@@ -408,15 +408,15 @@ fn make_task_stop_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
                 Ok(format!("Agent {task_id} stopped."))
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 /// `SendMessage`: gives a background agent more to do.
 #[must_use]
 fn make_send_message_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
-    RegisteredTool {
-        definition: definition(
+    RegisteredTool::new(
+        definition(
             NativeTool::MessageAgent,
             "Send additional instructions to a background agent by its task ID. A running agent \
              receives them at a safe turn boundary. A completed agent starts another turn in the \
@@ -442,7 +442,7 @@ fn make_send_message_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
                 "additionalProperties": false
             }),
         ),
-        executor:   Arc::new(move |arguments, _context| {
+        Arc::new(move |arguments, _context| {
             let supervisor = supervisor.clone();
             Box::pin(async move {
                 let recipient = required_str(&arguments, "to")?;
@@ -451,8 +451,8 @@ fn make_send_message_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
                 Ok(format!("Message sent to agent {recipient}."))
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 #[cfg(test)]

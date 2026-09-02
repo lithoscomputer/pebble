@@ -400,15 +400,15 @@ pub(crate) mod tests {
 
     /// A built-in identity that only marks a prompt test's completed registry.
     pub(crate) fn native_marker(tool: NativeTool) -> RegisteredTool {
-        RegisteredTool {
-            definition: ToolDefinition::function(
+        RegisteredTool::new(
+            ToolDefinition::function(
                 tool.canonical_name(),
                 "Prompt capability marker",
                 json!({ "type": "object" }),
             ),
-            executor:   Arc::new(|_arguments, _context| Box::pin(async { Ok(String::new()) })),
-            source:     ToolSource::Native,
-        }
+            Arc::new(|_arguments, _context| Box::pin(async { Ok(String::new()) })),
+        )
+        .with_source(ToolSource::Native)
     }
 
     /// The environment every prompt test renders against, which is also what

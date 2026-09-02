@@ -42,8 +42,7 @@ pub fn make_shell_tool() -> RegisteredTool {
 pub fn make_shell_tool_with_options(options: &NativeToolOptions) -> RegisteredTool {
     let default_timeout = options.default_command_timeout_ms;
     let max_timeout = options.max_command_timeout_ms;
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(ToolDefinition::function(
             NativeTool::Shell.canonical_name(),
             "Execute Bash commands for terminal operations, package managers, tests and builds. \
              Use dedicated tools for file reads, file edits, filename searches, and content \
@@ -57,8 +56,7 @@ pub fn make_shell_tool_with_options(options: &NativeToolOptions) -> RegisteredTo
                 },
                 "required": ["command"]
             }),
-        ),
-        executor:   Arc::new(move |args, ctx| {
+        ), Arc::new(move |args, ctx| {
             Box::pin(async move {
                 let command = required_str(&args, "command")?;
                 let timeout_ms = args
@@ -69,9 +67,7 @@ pub fn make_shell_tool_with_options(options: &NativeToolOptions) -> RegisteredTo
 
                 run_shell_command(&ctx, command, timeout_ms, None).await
             })
-        }),
-        source:     ToolSource::Native,
-    }
+        })).with_source(ToolSource::Native)
 }
 
 /// Runs one command with the session's environment variables and

@@ -104,8 +104,7 @@ impl WebFetchSummarizer {
 /// summary was unavailable.
 #[must_use]
 pub fn make_web_fetch_tool(summarizer: Option<Arc<WebFetchSummarizer>>) -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(ToolDefinition::function(
             NativeTool::WebFetch.canonical_name(),
             "Fetch content from a URL that starts with http:// or https://. Pass a prompt to \
              extract specific information or summarize the page; omit prompt to return the page \
@@ -119,8 +118,7 @@ pub fn make_web_fetch_tool(summarizer: Option<Arc<WebFetchSummarizer>>) -> Regis
                 },
                 "required": ["url"]
             }),
-        ),
-        executor:   Arc::new(move |args, ctx| {
+        ), Arc::new(move |args, ctx| {
             let summarizer = summarizer.clone();
             Box::pin(async move {
                 let url = required_str(&args, "url")?;
@@ -176,9 +174,7 @@ pub fn make_web_fetch_tool(summarizer: Option<Arc<WebFetchSummarizer>>) -> Regis
                     (None, _) => Ok(content),
                 }
             })
-        }),
-        source:     ToolSource::Native,
-    }
+        })).with_source(ToolSource::Native)
 }
 
 /// Cuts a fetched page to what a model is given, saying so when it had to.

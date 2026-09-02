@@ -26,8 +26,7 @@ const MAX_READ_MANY_FILES_CONCURRENCY: usize = 8;
 /// model that names no limit still gets a bounded read.
 #[must_use]
 pub fn make_read_file_tool() -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(ToolDefinition::function(
             NativeTool::ReadFile.canonical_name(),
             "Read files before editing them. Returns line-numbered text and supports offset/limit \
              for large files. Use this instead of shell cat, head, tail, or sed when inspecting \
@@ -41,8 +40,7 @@ pub fn make_read_file_tool() -> RegisteredTool {
                 },
                 "required": ["file_path"]
             }),
-        ),
-        executor:   Arc::new(|args, ctx| {
+        ), Arc::new(|args, ctx| {
             Box::pin(async move {
                 let file_path = required_str(&args, "file_path")?;
                 let offset = optional_usize_arg(&args, "offset")?;
@@ -50,16 +48,14 @@ pub fn make_read_file_tool() -> RegisteredTool {
 
                 Ok(ctx.env.read_file(file_path, offset, limit).await?)
             })
-        }),
-        source:     ToolSource::Native,
-    }
+        })).with_source(ToolSource::Native)
 }
 
 /// Writes a whole file.
 #[must_use]
 pub fn make_write_file_tool() -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(
+        ToolDefinition::function(
             NativeTool::WriteFile.canonical_name(),
             "Create new files, or overwrite an existing file only when replacement is explicitly \
              intended. Prefer edit_file for targeted changes to existing files because write_file \
@@ -73,7 +69,7 @@ pub fn make_write_file_tool() -> RegisteredTool {
                 "required": ["file_path", "content"]
             }),
         ),
-        executor:   Arc::new(|args, ctx| {
+        Arc::new(|args, ctx| {
             Box::pin(async move {
                 let file_path = required_str(&args, "file_path")?;
                 let content = required_str(&args, "content")?;
@@ -82,8 +78,8 @@ pub fn make_write_file_tool() -> RegisteredTool {
                 Ok(format!("Successfully wrote to {file_path}"))
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 /// Replaces one exact string in a file.
@@ -92,8 +88,7 @@ pub fn make_write_file_tool() -> RegisteredTool {
 /// shows, so a match is what the file holds and not what the model was shown.
 #[must_use]
 pub fn make_edit_file_tool() -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(ToolDefinition::function(
             NativeTool::EditFile.canonical_name(),
             "Edit a file by replacing an exact string. The old_string must be an exact match and \
              unique unless replace_all is true; include surrounding context when needed. Read the \
@@ -108,8 +103,7 @@ pub fn make_edit_file_tool() -> RegisteredTool {
                 },
                 "required": ["file_path", "old_string", "new_string"]
             }),
-        ),
-        executor:   Arc::new(|args, ctx| {
+        ), Arc::new(|args, ctx| {
             Box::pin(async move {
                 let file_path = required_str(&args, "file_path")?;
                 let old_string = required_str(&args, "old_string")?;
@@ -144,9 +138,7 @@ pub fn make_edit_file_tool() -> RegisteredTool {
                 ctx.env.write_existing_file(file_path, &new_content).await?;
                 Ok(format!("Successfully edited {file_path}"))
             })
-        }),
-        source:     ToolSource::Native,
-    }
+        })).with_source(ToolSource::Native)
 }
 
 /// Reads several files in one call.
@@ -156,8 +148,8 @@ pub fn make_edit_file_tool() -> RegisteredTool {
 /// nine that exist.
 #[must_use]
 pub fn make_read_many_files_tool() -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(
+        ToolDefinition::function(
             NativeTool::ReadManyFiles.canonical_name(),
             "Read multiple files at once",
             serde_json::json!({
@@ -172,7 +164,7 @@ pub fn make_read_many_files_tool() -> RegisteredTool {
                 "required": ["paths"]
             }),
         ),
-        executor:   Arc::new(|args, ctx| {
+        Arc::new(|args, ctx| {
             Box::pin(async move {
                 let paths = read_many_files_paths(&args)?;
 
@@ -202,8 +194,8 @@ pub fn make_read_many_files_tool() -> RegisteredTool {
                 Ok(output)
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 /// The `paths` argument of `read_many_files`, or the error the model is given

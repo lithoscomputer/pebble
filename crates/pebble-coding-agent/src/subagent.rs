@@ -43,7 +43,8 @@ use std::time::Duration;
 
 use futures_util::future::join_all;
 use lithos_llm::Client;
-use lithos_llm::types::{ReasoningEffort, Speed};
+#[cfg(test)]
+use lithos_llm::types::ReasoningEffort;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::{Instant, timeout_at};
@@ -56,14 +57,18 @@ use crate::environment::Environment;
 use crate::error::{Error, ErrorData, ErrorKind, InterruptReason, Result};
 use crate::event::EventCapacity;
 use crate::profile::AgentProfile;
+#[cfg(test)]
 use crate::record::SessionRecord;
 use crate::redact::Redactor;
 use crate::runtime::{CodingAgentBuildError, CodingRuntime, ShutdownReason};
 use crate::search::SearchProvider;
-use crate::tool::{RegisteredTool, ToolDefinitionWithSource, ToolEnvProvider, ToolError};
+#[cfg(test)]
+use crate::tool::ToolDefinitionWithSource;
+use crate::tool::{RegisteredTool, ToolEnvProvider, ToolError};
+#[cfg(test)]
+use crate::types::PermissionLevel;
 use crate::types::{
-    CodingAgentEvent, CodingAgentState, CodingEvent, INITIAL_SUBAGENT_GENERATION, PermissionLevel,
-    ToolErrorKind,
+    CodingAgentEvent, CodingAgentState, CodingEvent, INITIAL_SUBAGENT_GENERATION, ToolErrorKind,
 };
 
 /// How long a closing child has to stop on its own before it is aborted.
@@ -118,6 +123,72 @@ impl SubagentLimits {
 impl Default for SubagentLimits {
     fn default() -> Self {
         Self::new(DEFAULT_MAX_OPEN_SESSIONS)
+    }
+}
+
+/// Whether an agent may spawn subagents, and how many the tree may hold open.
+///
+/// Pebble builds the children itself, so this is the whole of what an
+/// application decides. The default is enabled with the default limits; give it
+/// to [`CodingAgentBuilder::subagents`](crate::CodingAgentBuilder::subagents)
+/// to turn subagents on.
+///
+/// ```
+/// use pebble_coding_agent::subagents::{SubagentLimits, SubagentOptions};
+///
+/// let options = SubagentOptions::default().with_limits(SubagentLimits::new(3));
+/// assert!(options.is_enabled());
+/// assert_eq!(options.limits().max_open_sessions, 3);
+/// assert!(!SubagentOptions::disabled().is_enabled());
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubagentOptions {
+    enabled: bool,
+    limits:  SubagentLimits,
+}
+
+impl SubagentOptions {
+    /// Subagents on, with the default limits.
+    #[must_use]
+    pub fn enabled() -> Self {
+        Self {
+            enabled: true,
+            limits:  SubagentLimits::default(),
+        }
+    }
+
+    /// Subagents off: no subagent tools are advertised.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            limits:  SubagentLimits::default(),
+        }
+    }
+
+    /// The same options, bounding the tree by `limits`.
+    #[must_use]
+    pub const fn with_limits(mut self, limits: SubagentLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+
+    /// Whether subagents are on.
+    #[must_use]
+    pub const fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// How many sessions the tree may hold open at once.
+    #[must_use]
+    pub const fn limits(&self) -> SubagentLimits {
+        self.limits
+    }
+}
+
+impl Default for SubagentOptions {
+    fn default() -> Self {
+        Self::enabled()
     }
 }
 
@@ -204,25 +275,13 @@ impl Drop for SessionSlot {
 
 /// Builds one child agent from the dependencies Pebble hands it.
 ///
-/// Registering a factory is what turns subagents on:
-/// [`CodingAgentBuilder::subagents`](crate::CodingAgentBuilder::subagents)
-/// registers the profile's subagent tools only when there is one, and an agent
-/// without one answers every spawn with a tool error.
-///
-/// The factory decides whether a child may be built at all and what to do with
-/// the child it returns — record it, install a
-/// completion coordinator. What it cannot do is widen the child: everything a
-/// child needs comes from the spec, which is built from the parent.
-///
-/// ```no_run
-/// use std::sync::Arc;
-///
-/// use pebble_coding_agent::subagents::{ChildAgentFactory, ChildAgentSpec};
-///
-/// let factory: ChildAgentFactory = Arc::new(|spec: ChildAgentSpec| spec.build());
-/// # let _ = factory;
-/// ```
-pub type ChildAgentFactory =
+/// Crate-internal: an application turns subagents on with
+/// [`SubagentOptions`], and pebble installs [`ChildAgentSpec::build`] as the
+/// factory. The crate's own tests install a recording factory to keep hold of
+/// the children a tree builds. What no factory can do is widen the child:
+/// everything a child needs comes from the spec, which is built from the
+/// parent.
+pub(crate) type ChildAgentFactory =
     Arc<dyn Fn(ChildAgentSpec) -> StdResult<ChildAgent, CodingAgentBuildError> + Send + Sync>;
 
 /// A child agent prepared for Pebble's subagent supervisor.
@@ -230,7 +289,7 @@ pub type ChildAgentFactory =
 /// The wrapper exposes only the settings a factory may narrow or coordinate.
 /// Its inherited model, tools, environment, and tree identity cannot be
 /// replaced.
-pub struct ChildAgent {
+pub(crate) struct ChildAgent {
     inner: CodingRuntime,
 }
 
@@ -245,52 +304,49 @@ impl fmt::Debug for ChildAgent {
 
 impl ChildAgent {
     /// The child's stable session identifier.
+    #[cfg(test)]
     #[must_use]
-    pub fn id(&self) -> &str {
+    pub(crate) fn id(&self) -> &str {
         self.inner.id()
     }
 
     /// The root session identifier shared by the subagent tree.
+    #[cfg(test)]
     #[must_use]
-    pub fn root_session_id(&self) -> &str {
+    pub(crate) fn root_session_id(&self) -> &str {
         self.inner.root_session_id()
     }
 
     /// The tools the child will expose after access policy is applied.
+    #[cfg(test)]
     #[must_use]
-    pub fn effective_tools(&self) -> Vec<ToolDefinitionWithSource> {
+    pub(crate) fn effective_tools(&self) -> Vec<ToolDefinitionWithSource> {
         self.inner.effective_tools()
     }
 
     /// The permission level inherited from the parent.
+    #[cfg(test)]
     #[must_use]
-    pub fn permission_level(&self) -> Option<PermissionLevel> {
+    pub(crate) fn permission_level(&self) -> Option<PermissionLevel> {
         self.inner.permission_level()
     }
 
     /// Captures the child's durable state before the supervisor starts it.
+    #[cfg(test)]
     #[must_use]
-    pub fn to_record(&self) -> SessionRecord {
+    pub(crate) fn to_record(&self) -> SessionRecord {
         self.inner.to_record()
     }
 
     /// Sets the reasoning effort used by the child.
-    pub fn set_reasoning_effort(&mut self, effort: Option<ReasoningEffort>) {
+    #[cfg(test)]
+    pub(crate) fn set_reasoning_effort(&mut self, effort: Option<ReasoningEffort>) {
         self.inner.set_reasoning_effort(effort);
     }
 
-    /// Sets the speed tier used by the child.
-    pub fn set_speed(&mut self, speed: Option<Speed>) {
-        self.inner.set_speed(speed);
-    }
-
-    /// Sets where the child's tool environment variables come from.
-    pub fn set_tool_env_provider(&mut self, provider: Arc<dyn ToolEnvProvider>) {
-        self.inner.set_tool_env_provider(provider);
-    }
-
     /// Sets fixed environment variables for the child's tool calls.
-    pub fn set_tool_env(&mut self, env: HashMap<String, String>) {
+    #[cfg(test)]
+    pub(crate) fn set_tool_env(&mut self, env: HashMap<String, String>) {
         self.inner.set_tool_env(env);
     }
 
@@ -317,7 +373,7 @@ impl ChildAgent {
 /// a child receives: inheritance is structural, not a convention a factory is
 /// asked to follow.
 #[must_use = "a spec builds nothing until `build` is called"]
-pub struct ChildAgentSpec {
+pub(crate) struct ChildAgentSpec {
     deps:              Arc<ChildDeps>,
     parent_session_id: String,
     root_session_id:   String,
@@ -338,40 +394,46 @@ impl fmt::Debug for ChildAgentSpec {
 
 impl ChildAgentSpec {
     /// The session that is spawning this child.
+    #[cfg(test)]
     #[must_use]
-    pub fn parent_session_id(&self) -> &str {
+    pub(crate) fn parent_session_id(&self) -> &str {
         &self.parent_session_id
     }
 
     /// The root of the tree this child belongs to, which root-scoped tools —
     /// one shared todo list across a tree of agents — key on.
+    #[cfg(test)]
     #[must_use]
-    pub fn root_session_id(&self) -> &str {
+    pub(crate) fn root_session_id(&self) -> &str {
         &self.root_session_id
     }
 
     /// How deep this child sits below the root, counting the root as zero.
+    #[cfg(test)]
     #[must_use]
-    pub const fn depth(&self) -> usize {
+    pub(crate) const fn depth(&self) -> usize {
         self.depth
     }
 
     /// The model the child will run, as the parent's catalog spells it.
+    #[cfg(test)]
     #[must_use]
-    pub fn model(&self) -> &str {
+    pub(crate) fn model(&self) -> &str {
         &self.deps.model_selector
     }
 
     /// Where the child's tools will act, which is where the parent's do.
+    #[cfg(test)]
     #[must_use]
-    pub fn environment(&self) -> &Arc<dyn Environment> {
+    pub(crate) fn environment(&self) -> &Arc<dyn Environment> {
         &self.deps.environment
     }
 
     /// How the child will behave, which is how the parent does apart from the
     /// memory files and skill directories the root loaded once.
+    #[cfg(test)]
     #[must_use]
-    pub fn options(&self) -> &CodingAgentOptions {
+    pub(crate) fn options(&self) -> &CodingAgentOptions {
         &self.deps.options
     }
 
@@ -390,13 +452,21 @@ impl ChildAgentSpec {
     /// [`CodingAgentBuilder::build`](crate::CodingAgentBuilder::build).
     /// A parent that built successfully normally means its child does too,
     /// because the selector and the harness are the parent's own.
-    pub fn build(self) -> StdResult<ChildAgent, CodingAgentBuildError> {
+    pub(crate) fn build(self) -> StdResult<ChildAgent, CodingAgentBuildError> {
         let deps = Arc::clone(&self.deps);
+        // A child is given a task, not the application's integrations: an
+        // application tool reaches it only when marked inheritable, and a tool
+        // that needs a person never does, because a child has nobody to ask.
+        let inherited = deps
+            .tools
+            .iter()
+            .filter(|tool| tool.is_inheritable())
+            .cloned();
         let mut builder = CodingRuntime::builder(deps.client.clone())
             .model(deps.model_selector.clone())
             .environment(Arc::clone(&deps.environment))
             .with_profile(Arc::clone(&deps.profile))
-            .tools(deps.tools.clone())
+            .tools(inherited)
             .options(deps.options.clone())
             .event_capacity(deps.event_capacity)
             .subagents(Arc::clone(&deps.factory))

@@ -91,13 +91,13 @@ fn nth_child(recorded: &Arc<Mutex<Vec<ChildHandle>>>, index: usize) -> ChildHand
 
 /// A tool that reports whether the call it ran in could have asked a person.
 fn person_probe(seen: Arc<Mutex<Vec<bool>>>) -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(
+        ToolDefinition::function(
             "probe_for_a_person",
             "Reports whether this call could ask a person",
             json!({ "type": "object" }),
         ),
-        executor:   Arc::new(move |_arguments, context| {
+        Arc::new(move |_arguments, context| {
             let seen = Arc::clone(&seen);
             Box::pin(async move {
                 seen.lock()
@@ -106,8 +106,8 @@ fn person_probe(seen: Arc<Mutex<Vec<bool>>>) -> RegisteredTool {
                 Ok("recorded".to_owned())
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 /// A parent whose one round calls `wait` on a child that never finishes.
@@ -801,4 +801,130 @@ async fn a_childs_events_reach_the_parents_durable_stream() {
         (1..=u64::try_from(recorded.len()).expect("a small stream")).collect::<Vec<_>>(),
         "one numbering covers the tree, in the order the pump recorded it"
     );
+}
+
+// --- What a child is given ---
+
+/// An application tool is root-only unless marked, a marked tool that needs a
+/// person is withheld all the same, and the parent's access policy binds the
+/// child: the child can never be shown more than its parent was.
+#[tokio::test]
+async fn a_child_inherits_only_the_tools_marked_for_it_under_its_parents_policy() {
+    use crate::config::{CodingAgentOptions, ToolAccess, ToolAccessPolicy, ToolExposureMode};
+
+    /// Denies the shell to the whole tree.
+    struct NoShell;
+
+    impl ToolAccessPolicy for NoShell {
+        fn access_for_tool(&self, tool_name: &str) -> ToolAccess {
+            if tool_name == "shell" {
+                ToolAccess::Denied
+            } else {
+                ToolAccess::Allowed
+            }
+        }
+    }
+
+    fn application_tool(name: &str) -> RegisteredTool {
+        RegisteredTool::function(
+            name,
+            "an application tool",
+            json!({"type": "object"}),
+            |_context, _arguments| async { Ok("ok".to_owned()) },
+        )
+    }
+
+    let child_tools: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&child_tools);
+    let factory: ChildAgentFactory = Arc::new(move |spec: ChildAgentSpec| {
+        let child = spec.build()?;
+        let mut names: Vec<String> = child
+            .effective_tools()
+            .into_iter()
+            .map(|tool| tool.definition.name)
+            .collect();
+        names.sort();
+        recorder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(names);
+        Ok(child)
+    });
+
+    // Registered on the builder as an application would register them, not
+    // through the test profile, which would make them the harness's own.
+    let (client, _provider) = scripted_client(answers("done"));
+    let mut parent = CodingRuntime::builder(client)
+        .model("test/model")
+        .environment(Arc::new(MockEnvironment::linux()))
+        .tools([
+            application_tool("audit"),
+            application_tool("lint").allow_in_subagents(),
+            application_tool("ask_ops")
+                .allow_in_subagents()
+                .requires_human_input(),
+        ])
+        .options(CodingAgentOptions {
+            tool_access_policy: Some(Arc::new(NoShell)),
+            tool_exposure_mode: ToolExposureMode::IncludeRequiresApproval,
+            ..CodingAgentOptions::default()
+        })
+        .subagents(factory)
+        .build()
+        .expect("the parent builds");
+    parent.initialize().await.expect("initialization succeeds");
+    let supervisor = parent
+        .subagent_supervisor()
+        .expect("the parent can spawn")
+        .clone();
+
+    let agent_id = supervisor
+        .spawn(parent.id(), parent.root_session_id(), "work".to_owned())
+        .expect("the spawn succeeds");
+    supervisor
+        .wait_with_cancel(&agent_id, &CancellationToken::new())
+        .await
+        .expect("the child answers");
+
+    let parent_tools: Vec<String> = parent
+        .effective_tools()
+        .into_iter()
+        .map(|tool| tool.definition.name)
+        .collect();
+    for name in ["audit", "lint", "ask_ops"] {
+        assert!(parent_tools.contains(&name.to_owned()), "{parent_tools:?}");
+    }
+    assert!(
+        !parent_tools.contains(&"shell".to_owned()),
+        "the policy binds the parent too: {parent_tools:?}"
+    );
+
+    let child = child_tools
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .first()
+        .cloned()
+        .expect("one child was built");
+    assert!(child.contains(&"lint".to_owned()), "{child:?}");
+    assert!(
+        !child.contains(&"audit".to_owned()),
+        "an unmarked application tool is root-only: {child:?}"
+    );
+    assert!(
+        !child.contains(&"ask_ops".to_owned()),
+        "a tool that needs a person never reaches a child: {child:?}"
+    );
+    assert!(
+        !child.contains(&"shell".to_owned()),
+        "a child cannot widen its parent's policy: {child:?}"
+    );
+    assert!(
+        child.contains(&"read_file".to_owned()),
+        "built-in tools are inherited: {child:?}"
+    );
+
+    parent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the parent shuts down");
 }

@@ -154,8 +154,8 @@ const CLAUDE5_QUESTION_LIMITS: QuestionLimits = QuestionLimits {
 /// back as JSON keyed by it.
 #[must_use]
 pub fn make_openai_question_tool() -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(
+        ToolDefinition::function(
             NativeTool::RequestUserInput.canonical_name(),
             "Ask the human one or more questions and wait for their answers before continuing \
              this stage.",
@@ -190,7 +190,7 @@ pub fn make_openai_question_tool() -> RegisteredTool {
                 }
             }),
         ),
-        executor:   Arc::new(|args, ctx| {
+        Arc::new(|args, ctx| {
             Box::pin(async move {
                 let parsed: OpenAiQuestionToolArgs = parse_tool_args(args)?;
                 let questions = normalize_openai_questions(parsed)?;
@@ -198,8 +198,9 @@ pub fn make_openai_question_tool() -> RegisteredTool {
                 format_openai_answers(&answers)
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
+    .requires_human_input()
 }
 
 /// Asks a person one or more questions, the way the Anthropic harnesses do.
@@ -208,8 +209,8 @@ pub fn make_openai_question_tool() -> RegisteredTool {
 /// and there is no bound on how many questions or options one call carries.
 #[must_use]
 pub fn make_anthropic_question_tool() -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(
+        ToolDefinition::function(
             NativeTool::AskUserQuestion.canonical_name(),
             "Ask the human one or more questions and wait for their answers before continuing \
              this stage.",
@@ -245,7 +246,7 @@ pub fn make_anthropic_question_tool() -> RegisteredTool {
                 }
             }),
         ),
-        executor:   Arc::new(|args, ctx| {
+        Arc::new(|args, ctx| {
             Box::pin(async move {
                 let parsed: AnthropicQuestionToolArgs = parse_tool_args(args)?;
                 let questions = normalize_anthropic_questions(parsed, &ANTHROPIC_QUESTION_LIMITS)?;
@@ -253,8 +254,9 @@ pub fn make_anthropic_question_tool() -> RegisteredTool {
                 format_anthropic_answers(&answers)
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
+    .requires_human_input()
 }
 
 /// Asks a person one or more questions, the way Claude 5 does.
@@ -266,8 +268,7 @@ pub fn make_anthropic_question_tool() -> RegisteredTool {
 /// enforces all of it rather than trusting the schema to.
 #[must_use]
 pub fn make_claude5_question_tool() -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(ToolDefinition::function(
             NativeTool::AskUserQuestion.canonical_name(),
             "Ask the human up to four questions when a decision is genuinely theirs to make. The \
              UI automatically provides an Other option for custom text.",
@@ -329,17 +330,15 @@ pub fn make_claude5_question_tool() -> RegisteredTool {
                 "required": ["questions"],
                 "additionalProperties": false
             }),
-        ),
-        executor:   Arc::new(|args, ctx| {
+        ), Arc::new(|args, ctx| {
             Box::pin(async move {
                 let parsed: AnthropicQuestionToolArgs = parse_tool_args(args)?;
                 let questions = normalize_anthropic_questions(parsed, &CLAUDE5_QUESTION_LIMITS)?;
                 let answers = ask(ctx, questions).await?;
                 format_anthropic_answers(&answers)
             })
-        }),
-        source:     ToolSource::Native,
-    }
+        })).with_source(ToolSource::Native)
+        .requires_human_input()
 }
 
 /// The arguments as the tool's own wire shape.

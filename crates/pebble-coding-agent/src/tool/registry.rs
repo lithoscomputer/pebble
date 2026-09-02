@@ -254,6 +254,12 @@ pub type ToolExecutor = Arc<
 >;
 
 /// A tool a session can call: what the model is told, and what runs.
+///
+/// Build one with [`function`](Self::function) or [`new`](Self::new), then say
+/// where it came from and how far it reaches. An application tool is root-only
+/// unless [`allow_in_subagents`](Self::allow_in_subagents) says otherwise, and
+/// one that [`requires_human_input`](Self::requires_human_input) never reaches
+/// a child however it is marked, because a child has nobody to ask.
 #[derive(Clone)]
 pub struct RegisteredTool {
     /// What the model is told about the tool. The registry may rename it on
@@ -263,9 +269,29 @@ pub struct RegisteredTool {
     pub executor:   ToolExecutor,
     /// Where the tool came from.
     pub source:     ToolSource,
+    /// Whether a child session may be given this tool.
+    inheritable:    bool,
+    /// Whether the tool parks a prompt on a person's answer.
+    human_input:    bool,
 }
 
 impl RegisteredTool {
+    /// Pairs a definition with what runs, as an application tool.
+    ///
+    /// The tool is root-only until
+    /// [`allow_in_subagents`](Self::allow_in_subagents) says otherwise.
+    /// Name another origin with [`with_source`](Self::with_source).
+    #[must_use]
+    pub fn new(definition: ToolDefinition, executor: ToolExecutor) -> Self {
+        Self {
+            definition,
+            executor,
+            source: ToolSource::Application,
+            inheritable: false,
+            human_input: false,
+        }
+    }
+
     /// Defines an application tool with an asynchronous closure.
     ///
     /// Arguments have already been validated against `input_schema` when the
@@ -281,11 +307,60 @@ impl RegisteredTool {
         F: Fn(ToolContext, Value) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<String, ToolError>> + Send + 'static,
     {
-        Self {
-            definition: ToolDefinition::function(name, description, input_schema),
-            executor:   Arc::new(move |arguments, context| Box::pin(execute(context, arguments))),
-            source:     ToolSource::Application,
+        Self::new(
+            ToolDefinition::function(name, description, input_schema),
+            Arc::new(move |arguments, context| Box::pin(execute(context, arguments))),
+        )
+    }
+
+    /// Names where the tool came from.
+    ///
+    /// A built-in registered as [`Native`](ToolSource::Native) is renamed into
+    /// the session's vocabulary and categorized by the permission table.
+    #[must_use]
+    pub fn with_source(mut self, source: ToolSource) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// Lets a child session be given this tool.
+    ///
+    /// Application tools are root-only by default: a child is given a task,
+    /// not the application's integrations, unless the application says so per
+    /// tool. Pebble's built-in tools are always inheritable. A tool that
+    /// [`requires_human_input`](Self::requires_human_input) is withheld from
+    /// children whatever this says.
+    #[must_use]
+    pub const fn allow_in_subagents(mut self) -> Self {
+        self.inheritable = true;
+        self
+    }
+
+    /// Declares that the tool parks a prompt until a person answers.
+    ///
+    /// A child session has nobody to ask, so such a tool never reaches one.
+    #[must_use]
+    pub const fn requires_human_input(mut self) -> Self {
+        self.human_input = true;
+        self
+    }
+
+    /// Whether a child session may be given this tool.
+    ///
+    /// Built-in tools always may; an application tool only when marked. A tool
+    /// that needs a person is never given to a child.
+    #[must_use]
+    pub fn is_inheritable(&self) -> bool {
+        if self.human_input {
+            return false;
         }
+        self.inheritable || matches!(self.source, ToolSource::Native | ToolSource::Skill)
+    }
+
+    /// Whether the tool parks a prompt on a person's answer.
+    #[must_use]
+    pub const fn needs_human_input(&self) -> bool {
+        self.human_input
     }
 }
 
@@ -552,15 +627,11 @@ mod tests {
     }
 
     fn make_tool(name: &str) -> RegisteredTool {
-        RegisteredTool {
-            definition: ToolDefinition::function(
-                name,
-                format!("Tool {name}"),
-                json!({"type": "object"}),
-            ),
-            executor:   Arc::new(|_args, _ctx| Box::pin(async { Ok("ok".to_owned()) })),
-            source:     ToolSource::Native,
-        }
+        RegisteredTool::new(
+            ToolDefinition::function(name, format!("Tool {name}"), json!({"type": "object"})),
+            Arc::new(|_args, _ctx| Box::pin(async { Ok("ok".to_owned()) })),
+        )
+        .with_source(ToolSource::Native)
     }
 
     fn context() -> ToolContext {
@@ -656,16 +727,20 @@ mod tests {
     #[test]
     fn name_collision_overrides() {
         let mut registry = ToolRegistry::new();
-        registry.register(RegisteredTool {
-            definition: ToolDefinition::function("tool_a", "version 1", json!({})),
-            executor:   Arc::new(|_args, _ctx| Box::pin(async { Ok("v1".to_owned()) })),
-            source:     ToolSource::Native,
-        });
-        registry.register(RegisteredTool {
-            definition: ToolDefinition::function("tool_a", "version 2", json!({})),
-            executor:   Arc::new(|_args, _ctx| Box::pin(async { Ok("v2".to_owned()) })),
-            source:     ToolSource::Native,
-        });
+        registry.register(
+            RegisteredTool::new(
+                ToolDefinition::function("tool_a", "version 1", json!({})),
+                Arc::new(|_args, _ctx| Box::pin(async { Ok("v1".to_owned()) })),
+            )
+            .with_source(ToolSource::Native),
+        );
+        registry.register(
+            RegisteredTool::new(
+                ToolDefinition::function("tool_a", "version 2", json!({})),
+                Arc::new(|_args, _ctx| Box::pin(async { Ok("v2".to_owned()) })),
+            )
+            .with_source(ToolSource::Native),
+        );
 
         let tool = registry.get("tool_a").expect("registered");
         assert_eq!(tool.definition.description, "version 2");
@@ -793,13 +868,15 @@ mod tests {
     #[tokio::test]
     async fn an_executor_reports_a_typed_failure() {
         let mut registry = ToolRegistry::new();
-        registry.register(RegisteredTool {
-            definition: ToolDefinition::function("boom", "Fails", json!({})),
-            executor:   Arc::new(|_args, _ctx| {
-                Box::pin(async { Err(ToolError::invalid_arguments("path is required")) })
-            }),
-            source:     ToolSource::Native,
-        });
+        registry.register(
+            RegisteredTool::new(
+                ToolDefinition::function("boom", "Fails", json!({})),
+                Arc::new(|_args, _ctx| {
+                    Box::pin(async { Err(ToolError::invalid_arguments("path is required")) })
+                }),
+            )
+            .with_source(ToolSource::Native),
+        );
         let tool = registry.get("boom").expect("registered");
 
         let error = (tool.executor)(json!({}), context())

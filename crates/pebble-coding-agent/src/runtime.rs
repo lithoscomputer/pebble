@@ -68,9 +68,10 @@ use crate::tools::{
     WebFetchSummarizer, make_question_tool, make_use_skill_tool_for_vocabulary,
     make_web_search_tool,
 };
+#[cfg(test)]
+use crate::types::PermissionLevel;
 use crate::types::{
-    AgentProfileKind, CodingAgentEvent, CodingAgentState, CodingEvent, PermissionLevel, TokenUsage,
-    rfc3339_millis,
+    AgentProfileKind, CodingAgentEvent, CodingAgentState, CodingEvent, TokenUsage, rfc3339_millis,
 };
 
 /// The catalog metadata namespace pebble reads.
@@ -313,11 +314,10 @@ impl CodingRuntimeBuilder {
     /// this session's event pipeline, so a child's events cannot be lost by an
     /// application that forgot to connect them.
     ///
-    /// Pebble builds the
-    /// [`ChildAgentSpec`](crate::subagents::ChildAgentSpec) each
-    /// call receives from this
-    /// session, so a child inherits the environment, the tools, the access
-    /// policy, and the hooks its parent had, and never a
+    /// Pebble builds the [`ChildAgentSpec`](crate::subagent::ChildAgentSpec)
+    /// each call receives from this session, so a child inherits the
+    /// environment, the inheritable tools, the
+    /// access policy, and the hooks its parent had, and never a
     /// [`HumanInputProvider`]: a child cannot ask a person a question.
     pub(crate) fn subagents(mut self, factory: ChildAgentFactory) -> Self {
         self.subagents = Some(factory);
@@ -1140,6 +1140,7 @@ impl CodingRuntime {
     /// built, by whoever spawned it. Root-scoped tools, forwarded events and
     /// stored records all key on this, so a session that could be re-rooted
     /// afterwards could be detached from the tree that owns it.
+    #[cfg(test)]
     pub(crate) fn root_session_id(&self) -> &str {
         &self.root_session_id
     }
@@ -1167,6 +1168,7 @@ impl CodingRuntime {
     }
 
     /// The permission level the application recorded for this session.
+    #[cfg(test)]
     pub(crate) fn permission_level(&self) -> Option<PermissionLevel> {
         self.config.permission_level
     }
@@ -1357,6 +1359,7 @@ impl CodingRuntime {
     }
 
     /// Changes where a tool call's extra environment variables come from.
+    #[cfg(test)]
     pub(crate) fn set_tool_env_provider(&mut self, provider: Arc<dyn ToolEnvProvider>) {
         self.tool_env_provider = Some(Arc::clone(&provider));
         if let Some(bridge) = &self.coding_bridge {
@@ -1365,6 +1368,7 @@ impl CodingRuntime {
     }
 
     /// Sets fixed extra environment variables for every tool call.
+    #[cfg(test)]
     pub(crate) fn set_tool_env(&mut self, env: HashMap<String, String>) {
         self.set_tool_env_provider(Arc::new(StaticEnvProvider(env)));
     }

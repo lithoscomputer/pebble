@@ -80,8 +80,8 @@ parallel calls in one response so their output stays separate.
 explicitly asked. Never run commands requiring superuser privileges unless explicitly asked."
     );
 
-    RegisteredTool {
-        definition: definition(
+    RegisteredTool::new(
+        definition(
             NativeTool::Shell,
             description,
             json!({
@@ -107,7 +107,7 @@ explicitly asked. Never run commands requiring superuser privileges unless expli
                 "required": ["command"]
             }),
         ),
-        executor:   Arc::new(move |arguments, context| {
+        Arc::new(move |arguments, context| {
             Box::pin(async move {
                 let command = required_str(&arguments, "command")?;
                 let cwd = arguments.get("cwd").and_then(Value::as_str);
@@ -156,15 +156,15 @@ explicitly asked. Never run commands requiring superuser privileges unless expli
                 }
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 /// `Read`, where a negative `line_offset` reads from the end of the file.
 #[must_use]
 pub(crate) fn make_kimi_read_tool() -> RegisteredTool {
-    RegisteredTool {
-        definition: definition(
+    RegisteredTool::new(
+        definition(
             NativeTool::ReadFile,
             "Read a text file from the workspace.
 
@@ -199,7 +199,7 @@ depends on an exact file, API, or output shape, inspect the final result before 
                 "required": ["path"]
             }),
         ),
-        executor:   Arc::new(|arguments, context| {
+        Arc::new(|arguments, context| {
             Box::pin(async move {
                 let path = required_str(&arguments, "path")?;
                 let n_lines =
@@ -249,8 +249,8 @@ depends on an exact file, API, or output shape, inspect the final result before 
                 }
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 /// What Kimi Code's `Write` does with a file that already exists.
@@ -277,8 +277,7 @@ impl KimiWriteMode {
 /// `Write`, with Kimi Code's `mode` so it can append.
 #[must_use]
 pub(crate) fn make_kimi_write_tool() -> RegisteredTool {
-    RegisteredTool {
-        definition: definition(
+    RegisteredTool::new(definition(
             NativeTool::WriteFile,
             "Create, append to, or replace a file entirely.
 
@@ -305,8 +304,7 @@ contents have little continuity with the old contents.
                 },
                 "required": ["path", "content"]
             }),
-        ),
-        executor:   Arc::new(|arguments, context| {
+        ), Arc::new(|arguments, context| {
             Box::pin(async move {
                 let path = required_str(&arguments, "path")?;
                 let content = required_str(&arguments, "content")?;
@@ -333,9 +331,7 @@ contents have little continuity with the old contents.
                 }
                 Ok(format!("Wrote {path}"))
             })
-        }),
-        source:     ToolSource::Native,
-    }
+        })).with_source(ToolSource::Native)
 }
 
 /// `Edit`, whose target is named `path`.
@@ -346,8 +342,8 @@ contents have little continuity with the old contents.
 #[must_use]
 pub(crate) fn make_kimi_edit_tool(description: &str) -> RegisteredTool {
     let shared_executor = make_edit_file_tool().executor;
-    RegisteredTool {
-        definition: definition(
+    RegisteredTool::new(
+        definition(
             NativeTool::EditFile,
             description,
             json!({
@@ -364,7 +360,7 @@ pub(crate) fn make_kimi_edit_tool(description: &str) -> RegisteredTool {
                 "required": ["path", "old_string", "new_string"]
             }),
         ),
-        executor:   Arc::new(move |mut arguments, context| {
+        Arc::new(move |mut arguments, context| {
             let shared_executor = Arc::clone(&shared_executor);
             Box::pin(async move {
                 let object = arguments.as_object_mut().ok_or_else(|| {
@@ -377,8 +373,8 @@ pub(crate) fn make_kimi_edit_tool(description: &str) -> RegisteredTool {
                 shared_executor(arguments, context).await
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 /// The shapes Kimi Code's `Grep` returns its results in.
@@ -414,8 +410,7 @@ impl GrepOutputMode {
 /// advertising a parameter that is ignored is worse than omitting it.
 #[must_use]
 pub(crate) fn make_kimi_grep_tool() -> RegisteredTool {
-    RegisteredTool {
-        definition: definition(
+    RegisteredTool::new(definition(
             NativeTool::Grep,
             "Search file contents with a regular expression.
 
@@ -457,8 +452,7 @@ page through a large result set.
                 },
                 "required": ["pattern"]
             }),
-        ),
-        executor:   Arc::new(|arguments, context| {
+        ), Arc::new(|arguments, context| {
             Box::pin(async move {
                 let pattern = required_str(&arguments, "pattern")?;
                 // The environment requires a search root; "." is the working
@@ -528,9 +522,7 @@ page through a large result set.
                 }
                 Ok(results.join("\n"))
             })
-        }),
-        source:     ToolSource::Native,
-    }
+        })).with_source(ToolSource::Native)
 }
 
 /// The search results, grouped the way `mode` asks for, in the order they were

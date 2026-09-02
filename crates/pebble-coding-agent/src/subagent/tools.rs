@@ -45,8 +45,8 @@ pub(crate) fn tree_position(context: &ToolContext) -> Result<(&str, &str), ToolE
 
 /// Starts a child on a task and answers with its identifier.
 fn spawn_agent_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(
+        ToolDefinition::function(
             NativeTool::SpawnAgent.canonical_name(),
             "Spawn a subagent for independent work or context isolation. Use it for tasks that \
              can proceed separately, and avoid duplicating the same work in the parent session.",
@@ -61,7 +61,7 @@ fn spawn_agent_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
                 "required": ["task"]
             }),
         ),
-        executor:   Arc::new(move |arguments, context| {
+        Arc::new(move |arguments, context| {
             let supervisor = supervisor.clone();
             Box::pin(async move {
                 let task = required_str(&arguments, "task")?;
@@ -69,14 +69,14 @@ fn spawn_agent_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
                 supervisor.spawn(session_id, root_session_id, task.to_owned())
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 /// Gives a child more to do.
 fn send_input_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(
+        ToolDefinition::function(
             NativeTool::SendInput.canonical_name(),
             "Send a follow-up message to a subagent. A running agent receives it at a safe turn \
              boundary. A completed agent starts another turn in the same session with its \
@@ -96,7 +96,7 @@ fn send_input_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
                 "required": ["agent_id", "message"]
             }),
         ),
-        executor:   Arc::new(move |arguments, _context| {
+        Arc::new(move |arguments, _context| {
             let supervisor = supervisor.clone();
             Box::pin(async move {
                 let agent_id = required_str(&arguments, "agent_id")?;
@@ -105,14 +105,14 @@ fn send_input_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
                 Ok(format!("Message sent to agent {agent_id}"))
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 /// Waits for a child's current turn to finish.
 fn wait_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(
+        ToolDefinition::function(
             NativeTool::Wait.canonical_name(),
             "Wait for a subagent to complete, then use the result to synthesize the outcome for \
              the user.",
@@ -127,7 +127,7 @@ fn wait_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
                 "required": ["agent_id"]
             }),
         ),
-        executor:   Arc::new(move |arguments, context| {
+        Arc::new(move |arguments, context| {
             let supervisor = supervisor.clone();
             Box::pin(async move {
                 let agent_id = required_str(&arguments, "agent_id")?;
@@ -143,14 +143,14 @@ fn wait_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
                 ))
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 /// Closes a child that is no longer needed.
 fn close_agent_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(
+        ToolDefinition::function(
             NativeTool::CloseAgent.canonical_name(),
             "Close a running or completed subagent that is no longer needed.",
             json!({
@@ -164,7 +164,7 @@ fn close_agent_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
                 "required": ["agent_id"]
             }),
         ),
-        executor:   Arc::new(move |arguments, _context| {
+        Arc::new(move |arguments, _context| {
             let supervisor = supervisor.clone();
             Box::pin(async move {
                 let agent_id = required_str(&arguments, "agent_id")?;
@@ -172,6 +172,6 @@ fn close_agent_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
                 Ok(format!("Agent {agent_id} closed"))
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }

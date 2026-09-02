@@ -99,8 +99,7 @@ fn make_shell_command_tool(
     let default_timeout_ms = options.default_command_timeout_ms;
     let max_timeout_ms = options.max_command_timeout_ms;
 
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(ToolDefinition::function(
             // The canonical identity; the registry renames it to
             // `shell_command` for the Codex vocabulary.
             NativeTool::Shell.canonical_name(),
@@ -125,8 +124,7 @@ fn make_shell_command_tool(
                 },
                 "required": ["command"]
             }),
-        ),
-        executor:   Arc::new(move |arguments, context| {
+        ), Arc::new(move |arguments, context| {
             Box::pin(async move {
                 let command = required_str(&arguments, "command")?;
                 let workdir = arguments.get("workdir").and_then(Value::as_str);
@@ -138,9 +136,7 @@ fn make_shell_command_tool(
 
                 run_shell_command(&context, command, timeout_ms, workdir).await
             })
-        }),
-        source:     ToolSource::Native,
-    }
+        })).with_source(ToolSource::Native)
 }
 
 impl AgentProfile for Gpt56Profile {

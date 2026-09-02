@@ -92,8 +92,9 @@ impl EnvContext {
 /// instead — so a profile builds them rather than a builder choosing for it.
 ///
 /// It carries the session's place in the tree, and — when the application
-/// configured a [`ChildAgentFactory`](crate::subagents::ChildAgentFactory) —
-/// the supervisor the tools drive. The supervisor is a shared handle, so this
+/// enabled subagents with
+/// [`SubagentOptions`](crate::subagents::SubagentOptions) — the supervisor the
+/// tools drive. The supervisor is a shared handle, so this
 /// type deliberately derives neither `Copy` nor `Eq`: growing it must not have
 /// to remove a derive that callers depend on.
 ///
@@ -394,11 +395,11 @@ mod tests {
     }
 
     fn tool(name: &str) -> RegisteredTool {
-        RegisteredTool {
-            definition: ToolDefinition::function(name, format!("Tool {name}"), json!({})),
-            executor:   Arc::new(|_arguments, _context| Box::pin(async { Ok("ok".to_owned()) })),
-            source:     ToolSource::Native,
-        }
+        RegisteredTool::new(
+            ToolDefinition::function(name, format!("Tool {name}"), json!({})),
+            Arc::new(|_arguments, _context| Box::pin(async { Ok("ok".to_owned()) })),
+        )
+        .with_source(ToolSource::Native)
     }
 
     #[test]

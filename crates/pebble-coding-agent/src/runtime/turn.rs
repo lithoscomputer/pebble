@@ -160,6 +160,7 @@ impl CodingAgentBridge {
         runtime.last_prompt = state.totals;
     }
 
+    #[cfg(test)]
     pub(super) fn set_tool_env_provider(&self, provider: Arc<dyn ToolEnvProvider>) {
         *self
             .tool_env_provider

@@ -341,17 +341,15 @@ async fn a_failed_compaction_neither_stops_the_prompt_nor_repeats() {
 
 #[tokio::test]
 async fn the_summarizing_call_carries_the_prompt_and_the_files() {
-    let read_file = RegisteredTool {
-        definition: ToolDefinition::function(
+    let read_file = RegisteredTool::new(
+        ToolDefinition::function(
             "read_file",
             "Read a file",
             json!({"type": "object", "properties": {"file_path": {"type": "string"}}}),
         ),
-        executor:   Arc::new(|_arguments, _context| {
-            Box::pin(async { Ok("file contents".to_owned()) })
-        }),
-        source:     ToolSource::Native,
-    };
+        Arc::new(|_arguments, _context| Box::pin(async { Ok("file contents".to_owned()) })),
+    )
+    .with_source(ToolSource::Native);
     let (mut session, provider) = TestSession::new(vec![
         ScriptedCall::response(tool_call_response(
             "read_file",

@@ -773,8 +773,8 @@ mod tests {
     }
 
     fn echo_tool() -> RegisteredTool {
-        RegisteredTool {
-            definition: ToolDefinition::function(
+        RegisteredTool::new(
+            ToolDefinition::function(
                 "echo",
                 "Echo input",
                 json!({
@@ -783,32 +783,32 @@ mod tests {
                     "required": ["text"],
                 }),
             ),
-            executor:   Arc::new(|arguments: Value, _context| {
+            Arc::new(|arguments: Value, _context| {
                 Box::pin(async move {
                     let text = arguments["text"].as_str().unwrap_or_default();
                     Ok(format!("echo: {text}"))
                 })
             }),
-            source:     ToolSource::Native,
-        }
+        )
+        .with_source(ToolSource::Native)
     }
 
     fn failing_tool() -> RegisteredTool {
-        RegisteredTool {
-            definition: ToolDefinition::function("fail_tool", "Always fails", json!({})),
-            executor:   Arc::new(|_arguments, _context| {
+        RegisteredTool::new(
+            ToolDefinition::function("fail_tool", "Always fails", json!({})),
+            Arc::new(|_arguments, _context| {
                 Box::pin(async { Err(ToolError::execution("tool failed")) })
             }),
-            source:     ToolSource::Native,
-        }
+        )
+        .with_source(ToolSource::Native)
     }
 
     /// A tool shaped like the shell tool: it reports its subprocess itself,
     /// through the context, before the dispatch layer completes the call.
     fn process_tool(exit_code: i32) -> RegisteredTool {
-        RegisteredTool {
-            definition: ToolDefinition::function("shell", "Runs a command", json!({})),
-            executor:   Arc::new(move |_arguments, context: ToolContext| {
+        RegisteredTool::new(
+            ToolDefinition::function("shell", "Runs a command", json!({})),
+            Arc::new(move |_arguments, context: ToolContext| {
                 Box::pin(async move {
                     context.record_tool_output_stats(OutputCaptureStats::complete(3));
                     context.emit_coding_event(CodingEvent::ToolProcessCompleted {
@@ -828,21 +828,21 @@ mod tests {
                     }
                 })
             }),
-            source:     ToolSource::Native,
-        }
+        )
+        .with_source(ToolSource::Native)
     }
 
     /// The smallest tool that asks a person something: it answers through
     /// whatever provider the context carries, so what is under test here is
     /// the dispatch path rather than any shipped question tool's schema.
     fn question_tool() -> RegisteredTool {
-        RegisteredTool {
-            definition: ToolDefinition::function(
+        RegisteredTool::new(
+            ToolDefinition::function(
                 "request_user_input",
                 "Ask the person a question",
                 json!({"type": "object"}),
             ),
-            executor:   Arc::new(|_arguments, context: ToolContext| {
+            Arc::new(|_arguments, context: ToolContext| {
                 Box::pin(async move {
                     let provider = context
                         .human_input
@@ -870,8 +870,8 @@ mod tests {
                         .join(", "))
                 })
             }),
-            source:     ToolSource::Native,
-        }
+        )
+        .with_source(ToolSource::Native)
     }
 
     struct StubHumanInput;
@@ -1225,21 +1225,17 @@ mod tests {
     async fn a_denied_tool_is_refused_before_it_is_looked_up() {
         let runs = Arc::new(Mutex::new(0_usize));
         let counter = Arc::clone(&runs);
-        let registry = registry_with([RegisteredTool {
-            definition: ToolDefinition::function(
-                "write_file",
-                "Writes a file",
-                json!({"type": "object"}),
-            ),
-            executor:   Arc::new(move |_arguments, _context| {
+        let registry = registry_with([RegisteredTool::new(
+            ToolDefinition::function("write_file", "Writes a file", json!({"type": "object"})),
+            Arc::new(move |_arguments, _context| {
                 let counter = Arc::clone(&counter);
                 Box::pin(async move {
                     *counter.lock().unwrap_or_else(PoisonError::into_inner) += 1;
                     Ok("wrote".to_owned())
                 })
             }),
-            source:     ToolSource::Native,
-        }]);
+        )
+        .with_source(ToolSource::Native)]);
         let environment = environment();
         let config = CodingAgentOptions {
             tool_access_policy: Some(Arc::new(NamedPolicy::new([(
@@ -1281,21 +1277,17 @@ mod tests {
     async fn a_tool_the_exposure_mode_hides_is_refused() {
         let runs = Arc::new(Mutex::new(0_usize));
         let counter = Arc::clone(&runs);
-        let registry = registry_with([RegisteredTool {
-            definition: ToolDefinition::function(
-                "shell",
-                "Runs a command",
-                json!({"type": "object"}),
-            ),
-            executor:   Arc::new(move |_arguments, _context| {
+        let registry = registry_with([RegisteredTool::new(
+            ToolDefinition::function("shell", "Runs a command", json!({"type": "object"})),
+            Arc::new(move |_arguments, _context| {
                 let counter = Arc::clone(&counter);
                 Box::pin(async move {
                     *counter.lock().unwrap_or_else(PoisonError::into_inner) += 1;
                     Ok("ran".to_owned())
                 })
             }),
-            source:     ToolSource::Native,
-        }]);
+        )
+        .with_source(ToolSource::Native)]);
         let environment = environment();
         let config = CodingAgentOptions {
             tool_access_policy: Some(Arc::new(NamedPolicy::new([(
@@ -1674,11 +1666,11 @@ mod tests {
 
     #[tokio::test]
     async fn history_keeps_a_smaller_copy_than_the_events_carried() {
-        let registry = registry_with([RegisteredTool {
-            definition: ToolDefinition::function("shell", "Runs a command", json!({})),
-            executor:   Arc::new(|_arguments, _context| Box::pin(async { Ok("x".repeat(60_000)) })),
-            source:     ToolSource::Native,
-        }]);
+        let registry = registry_with([RegisteredTool::new(
+            ToolDefinition::function("shell", "Runs a command", json!({})),
+            Arc::new(|_arguments, _context| Box::pin(async { Ok("x".repeat(60_000)) })),
+        )
+        .with_source(ToolSource::Native)]);
         let environment = environment();
         let config = CodingAgentOptions::default();
         let events = Events::new();
@@ -1711,13 +1703,13 @@ mod tests {
 
     #[tokio::test]
     async fn truncation_preserves_the_call_id_and_the_error_state() {
-        let registry = registry_with([RegisteredTool {
-            definition: ToolDefinition::function("shell", "Runs a command", json!({})),
-            executor:   Arc::new(|_arguments, _context| {
+        let registry = registry_with([RegisteredTool::new(
+            ToolDefinition::function("shell", "Runs a command", json!({})),
+            Arc::new(|_arguments, _context| {
                 Box::pin(async { Err(ToolError::execution("x".repeat(60_000))) })
             }),
-            source:     ToolSource::Native,
-        }]);
+        )
+        .with_source(ToolSource::Native)]);
         let environment = environment();
         let config = CodingAgentOptions::default();
         let events = Events::new();

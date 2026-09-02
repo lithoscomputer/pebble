@@ -107,8 +107,8 @@ impl ToolHookCallback for HookLog {
 /// A tool that reads a file through the session's environment and reports what
 /// it found, so the round exercises the environment seam as well.
 fn read_tool() -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(
+        ToolDefinition::function(
             "read_file",
             "Read a file",
             json!({
@@ -117,25 +117,25 @@ fn read_tool() -> RegisteredTool {
                 "required": ["path"],
             }),
         ),
-        executor:   Arc::new(|arguments: Value, context: ToolContext| {
+        Arc::new(|arguments: Value, context: ToolContext| {
             Box::pin(async move {
                 let path = arguments["path"].as_str().unwrap_or_default().to_owned();
                 let content = context.env.read_file_text(&path).await?;
                 Ok(content)
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 fn failing_tool() -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function("boom", "Always fails", json!({})),
-        executor:   Arc::new(|_arguments, _context| {
+    RegisteredTool::new(
+        ToolDefinition::function("boom", "Always fails", json!({})),
+        Arc::new(|_arguments, _context| {
             Box::pin(async { Err(ToolError::execution("the tool could not finish")) })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 fn environment() -> Arc<dyn Environment> {
@@ -265,11 +265,13 @@ async fn a_round_runs_its_tools_publishes_their_events_and_calls_the_hooks_in_or
 #[tokio::test]
 async fn output_past_the_session_budget_is_bounded_before_anything_else_sees_it() {
     let mut registry = ToolRegistry::new();
-    registry.register(RegisteredTool {
-        definition: ToolDefinition::function("read_file", "Read a file", json!({})),
-        executor:   Arc::new(|_arguments, _context| Box::pin(async { Ok("x".repeat(80_000)) })),
-        source:     ToolSource::Native,
-    });
+    registry.register(
+        RegisteredTool::new(
+            ToolDefinition::function("read_file", "Read a file", json!({})),
+            Arc::new(|_arguments, _context| Box::pin(async { Ok("x".repeat(80_000)) })),
+        )
+        .with_source(ToolSource::Native),
+    );
     let environment = environment();
     let config = CodingAgentOptions {
         tool_output_retention_bytes: 4_096,

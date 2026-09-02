@@ -26,7 +26,7 @@ use crate::runtime::{
     SteeringLease, WarmState,
 };
 use crate::search::SearchProvider;
-use crate::subagent::{ChildAgentFactory, SubagentLimits};
+use crate::subagent::{ChildAgentSpec, SubagentOptions};
 use crate::tool::{RegisteredTool, ToolEnvProvider};
 use crate::types::{Actor, CodingAgentEvent, CodingAgentState, Message, TokenUsage};
 
@@ -362,15 +362,23 @@ impl CodingAgentBuilder {
         self
     }
 
-    /// Enables coding subagents built by `factory`.
-    pub fn subagents(mut self, factory: ChildAgentFactory) -> Self {
-        self.inner = self.inner.subagents(factory);
-        self
-    }
-
-    /// Sets the open-session limit for the subagent tree.
-    pub fn subagent_limits(mut self, limits: SubagentLimits) -> Self {
-        self.inner = self.inner.subagent_limits(limits);
+    /// Configures the subagents this agent may spawn.
+    ///
+    /// Pebble builds the children itself. A child acts through this agent's
+    /// environment, runs on its model under its tool access policy and hooks,
+    /// forwards its events through this agent's stream, and inherits only the
+    /// application tools marked
+    /// [`allow_in_subagents`](RegisteredTool::allow_in_subagents) — never one
+    /// that [`requires_human_input`](RegisteredTool::requires_human_input).
+    /// Without this call, or with [`SubagentOptions::disabled`], no subagent
+    /// tools are advertised.
+    pub fn subagents(mut self, options: SubagentOptions) -> Self {
+        if options.is_enabled() {
+            self.inner = self
+                .inner
+                .subagents(Arc::new(ChildAgentSpec::build))
+                .subagent_limits(options.limits());
+        }
         self
     }
 
@@ -1070,13 +1078,13 @@ mod tests {
 
     /// A tool that says when it starts and waits for the test to let it finish.
     fn checkpoint_tool(reached: Arc<Notify>, release: Arc<Notify>) -> RegisteredTool {
-        RegisteredTool {
-            definition: ToolDefinition::function(
+        RegisteredTool::new(
+            ToolDefinition::function(
                 "checkpoint",
                 "Waits for the test",
                 json!({"type": "object"}),
             ),
-            executor:   Arc::new(move |_arguments, _context| {
+            Arc::new(move |_arguments, _context| {
                 let reached = Arc::clone(&reached);
                 let release = Arc::clone(&release);
                 Box::pin(async move {
@@ -1085,8 +1093,8 @@ mod tests {
                     Ok("ready".to_owned())
                 })
             }),
-            source:     ToolSource::Native,
-        }
+        )
+        .with_source(ToolSource::Native)
     }
 
     async fn agent_with(

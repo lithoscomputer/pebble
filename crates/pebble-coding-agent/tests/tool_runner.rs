@@ -324,11 +324,11 @@ async fn a_hook_that_blocks_a_call_answers_it_with_the_reason() {
 async fn a_runner_bounds_output_like_a_session() {
     let log = Arc::new(EventLog::default());
     let recorder = Arc::clone(&log);
-    let big = RegisteredTool {
-        definition: ToolDefinition::function("big", "Answers with a lot", json!({})),
-        executor:   Arc::new(|_arguments, _context| Box::pin(async { Ok("x".repeat(80_000)) })),
-        source:     ToolSource::Application,
-    };
+    let big = RegisteredTool::new(
+        ToolDefinition::function("big", "Answers with a lot", json!({})),
+        Arc::new(|_arguments, _context| Box::pin(async { Ok("x".repeat(80_000)) })),
+    )
+    .with_source(ToolSource::Application);
     let runner = ToolRunner::new(
         CodingToolSet::core().with_tool(big),
         mock_environment() as Arc<dyn Environment>,
@@ -373,16 +373,16 @@ async fn a_runner_bounds_output_like_a_session() {
 
 #[tokio::test]
 async fn an_unknown_tool_and_a_cancelled_call_are_both_answered() {
-    let cancelled_tool = RegisteredTool {
-        definition: ToolDefinition::function("waits", "Waits until cancelled", json!({})),
-        executor:   Arc::new(|_arguments, context| {
+    let cancelled_tool = RegisteredTool::new(
+        ToolDefinition::function("waits", "Waits until cancelled", json!({})),
+        Arc::new(|_arguments, context| {
             Box::pin(async move {
                 context.cancel.cancelled().await;
                 Err(ToolError::cancelled("Cancelled"))
             })
         }),
-        source:     ToolSource::Application,
-    };
+    )
+    .with_source(ToolSource::Application);
     let runner = ToolRunner::new(
         CodingToolSet::empty().with_tool(cancelled_tool),
         mock_environment() as Arc<dyn Environment>,

@@ -386,13 +386,13 @@ pub(crate) fn count(events: &[CodingEvent], matcher: impl Fn(&CodingEvent) -> bo
 
 /// A tool that answers with `echo: <text>`.
 pub(crate) fn echo_tool() -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(
+        ToolDefinition::function(
             "echo",
             "Echoes the input",
             json!({"type": "object", "properties": {"text": {"type": "string"}}}),
         ),
-        executor:   Arc::new(|arguments: Value, _context| {
+        Arc::new(|arguments: Value, _context| {
             Box::pin(async move {
                 let text = arguments
                     .get("text")
@@ -401,52 +401,40 @@ pub(crate) fn echo_tool() -> RegisteredTool {
                 Ok(format!("echo: {text}"))
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 /// A tool that always fails.
 pub(crate) fn failing_tool() -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
-            "fail_tool",
-            "Always fails",
-            json!({"type": "object"}),
-        ),
-        executor:   Arc::new(|_arguments, _context| {
+    RegisteredTool::new(
+        ToolDefinition::function("fail_tool", "Always fails", json!({"type": "object"})),
+        Arc::new(|_arguments, _context| {
             Box::pin(async { Err(ToolError::execution("tool execution failed")) })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 /// A tool named `name` that answers `ok`.
 pub(crate) fn noop_tool(name: &str) -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
-            name,
-            format!("Tool {name}"),
-            json!({"type": "object"}),
-        ),
-        executor:   Arc::new(|_arguments, _context| Box::pin(async { Ok("ok".to_owned()) })),
-        source:     ToolSource::Native,
-    }
+    RegisteredTool::new(
+        ToolDefinition::function(name, format!("Tool {name}"), json!({"type": "object"})),
+        Arc::new(|_arguments, _context| Box::pin(async { Ok("ok".to_owned()) })),
+    )
+    .with_source(ToolSource::Native)
 }
 
 /// A tool that waits until the round or the prompt is cancelled.
 pub(crate) fn blocking_tool(name: &'static str) -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
-            name,
-            "Waits until cancelled",
-            json!({"type": "object"}),
-        ),
-        executor:   Arc::new(|_arguments, context| {
+    RegisteredTool::new(
+        ToolDefinition::function(name, "Waits until cancelled", json!({"type": "object"})),
+        Arc::new(|_arguments, context| {
             Box::pin(async move {
                 context.cancel.cancelled().await;
                 Err(ToolError::cancelled("Cancelled"))
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }

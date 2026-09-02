@@ -181,8 +181,8 @@ fn reconcile_replacement_list(
 /// The list is scoped to the calling session, so a child plans its own work.
 #[must_use]
 pub fn make_update_plan_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(
+        ToolDefinition::function(
             NativeTool::UpdatePlan.canonical_name(),
             "Update the multi-step plan for the current task. Submit the entire plan; existing \
              steps are reconciled by exact step text.",
@@ -212,7 +212,7 @@ pub fn make_update_plan_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
                 "required": ["plan"]
             }),
         ),
-        executor:   Arc::new(move |args, ctx| {
+        Arc::new(move |args, ctx| {
             let runtime = Arc::clone(&runtime);
             Box::pin(async move {
                 let list_id = session_todo_scope(&ctx, TodoListKind::OpenAiPlan, "update_plan")?;
@@ -256,8 +256,8 @@ pub fn make_update_plan_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
                 Ok("Plan updated".to_owned())
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 /// One status as Kimi Code spells it.
@@ -310,8 +310,7 @@ fn render_kimi_todos<'a>(items: impl IntoIterator<Item = (TodoStatus, &'a str)>)
 /// everything that did not change.
 #[must_use]
 pub fn make_todo_list_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(ToolDefinition::function(
             NativeTool::TodoList.canonical_name(),
             "Maintain a structured TODO list for the current task. Use it proactively for \
              multi-step work. Pass `todos` to replace the entire list, omit `todos` to read the \
@@ -342,8 +341,7 @@ pub fn make_todo_list_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
                     }
                 }
             }),
-        ),
-        executor:   Arc::new(move |args, ctx| {
+        ), Arc::new(move |args, ctx| {
             let runtime = Arc::clone(&runtime);
             Box::pin(async move {
                 let list_id = session_todo_scope(&ctx, TodoListKind::KimiTodos, "TodoList")?;
@@ -400,9 +398,7 @@ pub fn make_todo_list_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
                         .map(|todo| (todo.status, todo.subject.as_str())),
                 ))
             })
-        }),
-        source:     ToolSource::Native,
-    }
+        })).with_source(ToolSource::Native)
 }
 
 /// One optional string argument, or `None` when it is absent or not a string.
@@ -464,8 +460,8 @@ fn format_task_details(todo: &TodoProjection) -> String {
 /// Creates one task in the session tree's shared list.
 #[must_use]
 pub fn make_task_create_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(
+        ToolDefinition::function(
             NativeTool::TaskCreate.canonical_name(),
             TASK_CREATE_DESCRIPTION,
             serde_json::json!({
@@ -479,7 +475,7 @@ pub fn make_task_create_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
                 "required": ["subject", "description"]
             }),
         ),
-        executor:   Arc::new(move |args, ctx| {
+        Arc::new(move |args, ctx| {
             let runtime = Arc::clone(&runtime);
             Box::pin(async move {
                 let list_id = anthropic_task_scope(&ctx)?;
@@ -499,8 +495,8 @@ pub fn make_task_create_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
                 Ok(format!("Task #{task_id} created successfully: {subject}"))
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 /// Changes one task.
@@ -510,8 +506,8 @@ pub fn make_task_create_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
 /// owner without knowing what it was.
 #[must_use]
 pub fn make_task_update_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(
+        ToolDefinition::function(
             NativeTool::TaskUpdate.canonical_name(),
             TASK_UPDATE_DESCRIPTION,
             serde_json::json!({
@@ -533,7 +529,7 @@ pub fn make_task_update_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
                 "required": ["taskId"]
             }),
         ),
-        executor:   Arc::new(move |args, ctx| {
+        Arc::new(move |args, ctx| {
             let runtime = Arc::clone(&runtime);
             Box::pin(async move {
                 let list_id = anthropic_task_scope(&ctx)?;
@@ -571,15 +567,15 @@ pub fn make_task_update_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
                 }
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 /// Reads one task in full.
 #[must_use]
 pub fn make_task_get_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(
+        ToolDefinition::function(
             NativeTool::TaskGet.canonical_name(),
             TASK_GET_DESCRIPTION,
             serde_json::json!({
@@ -590,7 +586,7 @@ pub fn make_task_get_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
                 "required": ["taskId"]
             }),
         ),
-        executor:   Arc::new(move |args, ctx| {
+        Arc::new(move |args, ctx| {
             let runtime = Arc::clone(&runtime);
             Box::pin(async move {
                 let list_id = anthropic_task_scope(&ctx)?;
@@ -606,15 +602,15 @@ pub fn make_task_get_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
                 Ok(format_task_details(todo))
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 /// Lists the session tree's tasks, one to a line.
 #[must_use]
 pub fn make_task_list_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(
+        ToolDefinition::function(
             NativeTool::TaskList.canonical_name(),
             TASK_LIST_DESCRIPTION,
             serde_json::json!({
@@ -623,7 +619,7 @@ pub fn make_task_list_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
                 "additionalProperties": false
             }),
         ),
-        executor:   Arc::new(move |_args, ctx| {
+        Arc::new(move |_args, ctx| {
             let runtime = Arc::clone(&runtime);
             Box::pin(async move {
                 let list_id = anthropic_task_scope(&ctx)?;
@@ -666,8 +662,8 @@ pub fn make_task_list_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
                 Ok(out.trim_end().to_owned())
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 #[cfg(test)]

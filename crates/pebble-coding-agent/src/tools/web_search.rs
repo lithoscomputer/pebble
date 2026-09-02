@@ -24,8 +24,7 @@ const MAX_RESULTS: u32 = 20;
 /// on the other.
 #[must_use]
 pub fn make_web_search_tool(provider: Arc<dyn SearchProvider>) -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(ToolDefinition::function(
             NativeTool::WebSearch.canonical_name(),
             "Search the web when current external information is needed. Returns result titles, \
              URLs, and descriptions; use web_fetch for a specific URL.",
@@ -37,8 +36,7 @@ pub fn make_web_search_tool(provider: Arc<dyn SearchProvider>) -> RegisteredTool
                 },
                 "required": ["query"]
             }),
-        ),
-        executor:   Arc::new(move |args, _ctx| {
+        ), Arc::new(move |args, _ctx| {
             let provider = Arc::clone(&provider);
             Box::pin(async move {
                 let query = required_str(&args, "query")?.to_owned();
@@ -47,9 +45,7 @@ pub fn make_web_search_tool(provider: Arc<dyn SearchProvider>) -> RegisteredTool
                 let results = provider.search(request).await?;
                 Ok(format_results(&results))
             })
-        }),
-        source:     ToolSource::Native,
-    }
+        })).with_source(ToolSource::Native)
 }
 
 /// How many results this call asked for, bounded.

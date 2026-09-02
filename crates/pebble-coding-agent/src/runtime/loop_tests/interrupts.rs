@@ -502,15 +502,11 @@ async fn a_tool_that_ignores_its_cancellation_holds_the_round_open() {
     // made rather than dropping it, which is what keeps every call paired with
     // a result. The cost is pinned here: a tool that never watches its token
     // holds the round, and the prompt ending it, open until it returns.
-    let stubborn = RegisteredTool {
-        definition: ToolDefinition::function(
-            "stubborn",
-            "Never answers",
-            json!({"type": "object"}),
-        ),
-        executor:   Arc::new(|_arguments, _context| Box::pin(pending())),
-        source:     ToolSource::Native,
-    };
+    let stubborn = RegisteredTool::new(
+        ToolDefinition::function("stubborn", "Never answers", json!({"type": "object"})),
+        Arc::new(|_arguments, _context| Box::pin(pending())),
+    )
+    .with_source(ToolSource::Native);
     let (mut session, _provider) = TestSession::new(vec![
         ScriptedCall::response(tool_call_response("stubborn", "call_1", json!({}))),
         ScriptedCall::response(text_response("done")),
@@ -891,9 +887,9 @@ async fn a_tool_that_ends_the_round_is_still_answered_before_the_next_one() {
     // result and goes round again rather than dropping the call.
     let started = Arc::new(Counter::default());
     let counter = Arc::clone(&started);
-    let watcher = RegisteredTool {
-        definition: ToolDefinition::function("watch", "Waits", json!({"type": "object"})),
-        executor:   Arc::new(move |_arguments, context| {
+    let watcher = RegisteredTool::new(
+        ToolDefinition::function("watch", "Waits", json!({"type": "object"})),
+        Arc::new(move |_arguments, context| {
             let counter = Arc::clone(&counter);
             Box::pin(async move {
                 counter.bump();
@@ -901,8 +897,8 @@ async fn a_tool_that_ends_the_round_is_still_answered_before_the_next_one() {
                 Err(ToolError::cancelled("Cancelled"))
             })
         }),
-        source:     ToolSource::Native,
-    };
+    )
+    .with_source(ToolSource::Native);
     let (mut session, _provider) = TestSession::new(vec![
         ScriptedCall::response(tool_call_response("watch", "call_1", json!({}))),
         ScriptedCall::response(text_response("after the interrupt")),

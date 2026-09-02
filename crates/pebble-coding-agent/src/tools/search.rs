@@ -14,8 +14,7 @@ use crate::types::ToolSource;
 /// Searches file contents for a regular expression.
 #[must_use]
 pub fn make_grep_tool() -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(ToolDefinition::function(
             NativeTool::Grep.canonical_name(),
             "Search file contents with a regex pattern. Use path to choose the search root, \
              glob_filter to limit matching files, case_insensitive for case folding, and \
@@ -31,8 +30,7 @@ pub fn make_grep_tool() -> RegisteredTool {
                 },
                 "required": ["pattern"]
             }),
-        ),
-        executor:   Arc::new(|args, ctx| {
+        ), Arc::new(|args, ctx| {
             Box::pin(async move {
                 let pattern = required_str(&args, "pattern")?;
                 let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
@@ -51,9 +49,7 @@ pub fn make_grep_tool() -> RegisteredTool {
                 let results = execute_grep(&ctx, pattern, path, &options).await?;
                 Ok(results.join("\n"))
             })
-        }),
-        source:     ToolSource::Native,
-    }
+        })).with_source(ToolSource::Native)
 }
 
 /// Runs one content search.
@@ -109,8 +105,7 @@ pub fn grep_result_path<'a>(line: &'a str, searched: &'a str) -> &'a str {
 /// Finds files by name.
 #[must_use]
 pub fn make_glob_tool() -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(ToolDefinition::function(
             NativeTool::Glob.canonical_name(),
             "Find files by search-root-relative path using a glob pattern. Use path to choose the \
              search root. `*` stays within one path segment and `**` searches recursively. Prefer \
@@ -123,8 +118,7 @@ pub fn make_glob_tool() -> RegisteredTool {
                 },
                 "required": ["pattern"]
             }),
-        ),
-        executor:   Arc::new(|args, ctx| {
+        ), Arc::new(|args, ctx| {
             Box::pin(async move {
                 let pattern = required_str(&args, "pattern")?;
                 let path = args.get("path").and_then(Value::as_str);
@@ -132,16 +126,14 @@ pub fn make_glob_tool() -> RegisteredTool {
                 let results = ctx.env.glob(pattern, path).await?;
                 Ok(results.join("\n"))
             })
-        }),
-        source:     ToolSource::Native,
-    }
+        })).with_source(ToolSource::Native)
 }
 
 /// Lists a directory.
 #[must_use]
 pub fn make_list_dir_tool() -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::function(
+    RegisteredTool::new(
+        ToolDefinition::function(
             NativeTool::ListDir.canonical_name(),
             "List directory contents with depth control",
             serde_json::json!({
@@ -153,7 +145,7 @@ pub fn make_list_dir_tool() -> RegisteredTool {
                 "required": ["path"]
             }),
         ),
-        executor:   Arc::new(|args, ctx| {
+        Arc::new(|args, ctx| {
             Box::pin(async move {
                 let path = required_str(&args, "path")?;
                 let depth = optional_usize_arg(&args, "depth")?;
@@ -172,8 +164,8 @@ pub fn make_list_dir_tool() -> RegisteredTool {
                 Ok(lines.join("\n"))
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 #[cfg(test)]

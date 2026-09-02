@@ -594,8 +594,8 @@ fn format_summary(added: &[String], modified: &[String], deleted: &[String]) -> 
 /// constrain output is given.
 #[must_use]
 pub fn make_apply_patch_tool() -> RegisteredTool {
-    RegisteredTool {
-        definition: ToolDefinition::custom(
+    RegisteredTool::new(
+        ToolDefinition::custom(
             NativeTool::ApplyPatch.canonical_name(),
             "Use the `apply_patch` tool to edit files. This is a FREEFORM tool, so do not wrap \
              the patch in JSON.",
@@ -605,7 +605,7 @@ pub fn make_apply_patch_tool() -> RegisteredTool {
                 "definition": apply_patch_lark_grammar_definition(),
             }),
         ),
-        executor:   Arc::new(|args, ctx| {
+        Arc::new(|args, ctx| {
             Box::pin(async move {
                 let patch_text = args.as_str().ok_or_else(|| {
                     ToolError::invalid_arguments("apply_patch expects raw patch text")
@@ -615,8 +615,8 @@ pub fn make_apply_patch_tool() -> RegisteredTool {
                 apply_patch_operations(&ops, ctx.env.as_ref()).await
             })
         }),
-        source:     ToolSource::Native,
-    }
+    )
+    .with_source(ToolSource::Native)
 }
 
 #[cfg(test)]
