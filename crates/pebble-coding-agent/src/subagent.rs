@@ -1348,6 +1348,50 @@ impl SubagentSupervisor {
         }
     }
 
+    /// Waits for every child that has not finished, in spawn order, and
+    /// answers with each child's result beside its id.
+    ///
+    /// A child that already finished is included with its cached result, so
+    /// the caller sees the whole tree once rather than only what was still
+    /// running. Children that are closed are left out: a closed agent has no
+    /// result to report and the model was told so when it closed it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ToolError::cancelled`] when `cancel` fires. A child's own
+    /// failure is not an error here: it is reported in that child's entry.
+    pub(crate) async fn wait_all_with_cancel(
+        &self,
+        cancel: &CancellationToken,
+    ) -> StdResult<Vec<(String, StdResult<SubagentResult, ToolError>)>, ToolError> {
+        let mut ids: Vec<(u64, String)> = {
+            let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state
+                .agents
+                .iter()
+                .filter(|(_, agent)| {
+                    !matches!(
+                        *agent.status.borrow(),
+                        SubagentStatus::Closing | SubagentStatus::Closed
+                    )
+                })
+                .map(|(id, agent)| (agent.spawn_seq, id.clone()))
+                .collect()
+        };
+        ids.sort();
+        let mut results = Vec::with_capacity(ids.len());
+        for (_, agent_id) in ids {
+            let result = self.wait_with_cancel(&agent_id, cancel).await;
+            if let Err(error) = &result
+                && error.kind() == ToolErrorKind::Cancelled
+            {
+                return Err(result.expect_err("checked above"));
+            }
+            results.push((agent_id, result));
+        }
+        Ok(results)
+    }
+
     /// Stops automatic delivery for an agent whose result the parent retrieved
     /// explicitly.
     ///
@@ -3385,7 +3429,10 @@ mod tests {
         assert!(send["properties"]["message"].is_object());
 
         let wait = schema_of(&tool_named(&tools, "wait"));
-        assert_eq!(wait["required"], json!(["agent_id"]));
+        assert!(
+            wait.get("required").is_none(),
+            "a wait with no id waits for every child"
+        );
         assert!(wait["properties"]["agent_id"].is_object());
 
         let close = schema_of(&tool_named(&tools, "close_agent"));
@@ -3440,12 +3487,57 @@ mod tests {
         let tools = subagent_tools(&supervisor);
         let context = ToolContext::new(Arc::new(MockEnvironment::linux()));
 
-        let error = (tool_named(&tools, "wait").executor)(json!({}), context)
-            .await
-            .expect_err("the call names no agent");
+        let error = (tool_named(&tools, "send_input").executor)(
+            json!({"message": "no recipient"}),
+            context,
+        )
+        .await
+        .expect_err("the call names no agent");
 
         assert_eq!(error.kind(), ToolErrorKind::InvalidArguments);
         assert_eq!(error.message(), "Missing required parameter: agent_id");
+    }
+
+    #[tokio::test]
+    async fn waiting_without_an_id_waits_for_every_child() {
+        let (parent, supervisor) = parent_over(vec!["first done", "second done"]);
+        let first = spawn(&supervisor, &parent, "first task");
+        let second = spawn(&supervisor, &parent, "second task");
+        let tools = subagent_tools(&supervisor);
+        let context = ToolContext::new(Arc::new(MockEnvironment::linux()));
+
+        let output = (tool_named(&tools, "wait").executor)(json!({}), context)
+            .await
+            .expect("both children answer");
+
+        let first_at = output
+            .find(&format!("Agent {first}:"))
+            .expect("first is reported");
+        let second_at = output
+            .find(&format!("Agent {second}:"))
+            .expect("second is reported");
+        assert!(
+            first_at < second_at,
+            "children report in spawn order:\n{output}"
+        );
+        assert!(
+            output.contains("first done") && output.contains("second done"),
+            "{output}"
+        );
+        supervisor.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    async fn waiting_without_an_id_and_without_children_says_so() {
+        let (_parent, supervisor) = parent_over(vec!["unused"]);
+        let tools = subagent_tools(&supervisor);
+        let context = ToolContext::new(Arc::new(MockEnvironment::linux()));
+
+        let output = (tool_named(&tools, "wait").executor)(json!({}), context)
+            .await
+            .expect("an empty tree is not an error");
+
+        assert_eq!(output, "No subagents are running.");
     }
 
     #[tokio::test]

@@ -109,42 +109,71 @@ fn send_input_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
     .with_source(ToolSource::Native)
 }
 
-/// Waits for a child's current turn to finish.
+/// Waits for a child's current turn to finish, or for every child's.
 fn wait_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
     RegisteredTool::new(
         ToolDefinition::function(
             NativeTool::Wait.canonical_name(),
             "Wait for a subagent to complete, then use the result to synthesize the outcome for \
-             the user.",
+             the user. Omit agent_id to wait for every running subagent at once.",
             json!({
                 "type": "object",
                 "properties": {
                     "agent_id": {
                         "type": "string",
-                        "description": "The ID of the agent to wait for"
+                        "description": "The ID of the agent to wait for. When omitted, waits for \
+                                        every subagent and reports each one."
                     }
-                },
-                "required": ["agent_id"]
+                }
             }),
         ),
         Arc::new(move |arguments, context| {
             let supervisor = supervisor.clone();
             Box::pin(async move {
-                let agent_id = required_str(&arguments, "agent_id")?;
                 // The context's token is the composite one: an interrupted
                 // turn and an ended prompt both reach the wait, and both close
                 // the child on their way out.
-                let result = supervisor
-                    .wait_with_cancel(agent_id, &context.cancel)
-                    .await?;
-                Ok(format!(
-                    "Agent completed (success: {}, turns: {})\n\n{}",
-                    result.success, result.turns_used, result.output
-                ))
+                let agent_id = arguments
+                    .get("agent_id")
+                    .filter(|value| !value.is_null())
+                    .map(|value| {
+                        value.as_str().ok_or_else(|| {
+                            ToolError::invalid_arguments("agent_id must be a string")
+                        })
+                    })
+                    .transpose()?;
+                if let Some(agent_id) = agent_id {
+                    let result = supervisor
+                        .wait_with_cancel(agent_id, &context.cancel)
+                        .await?;
+                    return Ok(format_wait_result(&result));
+                }
+                let results = supervisor.wait_all_with_cancel(&context.cancel).await?;
+                if results.is_empty() {
+                    return Ok("No subagents are running.".to_owned());
+                }
+                Ok(results
+                    .iter()
+                    .map(|(agent_id, result)| match result {
+                        Ok(result) => {
+                            format!("Agent {agent_id}: {}", format_wait_result(result))
+                        }
+                        Err(error) => format!("Agent {agent_id}: failed: {}", error.message()),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n\n"))
             })
         }),
     )
     .with_source(ToolSource::Native)
+}
+
+/// How a finished child's turn reads to the parent.
+fn format_wait_result(result: &super::SubagentResult) -> String {
+    format!(
+        "Agent completed (success: {}, turns: {})\n\n{}",
+        result.success, result.turns_used, result.output
+    )
 }
 
 /// Closes a child that is no longer needed.

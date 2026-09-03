@@ -484,8 +484,11 @@ impl Environment for LocalEnvironment {
             .ripgrep_available
             .get_or_init(|| binary_path_on_path("rg").is_some());
 
+        // The workspace's own ignore files apply; ignore files above the
+        // working directory do not, or a parent's rules could hide the
+        // model's files from it. `grep` has no ignore rules to begin with.
         let (binary, mut arguments) = if use_ripgrep {
-            ("rg", vec!["-n".to_owned()])
+            ("rg", vec!["-n".to_owned(), "--no-ignore-parent".to_owned()])
         } else {
             ("grep", vec!["-rn".to_owned()])
         };
@@ -1791,6 +1794,26 @@ mod tests {
 
             assert_eq!(matches.len(), 1);
             assert!(matches[0].contains("println"), "{:?}", matches[0]);
+        }
+
+        /// An ignore file above the working directory must not hide the
+        /// model's own files. A sandboxed workspace often sits under a
+        /// directory that a build tool or a test harness ignores wholesale.
+        #[tokio::test]
+        async fn grep_ignores_parent_ignore_files() {
+            let parent = TempDir::new("local-env");
+            parent.write(".gitignore", "*\n");
+            let workspace = parent.path().join("workspace");
+            sync_fs::create_dir_all(&workspace).expect("the workspace is created");
+            sync_fs::write(workspace.join("main.rs"), "// TODO: later\n")
+                .expect("the file is written");
+
+            let matches = LocalEnvironment::new(&workspace)
+                .grep("TODO", ".", &GrepOptions::default())
+                .await
+                .expect("the search runs");
+
+            assert_eq!(matches.len(), 1, "{matches:?}");
         }
 
         #[tokio::test]
