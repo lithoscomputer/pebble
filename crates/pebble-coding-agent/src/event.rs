@@ -695,41 +695,7 @@ impl EventPump {
 }
 
 /// Byte counts for the output one tool call produced.
-///
-/// A tool observes every byte, retains what the output budget allows, and
-/// omits the rest; the three counters land on
-/// [`CodingEvent::ToolCallCompleted`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct OutputCaptureStats {
-    /// Bytes the tool produced.
-    pub observed_bytes: usize,
-    /// Bytes kept for the model and for history.
-    pub retained_bytes: usize,
-    /// Bytes the budget dropped.
-    pub omitted_bytes:  usize,
-}
-
-impl OutputCaptureStats {
-    /// Counts output that was kept whole.
-    #[must_use]
-    pub const fn complete(byte_count: usize) -> Self {
-        Self {
-            observed_bytes: byte_count,
-            retained_bytes: byte_count,
-            omitted_bytes:  0,
-        }
-    }
-
-    /// Sums two captures, as when a process reports stdout and stderr apart.
-    #[must_use]
-    pub const fn combine(self, other: Self) -> Self {
-        Self {
-            observed_bytes: self.observed_bytes.saturating_add(other.observed_bytes),
-            retained_bytes: self.retained_bytes.saturating_add(other.retained_bytes),
-            omitted_bytes:  self.omitted_bytes.saturating_add(other.omitted_bytes),
-        }
-    }
-}
+pub use pebble_agent::ToolOutputStats as OutputCaptureStats;
 
 /// A session- and tool-bound view of an [`Emitter`], handed to a running tool.
 ///

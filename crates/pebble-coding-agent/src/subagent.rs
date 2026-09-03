@@ -1130,7 +1130,7 @@ impl SubagentSupervisor {
         slot: SessionSlot,
     ) -> String {
         let agent_id = format!("{:08x}", uuid::Uuid::new_v4().as_fields().0);
-        let control = session.agent_control_handle();
+        let control = session.control_handle();
         let cancel_token = session.cancel_token();
 
         let (start_tx, start_rx) = oneshot::channel();

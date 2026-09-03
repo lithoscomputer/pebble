@@ -310,19 +310,20 @@ mod tests {
     }
 
     fn request(descriptor: ToolDescriptor) -> ToolCallRequest {
-        ToolCallRequest::new(
-            0,
-            ToolCall {
-                id:                "call_1".to_owned(),
-                name:              "shell".to_owned(),
-                arguments:         json!({"command": "cargo test"}),
-                kind:              ToolCallKind::Function,
-                raw_arguments:     None,
-                provider_metadata: BTreeMap::new(),
-            },
-            descriptor,
-            CancellationToken::new(),
-        )
+        ToolCatalog::new([descriptor])
+            .resolve(
+                0,
+                ToolCall {
+                    id:                "call_1".to_owned(),
+                    name:              "shell".to_owned(),
+                    arguments:         json!({"command": "cargo test"}),
+                    kind:              ToolCallKind::Function,
+                    raw_arguments:     None,
+                    provider_metadata: BTreeMap::new(),
+                },
+                CancellationToken::new(),
+            )
+            .unwrap_or_else(|_| panic!("the test request is valid"))
     }
 
     #[tokio::test]
@@ -385,7 +386,7 @@ mod tests {
             .await
             .expect("the call succeeds");
 
-        assert!(matches!(outcome, ToolOutcome::Success(_)));
+        assert!(matches!(outcome, ToolOutcome::Success { .. }));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(*approval.arguments.lock().expect("the lock is healthy"), [
             json!({"command": "cargo test"})

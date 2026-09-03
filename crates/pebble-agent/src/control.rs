@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::ops::RangeInclusive;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::Notify;
@@ -147,16 +148,12 @@ impl Control {
             .is_parked()
     }
 
-    pub(crate) fn settle_interrupts(&self) -> Vec<u64> {
+    pub(crate) fn settle_interrupts(&self) -> Option<RangeInclusive<u64>> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let first = state.settled_interrupt_generation.saturating_add(1);
         let last = state.interrupt_generation;
         state.settled_interrupt_generation = last;
-        if first <= last {
-            (first..=last).collect()
-        } else {
-            Vec::new()
-        }
+        (first <= last).then_some(first..=last)
     }
 
     pub(crate) async fn wait_for_completion(
@@ -218,6 +215,8 @@ pub enum QueueOutcome {
     /// The message is queued, and the queue was at its bound: this older
     /// message was dropped to make room and the agent will never see it.
     Evicted(UserMessage),
+    /// The bound was zero, so the message could not be queued.
+    Rejected(UserMessage),
     /// The agent is closed and nothing was queued.
     Closed,
 }
@@ -357,13 +356,13 @@ impl AgentControlHandle {
     /// A full queue drops its oldest message to make room, and the outcome
     /// carries what was dropped. The interrupt and the enqueue happen under one
     /// lock, so the loop can never observe the interrupt with the queue still
-    /// empty.
+    /// empty. A zero capacity rejects the new message.
     pub fn steer_bounded(&self, message: impl Into<UserMessage>, capacity: usize) -> QueueOutcome {
         self.queue_steering(message.into(), true, Some(capacity))
     }
 
     /// Queues steering without interrupting, keeping at most `capacity`
-    /// messages queued.
+    /// messages queued. A zero capacity rejects the new message.
     pub fn enqueue_steering_bounded(
         &self,
         message: impl Into<UserMessage>,
@@ -386,10 +385,10 @@ impl AgentControlHandle {
         if state.closed {
             return QueueOutcome::Closed;
         }
-        let evicted = capacity
-            .filter(|capacity| state.steering.len() >= *capacity)
-            .and_then(|_| state.steering.pop_front());
-        state.steering.push_back(message);
+        let outcome = push_bounded(&mut state.steering, message, capacity);
+        if !outcome.is_queued() {
+            return outcome;
+        }
         state.paused = false;
         if interrupt && state.running {
             state.interrupt_generation = state.interrupt_generation.saturating_add(1);
@@ -397,7 +396,7 @@ impl AgentControlHandle {
         }
         drop(state);
         self.control.resume.notify_waiters();
-        evicted.map_or(QueueOutcome::Queued, QueueOutcome::Evicted)
+        outcome
     }
 
     /// Queues input to process after the current prompt reaches an answer.
@@ -410,6 +409,7 @@ impl AgentControlHandle {
     /// Queues follow-up input, keeping at most `capacity` messages queued.
     ///
     /// A full queue drops its oldest message to make room and returns it.
+    /// A zero capacity rejects the new message.
     pub fn follow_up_bounded(
         &self,
         message: impl Into<UserMessage>,
@@ -427,11 +427,7 @@ impl AgentControlHandle {
         if state.closed {
             return QueueOutcome::Closed;
         }
-        let evicted = capacity
-            .filter(|capacity| state.follow_up.len() >= *capacity)
-            .and_then(|_| state.follow_up.pop_front());
-        state.follow_up.push_back(message);
-        evicted.map_or(QueueOutcome::Queued, QueueOutcome::Evicted)
+        push_bounded(&mut state.follow_up, message, capacity)
     }
 
     /// Aborts the active prompt.
@@ -607,15 +603,31 @@ impl AgentControlHandle {
 
 impl fmt::Debug for AgentControlHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let snapshot = self.snapshot();
         formatter
             .debug_struct("AgentControlHandle")
-            .field("running", &self.is_running())
-            .field("closed", &self.is_closed())
-            .field("paused", &self.is_paused())
-            .field("pending_steering", &self.pending_steering())
-            .field("pending_follow_ups", &self.pending_follow_ups())
+            .field("running", &snapshot.is_running())
+            .field("closed", &snapshot.is_closed())
+            .field("paused", &snapshot.is_paused())
+            .field("pending_steering", &snapshot.pending_steering())
+            .field("pending_follow_ups", &snapshot.pending_follow_ups())
             .finish()
     }
+}
+
+fn push_bounded(
+    queue: &mut VecDeque<UserMessage>,
+    message: UserMessage,
+    capacity: Option<usize>,
+) -> QueueOutcome {
+    if capacity == Some(0) {
+        return QueueOutcome::Rejected(message);
+    }
+    let evicted = capacity
+        .filter(|capacity| queue.len() >= *capacity)
+        .and_then(|_| queue.pop_front());
+    queue.push_back(message);
+    evicted.map_or(QueueOutcome::Queued, QueueOutcome::Evicted)
 }
 
 #[cfg(test)]
@@ -664,8 +676,19 @@ mod tests {
         assert!(handle.interrupt());
         assert!(handle.steer("continue"));
 
-        assert_eq!(handle.control.settle_interrupts(), [1, 2]);
-        assert!(handle.control.settle_interrupts().is_empty());
+        assert_eq!(handle.control.settle_interrupts(), Some(1..=2));
+        assert_eq!(handle.control.settle_interrupts(), None);
+    }
+
+    #[test]
+    fn a_zero_bound_rejects_the_message() {
+        let handle = AgentControlHandle::detached();
+
+        assert_eq!(
+            handle.enqueue_steering_bounded("never queued", 0),
+            QueueOutcome::Rejected(UserMessage::text("never queued"))
+        );
+        assert_eq!(handle.snapshot().pending_steering(), 0);
     }
 
     #[test]

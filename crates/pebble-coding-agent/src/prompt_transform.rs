@@ -19,8 +19,9 @@ use crate::types::{MemoryFileSummary, SkillSummary, ToolSummary};
 ///
 /// Everything here is read-only and describes the session as the default
 /// prompt describes it: the environment the prompt was written for, the tools
-/// the model will be shown, and what was loaded into the prompt as memory and
-/// skills. The summaries carry descriptions, never the loaded text.
+/// registered before per-turn middleware filters them, and what was loaded
+/// into the prompt as memory and skills. The summaries carry descriptions,
+/// never the loaded text.
 #[derive(Clone, Copy)]
 pub struct SystemPromptContext<'a> {
     default_prompt: &'a str,
@@ -59,7 +60,9 @@ impl<'a> SystemPromptContext<'a> {
         self.environment
     }
 
-    /// The tools the model will be shown, under the names it will call them.
+    /// The registered tools, under their model-visible names.
+    ///
+    /// Per-turn middleware can hide some of these tools later.
     #[must_use]
     pub const fn tools(&self) -> &'a [ToolSummary] {
         self.tools

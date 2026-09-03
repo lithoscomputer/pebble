@@ -4,6 +4,7 @@ use std::error::Error as StdError;
 use std::fmt::Write as _;
 
 use crate::environment::{EnvironmentError, EnvironmentErrorKind};
+use crate::error::render_error;
 use crate::types::ToolErrorKind;
 
 /// A failed tool call.
@@ -67,13 +68,7 @@ impl ToolError {
         context: impl Into<String>,
         source: impl StdError + Send + Sync + 'static,
     ) -> Self {
-        let mut message = context.into();
-        let _ = write!(message, ": {source}");
-        let mut current = source.source();
-        while let Some(cause) = current {
-            let _ = write!(message, ": {cause}");
-            current = cause.source();
-        }
+        let message = format!("{}: {}", context.into(), render_error(&source));
         Self {
             kind,
             message,

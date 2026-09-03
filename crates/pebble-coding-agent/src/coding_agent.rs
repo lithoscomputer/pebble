@@ -912,14 +912,7 @@ impl CodingAgent {
         cancel: Option<&CancellationToken>,
     ) -> Result<PromptOutcome, Error> {
         let text = self.inner.prompt_with_cancellation(input, cancel).await?;
-        let final_message = self
-            .inner
-            .history()
-            .turns()
-            .iter()
-            .rev()
-            .find(|message| matches!(message, Message::Assistant { .. }))
-            .cloned();
+        let final_message = self.inner.final_assistant_message();
         Ok(PromptOutcome {
             text,
             final_message,

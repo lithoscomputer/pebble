@@ -21,12 +21,13 @@ use crate::error::{AgentBuildError, AgentError, Result};
 use crate::event::{AgentEvent, EventHub, EventProjection, FirstOutputKind};
 use crate::integration::{StreamObserver, StreamOutcome, stream_response};
 use crate::model::ModelService;
+#[cfg(test)]
+use crate::tool::ToolCallRequest;
 use crate::tool::{
-    StaticToolService, Tool, ToolCallRequest, ToolCatalog, ToolDiscoveryContext, ToolErrorKind,
-    ToolMiddleware, ToolOutcome, ToolScheduling, ToolService, ToolSystem,
+    StaticToolService, Tool, ToolCatalog, ToolDiscoveryContext, ToolErrorKind, ToolMiddleware,
+    ToolOutcome, ToolScheduling, ToolService, ToolSystem,
 };
 use crate::turn::{AfterAnswerAction, AgentLifecycle, ConversationUpdate, TurnContext};
-use crate::validation::validate_tool_arguments;
 
 /// The default number of lifecycle events held for each subscriber.
 const DEFAULT_EVENT_CAPACITY: usize = 256;
@@ -637,6 +638,21 @@ impl Agent {
                 }
 
                 let tools = self.discover_tools(turn_count).await?;
+                if let Some(lifecycle) = self.lifecycle.clone() {
+                    let context = TurnContext::new(&self.model, turn_count, &self.messages);
+                    let prepared = lifecycle
+                        .after_tool_discovery(context, &tools, &round_cancel)
+                        .await;
+                    if prompt_cancel.is_cancelled() {
+                        return Err(AgentError::Aborted);
+                    }
+                    if round_cancel.is_cancelled() {
+                        self.emit_pending_interrupts();
+                        continue;
+                    }
+                    let update = prepared.map_err(|source| AgentError::Lifecycle { source })?;
+                    self.apply_conversation_update(update);
+                }
                 self.emit(AgentEvent::TurnStarted { turn: turn_count });
                 let request = self.build_request(&tools)?;
                 self.emit(AgentEvent::ModelRequestStarted {
@@ -897,8 +913,10 @@ impl Agent {
     }
 
     fn emit_pending_interrupts(&self) {
-        for generation in self.control.settle_interrupts() {
-            self.emit(AgentEvent::TurnInterrupted { generation });
+        if let Some(generations) = self.control.settle_interrupts() {
+            for generation in generations {
+                self.emit(AgentEvent::TurnInterrupted { generation });
+            }
         }
     }
 
@@ -1038,36 +1056,16 @@ impl Agent {
             return ExecutedCall::completed(cancelled_tool_result(call));
         }
         self.emit(AgentEvent::ToolStarted { call: call.clone() });
-        let Some(descriptor) = tools.find_by_name(&call.name) else {
-            return self.complete_tool(
-                call,
-                ToolOutcome::failure(
-                    ToolErrorKind::Unavailable,
-                    format!("unknown tool `{}`", call.name),
-                ),
-                None,
-            );
-        };
-        if let Err(error) = validate_tool_arguments(&descriptor.definition().kind, &call.arguments)
-        {
-            return self.complete_tool(
-                call,
-                ToolOutcome::failure(ToolErrorKind::InvalidArguments, error.to_string()),
-                None,
-            );
-        }
-
-        let request =
-            ToolCallRequest::new(turn, call.clone(), descriptor.clone(), cancel.child_token())
-                .with_events(self.events.clone());
-        let called = self.tool_system.call(request).await;
-        if cancel.is_cancelled() {
-            return self.complete_tool(
-                call,
-                ToolOutcome::failure(ToolErrorKind::Cancelled, CANCELLED),
-                None,
-            );
-        }
+        let called = self
+            .tool_system
+            .execute_observed(
+                tools,
+                turn,
+                call.clone(),
+                cancel.child_token(),
+                self.events.clone(),
+            )
+            .await;
         match called {
             Ok(outcome) => self.complete_tool(call, outcome, None),
             Err(error) => {
@@ -1099,9 +1097,13 @@ impl Agent {
         outcome: ToolOutcome,
         system_error: Option<crate::ToolSystemError>,
     ) -> ExecutedCall {
-        let result = tool_result(call, outcome);
+        let error_kind = outcome.error_kind();
+        let output_stats = outcome.output_stats();
+        let result = outcome.into_result(call);
         self.emit(AgentEvent::ToolCompleted {
             result: result.clone(),
+            error_kind,
+            output_stats,
         });
         ExecutedCall {
             result,
@@ -1225,18 +1227,6 @@ fn error_tool_result(call: &ToolCall, message: String) -> ToolResult {
         name:         Some(call.name.clone()),
         content:      vec![ContentPart::Text { text: message }],
         is_error:     true,
-    }
-}
-
-fn tool_result(call: &ToolCall, outcome: ToolOutcome) -> ToolResult {
-    match outcome {
-        ToolOutcome::Success(output) => ToolResult {
-            tool_call_id: call.id.clone(),
-            name:         Some(call.name.clone()),
-            content:      nonempty_content(output.into_content()),
-            is_error:     false,
-        },
-        ToolOutcome::Failure { message, .. } => error_tool_result(call, message),
     }
 }
 

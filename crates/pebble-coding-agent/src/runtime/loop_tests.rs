@@ -392,6 +392,7 @@ async fn arguments_that_miss_the_schema_answer_with_a_validation_error() {
     ])
     .tools([strict])
     .build();
+    let mut events = session.subscribe();
 
     session
         .prompt("Use strict tool")
@@ -404,6 +405,24 @@ async fn arguments_that_miss_the_schema_answer_with_a_validation_error() {
     assert!(
         text.contains("text") && text.contains("required"),
         "the validation error names the missing property: {text}"
+    );
+    let published = settled(&mut session, &mut events).await;
+    assert_eq!(
+        count(&published, |event| matches!(
+            event,
+            CodingEvent::ToolCallStarted { tool_name, .. } if tool_name == "strict_tool"
+        )),
+        1
+    );
+    assert_eq!(
+        count(&published, |event| matches!(
+            event,
+            CodingEvent::ToolCallCompleted {
+                error_kind: Some(pebble_agent::ToolErrorKind::InvalidArguments),
+                ..
+            }
+        )),
+        1
     );
 }
 

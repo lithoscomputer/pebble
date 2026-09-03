@@ -9,6 +9,7 @@ use lithos_llm::types::{Message, Response};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::UserMessage;
+use crate::tool::ToolCatalog;
 
 /// What the agent does after a model turn answers without tool calls.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -104,6 +105,16 @@ pub trait AgentLifecycle: Send + Sync {
     async fn before_model(
         &self,
         _context: TurnContext<'_>,
+        _cancel: &CancellationToken,
+    ) -> StdResult<ConversationUpdate, LifecycleError> {
+        Ok(ConversationUpdate::unchanged())
+    }
+
+    /// Runs after middleware has selected the tools visible for this turn.
+    async fn after_tool_discovery(
+        &self,
+        _context: TurnContext<'_>,
+        _tools: &ToolCatalog,
         _cancel: &CancellationToken,
     ) -> StdResult<ConversationUpdate, LifecycleError> {
         Ok(ConversationUpdate::unchanged())

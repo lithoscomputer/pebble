@@ -19,6 +19,7 @@ pub use self::system::{
     ToolDiscoveryNext, ToolId, ToolIdError, ToolMiddleware, ToolOutcome, ToolScheduling,
     ToolService, ToolSystem, ToolSystemError,
 };
+use crate::event::{AgentEvent, EventHub};
 
 /// Why a tool call failed.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -37,40 +38,91 @@ pub enum ToolErrorKind {
     Execution,
 }
 
+/// Byte counts for the output one tool call produced.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ToolOutputStats {
+    /// Bytes the tool produced.
+    pub observed_bytes: usize,
+    /// Bytes retained for consumers.
+    pub retained_bytes: usize,
+    /// Bytes omitted by an output limit.
+    pub omitted_bytes:  usize,
+}
+
+impl ToolOutputStats {
+    /// Counts output that was retained in full.
+    #[must_use]
+    pub const fn complete(byte_count: usize) -> Self {
+        Self {
+            observed_bytes: byte_count,
+            retained_bytes: byte_count,
+            omitted_bytes:  0,
+        }
+    }
+
+    /// Sums two output captures.
+    #[must_use]
+    pub const fn combine(self, other: Self) -> Self {
+        Self {
+            observed_bytes: self.observed_bytes.saturating_add(other.observed_bytes),
+            retained_bytes: self.retained_bytes.saturating_add(other.retained_bytes),
+            omitted_bytes:  self.omitted_bytes.saturating_add(other.omitted_bytes),
+        }
+    }
+}
+
 /// The context supplied to one tool call.
 #[derive(Clone)]
 pub struct ToolContext {
-    request: ToolCallRequest,
+    tool_call_id: String,
+    tool_name:    String,
+    cancellation: CancellationToken,
+    events:       Option<EventHub>,
 }
 
 impl ToolContext {
-    const fn new(request: ToolCallRequest) -> Self {
-        Self { request }
+    const fn new(
+        tool_call_id: String,
+        tool_name: String,
+        cancellation: CancellationToken,
+        events: Option<EventHub>,
+    ) -> Self {
+        Self {
+            tool_call_id,
+            tool_name,
+            cancellation,
+            events,
+        }
     }
 
     /// The provider's identifier for this call.
     #[must_use]
     pub fn tool_call_id(&self) -> &str {
-        &self.request.call().id
+        &self.tool_call_id
     }
 
     /// The registered tool name.
     #[must_use]
     pub fn tool_name(&self) -> &str {
-        &self.request.call().name
+        &self.tool_name
     }
 
     /// The cooperative cancellation signal for this call.
     #[must_use]
     pub const fn cancellation(&self) -> &CancellationToken {
-        self.request.cancellation()
+        &self.cancellation
     }
 
     /// Publishes incremental output for observers.
     ///
     /// This does not add the fragment to the result returned to the model.
     pub fn emit_output_delta(&self, delta: impl Into<String>) {
-        self.request.emit_output_delta(delta);
+        if let Some(events) = &self.events {
+            events.emit(AgentEvent::ToolOutputDelta {
+                tool_call_id: self.tool_call_id.clone(),
+                delta:        delta.into(),
+            });
+        }
     }
 }
 
@@ -208,13 +260,11 @@ impl ToolService for StaticToolService {
                 format!("unknown tool `{}`", request.call().name),
             ));
         };
-        let arguments = request.call().arguments.clone();
-        Ok(
-            match tool.execute(ToolContext::new(request), arguments).await {
-                Ok(output) => ToolOutcome::success(output),
-                Err(error) => ToolOutcome::failure(ToolErrorKind::Execution, error.to_string()),
-            },
-        )
+        let (context, arguments) = request.into_context_and_arguments();
+        Ok(match tool.execute(context, arguments).await {
+            Ok(output) => ToolOutcome::success(output),
+            Err(error) => ToolOutcome::failure(ToolErrorKind::Execution, error.to_string()),
+        })
     }
 }
 

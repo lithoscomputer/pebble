@@ -371,7 +371,7 @@ impl From<&Error> for ErrorData {
 }
 
 /// Renders `error` and each source once on one line.
-fn render_error(error: &(dyn StdError + 'static)) -> String {
+pub(crate) fn render_error(error: &(dyn StdError + 'static)) -> String {
     let mut rendered = error.to_string();
     let mut current = error.source();
     while let Some(cause) = current {

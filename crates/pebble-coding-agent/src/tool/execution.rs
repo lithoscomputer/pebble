@@ -4,10 +4,10 @@
 //! call it is given — including the ones it refuses — so a conversation never
 //! carries a call without its result.
 //!
-//! Each call runs through one tool service and its middleware. The fixed outer
-//! layer publishes the start, application middleware may continue or refuse,
-//! the terminal runs the tool, and the outer layer bounds and publishes the
-//! result. History sees a further-truncated copy.
+//! Each call runs through one tool service and its middleware. Application
+//! middleware may continue or refuse, the terminal runs the tool, and the
+//! fixed outer layer bounds the result. The generic agent loop owns call
+//! lifecycle events. History sees a further-truncated copy.
 //!
 //! Output is bounded twice, by
 //! [`CodingAgentOptions::tool_output_retention_bytes`] and
@@ -20,15 +20,16 @@
 //! and its peers are refused with an explanation the model can act on.
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::mem;
 use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 #[cfg(test)]
 use futures_util::future::join_all;
-use lithos_llm::types::{ContentPart, ToolCall, ToolCallKind, ToolDefinitionKind, ToolResult};
+use lithos_llm::types::{ContentPart, ToolCall, ToolResult};
 use pebble_agent as agent;
+#[cfg(test)]
 use pebble_agent::integration::validate_tool_arguments;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -65,31 +66,30 @@ const QUESTIONS_RUN_ALONE: &str = "This tool call was not executed because human
 #[cfg(test)]
 const CANCELLED: &str = "Cancelled";
 
-/// The coding-tool terminal and its fixed event/output envelope.
+/// The coding-tool terminal and its fixed output envelope.
 ///
 /// A coding agent and a standalone runner both put this service outside their
-/// application middleware. This keeps call events and output limits identical,
-/// including when inner middleware refuses a call without reaching the tool.
+/// application middleware. This keeps output limits identical, including when
+/// inner middleware refuses a call without reaching the tool.
 #[derive(Clone)]
 pub(crate) struct CodingToolService {
-    registry:          ToolRegistry,
+    registry:          Arc<ToolRegistry>,
     env:               Arc<dyn Environment>,
-    config:            CodingAgentOptions,
+    config:            Arc<CodingAgentOptions>,
     emitter:           Emitter,
     session_id:        String,
     root_session_id:   String,
     tool_env_provider: Arc<Mutex<Option<Arc<dyn ToolEnvProvider>>>>,
     human_input:       Option<Arc<dyn HumanInputProvider>>,
     redactor:          Arc<dyn Redactor>,
-    output_stats:      Arc<Mutex<HashMap<String, OutputCaptureStats>>>,
 }
 
 impl CodingToolService {
     /// Creates a service with no optional call providers.
     pub(crate) fn new(
-        registry: ToolRegistry,
+        registry: Arc<ToolRegistry>,
         env: Arc<dyn Environment>,
-        config: CodingAgentOptions,
+        config: Arc<CodingAgentOptions>,
         emitter: Emitter,
         session_id: String,
         root_session_id: String,
@@ -105,7 +105,6 @@ impl CodingToolService {
             tool_env_provider: Arc::new(Mutex::new(None)),
             human_input: None,
             redactor,
-            output_stats: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -132,19 +131,11 @@ impl CodingToolService {
             .unwrap_or_else(PoisonError::into_inner) = Some(provider);
     }
 
-    /// Clears process-output state left by a cancelled prompt.
-    pub(crate) fn begin_prompt(&self) {
-        self.output_stats
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clear();
-    }
-
     fn dispatch(&self) -> ToolDispatch<'_> {
         ToolDispatch::new(
-            &self.registry,
+            self.registry.as_ref(),
             &self.env,
-            &self.config,
+            self.config.as_ref(),
             &self.emitter,
             &self.session_id,
             &self.root_session_id,
@@ -152,16 +143,31 @@ impl CodingToolService {
         .with_redactor(&self.redactor)
     }
 
-    /// Answers a call that the shared kernel could not enter into middleware.
-    pub(crate) fn answer_failure(
+    /// Publishes the start of one standalone call.
+    pub(crate) fn begin_standalone(&self, call: &ToolCall) {
+        self.dispatch().emit_started(call);
+    }
+
+    /// Applies output policy and publishes one standalone result.
+    pub(crate) fn complete_standalone(
         &self,
         call: &ToolCall,
-        kind: ToolErrorKind,
-        message: impl Into<String>,
-    ) -> agent::ToolOutcome {
-        let dispatch = self.dispatch();
-        dispatch.begin_terminal(call);
-        dispatch.finish_terminal(call, agent::ToolOutcome::failure(kind, message), None)
+        outcome: agent::ToolOutcome,
+    ) -> ToolResult {
+        let outcome = if outcome.output_stats().is_some() {
+            outcome
+        } else {
+            self.dispatch()
+                .finish_terminal(&call.id, &call.name, outcome)
+        };
+        let stats = outcome
+            .output_stats()
+            .unwrap_or_else(|| OutputCaptureStats::complete(0));
+        let error_kind = outcome.error_kind();
+        let result = outcome.into_result(call);
+        self.dispatch()
+            .emit_result(call, &result, stats, error_kind);
+        result
     }
 }
 
@@ -198,7 +204,6 @@ impl agent::ToolService for CodingToolService {
         &self,
         request: agent::ToolCallRequest,
     ) -> StdResult<agent::ToolOutcome, agent::ToolSystemError> {
-        let call_id = request.call().id.clone();
         let tool_env_provider = self
             .tool_env_provider
             .lock()
@@ -211,14 +216,7 @@ impl agent::ToolService for CodingToolService {
         if let Some(provider) = self.human_input.as_ref() {
             dispatch = dispatch.with_human_input(provider);
         }
-        let (outcome, stats) = dispatch.execute_terminal(request).await;
-        if let Some(stats) = stats {
-            self.output_stats
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(call_id, stats);
-        }
-        Ok(outcome)
+        Ok(dispatch.execute_terminal(request).await)
     }
 }
 
@@ -229,25 +227,13 @@ impl agent::ToolMiddleware for CodingToolService {
         request: agent::ToolCallRequest,
         next: agent::ToolCallNext<'_>,
     ) -> StdResult<agent::ToolOutcome, agent::ToolSystemError> {
-        let call = request.call().clone();
+        let call_id = request.call().id.clone();
+        let tool_name = request.call().name.clone();
         let dispatch = self.dispatch();
-        dispatch.begin_terminal(&call);
         let outcome = next.run(request).await;
-        let previous = self
-            .output_stats
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&call.id);
         match outcome {
-            Ok(outcome) => Ok(dispatch.finish_terminal(&call, outcome, previous)),
-            Err(error) => {
-                let _ = dispatch.finish_terminal(
-                    &call,
-                    agent::ToolOutcome::failure(ToolErrorKind::Execution, error.message()),
-                    previous,
-                );
-                Err(error)
-            }
+            Ok(outcome) => Ok(dispatch.finish_terminal(&call_id, &tool_name, outcome)),
+            Err(error) => Err(error),
         }
     }
 }
@@ -382,9 +368,14 @@ impl<'a> ToolDispatch<'a> {
         cancel: CancellationToken,
     ) -> ToolResult {
         self.emit_started(call);
-        let executed = self
-            .run_tool(call, self.registry.get(&call.name), cancel)
-            .await;
+        let mut owned_call = call.clone();
+        let executed = match self.registry.get(&call.name) {
+            Some(tool) => match validate_tool_arguments(&tool.definition.kind, &call.arguments) {
+                Ok(()) => self.run_tool(&mut owned_call, Some(tool), cancel).await,
+                Err(error) => self.failed(call, &ToolError::invalid_arguments(error.to_string())),
+            },
+            None => self.run_tool(&mut owned_call, None, cancel).await,
+        };
         let retained = self.retain(executed.result, executed.output_stats);
         self.emit_result(
             call,
@@ -399,14 +390,11 @@ impl<'a> ToolDispatch<'a> {
     pub(crate) async fn execute_terminal(
         &self,
         request: agent::ToolCallRequest,
-    ) -> (agent::ToolOutcome, Option<OutputCaptureStats>) {
-        let call = request.call().clone();
+    ) -> agent::ToolOutcome {
+        let tool_id = request.descriptor().id().clone();
+        let (mut call, cancellation) = request.into_call();
         let executed = self
-            .run_tool(
-                &call,
-                self.registry.get(&call.name),
-                request.cancellation().clone(),
-            )
+            .run_tool(&mut call, self.registry.get_by_id(&tool_id), cancellation)
             .await;
         let outcome = if executed.result.is_error {
             agent::ToolOutcome::failure(
@@ -416,53 +404,55 @@ impl<'a> ToolDispatch<'a> {
         } else {
             agent::ToolOutcome::success(agent::ToolOutput::new(executed.result.content))
         };
-        (outcome, executed.output_stats)
+        match executed.output_stats {
+            Some(stats) => outcome.with_output_stats(stats),
+            None => outcome,
+        }
     }
 
-    /// Publishes the start of a call entering the shared middleware stack.
-    pub(crate) fn begin_terminal(&self, call: &ToolCall) {
-        self.emit_started(call);
-    }
-
-    /// Applies coding output policy and publishes the final call result.
+    /// Applies coding output policy to the final call result.
     pub(crate) fn finish_terminal(
         &self,
-        call: &ToolCall,
+        call_id: &str,
+        tool_name: &str,
         outcome: agent::ToolOutcome,
-        previous: Option<OutputCaptureStats>,
     ) -> agent::ToolOutcome {
+        let previous = outcome.output_stats();
         let (result, error_kind) = match outcome {
-            agent::ToolOutcome::Success(output) => (
+            agent::ToolOutcome::Success { output, .. } => (
                 ToolResult {
-                    tool_call_id: call.id.clone(),
-                    name:         Some(call.name.clone()),
+                    tool_call_id: call_id.to_owned(),
+                    name:         Some(tool_name.to_owned()),
                     content:      output.content().to_vec(),
                     is_error:     false,
                 },
                 None,
             ),
-            agent::ToolOutcome::Failure { kind, message } => (
-                self.error_result(call, &ToolError::new(kind, message)),
+            agent::ToolOutcome::Failure { kind, message, .. } => (
+                self.error_result_for(call_id, tool_name, &ToolError::new(kind, message)),
                 Some(kind),
             ),
             _ => (
-                self.error_result(
-                    call,
+                self.error_result_for(
+                    call_id,
+                    tool_name,
                     &ToolError::execution("the tool returned an unsupported outcome"),
                 ),
                 Some(ToolErrorKind::Execution),
             ),
         };
         let retained = self.retain(result, previous);
-        self.emit_result(call, &retained.result, retained.output_stats, error_kind);
-        let result = self.truncate_for_history(retained.result, &call.name);
+        let output_stats = retained.output_stats;
+        let result = self.truncate_for_history(retained.result, tool_name);
         if result.is_error {
             agent::ToolOutcome::failure(
                 error_kind.unwrap_or(ToolErrorKind::Execution),
                 result_text(&result).into_owned(),
             )
+            .with_output_stats(output_stats)
         } else {
             agent::ToolOutcome::success(agent::ToolOutput::new(result.content))
+                .with_output_stats(output_stats)
         }
     }
 
@@ -530,10 +520,10 @@ impl<'a> ToolDispatch<'a> {
         results
     }
 
-    /// Validates the arguments and runs the tool.
+    /// Runs one resolved tool.
     async fn run_tool(
         &self,
-        call: &ToolCall,
+        call: &mut ToolCall,
         registered: Option<&RegisteredTool>,
         cancel: CancellationToken,
     ) -> ExecutedTool {
@@ -543,14 +533,6 @@ impl<'a> ToolDispatch<'a> {
                 &ToolError::unavailable(format!("Unknown tool: {}", call.name)),
             );
         };
-
-        // A custom tool's input is free-form text the model wrote against a
-        // provider grammar, not JSON this crate can judge.
-        if !matches!(call.kind, ToolCallKind::Custom)
-            && let Err(error) = validate_tool_args(&tool.definition.kind, &call.arguments)
-        {
-            return self.failed(call, &error);
-        }
 
         let bound = Arc::new(SessionBoundEmitter::new(
             self.emitter.clone(),
@@ -572,7 +554,8 @@ impl<'a> ToolDispatch<'a> {
             context = context.with_redactor(Arc::clone(redactor));
         }
 
-        let (result, error_kind) = match (tool.executor)(call.arguments.clone(), context).await {
+        let arguments = mem::take(&mut call.arguments);
+        let (result, error_kind) = match (tool.executor)(arguments, context).await {
             Ok(output) => (text_result(call, output, false), None),
             Err(error) => (self.error_result(call, &error), Some(error.kind())),
         };
@@ -600,11 +583,15 @@ impl<'a> ToolDispatch<'a> {
     /// error under it, and the path in that error is whatever the model
     /// asked for.
     fn error_result(&self, call: &ToolCall, error: &ToolError) -> ToolResult {
+        self.error_result_for(&call.id, &call.name, error)
+    }
+
+    fn error_result_for(&self, call_id: &str, tool_name: &str, error: &ToolError) -> ToolResult {
         let message = match self.redactor {
             Some(redactor) => redactor.redact(error.message()).into_owned(),
             None => error.message().to_owned(),
         };
-        text_result(call, message, true)
+        text_result_for(call_id, tool_name, message, true)
     }
 
     /// A call that was cancelled before it started.
@@ -735,43 +722,23 @@ struct Retained {
     output_stats: OutputCaptureStats,
 }
 
-/// Checks a call's arguments against the tool's schema.
-///
-/// The check is structural rather than a full JSON Schema evaluation: an
-/// object is required where the schema says `object`, every `required` property
-/// must be present, and a declared property that is present must have its
-/// declared `type`. Nested `properties` and array `items` are checked the same
-/// way.
-///
-/// Everything else in a schema — `enum`, `oneOf`/`anyOf`, `minimum`/`maximum`,
-/// `pattern`, formats — is left to the tool. A tool must defend itself against
-/// a model's arguments in any case, so a tool that treats one of those keywords
-/// as a guarantee is already relying on something this crate does not promise.
-///
-/// A tool described by a provider format rather than a schema is not checked,
-/// because its input is free-form text.
-///
-/// # Errors
-///
-/// Returns a [`ToolError`] of kind
-/// [`InvalidArguments`](ToolErrorKind::InvalidArguments) naming every problem
-/// found, so a model can fix them all in one retry.
-pub(crate) fn validate_tool_args(
-    kind: &ToolDefinitionKind,
-    arguments: &Value,
-) -> Result<(), ToolError> {
-    validate_tool_arguments(kind, arguments)
-        .map_err(|error| ToolError::invalid_arguments(error.to_string()))
-}
-
 /// A result carrying one block of text, which is what every pebble tool
 /// produces.
 fn text_result(call: &ToolCall, text: String, is_error: bool) -> ToolResult {
+    text_result_for(&call.id, &call.name, text, is_error)
+}
+
+fn text_result_for(
+    tool_call_id: &str,
+    tool_name: &str,
+    text: String,
+    is_error: bool,
+) -> ToolResult {
     ToolResult {
-        tool_call_id: call.id.clone(),
+        tool_call_id: tool_call_id.to_owned(),
         // Kept so a provider that labels a tool message by name has it; the
         // call id alone does not survive every wire format.
-        name: Some(call.name.clone()),
+        name: Some(tool_name.to_owned()),
         content: vec![ContentPart::Text { text }],
         is_error,
     }
@@ -798,7 +765,7 @@ pub(crate) fn result_text(result: &ToolResult) -> Cow<'_, str> {
 }
 
 /// A result's output as the JSON its completion event carries.
-fn output_value(result: &ToolResult) -> Value {
+pub(crate) fn output_value(result: &ToolResult) -> Value {
     match result.content.as_slice() {
         [ContentPart::Text { text }] => Value::String(text.clone()),
         other => serde_json::to_value(other).unwrap_or(Value::Null),
@@ -1661,115 +1628,5 @@ mod tests {
         assert!(result.is_error);
         assert!(text_of(&result).len() < 60_000);
         drop(events.drain().await);
-    }
-
-    #[test]
-    fn a_schema_with_nothing_to_say_accepts_anything() {
-        for schema in [json!(null), json!({})] {
-            let kind = ToolDefinitionKind::Function {
-                input_schema: schema,
-            };
-            assert!(validate_tool_args(&kind, &json!("anything")).is_ok());
-        }
-    }
-
-    #[test]
-    fn a_custom_tool_is_not_schema_checked() {
-        let kind = ToolDefinitionKind::Custom {
-            format: json!({"type": "grammar"}),
-        };
-        assert!(validate_tool_args(&kind, &json!("*** Begin Patch")).is_ok());
-    }
-
-    #[test]
-    fn arguments_of_the_wrong_shape_are_rejected() {
-        let kind = ToolDefinitionKind::Function {
-            input_schema: json!({"type": "object", "properties": {}}),
-        };
-
-        let error = validate_tool_args(&kind, &json!("not an object"))
-            .expect_err("a string is not an object");
-
-        assert_eq!(error.kind(), ToolErrorKind::InvalidArguments);
-        assert!(
-            error
-                .message()
-                .contains("arguments: expected object, got string"),
-            "{}",
-            error.message()
-        );
-    }
-
-    #[test]
-    fn every_missing_required_property_is_named_at_once() {
-        let kind = ToolDefinitionKind::Function {
-            input_schema: json!({
-                "type": "object",
-                "properties": {"name": {"type": "string"}, "age": {"type": "number"}},
-                "required": ["name", "age"],
-            }),
-        };
-
-        let error = validate_tool_args(&kind, &json!({})).expect_err("both properties are missing");
-
-        assert!(error.message().contains("\"name\""), "{}", error.message());
-        assert!(error.message().contains("\"age\""), "{}", error.message());
-    }
-
-    #[test]
-    fn a_declared_property_is_checked_against_its_type() {
-        let kind = ToolDefinitionKind::Function {
-            input_schema: json!({
-                "type": "object",
-                "properties": {"count": {"type": "integer"}},
-            }),
-        };
-
-        assert!(validate_tool_args(&kind, &json!({"count": 3})).is_ok());
-        assert!(validate_tool_args(&kind, &json!({"count": "three"})).is_err());
-        // A property the schema does not describe is not pebble's to judge.
-        assert!(validate_tool_args(&kind, &json!({"other": "three"})).is_ok());
-    }
-
-    #[test]
-    fn nested_objects_and_array_items_are_checked_too() {
-        let kind = ToolDefinitionKind::Function {
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "questions": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {"text": {"type": "string"}},
-                            "required": ["text"],
-                        },
-                    },
-                },
-            }),
-        };
-
-        assert!(validate_tool_args(&kind, &json!({"questions": [{"text": "Ship it?"}]})).is_ok());
-        let error = validate_tool_args(&kind, &json!({"questions": [{"header": "Decision"}]}))
-            .expect_err("the item misses a required property");
-        assert!(
-            error.message().contains("arguments.questions[0]"),
-            "{}",
-            error.message()
-        );
-    }
-
-    #[test]
-    fn a_type_union_accepts_either_member() {
-        let kind = ToolDefinitionKind::Function {
-            input_schema: json!({
-                "type": "object",
-                "properties": {"limit": {"type": ["integer", "null"]}},
-            }),
-        };
-
-        assert!(validate_tool_args(&kind, &json!({"limit": 10})).is_ok());
-        assert!(validate_tool_args(&kind, &json!({"limit": null})).is_ok());
-        assert!(validate_tool_args(&kind, &json!({"limit": "ten"})).is_err());
     }
 }

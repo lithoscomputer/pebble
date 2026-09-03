@@ -193,4 +193,111 @@ mod tests {
             "Tool argument validation failed: arguments.limit: expected integer, got number"
         );
     }
+
+    #[test]
+    fn an_empty_schema_accepts_anything() {
+        for schema in [json!(null), json!({})] {
+            let kind = ToolDefinitionKind::Function {
+                input_schema: schema,
+            };
+            assert!(validate_tool_arguments(&kind, &json!("anything")).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_custom_tool_is_not_schema_checked() {
+        let kind = ToolDefinitionKind::Custom {
+            format: json!({"type": "grammar"}),
+        };
+        assert!(validate_tool_arguments(&kind, &json!("*** Begin Patch")).is_ok());
+    }
+
+    #[test]
+    fn arguments_of_the_wrong_shape_are_rejected() {
+        let kind = ToolDefinitionKind::Function {
+            input_schema: json!({"type": "object", "properties": {}}),
+        };
+
+        let error = validate_tool_arguments(&kind, &json!("not an object"))
+            .expect_err("a string is not an object");
+
+        assert!(
+            error
+                .to_string()
+                .contains("arguments: expected object, got string")
+        );
+    }
+
+    #[test]
+    fn every_missing_required_property_is_named_at_once() {
+        let kind = ToolDefinitionKind::Function {
+            input_schema: json!({
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "age": {"type": "number"}},
+                "required": ["name", "age"],
+            }),
+        };
+
+        let error = validate_tool_arguments(&kind, &json!({}))
+            .expect_err("both properties are missing")
+            .to_string();
+
+        assert!(error.contains("\"name\""), "{error}");
+        assert!(error.contains("\"age\""), "{error}");
+    }
+
+    #[test]
+    fn declared_properties_are_checked_against_their_types() {
+        let kind = ToolDefinitionKind::Function {
+            input_schema: json!({
+                "type": "object",
+                "properties": {"count": {"type": "integer"}},
+            }),
+        };
+
+        assert!(validate_tool_arguments(&kind, &json!({"count": 3})).is_ok());
+        assert!(validate_tool_arguments(&kind, &json!({"count": "three"})).is_err());
+        assert!(validate_tool_arguments(&kind, &json!({"other": "three"})).is_ok());
+    }
+
+    #[test]
+    fn nested_objects_and_array_items_are_checked() {
+        let kind = ToolDefinitionKind::Function {
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "questions": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {"text": {"type": "string"}},
+                            "required": ["text"],
+                        },
+                    },
+                },
+            }),
+        };
+
+        assert!(
+            validate_tool_arguments(&kind, &json!({"questions": [{"text": "Ship it?"}]})).is_ok()
+        );
+        let error = validate_tool_arguments(&kind, &json!({"questions": [{"header": "Decision"}]}))
+            .expect_err("the item misses a required property")
+            .to_string();
+        assert!(error.contains("arguments.questions[0]"), "{error}");
+    }
+
+    #[test]
+    fn a_type_union_accepts_either_member() {
+        let kind = ToolDefinitionKind::Function {
+            input_schema: json!({
+                "type": "object",
+                "properties": {"limit": {"type": ["integer", "null"]}},
+            }),
+        };
+
+        assert!(validate_tool_arguments(&kind, &json!({"limit": 10})).is_ok());
+        assert!(validate_tool_arguments(&kind, &json!({"limit": null})).is_ok());
+        assert!(validate_tool_arguments(&kind, &json!({"limit": "ten"})).is_err());
+    }
 }

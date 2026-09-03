@@ -68,7 +68,8 @@ use crate::tools::{WebFetchSummarizer, make_question_tool, make_web_search_tool}
 #[cfg(test)]
 use crate::types::PermissionLevel;
 use crate::types::{
-    AgentProfileKind, CodingAgentEvent, CodingAgentState, CodingEvent, TokenUsage, rfc3339_millis,
+    AgentProfileKind, CodingAgentEvent, CodingAgentState, CodingEvent, Message, TokenUsage,
+    rfc3339_millis,
 };
 
 /// The catalog metadata namespace pebble reads.
@@ -1051,8 +1052,8 @@ impl CodingRuntime {
         );
         // The application's one chance to adjust the words the model reads
         // first. It sees the prompt as written and the session as the prompt
-        // describes it, and the tools, their names, and everything around them
-        // stay exactly as the profile decided.
+        // describes it. Tool summaries are the registered starting set;
+        // per-turn middleware can narrow what the model sees later.
         self.system_prompt = match &self.prompt_transform {
             Some(transform) => {
                 let tools: Vec<_> = self
@@ -1226,6 +1227,17 @@ impl CodingRuntime {
         self.conversation().history.clone()
     }
 
+    /// The most recent assistant message, without cloning the full history.
+    pub(crate) fn final_assistant_message(&self) -> Option<Message> {
+        self.conversation()
+            .history
+            .turns()
+            .iter()
+            .rev()
+            .find(|message| matches!(message, Message::Assistant { .. }))
+            .cloned()
+    }
+
     /// A snapshot of the files this session has read and changed.
     #[cfg(test)]
     pub(crate) fn file_tracker(&self) -> FileTracker {
@@ -1299,11 +1311,6 @@ impl CodingRuntime {
     #[cfg(test)]
     pub(crate) fn follow_up(&self, message: impl Into<String>) {
         let _ = self.agent_control.follow_up(message.into());
-    }
-
-    /// The generic control handle, for a producer outside the session.
-    pub(crate) fn agent_control_handle(&self) -> AgentControlHandle {
-        self.agent_control.clone()
     }
 
     /// Ends the prompt.

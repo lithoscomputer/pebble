@@ -6,11 +6,14 @@ use std::result::Result as StdResult;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lithos_llm::types::{Message, ToolCall, ToolDefinition};
+use lithos_llm::types::{
+    ContentPart, Message, ToolCall, ToolCallKind, ToolDefinition, ToolDefinitionKind, ToolResult,
+};
 use tokio_util::sync::CancellationToken;
 
-use super::{ToolErrorKind, ToolOutput};
+use super::{ToolContext, ToolErrorKind, ToolOutput, ToolOutputStats};
 use crate::event::{AgentEvent, EventHub};
+use crate::validation::validate_tool_arguments;
 
 /// A stable tool identity that does not depend on its model-visible name.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -169,6 +172,48 @@ impl ToolCatalog {
             .find(|entry| entry.descriptor.definition().name == name)
             .map(|entry| &entry.descriptor)
     }
+
+    /// Resolves and validates one model-requested call.
+    ///
+    /// The returned request binds the model-visible name and call kind to the
+    /// descriptor that policy and terminal dispatch use.
+    pub fn resolve(
+        &self,
+        turn: usize,
+        call: ToolCall,
+        cancellation: CancellationToken,
+    ) -> StdResult<ToolCallRequest, ToolOutcome> {
+        let Some(descriptor) = self.find_by_name(&call.name) else {
+            return Err(ToolOutcome::failure(
+                ToolErrorKind::Unavailable,
+                format!("unknown tool `{}`", call.name),
+            ));
+        };
+        let kind_matches = matches!(
+            (&descriptor.definition().kind, call.kind),
+            (ToolDefinitionKind::Function { .. }, ToolCallKind::Function)
+                | (ToolDefinitionKind::Custom { .. }, ToolCallKind::Custom)
+        );
+        if !kind_matches {
+            return Err(ToolOutcome::failure(
+                ToolErrorKind::InvalidArguments,
+                format!("tool call kind does not match `{}`", call.name),
+            ));
+        }
+        if let Err(error) = validate_tool_arguments(&descriptor.definition().kind, &call.arguments)
+        {
+            return Err(ToolOutcome::failure(
+                ToolErrorKind::InvalidArguments,
+                error.to_string(),
+            ));
+        }
+        Ok(ToolCallRequest::new(
+            turn,
+            call,
+            descriptor.clone(),
+            cancellation,
+        ))
+    }
 }
 
 /// An immutable view of the conversation during tool discovery.
@@ -220,9 +265,7 @@ pub struct ToolCallRequest {
 }
 
 impl ToolCallRequest {
-    /// Creates a request for an already resolved tool call.
-    #[must_use]
-    pub const fn new(
+    const fn new(
         turn: usize,
         call: ToolCall,
         descriptor: ToolDescriptor,
@@ -261,6 +304,12 @@ impl ToolCallRequest {
         &self.cancellation
     }
 
+    /// Takes the call and cancellation signal from this resolved request.
+    #[must_use]
+    pub fn into_call(self) -> (ToolCall, CancellationToken) {
+        (self.call, self.cancellation)
+    }
+
     /// Publishes incremental output for observers.
     ///
     /// This does not add the fragment to the result returned to the model.
@@ -276,6 +325,18 @@ impl ToolCallRequest {
     pub(crate) fn with_events(mut self, events: EventHub) -> Self {
         self.events = Some(events);
         self
+    }
+
+    pub(crate) fn into_context_and_arguments(self) -> (ToolContext, serde_json::Value) {
+        let Self {
+            call,
+            cancellation,
+            events,
+            ..
+        } = self;
+        let arguments = call.arguments;
+        let context = ToolContext::new(call.id, call.name, cancellation, events);
+        (context, arguments)
     }
 }
 
@@ -296,13 +357,20 @@ impl fmt::Debug for ToolCallRequest {
 #[non_exhaustive]
 pub enum ToolOutcome {
     /// The tool completed successfully.
-    Success(ToolOutput),
+    Success {
+        /// The content returned to the model.
+        output:       ToolOutput,
+        /// Output byte counts supplied by an execution layer.
+        output_stats: Option<ToolOutputStats>,
+    },
     /// The call was refused or failed.
     Failure {
         /// Why the call failed.
-        kind:    ToolErrorKind,
+        kind:         ToolErrorKind,
         /// The safe message returned to the model.
-        message: String,
+        message:      String,
+        /// Output byte counts supplied by an execution layer.
+        output_stats: Option<ToolOutputStats>,
     },
 }
 
@@ -310,7 +378,10 @@ impl ToolOutcome {
     /// A successful call.
     #[must_use]
     pub const fn success(output: ToolOutput) -> Self {
-        Self::Success(output)
+        Self::Success {
+            output,
+            output_stats: None,
+        }
     }
 
     /// A failed call with a model-facing message.
@@ -319,6 +390,64 @@ impl ToolOutcome {
         Self::Failure {
             kind,
             message: message.into(),
+            output_stats: None,
+        }
+    }
+
+    /// Attaches the byte counts observed while producing this outcome.
+    #[must_use]
+    pub const fn with_output_stats(mut self, stats: ToolOutputStats) -> Self {
+        match &mut self {
+            Self::Success { output_stats, .. } | Self::Failure { output_stats, .. } => {
+                *output_stats = Some(stats);
+            }
+        }
+        self
+    }
+
+    /// The output byte counts, when an execution layer supplied them.
+    #[must_use]
+    pub const fn output_stats(&self) -> Option<ToolOutputStats> {
+        match self {
+            Self::Success { output_stats, .. } | Self::Failure { output_stats, .. } => {
+                *output_stats
+            }
+        }
+    }
+
+    /// Why this call failed, or `None` when it succeeded.
+    #[must_use]
+    pub const fn error_kind(&self) -> Option<ToolErrorKind> {
+        match self {
+            Self::Success { .. } => None,
+            Self::Failure { kind, .. } => Some(*kind),
+        }
+    }
+
+    /// Converts the logical outcome to the provider-neutral call result.
+    #[must_use]
+    pub fn into_result(self, call: &ToolCall) -> ToolResult {
+        match self {
+            Self::Success { output, .. } => {
+                let mut content = output.into_content();
+                if content.is_empty() {
+                    content.push(ContentPart::Text {
+                        text: String::new(),
+                    });
+                }
+                ToolResult {
+                    tool_call_id: call.id.clone(),
+                    name: Some(call.name.clone()),
+                    content,
+                    is_error: false,
+                }
+            }
+            Self::Failure { message, .. } => ToolResult {
+                tool_call_id: call.id.clone(),
+                name:         Some(call.name.clone()),
+                content:      vec![ContentPart::Text { text: message }],
+                is_error:     true,
+            },
         }
     }
 }
@@ -532,6 +661,49 @@ impl ToolSystem {
         .run(request)
         .await
     }
+
+    /// Resolves, validates, and invokes one call through the complete stack.
+    pub async fn execute(
+        &self,
+        catalog: &ToolCatalog,
+        turn: usize,
+        call: ToolCall,
+        cancellation: CancellationToken,
+    ) -> StdResult<ToolOutcome, ToolSystemError> {
+        let request = match catalog.resolve(turn, call, cancellation.clone()) {
+            Ok(request) => request,
+            Err(outcome) => return Ok(outcome),
+        };
+        self.execute_resolved(request, &cancellation).await
+    }
+
+    pub(crate) async fn execute_observed(
+        &self,
+        catalog: &ToolCatalog,
+        turn: usize,
+        call: ToolCall,
+        cancellation: CancellationToken,
+        events: EventHub,
+    ) -> StdResult<ToolOutcome, ToolSystemError> {
+        let request = match catalog.resolve(turn, call, cancellation.clone()) {
+            Ok(request) => request.with_events(events),
+            Err(outcome) => return Ok(outcome),
+        };
+        self.execute_resolved(request, &cancellation).await
+    }
+
+    async fn execute_resolved(
+        &self,
+        request: ToolCallRequest,
+        cancellation: &CancellationToken,
+    ) -> StdResult<ToolOutcome, ToolSystemError> {
+        let outcome = self.call(request).await?;
+        if cancellation.is_cancelled() {
+            Ok(ToolOutcome::failure(ToolErrorKind::Cancelled, "Cancelled"))
+        } else {
+            Ok(outcome)
+        }
+    }
 }
 
 impl fmt::Debug for ToolSystem {
@@ -711,8 +883,9 @@ mod tests {
         let outcome = system.call(request()).await.expect("the refusal succeeds");
 
         assert_eq!(outcome, ToolOutcome::Failure {
-            kind:    ToolErrorKind::Denied,
-            message: "not allowed".to_owned(),
+            kind:         ToolErrorKind::Denied,
+            message:      "not allowed".to_owned(),
+            output_stats: None,
         });
         assert!(
             calls
@@ -720,6 +893,23 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn resolution_rejects_a_call_kind_that_does_not_match_the_descriptor() {
+        let catalog = ToolCatalog::new([descriptor("inspect")]);
+        let outcome = catalog
+            .resolve(
+                0,
+                ToolCall::custom("call_1", "inspect", "free form"),
+                CancellationToken::new(),
+            )
+            .expect_err("a custom call cannot invoke a function descriptor");
+
+        assert!(matches!(outcome, ToolOutcome::Failure {
+            kind: ToolErrorKind::InvalidArguments,
+            ..
+        }));
     }
 
     #[test]
@@ -749,7 +939,7 @@ mod tests {
             ToolOutcome::success(ToolOutput::new([ContentPart::Text {
                 text: "ok".to_owned(),
             }])),
-            ToolOutcome::Success(_)
+            ToolOutcome::Success { .. }
         ));
     }
 }

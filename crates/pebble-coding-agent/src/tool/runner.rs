@@ -13,13 +13,9 @@ use std::result::Result as StdResult;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use lithos_llm::types::{ContentPart, Message, ToolCall, ToolDefinition, ToolResult};
-use pebble_agent::integration::validate_tool_arguments;
-use pebble_agent::{
-    ToolCallRequest, ToolDiscoveryContext, ToolMiddleware, ToolOutcome, ToolSystem,
-};
+use lithos_llm::types::{Message, ToolCall, ToolDefinition, ToolResult};
+use pebble_agent::{ToolDiscoveryContext, ToolMiddleware, ToolOutcome, ToolSystem};
 use tokio_util::sync::CancellationToken;
-use tracing::warn;
 
 use super::execution::CodingToolService;
 use super::registry::{RegisteredTool, ToolDefinitionWithSource, ToolEnvProvider, ToolRegistry};
@@ -138,14 +134,15 @@ pub type ToolEventCallback = Arc<dyn Fn(CodingAgentEvent) + Send + Sync>;
 /// Executes one coding tool call at a time, the way a session would.
 ///
 /// A call goes through the pipeline a session's rounds use: configured tool
-/// middleware inside the same fixed event and output envelope. The events the
-/// call publishes reach the callback given to [`on_event`](Self::on_event), in
-/// order, before [`run`](Self::run) returns.
+/// middleware inside the same fixed output envelope. The runner projects the
+/// call lifecycle onto the event pipeline. Those events reach the callback
+/// given to [`on_event`](Self::on_event), in order, before
+/// [`run`](Self::run) returns.
 #[derive(Clone)]
 pub struct ToolRunner {
-    registry:          ToolRegistry,
+    registry:          Arc<ToolRegistry>,
     environment:       Arc<dyn Environment>,
-    options:           CodingAgentOptions,
+    options:           Arc<CodingAgentOptions>,
     tool_middleware:   Vec<Arc<dyn ToolMiddleware>>,
     redactor:          Option<Arc<dyn Redactor>>,
     tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
@@ -158,9 +155,9 @@ impl ToolRunner {
     #[must_use]
     pub fn new(tools: CodingToolSet, environment: Arc<dyn Environment>) -> Self {
         Self {
-            registry: tools.registry,
+            registry: Arc::new(tools.registry),
             environment,
-            options: CodingAgentOptions::default(),
+            options: Arc::new(CodingAgentOptions::default()),
             tool_middleware: Vec::new(),
             redactor: None,
             tool_env_provider: None,
@@ -172,11 +169,11 @@ impl ToolRunner {
     /// Sets the output and execution options calls run under.
     #[must_use]
     pub fn options(mut self, options: CodingAgentOptions) -> Self {
-        self.options = options;
+        self.options = Arc::new(options);
         self
     }
 
-    /// Adds one middleware inside the runner's fixed event/output envelope.
+    /// Adds one middleware inside the runner's fixed output envelope.
     #[must_use]
     pub fn tool_middleware(mut self, middleware: Arc<dyn ToolMiddleware>) -> Self {
         self.tool_middleware.push(middleware);
@@ -254,9 +251,9 @@ impl ToolRunner {
             .clone()
             .unwrap_or_else(|| Arc::new(NoRedaction));
         let mut service = CodingToolService::new(
-            self.registry.clone(),
+            Arc::clone(&self.registry),
             Arc::clone(&self.environment),
-            self.options.clone(),
+            Arc::clone(&self.options),
             emitter.clone(),
             self.session_id.clone(),
             self.session_id.clone(),
@@ -272,50 +269,58 @@ impl ToolRunner {
         }
 
         let messages: [Message; 0] = [];
-        let outcome = match system
+        let (outcome, call_started) = match system
             .discover(ToolDiscoveryContext::new("standalone", 0, &messages))
             .await
         {
-            Ok(catalog) => match catalog.find_by_name(&call.name) {
-                Some(descriptor) => {
-                    match validate_tool_arguments(&descriptor.definition().kind, &call.arguments) {
-                        Ok(()) => {
-                            system
-                                .call(ToolCallRequest::new(
-                                    0,
-                                    call.clone(),
-                                    descriptor.clone(),
-                                    cancel,
-                                ))
-                                .await
-                        }
-                        Err(error) => Ok(service.answer_failure(
-                            call,
-                            pebble_agent::ToolErrorKind::InvalidArguments,
-                            error.to_string(),
-                        )),
-                    }
+            Ok(catalog) => {
+                service.begin_standalone(call);
+                (
+                    system.execute(&catalog, 0, call.clone(), cancel).await,
+                    true,
+                )
+            }
+            Err(error) => (Err(error), false),
+        };
+
+        let result = match outcome {
+            Ok(outcome) => Ok(service.complete_standalone(call, outcome)),
+            Err(error) => {
+                if call_started {
+                    let _ = service.complete_standalone(
+                        call,
+                        ToolOutcome::failure(
+                            pebble_agent::ToolErrorKind::Execution,
+                            error.message(),
+                        ),
+                    );
                 }
-                None => Ok(service.answer_failure(
-                    call,
-                    pebble_agent::ToolErrorKind::Unavailable,
-                    format!("unknown tool `{}`", call.name),
-                )),
-            },
-            Err(error) => Err(error),
+                Err(error)
+            }
         };
 
         // Closing the pipeline publishes everything queued, so the callback has
         // seen every event by the time the caller has the result.
-        drop(system);
-        drop(service);
-        drop(emitter);
-        match pump.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => warn!(%error, "a tool runner's event callback failed"),
-            Err(error) => warn!(%error, "a tool runner's event pump task failed"),
-        }
-        outcome.map(|outcome| result_from_outcome(call, outcome))
+        let close = emitter.close().await.map_err(|source| {
+            pebble_agent::ToolSystemError::with_source(
+                "tool event pipeline failed",
+                source.into_runtime_error(),
+            )
+        });
+        let joined = pump
+            .await
+            .map_err(|source| {
+                pebble_agent::ToolSystemError::with_source(
+                    "tool event pipeline task failed",
+                    source,
+                )
+            })?
+            .map_err(|source| {
+                pebble_agent::ToolSystemError::with_source("tool event pipeline failed", source)
+            });
+        close?;
+        joined?;
+        result
     }
 }
 
@@ -328,31 +333,6 @@ impl fmt::Debug for ToolRunner {
             .field("tool_middleware", &self.tool_middleware.len())
             .field("has_event_callback", &self.on_event.is_some())
             .finish_non_exhaustive()
-    }
-}
-
-fn result_from_outcome(call: &ToolCall, outcome: ToolOutcome) -> ToolResult {
-    match outcome {
-        ToolOutcome::Success(output) => ToolResult {
-            tool_call_id: call.id.clone(),
-            name:         Some(call.name.clone()),
-            content:      output.content().to_vec(),
-            is_error:     false,
-        },
-        ToolOutcome::Failure { message, .. } => ToolResult {
-            tool_call_id: call.id.clone(),
-            name:         Some(call.name.clone()),
-            content:      vec![ContentPart::Text { text: message }],
-            is_error:     true,
-        },
-        _ => ToolResult {
-            tool_call_id: call.id.clone(),
-            name:         Some(call.name.clone()),
-            content:      vec![ContentPart::Text {
-                text: "the tool returned an unsupported outcome".to_owned(),
-            }],
-            is_error:     true,
-        },
     }
 }
 

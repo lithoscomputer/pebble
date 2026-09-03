@@ -525,8 +525,17 @@ impl ToolRegistry {
 
     /// The tool exposed under `name`.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn get(&self, name: &str) -> Option<&RegisteredTool> {
         self.tools.get(name)
+    }
+
+    /// The tool with this stable identity, independent of visible vocabulary.
+    #[must_use]
+    pub(crate) fn get_by_id(&self, id: &pebble_agent::ToolId) -> Option<&RegisteredTool> {
+        NativeTool::from_canonical_name(id.as_str())
+            .and_then(|tool| self.get_native(tool))
+            .or_else(|| self.tools.get(id.as_str()))
     }
 
     /// A built-in tool by identity, whatever vocabulary it is exposed under.

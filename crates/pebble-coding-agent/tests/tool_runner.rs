@@ -91,7 +91,7 @@ impl ToolMiddleware for MiddlewareLog {
         self.push(format!("pre {name}"));
         let outcome = next.run(request).await?;
         match &outcome {
-            ToolOutcome::Success(_) => self.push(format!("post {name} {id}")),
+            ToolOutcome::Success { .. } => self.push(format!("post {name} {id}")),
             ToolOutcome::Failure { kind, .. } => self.push(format!("fail {name} {id} {kind:?}")),
             _ => self.push(format!("fail {name} {id} unknown")),
         }
@@ -432,4 +432,27 @@ async fn an_unknown_tool_and_a_cancelled_call_are_both_answered() {
     assert_eq!(text_of(&unknown), "unknown tool `nope`");
     assert!(cancelled.is_error);
     assert_eq!(text_of(&cancelled), "Cancelled");
+}
+
+#[tokio::test]
+async fn an_event_callback_failure_fails_the_run() {
+    let runner = ToolRunner::new(
+        CodingToolSet::core(),
+        mock_environment() as Arc<dyn Environment>,
+    )
+    .on_event(|_| panic!("callback failed"));
+
+    let error = runner
+        .run(
+            &ToolCall::function(
+                "call_read",
+                "read_file",
+                json!({"file_path": "/work/notes.md"}),
+            ),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("a failed callback makes event delivery incomplete");
+
+    assert!(error.message().contains("event pipeline"));
 }

@@ -224,6 +224,40 @@ async fn ten_unused_assistant_turns_bring_back_the_task_reminder() {
 }
 
 #[tokio::test]
+async fn hidden_task_tools_do_not_trigger_a_task_reminder() {
+    let (mut session, provider) = TestSession::new(answers("done"))
+        .tools([noop_tool("TaskCreate"), noop_tool("TaskUpdate")])
+        .tool_middleware(permission_middleware(
+            vec![
+                ("TaskCreate", ToolPermission::Deny {
+                    reason: "tasks are disabled".to_owned(),
+                }),
+                ("TaskUpdate", ToolPermission::Deny {
+                    reason: "tasks are disabled".to_owned(),
+                }),
+            ],
+            None,
+        ))
+        .build();
+
+    for index in 0..=10 {
+        session
+            .prompt(&format!("turn {index}"))
+            .await
+            .expect("the prompt succeeds");
+    }
+
+    let requests = provider.requests();
+    let last = requests.last().expect("the last round was requested");
+    assert!(
+        last.messages().iter().all(|message| {
+            message.role() != Role::System || message_text(message) != TASK_REMINDER_TEXT
+        }),
+        "hidden task tools are not mentioned to the model"
+    );
+}
+
+#[tokio::test]
 async fn the_reasoning_effort_a_session_is_given_reaches_the_request() {
     // A model whose catalog row says it can be asked to think harder.
     let (mut session, provider) = TestSession::new(answers("captured"))
@@ -360,7 +394,7 @@ impl ToolMiddleware for RecordingToolMiddleware {
             .push(format!("before {name}"));
         let outcome = next.run(request).await?;
         let status = match &outcome {
-            ToolOutcome::Success(_) => "success",
+            ToolOutcome::Success { .. } => "success",
             ToolOutcome::Failure { .. } => "failure",
             _ => "unknown",
         };

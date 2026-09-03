@@ -35,11 +35,11 @@ use crate::task_reminder::maybe_task_reminder;
 #[cfg(test)]
 use crate::tool::ToolEnvProvider;
 use crate::tool::{
-    CodingToolService, NativeTool, ToolDefinitionWithSource, ToolRegistry, canonical_tool_name,
+    CodingToolService, NativeTool, ToolRegistry, canonical_tool_name, output_value, result_text,
 };
 use crate::types::{
     CodingAgentState, CodingEvent, ContextWindowSnapshot, CostSource, LlmOutputKind, LlmRetryPhase,
-    Message, SkillActivationSource, TokenUsage, ToolErrorKind, message_text,
+    Message, SkillActivationSource, TokenUsage, message_text,
 };
 
 /// How many failed response streams Pebble replays after the first attempt.
@@ -58,8 +58,8 @@ pub(super) struct CodingAgentBridge {
     provider:       String,
     system_prompt:  String,
     facts:          ModelFacts,
-    config:         CodingAgentOptions,
-    registry:       ToolRegistry,
+    config:         Arc<CodingAgentOptions>,
+    registry:       Arc<ToolRegistry>,
     tools:          Arc<CodingToolService>,
     emitter:        Emitter,
     session_id:     String,
@@ -115,10 +115,12 @@ impl ConversationState {
 
 impl CodingAgentBridge {
     fn from_runtime(runtime: &CodingRuntime) -> Self {
+        let registry = Arc::new(runtime.registry.clone());
+        let config = Arc::new(runtime.config.clone());
         let mut tools = CodingToolService::new(
-            runtime.registry.clone(),
+            Arc::clone(&registry),
             Arc::clone(&runtime.env),
-            runtime.config.clone(),
+            Arc::clone(&config),
             runtime.emitter.clone(),
             runtime.id.clone(),
             runtime.root_session_id.clone(),
@@ -131,24 +133,24 @@ impl CodingAgentBridge {
             tools = tools.with_human_input(Arc::clone(provider));
         }
         Self {
-            state:          Arc::clone(&runtime.conversation),
-            client:         runtime.client.clone(),
+            state: Arc::clone(&runtime.conversation),
+            client: runtime.client.clone(),
             model_selector: runtime.model_selector.clone(),
-            model:          runtime.model.clone(),
-            provider:       runtime.provider.clone(),
-            system_prompt:  runtime.system_prompt.clone(),
-            facts:          runtime.facts,
-            config:         runtime.config.clone(),
-            registry:       runtime.registry.clone(),
-            tools:          Arc::new(tools),
-            emitter:        runtime.emitter.clone(),
-            session_id:     runtime.id.clone(),
-            memory_tokens:  runtime.memory_tokens,
-            skills_tokens:  runtime.skills_tokens,
-            state_machine:  runtime.state.clone(),
-            prompt_cancel:  Arc::new(Mutex::new(runtime.cancel_token.clone())),
-            subagents:      runtime.subagents.clone(),
-            skills:         runtime.skills.clone(),
+            model: runtime.model.clone(),
+            provider: runtime.provider.clone(),
+            system_prompt: runtime.system_prompt.clone(),
+            facts: runtime.facts,
+            config,
+            registry,
+            tools: Arc::new(tools),
+            emitter: runtime.emitter.clone(),
+            session_id: runtime.id.clone(),
+            memory_tokens: runtime.memory_tokens,
+            skills_tokens: runtime.skills_tokens,
+            state_machine: runtime.state.clone(),
+            prompt_cancel: Arc::new(Mutex::new(runtime.cancel_token.clone())),
+            subagents: runtime.subagents.clone(),
+            skills: runtime.skills.clone(),
         }
     }
 
@@ -157,7 +159,6 @@ impl CodingAgentBridge {
             .prompt_cancel
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = prompt_cancel;
-        self.tools.begin_prompt();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.totals = PromptTotals::default();
         state.compaction_failed = false;
@@ -211,10 +212,6 @@ impl CodingAgentBridge {
 
     fn emit(&self, event: CodingEvent) {
         self.emitter.emit(self.session_id.clone(), event);
-    }
-
-    fn registered_tools(&self) -> Vec<ToolDefinitionWithSource> {
-        self.registry.definitions_with_source()
     }
 
     pub(super) fn finish_inference(&self) {
@@ -294,11 +291,10 @@ impl CodingAgentBridge {
         }
     }
 
-    fn stage_task_reminder(&self) {
-        let tools = self.registered_tools();
+    fn stage_task_reminder(&self, tools: &agent::ToolCatalog) {
         let names = tools
-            .iter()
-            .map(|tool| tool.definition.name.as_str())
+            .visible_tools()
+            .map(|tool| tool.definition().name.as_str())
             .collect::<Vec<_>>();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.pending_task_reminder =
@@ -504,33 +500,24 @@ impl agent::EventProjection for CodingAgentBridge {
                 self.state_machine.transition(CodingAgentState::Executing);
                 let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
                 state.tool_start.get_or_insert_with(Instant::now);
-                if self.registry.get(&call.name).is_none() {
-                    self.emitter.emit_with_tool_call_id(
-                        &self.session_id,
-                        CodingEvent::ToolCallStarted {
-                            tool_name:    call.name.clone(),
-                            tool_call_id: call.id.clone(),
-                            arguments:    call.arguments.clone(),
-                        },
-                        Some(call.id.clone()),
-                    );
-                }
+                self.emitter.emit_with_tool_call_id(
+                    &self.session_id,
+                    CodingEvent::ToolCallStarted {
+                        tool_name:    call.name.clone(),
+                        tool_call_id: call.id.clone(),
+                        arguments:    call.arguments.clone(),
+                    },
+                    Some(call.id.clone()),
+                );
             }
-            agent::AgentEvent::ToolCompleted { result }
-                if result
-                    .name
-                    .as_deref()
-                    .is_some_and(|name| self.registry.get(name).is_none()) =>
-            {
-                let text = result
-                    .content
-                    .iter()
-                    .find_map(|part| match part {
-                        ContentPart::Text { text } => Some(text.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-                let stats = OutputCaptureStats::complete(text.len());
+            agent::AgentEvent::ToolCompleted {
+                result,
+                error_kind,
+                output_stats,
+            } => {
+                let text = result_text(result).into_owned();
+                let stats =
+                    output_stats.unwrap_or_else(|| OutputCaptureStats::complete(text.len()));
                 self.emitter.emit_with_tool_call_id(
                     &self.session_id,
                     CodingEvent::ToolCallOutputDelta {
@@ -543,11 +530,9 @@ impl agent::EventProjection for CodingAgentBridge {
                     CodingEvent::ToolCallCompleted {
                         tool_name:             result.name.clone().unwrap_or_default(),
                         tool_call_id:          result.tool_call_id.clone(),
-                        output:                Value::String(text),
+                        output:                output_value(result),
                         is_error:              result.is_error,
-                        error_kind:            result
-                            .is_error
-                            .then_some(ToolErrorKind::Unavailable),
+                        error_kind:            *error_kind,
                         output_bytes_observed: stats.observed_bytes,
                         output_bytes_retained: stats.retained_bytes,
                         output_bytes_omitted:  stats.omitted_bytes,
@@ -584,11 +569,23 @@ impl agent::AgentLifecycle for CodingAgentBridge {
         // Commit the input and any steering before work on the next request.
         self.flush_events().await?;
         self.compact_once_if_needed().await;
-        self.stage_task_reminder();
-        let update = self.conversation_update(true);
+        let update = self.conversation_update(false);
         // Compaction can publish its own result or failure.
         self.flush_events().await?;
         Ok(update)
+    }
+
+    async fn after_tool_discovery(
+        &self,
+        _context: agent::TurnContext<'_>,
+        tools: &agent::ToolCatalog,
+        cancel: &CancellationToken,
+    ) -> StdResult<agent::ConversationUpdate, agent::LifecycleError> {
+        if cancel.is_cancelled() || self.prompt_cancel().is_cancelled() {
+            return Ok(agent::ConversationUpdate::unchanged());
+        }
+        self.stage_task_reminder(tools);
+        Ok(self.conversation_update(true))
     }
 
     async fn after_model(
