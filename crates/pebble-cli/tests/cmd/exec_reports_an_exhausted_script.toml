@@ -1,0 +1,10 @@
+bin.name = "pebble"
+args = ["exec", "--model", "openai/gpt-5.4", "--quiet", "keep going"]
+fs.sandbox = true
+status.code = 1
+
+[env]
+inherit = false
+
+[env.add]
+OPENAI_API_KEY = "exec_reports_an_exhausted_script"

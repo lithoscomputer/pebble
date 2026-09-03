@@ -1,0 +1,10 @@
+Run a coding agent from the command line
+
+Usage: pebble <COMMAND>
+
+Commands:
+  exec  Run one prompt to completion and print the answer
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version

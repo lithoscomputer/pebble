@@ -1,0 +1,10 @@
+bin.name = "pebble"
+args = ["exec", "--model", "openai/gpt-5.6-sol", "--permission", "full", "build in sub"]
+fs.sandbox = true
+status = "success"
+
+[env]
+inherit = false
+
+[env.add]
+OPENAI_API_KEY = "exec_uses_gpt56_tools"

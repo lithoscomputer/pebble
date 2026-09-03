@@ -1,0 +1,46 @@
+Run one prompt to completion and print the answer
+
+Usage: pebble exec [OPTIONS] [PROMPT]
+
+Arguments:
+  [PROMPT]
+          The prompt. Read from standard input when omitted
+
+Options:
+  -m, --model <MODEL>
+          The model selector, as the catalog knows it
+[..]
+          [default: claude-sonnet-5]
+
+  -C, --cwd <DIR>
+          The directory the agent works in. Created when missing
+[..]
+          [default: .]
+
+      --permission <PERMISSION>
+          What the agent may do without asking
+
+          Possible values:
+          - read-only:  Reads only
+          - read-write: Reads and writes, but no commands
+          - full:       Everything, including commands
+[..]
+          [default: read-write]
+
+      --timeout <DURATION>
+          End the prompt after this long, for example 30s, 10m, or 1h
+
+      --instructions <TEXT>
+          Extra instructions added to the system prompt
+
+      --json
+          Write every event to standard error as one JSON object per line
+
+  -q, --quiet
+          Write nothing to standard error but errors
+
+      --subagents
+          Let the agent spawn subagents for independent work
+
+  -h, --help
+          Print help (see a summary with '-h')

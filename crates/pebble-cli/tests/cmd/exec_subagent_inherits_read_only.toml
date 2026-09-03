@@ -1,0 +1,10 @@
+bin.name = "pebble"
+args = ["exec", "--model", "openai/gpt-5.4", "--quiet", "--subagents", "--permission", "read-only", "delegate the build"]
+fs.sandbox = true
+status = "success"
+
+[env]
+inherit = false
+
+[env.add]
+OPENAI_API_KEY = "exec_subagent_inherits_read_only"

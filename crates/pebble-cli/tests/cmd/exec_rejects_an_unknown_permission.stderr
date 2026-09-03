@@ -1,0 +1,4 @@
+error: invalid value 'root' for '--permission <PERMISSION>'
+  [possible values: read-only, read-write, full]
+
+For more information, try '--help'.

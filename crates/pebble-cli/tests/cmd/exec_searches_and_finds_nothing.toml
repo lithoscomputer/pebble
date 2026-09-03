@@ -1,0 +1,10 @@
+bin.name = "pebble"
+args = ["exec", "--model", "openai/gpt-5.4", "find nothing"]
+fs.sandbox = true
+status = "success"
+
+[env]
+inherit = false
+
+[env.add]
+OPENAI_API_KEY = "exec_searches_and_finds_nothing"

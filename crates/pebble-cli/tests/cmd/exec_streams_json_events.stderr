@@ -1,0 +1,14 @@
+{"seq":4,"stream_id":"[..]","event":{"UserInput":{"text":"write it"}},"timestamp":"[..]","session_id":"[..]"}
+{"seq":5,"stream_id":"[..]","event":{"LlmRequestStarted":{"requested_model":"gpt-5.4"}},"timestamp":"[..]","session_id":"[..]"}
+{"seq":6,"stream_id":"[..]","event":{"LlmFirstOutput":{"kind":"text"}},"timestamp":"[..]","session_id":"[..]"}
+{"seq":7,"stream_id":"[..]","event":{"TextDelta":{"delta":"Writing."}},"timestamp":"[..]","session_id":"[..]"}
+{"seq":8,"stream_id":"[..]","event":{"AssistantMessage":{"text":"Writing.","model":"gpt-5.4","usage":{"input":10,"output":5,"reasoning":0,"cache_read":0,"cache_write":0},"cost_usd_micros":100,"cost_source":"catalog","tool_call_count":1,"context_window":[..]}},"timestamp":"[..]","session_id":"[..]"}
+{"seq":9,"stream_id":"[..]","event":{"ToolCallStarted":{"tool_name":"write_file","tool_call_id":"call_write","arguments":{"file_path":"it.txt","content":"it/n"}}},"timestamp":"[..]","session_id":"[..]","tool_call_id":"call_write"}
+{"seq":10,"stream_id":"[..]","event":{"ToolCallOutputDelta":{"delta":"Successfully wrote to it.txt"}},"timestamp":"[..]","session_id":"[..]","tool_call_id":"call_write"}
+{"seq":11,"stream_id":"[..]","event":{"ToolCallCompleted":{"tool_name":"write_file","tool_call_id":"call_write","output":"Successfully wrote to it.txt","is_error":false,"output_bytes_observed":28,"output_bytes_retained":28,"output_bytes_omitted":0}},"timestamp":"[..]","session_id":"[..]","tool_call_id":"call_write"}
+{"seq":12,"stream_id":"[..]","event":{"LlmRequestStarted":{"requested_model":"gpt-5.4"}},"timestamp":"[..]","session_id":"[..]"}
+{"seq":13,"stream_id":"[..]","event":{"LlmFirstOutput":{"kind":"text"}},"timestamp":"[..]","session_id":"[..]"}
+{"seq":14,"stream_id":"[..]","event":{"TextDelta":{"delta":"Wrote it."}},"timestamp":"[..]","session_id":"[..]"}
+{"seq":15,"stream_id":"[..]","event":{"AssistantMessage":{"text":"Wrote it.","model":"gpt-5.4","usage":{"input":10,"output":5,"reasoning":0,"cache_read":0,"cache_write":0},"cost_usd_micros":100,"cost_source":"catalog","tool_call_count":0,"context_window":[..]}},"timestamp":"[..]","session_id":"[..]"}
+{"seq":16,"stream_id":"[..]","event":"ProcessingEnd","timestamp":"[..]","session_id":"[..]"}
+{"seq":17,"stream_id":"[..]","event":"SessionEnded","timestamp":"[..]","session_id":"[..]"}

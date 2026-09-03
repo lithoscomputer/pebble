@@ -1,0 +1,10 @@
+bin.name = "pebble"
+args = ["exec", "--model", "fireworks/kimi-k2.7-code", "--quiet", "say hello"]
+fs.sandbox = true
+status = "success"
+
+[env]
+inherit = false
+
+[env.add]
+FIREWORKS_API_KEY = "exec_answers_through_fireworks"

@@ -1,12 +1,13 @@
 # Developing
 
-Pebble is a two-crate library workspace with one example binary.
+Pebble is a workspace of two library crates, one example, and one binary.
 `crates/pebble-agent` is the provider-neutral agent loop.
 `crates/pebble-coding-agent` is the coding-agent layer and owns the example.
-Most coding-agent work is a change to `crates/pebble-coding-agent/src/`, its
-unit tests beside it, and the contract tests in
-`crates/pebble-coding-agent/tests/`. Generic turn-loop work belongs in
-`crates/pebble-agent/src/`.
+`crates/pebble-cli` is the `pebble` command, the smallest application that
+embeds the coding agent. Most coding-agent work is a change to
+`crates/pebble-coding-agent/src/`, its unit tests beside it, and the contract
+tests in `crates/pebble-coding-agent/tests/`. Generic turn-loop work belongs
+in `crates/pebble-agent/src/`.
 
 ## Setup
 
@@ -36,6 +37,7 @@ mise run setup
 | Command | Purpose |
 | --- | --- |
 | `mise run dev` | Run the coding-agent example against a live provider |
+| `mise run exec -- <PROMPT>` | Run `pebble exec` against a live provider |
 | `mise run fmt` | Format Rust code |
 | `mise run fmt:check` | Check formatting without changing files |
 | `mise run lint` | Run Clippy with warnings denied |
@@ -93,6 +95,22 @@ and a real temporary directory, so it needs no credentials and no network.
 Tests that reach `pebble_coding_agent::test_support` need the `test-util` feature, which is
 why the test tasks pass `--all-features`.
 
+The `pebble` binary is tested with `trycmd`: each case under
+`crates/pebble-cli/tests/cmd/` names the arguments, the expected output on
+each stream, and the exit status. A case that runs a prompt talks to
+[twin-openai](https://github.com/lithoscomputer/twins), a deterministic
+OpenAI-compatible server the harness starts in the test process on an
+ephemeral port and hands to the binary through `PEBBLE_<PROVIDER>_BASE_URL`.
+The real codec and transport run; only the far end is scripted. Each case's
+API key, `OPENAI_API_KEY`, `MOONSHOT_API_KEY`, or `VENICE_API_KEY`, names its
+scenario namespace
+in `tests/cmd/scenarios.json`, and its working directory is a sandbox copy of
+its `.in/` directory. A subagent's id is random, so a scripted parent waits
+with no `agent_id`, which waits for every child, and fixtures elide the id
+with `[..]`. Run
+`TRYCMD=overwrite mise run test` to accept changed output after reviewing it,
+and `TRYCMD=dump` to write actual output to a `dump/` directory instead.
+
 ## Rust policy
 
 This project follows the pinned Brynary Rust Style Guide. Run
@@ -129,6 +147,13 @@ project builds today. Cargo records the optional dependencies of a dependency
 even when no feature enables them, and enabling that feature later would build
 whatever version the lockfile named. A dependency that drags in entries no
 `lithos-llm` version covers is the wrong dependency.
+
+Test tooling follows the same rule. `trycmd` and `twin-openai` are
+dev-dependencies of `lithos-llm` too, so pebble's lockfile takes their
+entries from there. When one of them needs to move, move it in `lithos-llm`
+first, then re-pin here. The `twin-openai` revision may run ahead of
+`lithos-llm`'s while a twin feature pebble needs is still landing; the crate
+version stays the same and the two revisions meet at the next re-pin.
 
 ## Releases
 

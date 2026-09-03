@@ -1,0 +1,15 @@
+[ask] gpt-5.4
+Waiting.
+[turn] 15 tokens, 1 tool call(s)
+[tool] shell {"command":"sleep 30","timeout_ms":300}
+[exec] exit ? in [..] ms
+[tool] shell failed: Termination: timed_out Exit code: none Duration: [..]ms
+[ask] gpt-5.4
+The command was stopped.
+[turn] 15 tokens, 0 tool call(s)
+
+turns:  2
+tools:  1 call(s), 1 failed
+        shell x1
+tokens: 20 in, 10 out, 0 reasoning, 0 cached (30 total)
+cost:   $0.0002

@@ -1,0 +1,25 @@
+[ask] claude-sonnet-5
+Farming it out.
+[turn] 15 tokens, 1 tool call(s)
+[tool] Agent {"description":"Summarize notes","prompt":"child: summarize notes","run_in_background":true}
+[spawn] [..] at depth 1
+...
+[retry] attempt 0 in 0.1s: provider venice The child's model fell over.
+...
+[retry] attempt 1 in 0.2s: provider venice The child's model fell over.
+...
+[retry] attempt 2 in 0.4s: provider venice The child's model fell over.
+...
+[error] calling the model: provider venice The child's model fell over.
+...
+[child] [..] failed: calling the model: provider venice The child's model fell over.
+...
+The background agent failed.
+[turn] 15 tokens, 0 tool call(s)
+
+turns:  3
+tools:  1 call(s), 0 failed
+        Agent x1
+tokens: 30 in, 15 out, 0 reasoning, 0 cached (45 total)
+cost:   $0.0002
+retries: 3

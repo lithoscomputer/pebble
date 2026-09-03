@@ -1,0 +1,3 @@
+bin.name = "pebble"
+args = ["exec", "   "]
+status.code = 1

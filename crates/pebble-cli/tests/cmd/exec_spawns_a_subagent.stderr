@@ -1,0 +1,14 @@
+[ask] gpt-5.4
+Delegating.
+[turn] 15 tokens, 1 tool call(s)
+[tool] spawn_agent {"task":"child: say hello back"}
+[spawn] [..] at depth 1
+...
+The child said hello.
+[turn] 15 tokens, 0 tool call(s)
+
+turns:  4
+tools:  2 call(s), 0 failed
+        spawn_agent x1, wait x1
+tokens: 30 in, 15 out, 0 reasoning, 0 cached (45 total)
+cost:   $0.0003

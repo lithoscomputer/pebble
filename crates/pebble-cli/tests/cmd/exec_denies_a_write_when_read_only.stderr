@@ -1,0 +1,14 @@
+[ask] gpt-5.4
+Writing.
+[turn] 15 tokens, 1 tool call(s)
+[tool] write_file {"file_path":"notes.txt","content":"x/n"}
+[tool] write_file failed: write_file requires approval, but no approval service is installed
+[ask] gpt-5.4
+I am not allowed to write.
+[turn] 15 tokens, 0 tool call(s)
+
+turns:  2
+tools:  1 call(s), 1 failed
+        write_file x1
+tokens: 20 in, 10 out, 0 reasoning, 0 cached (30 total)
+cost:   $0.0002

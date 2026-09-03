@@ -1,0 +1,9 @@
+bin.name = "pebble"
+args = ["exec", "--model", "openai/gpt-5.6-sol", "patch lib.rs"]
+fs.sandbox = true
+
+[env]
+inherit = false
+
+[env.add]
+OPENAI_API_KEY = "exec_patches_a_file_as_gpt56"

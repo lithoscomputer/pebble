@@ -1,0 +1,10 @@
+bin.name = "pebble"
+args = ["exec", "--permission", "read-only", "--model", "openai/gpt-5.4", "run make"]
+fs.sandbox = true
+status = "success"
+
+[env]
+inherit = false
+
+[env.add]
+OPENAI_API_KEY = "exec-denies-a-command-below-full"

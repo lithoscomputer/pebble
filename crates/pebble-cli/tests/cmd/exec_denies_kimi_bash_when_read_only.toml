@@ -1,0 +1,10 @@
+bin.name = "pebble"
+args = ["exec", "--model", "moonshot/kimi-k3", "--quiet", "--permission", "read-only", "run it"]
+fs.sandbox = true
+status = "success"
+
+[env]
+inherit = false
+
+[env.add]
+MOONSHOT_API_KEY = "exec_denies_kimi_bash_when_read_only"

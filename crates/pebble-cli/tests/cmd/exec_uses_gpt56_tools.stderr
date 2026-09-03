@@ -1,0 +1,15 @@
+[ask] gpt-5.6-sol
+Planning.
+[turn] 15 tokens, 2 tool call(s)
+[tool] update_plan {"plan":[{"step":"build","status":"in_progress"}]}
+[tool] shell_command {"command":"pwd; echo ok > built.txt","workdir":"sub"}
+[exec] exit 0 in [..] ms
+[ask] gpt-5.6-sol
+Built in sub.
+[turn] 15 tokens, 0 tool call(s)
+
+turns:  2
+tools:  2 call(s), 0 failed
+        shell_command x1, update_plan x1
+tokens: 20 in, 10 out, 0 reasoning, 0 cached (30 total)
+cost:   $0.0003

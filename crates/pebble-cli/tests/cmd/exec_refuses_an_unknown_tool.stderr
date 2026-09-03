@@ -1,0 +1,14 @@
+[ask] gpt-5.4
+Trying.
+[turn] 15 tokens, 1 tool call(s)
+[tool] frobnicate {"x":1}
+[tool] frobnicate failed: unknown tool `frobnicate`
+[ask] gpt-5.4
+That tool does not exist.
+[turn] 15 tokens, 0 tool call(s)
+
+turns:  2
+tools:  1 call(s), 1 failed
+        frobnicate x1
+tokens: 20 in, 10 out, 0 reasoning, 0 cached (30 total)
+cost:   $0.0002

@@ -1,0 +1,8 @@
+{"seq":4,"stream_id":"[..]","event":{"UserInput":{"text":"think"}},"timestamp":"[..]","session_id":"[..]"}
+{"seq":5,"stream_id":"[..]","event":{"LlmRequestStarted":{"requested_model":"kimi-k3"}},"timestamp":"[..]","session_id":"[..]"}
+{"seq":6,"stream_id":"[..]","event":{"LlmFirstOutput":{"kind":"text"}},"timestamp":"[..]","session_id":"[..]"}
+{"seq":7,"stream_id":"[..]","event":{"TextDelta":{"delta":"Forty-two."}},"timestamp":"[..]","session_id":"[..]"}
+{"seq":8,"stream_id":"[..]","event":{"ReasoningDelta":{"delta":"Let me think about this carefully."}},"timestamp":"[..]","session_id":"[..]"}
+{"seq":9,"stream_id":"[..]","event":{"AssistantMessage":{"text":"Forty-two.","model":"kimi-k3","usage":{"input":10,"output":5,"reasoning":0,"cache_read":0,"cache_write":0},"cost_usd_micros":105,"cost_source":"catalog","tool_call_count":0,"context_window":[..],"reasoning":{"trace":"Let me think about this carefully."}}},"timestamp":"[..]","session_id":"[..]"}
+{"seq":10,"stream_id":"[..]","event":"ProcessingEnd","timestamp":"[..]","session_id":"[..]"}
+{"seq":11,"stream_id":"[..]","event":"SessionEnded","timestamp":"[..]","session_id":"[..]"}

@@ -1,0 +1,2093 @@
+{
+  "scenarios": [
+    {
+      "scenario_id": "exec-answers-without-tools/1",
+      "namespace": "exec-answers-without-tools",
+      "matcher": {
+        "endpoint": "responses",
+        "input_contains": "say hello"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Hello from the twin."
+      }
+    },
+    {
+      "scenario_id": "exec-reads-the-prompt-from-stdin/1",
+      "namespace": "exec-reads-the-prompt-from-stdin",
+      "matcher": {
+        "endpoint": "responses",
+        "input_contains": "say hello from stdin"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Hello from the twin."
+      }
+    },
+    {
+      "scenario_id": "exec-writes-a-file/1",
+      "namespace": "exec-writes-a-file",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Writing the file.",
+        "tool_calls": [
+          {
+            "id": "call_write",
+            "name": "write_file",
+            "arguments": {
+              "file_path": "greeting.txt",
+              "content": "one\ntwo\nthree\n"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec-writes-a-file/2",
+      "namespace": "exec-writes-a-file",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "greeting.txt has three lines."
+      }
+    },
+    {
+      "scenario_id": "exec-denies-a-command-below-full/1",
+      "namespace": "exec-denies-a-command-below-full",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Running the build.",
+        "tool_calls": [
+          {
+            "id": "call_shell",
+            "name": "shell",
+            "arguments": {
+              "command": "echo should-not-run > ran.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec-denies-a-command-below-full/2",
+      "namespace": "exec-denies-a-command-below-full",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "The shell was not available."
+      }
+    },
+    {
+      "scenario_id": "exec-reports-a-provider-error/1",
+      "namespace": "exec-reports-a-provider-error",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "error",
+        "status": 400,
+        "message": "The twin refused this request.",
+        "error_type": "invalid_request_error",
+        "code": "invalid_request"
+      }
+    },
+    {
+      "scenario_id": "exec_reads_a_file/1",
+      "namespace": "exec_reads_a_file",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Reading.",
+        "tool_calls": [
+          {
+            "id": "call_read",
+            "name": "read_file",
+            "arguments": {
+              "file_path": "notes.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_reads_a_file/2",
+      "namespace": "exec_reads_a_file",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "notes.txt has three words."
+      }
+    },
+    {
+      "scenario_id": "exec_edits_a_file/1",
+      "namespace": "exec_edits_a_file",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Editing.",
+        "tool_calls": [
+          {
+            "id": "call_edit",
+            "name": "edit_file",
+            "arguments": {
+              "file_path": "notes.txt",
+              "old_string": "colour",
+              "new_string": "color"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_edits_a_file/2",
+      "namespace": "exec_edits_a_file",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Fixed the spelling."
+      }
+    },
+    {
+      "scenario_id": "exec_reports_a_missing_edit_anchor/1",
+      "namespace": "exec_reports_a_missing_edit_anchor",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Editing.",
+        "tool_calls": [
+          {
+            "id": "call_edit",
+            "name": "edit_file",
+            "arguments": {
+              "file_path": "notes.txt",
+              "old_string": "colour",
+              "new_string": "color"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_reports_a_missing_edit_anchor/2",
+      "namespace": "exec_reports_a_missing_edit_anchor",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "The text was not there."
+      }
+    },
+    {
+      "scenario_id": "exec_reports_an_ambiguous_edit_anchor/1",
+      "namespace": "exec_reports_an_ambiguous_edit_anchor",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Editing.",
+        "tool_calls": [
+          {
+            "id": "call_edit",
+            "name": "edit_file",
+            "arguments": {
+              "file_path": "notes.txt",
+              "old_string": "same",
+              "new_string": "other"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_reports_an_ambiguous_edit_anchor/2",
+      "namespace": "exec_reports_an_ambiguous_edit_anchor",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "The anchor was ambiguous."
+      }
+    },
+    {
+      "scenario_id": "exec_reports_a_missing_file/1",
+      "namespace": "exec_reports_a_missing_file",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Reading.",
+        "tool_calls": [
+          {
+            "id": "call_read",
+            "name": "read_file",
+            "arguments": {
+              "file_path": "missing.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_reports_a_missing_file/2",
+      "namespace": "exec_reports_a_missing_file",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "There is no such file."
+      }
+    },
+    {
+      "scenario_id": "exec_searches_the_tree/1",
+      "namespace": "exec_searches_the_tree",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Searching.",
+        "tool_calls": [
+          {
+            "id": "call_grep",
+            "name": "grep",
+            "arguments": {
+              "pattern": "TODO",
+              "path": "."
+            }
+          },
+          {
+            "id": "call_glob",
+            "name": "glob",
+            "arguments": {
+              "pattern": "**/*.rs"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_searches_the_tree/2",
+      "namespace": "exec_searches_the_tree",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Found one TODO in src/main.rs."
+      }
+    },
+    {
+      "scenario_id": "exec_runs_a_command/1",
+      "namespace": "exec_runs_a_command",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Running.",
+        "tool_calls": [
+          {
+            "id": "call_shell",
+            "name": "shell",
+            "arguments": {
+              "command": "echo built; echo warn >&2"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_runs_a_command/2",
+      "namespace": "exec_runs_a_command",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "The build printed built."
+      }
+    },
+    {
+      "scenario_id": "exec_reports_a_failing_command/1",
+      "namespace": "exec_reports_a_failing_command",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Running.",
+        "tool_calls": [
+          {
+            "id": "call_shell",
+            "name": "shell",
+            "arguments": {
+              "command": "echo boom >&2; exit 3"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_reports_a_failing_command/2",
+      "namespace": "exec_reports_a_failing_command",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "The build failed with exit 3."
+      }
+    },
+    {
+      "scenario_id": "exec_stops_a_command_that_overruns/1",
+      "namespace": "exec_stops_a_command_that_overruns",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Waiting.",
+        "tool_calls": [
+          {
+            "id": "call_shell",
+            "name": "shell",
+            "arguments": {
+              "command": "sleep 30",
+              "timeout_ms": 300
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_stops_a_command_that_overruns/2",
+      "namespace": "exec_stops_a_command_that_overruns",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "The command was stopped."
+      }
+    },
+    {
+      "scenario_id": "exec_writes_into_a_new_directory/1",
+      "namespace": "exec_writes_into_a_new_directory",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Scaffolding.",
+        "tool_calls": [
+          {
+            "id": "call_write",
+            "name": "write_file",
+            "arguments": {
+              "file_path": "deep/er/file.txt",
+              "content": "made\n"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_writes_into_a_new_directory/2",
+      "namespace": "exec_writes_into_a_new_directory",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Created deep/er/file.txt."
+      }
+    },
+    {
+      "scenario_id": "exec_runs_two_tools_in_one_round/1",
+      "namespace": "exec_runs_two_tools_in_one_round",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Writing both.",
+        "tool_calls": [
+          {
+            "id": "call_a",
+            "name": "write_file",
+            "arguments": {
+              "file_path": "a.txt",
+              "content": "a\n"
+            }
+          },
+          {
+            "id": "call_b",
+            "name": "write_file",
+            "arguments": {
+              "file_path": "b.txt",
+              "content": "b\n"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_runs_two_tools_in_one_round/2",
+      "namespace": "exec_runs_two_tools_in_one_round",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Wrote a.txt and b.txt."
+      }
+    },
+    {
+      "scenario_id": "exec_refuses_an_unknown_tool/1",
+      "namespace": "exec_refuses_an_unknown_tool",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Trying.",
+        "tool_calls": [
+          {
+            "id": "call_frob",
+            "name": "frobnicate",
+            "arguments": {
+              "x": 1
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_refuses_an_unknown_tool/2",
+      "namespace": "exec_refuses_an_unknown_tool",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "That tool does not exist."
+      }
+    },
+    {
+      "scenario_id": "exec_denies_a_write_when_read_only/1",
+      "namespace": "exec_denies_a_write_when_read_only",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Writing.",
+        "tool_calls": [
+          {
+            "id": "call_write",
+            "name": "write_file",
+            "arguments": {
+              "file_path": "notes.txt",
+              "content": "x\n"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_denies_a_write_when_read_only/2",
+      "namespace": "exec_denies_a_write_when_read_only",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "I am not allowed to write."
+      }
+    },
+    {
+      "scenario_id": "exec_bounds_large_tool_output/1",
+      "namespace": "exec_bounds_large_tool_output",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Printing.",
+        "tool_calls": [
+          {
+            "id": "call_shell",
+            "name": "shell",
+            "arguments": {
+              "command": "head -c 1200000 /dev/zero | tr '\\0' 'x'"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_bounds_large_tool_output/2",
+      "namespace": "exec_bounds_large_tool_output",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "That was a lot of output."
+      }
+    },
+    {
+      "scenario_id": "exec_answers_as_kimi/1",
+      "namespace": "exec_answers_as_kimi",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Hello from Kimi."
+      }
+    },
+    {
+      "scenario_id": "exec_uses_kimi_tools/1",
+      "namespace": "exec_uses_kimi_tools",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Working.",
+        "tool_calls": [
+          {
+            "id": "call_read",
+            "name": "Read",
+            "arguments": {
+              "path": "notes.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_uses_kimi_tools/2",
+      "namespace": "exec_uses_kimi_tools",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Editing.",
+        "tool_calls": [
+          {
+            "id": "call_edit",
+            "name": "Edit",
+            "arguments": {
+              "path": "notes.txt",
+              "old_string": "colour",
+              "new_string": "color"
+            }
+          },
+          {
+            "id": "call_write",
+            "name": "Write",
+            "arguments": {
+              "path": "new.txt",
+              "content": "hi\n"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_uses_kimi_tools/3",
+      "namespace": "exec_uses_kimi_tools",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Checking.",
+        "tool_calls": [
+          {
+            "id": "call_grep",
+            "name": "Grep",
+            "arguments": {
+              "pattern": "color",
+              "path": "."
+            }
+          },
+          {
+            "id": "call_bash",
+            "name": "Bash",
+            "arguments": {
+              "command": "cat new.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_uses_kimi_tools/4",
+      "namespace": "exec_uses_kimi_tools",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Done: edited notes.txt and wrote new.txt."
+      }
+    },
+    {
+      "scenario_id": "exec_denies_kimi_bash_when_read_only/1",
+      "namespace": "exec_denies_kimi_bash_when_read_only",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Running.",
+        "tool_calls": [
+          {
+            "id": "call_bash",
+            "name": "Bash",
+            "arguments": {
+              "command": "echo hi"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_denies_kimi_bash_when_read_only/2",
+      "namespace": "exec_denies_kimi_bash_when_read_only",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Bash was not available."
+      }
+    },
+    {
+      "scenario_id": "exec_keeps_a_kimi_todo_list/1",
+      "namespace": "exec_keeps_a_kimi_todo_list",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Planning.",
+        "tool_calls": [
+          {
+            "id": "call_todo",
+            "name": "TodoWrite",
+            "arguments": {
+              "todos": [
+                {
+                  "title": "read the config",
+                  "status": "done"
+                },
+                {
+                  "title": "patch the parser",
+                  "status": "in_progress"
+                },
+                {
+                  "title": "add a test",
+                  "status": "pending"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_keeps_a_kimi_todo_list/2",
+      "namespace": "exec_keeps_a_kimi_todo_list",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Plan recorded."
+      }
+    },
+    {
+      "scenario_id": "exec_reads_kimi_reasoning/1",
+      "namespace": "exec_reads_kimi_reasoning",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Forty-two.",
+        "reasoning": [
+          "Let me think about this carefully."
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_answers_as_gpt56/1",
+      "namespace": "exec_answers_as_gpt56",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Hello from Sol."
+      }
+    },
+    {
+      "scenario_id": "exec_uses_gpt56_tools/1",
+      "namespace": "exec_uses_gpt56_tools",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Planning.",
+        "tool_calls": [
+          {
+            "id": "call_plan",
+            "name": "update_plan",
+            "arguments": {
+              "plan": [
+                {
+                  "step": "build",
+                  "status": "in_progress"
+                }
+              ]
+            }
+          },
+          {
+            "id": "call_shell",
+            "name": "shell_command",
+            "arguments": {
+              "command": "pwd; echo ok > built.txt",
+              "workdir": "sub"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_uses_gpt56_tools/2",
+      "namespace": "exec_uses_gpt56_tools",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Built in sub."
+      }
+    },
+    {
+      "scenario_id": "exec_answers_through_openrouter/1",
+      "namespace": "exec_answers_through_openrouter",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Hello via OpenRouter."
+      }
+    },
+    {
+      "scenario_id": "exec_answers_through_venice/1",
+      "namespace": "exec_answers_through_venice",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Hello via Venice."
+      }
+    },
+    {
+      "scenario_id": "exec_answers_through_fireworks/1",
+      "namespace": "exec_answers_through_fireworks",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Hello via Fireworks."
+      }
+    },
+    {
+      "scenario_id": "exec_retries_a_rate_limit/1",
+      "namespace": "exec_retries_a_rate_limit",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "error",
+        "status": 429,
+        "message": "Slow down.",
+        "error_type": "rate_limit_error",
+        "code": "rate_limit_exceeded",
+        "retry_after": "1"
+      }
+    },
+    {
+      "scenario_id": "exec_retries_a_rate_limit/2",
+      "namespace": "exec_retries_a_rate_limit",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Hello after a retry."
+      }
+    },
+    {
+      "scenario_id": "exec_reports_an_authentication_failure/1",
+      "namespace": "exec_reports_an_authentication_failure",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "error",
+        "status": 401,
+        "message": "Bad key.",
+        "error_type": "authentication_error",
+        "code": "invalid_api_key"
+      }
+    },
+    {
+      "scenario_id": "exec_times_out_a_hung_model/1",
+      "namespace": "exec_times_out_a_hung_model",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "hang"
+      }
+    },
+    {
+      "scenario_id": "exec_replays_a_broken_stream/1",
+      "namespace": "exec_replays_a_broken_stream",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "This stream will break",
+        "close_after_chunks": 3
+      }
+    },
+    {
+      "scenario_id": "exec_replays_a_broken_stream/2",
+      "namespace": "exec_replays_a_broken_stream",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Hello after a replay."
+      }
+    },
+    {
+      "scenario_id": "exec_replays_a_malformed_stream/1",
+      "namespace": "exec_replays_a_malformed_stream",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "garbled",
+        "malformed_sse": true
+      }
+    },
+    {
+      "scenario_id": "exec_reports_an_exhausted_script/1",
+      "namespace": "exec_reports_an_exhausted_script",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Keep going.",
+        "tool_calls": [
+          {
+            "id": "call_one",
+            "name": "write_file",
+            "arguments": {
+              "file_path": "one.txt",
+              "content": "1\n"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_handles_an_empty_answer/1",
+      "namespace": "exec_handles_an_empty_answer",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": ""
+      }
+    },
+    {
+      "scenario_id": "exec_streams_json_events/1",
+      "namespace": "exec_streams_json_events",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Writing.",
+        "tool_calls": [
+          {
+            "id": "call_write",
+            "name": "write_file",
+            "arguments": {
+              "file_path": "it.txt",
+              "content": "it\n"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_streams_json_events/2",
+      "namespace": "exec_streams_json_events",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Wrote it."
+      }
+    },
+    {
+      "scenario_id": "exec_creates_the_working_directory/1",
+      "namespace": "exec_creates_the_working_directory",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Hello from a fresh directory."
+      }
+    },
+    {
+      "scenario_id": "exec_replays_a_malformed_stream/2",
+      "namespace": "exec_replays_a_malformed_stream",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "response_text": "Recovered after garbage.",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        }
+      }
+    },
+    {
+      "scenario_id": "exec_spawns_a_subagent/1",
+      "namespace": "exec_spawns_a_subagent",
+      "matcher": {
+        "input_contains": "delegate",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Delegating.",
+        "tool_calls": [
+          {
+            "id": "call_spawn",
+            "name": "spawn_agent",
+            "arguments": {
+              "task": "child: say hello back"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_spawns_a_subagent/2",
+      "namespace": "exec_spawns_a_subagent",
+      "matcher": {
+        "input_contains": "child: say hello back",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Hello from the child."
+      }
+    },
+    {
+      "scenario_id": "exec_spawns_a_subagent/3",
+      "namespace": "exec_spawns_a_subagent",
+      "matcher": {
+        "input_contains": "delegate",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Waiting.",
+        "tool_calls": [
+          {
+            "id": "call_wait",
+            "name": "wait",
+            "arguments": {}
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_spawns_a_subagent/4",
+      "namespace": "exec_spawns_a_subagent",
+      "matcher": {
+        "input_contains": "Agent completed",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "The child said hello."
+      }
+    },
+    {
+      "scenario_id": "exec_subagent_uses_inherited_tools/1",
+      "namespace": "exec_subagent_uses_inherited_tools",
+      "matcher": {
+        "input_contains": "delegate the write",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Delegating.",
+        "tool_calls": [
+          {
+            "id": "call_spawn",
+            "name": "spawn_agent",
+            "arguments": {
+              "task": "child: write child.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_subagent_uses_inherited_tools/2",
+      "namespace": "exec_subagent_uses_inherited_tools",
+      "matcher": {
+        "input_contains": "child: write child.txt",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Writing.",
+        "tool_calls": [
+          {
+            "id": "call_child_write",
+            "name": "write_file",
+            "arguments": {
+              "file_path": "child.txt",
+              "content": "from child\n"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_subagent_uses_inherited_tools/3",
+      "namespace": "exec_subagent_uses_inherited_tools",
+      "matcher": {
+        "input_contains": "Successfully wrote to child.txt",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Wrote child.txt."
+      }
+    },
+    {
+      "scenario_id": "exec_subagent_uses_inherited_tools/4",
+      "namespace": "exec_subagent_uses_inherited_tools",
+      "matcher": {
+        "input_contains": "delegate the write",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Waiting.",
+        "tool_calls": [
+          {
+            "id": "call_wait",
+            "name": "wait",
+            "arguments": {}
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_subagent_uses_inherited_tools/5",
+      "namespace": "exec_subagent_uses_inherited_tools",
+      "matcher": {
+        "input_contains": "Agent completed",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "The child wrote the file."
+      }
+    },
+    {
+      "scenario_id": "exec_subagent_inherits_read_only/1",
+      "namespace": "exec_subagent_inherits_read_only",
+      "matcher": {
+        "input_contains": "delegate the build",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Delegating.",
+        "tool_calls": [
+          {
+            "id": "call_spawn",
+            "name": "spawn_agent",
+            "arguments": {
+              "task": "child: run the build"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_subagent_inherits_read_only/2",
+      "namespace": "exec_subagent_inherits_read_only",
+      "matcher": {
+        "input_contains": "child: run the build",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Building.",
+        "tool_calls": [
+          {
+            "id": "call_child_shell",
+            "name": "shell",
+            "arguments": {
+              "command": "echo built > built.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_subagent_inherits_read_only/3",
+      "namespace": "exec_subagent_inherits_read_only",
+      "matcher": {
+        "input_contains": "requires approval",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "The shell was refused."
+      }
+    },
+    {
+      "scenario_id": "exec_subagent_inherits_read_only/4",
+      "namespace": "exec_subagent_inherits_read_only",
+      "matcher": {
+        "input_contains": "delegate the build",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Waiting.",
+        "tool_calls": [
+          {
+            "id": "call_wait",
+            "name": "wait",
+            "arguments": {}
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_subagent_inherits_read_only/5",
+      "namespace": "exec_subagent_inherits_read_only",
+      "matcher": {
+        "input_contains": "Agent completed",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "The child could not build."
+      }
+    },
+    {
+      "scenario_id": "exec_spawns_two_subagents/1",
+      "namespace": "exec_spawns_two_subagents",
+      "matcher": {
+        "input_contains": "delegate twice",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Delegating twice.",
+        "tool_calls": [
+          {
+            "id": "call_a",
+            "name": "spawn_agent",
+            "arguments": {
+              "task": "child alpha: report"
+            }
+          },
+          {
+            "id": "call_b",
+            "name": "spawn_agent",
+            "arguments": {
+              "task": "child beta: report"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_spawns_two_subagents/2",
+      "namespace": "exec_spawns_two_subagents",
+      "matcher": {
+        "input_contains": "child alpha",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Alpha reporting."
+      }
+    },
+    {
+      "scenario_id": "exec_spawns_two_subagents/3",
+      "namespace": "exec_spawns_two_subagents",
+      "matcher": {
+        "input_contains": "child beta",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Beta reporting."
+      }
+    },
+    {
+      "scenario_id": "exec_spawns_two_subagents/4",
+      "namespace": "exec_spawns_two_subagents",
+      "matcher": {
+        "input_contains": "delegate twice",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Waiting for both.",
+        "tool_calls": [
+          {
+            "id": "call_wait",
+            "name": "wait",
+            "arguments": {}
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_spawns_two_subagents/5",
+      "namespace": "exec_spawns_two_subagents",
+      "matcher": {
+        "input_contains": "Beta reporting",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Both children reported."
+      }
+    },
+    {
+      "scenario_id": "exec_reports_a_failed_subagent/1",
+      "namespace": "exec_reports_a_failed_subagent",
+      "matcher": {
+        "input_contains": "delegate badly",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Delegating.",
+        "tool_calls": [
+          {
+            "id": "call_spawn",
+            "name": "spawn_agent",
+            "arguments": {
+              "task": "child: fail please"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_reports_a_failed_subagent/2",
+      "namespace": "exec_reports_a_failed_subagent",
+      "matcher": {
+        "input_contains": "child: fail please",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "error",
+        "status": 500,
+        "message": "The child's model fell over.",
+        "error_type": "server_error",
+        "code": "server_error"
+      },
+      "sticky": true
+    },
+    {
+      "scenario_id": "exec_reports_a_failed_subagent/3",
+      "namespace": "exec_reports_a_failed_subagent",
+      "matcher": {
+        "input_contains": "delegate badly",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Waiting.",
+        "tool_calls": [
+          {
+            "id": "call_wait",
+            "name": "wait",
+            "arguments": {}
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_reports_a_failed_subagent/4",
+      "namespace": "exec_reports_a_failed_subagent",
+      "matcher": {
+        "input_contains": "fell over",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "The child failed."
+      }
+    },
+    {
+      "scenario_id": "exec_detects_a_loop/1",
+      "namespace": "exec_detects_a_loop",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Reading again.",
+        "tool_calls": [
+          {
+            "name": "read_file",
+            "arguments": {
+              "file_path": "notes.txt"
+            }
+          }
+        ]
+      },
+      "repeat": 6
+    },
+    {
+      "scenario_id": "exec_detects_a_loop/2",
+      "namespace": "exec_detects_a_loop",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "I will stop repeating myself."
+      }
+    },
+    {
+      "scenario_id": "exec_sends_instructions/1",
+      "namespace": "exec_sends_instructions",
+      "matcher": {
+        "instructions_contains": "Always answer in French.",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Bonjour."
+      }
+    },
+    {
+      "scenario_id": "exec_searches_and_finds_nothing/1",
+      "namespace": "exec_searches_and_finds_nothing",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Searching.",
+        "tool_calls": [
+          {
+            "id": "call_grep",
+            "name": "grep",
+            "arguments": {
+              "pattern": "NOPE",
+              "path": "."
+            }
+          },
+          {
+            "id": "call_glob",
+            "name": "glob",
+            "arguments": {
+              "pattern": "**/*.py"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_searches_and_finds_nothing/2",
+      "namespace": "exec_searches_and_finds_nothing",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Nothing matched."
+      }
+    },
+    {
+      "scenario_id": "exec_keeps_a_truncated_answer/1",
+      "namespace": "exec_keeps_a_truncated_answer",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "half an ans",
+        "finish_reason": "length"
+      }
+    },
+    {
+      "scenario_id": "exec_patches_a_file_as_gpt56/1",
+      "namespace": "exec_patches_a_file_as_gpt56",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Patching.",
+        "tool_calls": [
+          {
+            "id": "call_patch",
+            "name": "apply_patch",
+            "kind": "custom",
+            "arguments": "*** Begin Patch\n*** Update File: src/lib.rs\n@@ fn hello() {\n-    println!(\"old\");\n+    println!(\"new\");\n*** End Patch"
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_patches_a_file_as_gpt56/2",
+      "namespace": "exec_patches_a_file_as_gpt56",
+      "matcher": {
+        "input_contains": "Success. Updated the following files",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Patched lib.rs."
+      }
+    },
+    {
+      "scenario_id": "exec_runs_a_background_agent/1",
+      "namespace": "exec_runs_a_background_agent",
+      "matcher": {
+        "input_contains": "farm out the summary",
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Farming it out.",
+        "tool_calls": [
+          {
+            "id": "call_agent",
+            "name": "Agent",
+            "arguments": {
+              "description": "Summarize notes",
+              "prompt": "child: summarize notes",
+              "run_in_background": true
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_runs_a_background_agent/2",
+      "namespace": "exec_runs_a_background_agent",
+      "matcher": {
+        "input_contains": "child: summarize notes",
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Notes summarized: two items."
+      }
+    },
+    {
+      "scenario_id": "exec_runs_a_background_agent/3",
+      "namespace": "exec_runs_a_background_agent",
+      "matcher": {
+        "input_contains": "farm out the summary",
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "The summary is on its way."
+      }
+    },
+    {
+      "scenario_id": "exec_runs_a_background_agent/4",
+      "namespace": "exec_runs_a_background_agent",
+      "matcher": {
+        "input_contains": "task-notification",
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "The background agent found two items."
+      }
+    },
+    {
+      "scenario_id": "exec_waits_for_a_foreground_agent/1",
+      "namespace": "exec_waits_for_a_foreground_agent",
+      "matcher": {
+        "input_contains": "summarize in the foreground",
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Handing it off.",
+        "tool_calls": [
+          {
+            "id": "call_agent",
+            "name": "Agent",
+            "arguments": {
+              "description": "Summarize notes",
+              "prompt": "child: summarize notes",
+              "run_in_background": false
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_waits_for_a_foreground_agent/2",
+      "namespace": "exec_waits_for_a_foreground_agent",
+      "matcher": {
+        "input_contains": "child: summarize notes",
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Notes summarized: two items."
+      }
+    },
+    {
+      "scenario_id": "exec_waits_for_a_foreground_agent/3",
+      "namespace": "exec_waits_for_a_foreground_agent",
+      "matcher": {
+        "input_contains": "summarize in the foreground",
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "The agent found two items."
+      }
+    },
+    {
+      "scenario_id": "exec_reports_a_failed_background_agent/1",
+      "namespace": "exec_reports_a_failed_background_agent",
+      "matcher": {
+        "input_contains": "farm out a failure",
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Farming it out.",
+        "tool_calls": [
+          {
+            "id": "call_agent",
+            "name": "Agent",
+            "arguments": {
+              "description": "Summarize notes",
+              "prompt": "child: summarize notes",
+              "run_in_background": true
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_reports_a_failed_background_agent/2",
+      "namespace": "exec_reports_a_failed_background_agent",
+      "matcher": {
+        "input_contains": "child: summarize notes",
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "error",
+        "status": 500,
+        "message": "The child's model fell over.",
+        "error_type": "server_error",
+        "code": "server_error"
+      },
+      "sticky": true
+    },
+    {
+      "scenario_id": "exec_reports_a_failed_background_agent/3",
+      "namespace": "exec_reports_a_failed_background_agent",
+      "matcher": {
+        "input_contains": "farm out a failure",
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "The summary is on its way."
+      }
+    },
+    {
+      "scenario_id": "exec_reports_a_failed_background_agent/4",
+      "namespace": "exec_reports_a_failed_background_agent",
+      "matcher": {
+        "input_contains": "<status>failed</status>",
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "The background agent failed."
+      }
+    }
+  ]
+}

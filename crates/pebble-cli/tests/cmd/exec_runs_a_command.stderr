@@ -1,0 +1,14 @@
+[ask] gpt-5.4
+Running.
+[turn] 15 tokens, 1 tool call(s)
+[tool] shell {"command":"echo built; echo warn >&2"}
+[exec] exit 0 in [..] ms
+[ask] gpt-5.4
+The build printed built.
+[turn] 15 tokens, 0 tool call(s)
+
+turns:  2
+tools:  1 call(s), 0 failed
+        shell x1
+tokens: 20 in, 10 out, 0 reasoning, 0 cached (30 total)
+cost:   $0.0002

@@ -22,6 +22,10 @@ run = "bin/style-guides prepare"
 description = "Run the coding-agent example against a live provider"
 run = "cargo run --locked -p pebble-coding-agent --example coding_agent"
 
+[tasks.exec]
+description = "Run `pebble exec` against a live provider"
+run = "cargo run --locked -p pebble-cli -- exec"
+
 [tasks.fmt]
 description = "Format Rust with the pinned nightly formatter"
 run = "cargo +nightly-2026-04-14 fmt --all"

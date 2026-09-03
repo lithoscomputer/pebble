@@ -1,0 +1,10 @@
+bin.name = "pebble"
+args = ["exec", "--model", "openai/gpt-5.4", "--quiet", "--timeout", "2s", "say hello"]
+fs.sandbox = true
+status.code = 130
+
+[env]
+inherit = false
+
+[env.add]
+OPENAI_API_KEY = "exec_times_out_a_hung_model"

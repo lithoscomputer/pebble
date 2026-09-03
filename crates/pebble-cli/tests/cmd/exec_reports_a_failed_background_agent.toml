@@ -1,0 +1,9 @@
+bin.name = "pebble"
+args = ["exec", "--model", "venice/claude-sonnet-5", "--subagents", "farm out a failure"]
+fs.sandbox = true
+
+[env]
+inherit = false
+
+[env.add]
+VENICE_API_KEY = "exec_reports_a_failed_background_agent"

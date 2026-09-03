@@ -1,0 +1,8 @@
+[ask] gpt-5.4
+half an ans
+[turn] 15 tokens, 0 tool call(s)
+
+turns:  1
+tools:  0 call(s), 0 failed
+tokens: 10 in, 5 out, 0 reasoning, 0 cached (15 total)
+cost:   $0.0001

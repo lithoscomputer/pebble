@@ -1,0 +1,10 @@
+bin.name = "pebble"
+args = ["exec", "--model", "moonshot/kimi-k3", "--json", "think"]
+fs.sandbox = true
+status = "success"
+
+[env]
+inherit = false
+
+[env.add]
+MOONSHOT_API_KEY = "exec_reads_kimi_reasoning"

@@ -1,0 +1,3 @@
+bin.name = "pebble"
+args = ["--help"]
+status = "success"

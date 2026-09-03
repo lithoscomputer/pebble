@@ -1,0 +1,16 @@
+[ask] claude-sonnet-5
+Farming it out.
+[turn] 15 tokens, 1 tool call(s)
+[tool] Agent {"description":"Summarize notes","prompt":"child: summarize notes","run_in_background":true}
+[spawn] [..] at depth 1
+...
+[child] [..] completed after 2 turn(s)
+...
+The background agent found two items.
+[turn] 15 tokens, 0 tool call(s)
+
+turns:  4
+tools:  1 call(s), 0 failed
+        Agent x1
+tokens: 30 in, 15 out, 0 reasoning, 0 cached (45 total)
+cost:   $0.0002

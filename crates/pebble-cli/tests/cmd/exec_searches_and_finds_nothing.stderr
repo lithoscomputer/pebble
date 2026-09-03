@@ -1,0 +1,14 @@
+[ask] gpt-5.4
+Searching.
+[turn] 15 tokens, 2 tool call(s)
+[tool] grep {"pattern":"NOPE","path":"."}
+[tool] glob {"pattern":"**/*.py"}
+[ask] gpt-5.4
+Nothing matched.
+[turn] 15 tokens, 0 tool call(s)
+
+turns:  2
+tools:  2 call(s), 0 failed
+        glob x1, grep x1
+tokens: 20 in, 10 out, 0 reasoning, 0 cached (30 total)
+cost:   $0.0002

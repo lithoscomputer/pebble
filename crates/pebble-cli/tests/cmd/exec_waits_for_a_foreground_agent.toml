@@ -1,0 +1,9 @@
+bin.name = "pebble"
+args = ["exec", "--model", "venice/claude-sonnet-5", "--subagents", "summarize in the foreground"]
+fs.sandbox = true
+
+[env]
+inherit = false
+
+[env.add]
+VENICE_API_KEY = "exec_waits_for_a_foreground_agent"

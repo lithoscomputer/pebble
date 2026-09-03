@@ -1,0 +1,10 @@
+bin.name = "pebble"
+args = ["exec", "--model", "venice/deepseek-v4-flash", "fix the typo"]
+fs.sandbox = true
+status = "success"
+
+[env]
+inherit = false
+
+[env.add]
+VENICE_API_KEY = "exec_reports_a_missing_edit_anchor"

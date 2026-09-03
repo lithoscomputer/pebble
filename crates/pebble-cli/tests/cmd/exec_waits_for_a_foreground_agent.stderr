@@ -1,0 +1,19 @@
+[ask] claude-sonnet-5
+Handing it off.
+[turn] 15 tokens, 1 tool call(s)
+[tool] Agent {"description":"Summarize notes","prompt":"child: summarize notes","run_in_background":false}
+[spawn] [..] at depth 1
+[open] venice/claude-sonnet-5
+[ask] claude-sonnet-5
+Notes summarized: two items.
+[turn] 15 tokens, 0 tool call(s)
+[child] [..] completed after 2 turn(s)
+[ask] claude-sonnet-5
+The agent found two items.
+[turn] 15 tokens, 0 tool call(s)
+
+turns:  3
+tools:  1 call(s), 0 failed
+        Agent x1
+tokens: 20 in, 10 out, 0 reasoning, 0 cached (30 total)
+cost:   $0.0001

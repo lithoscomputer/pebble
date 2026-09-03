@@ -1,0 +1,43 @@
+[package]
+name = "pebble-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+description = "Command-line coding agent built on pebble-coding-agent"
+
+[[bin]]
+name = "pebble"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.5.47", features = ["derive"] }
+humantime = "2.2.0"
+# Every adapter the built-in catalog names, so no provider is reported as
+# unavailable at startup.
+lithos-llm = { workspace = true, features = [
+  "runtime",
+  "builtin-catalog",
+  "environment-credentials",
+  "anthropic",
+  "gemini",
+  "openai",
+  "openai-compatible",
+] }
+pebble-coding-agent = { path = "../pebble-coding-agent" }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+tokio-util.workspace = true
+
+[dev-dependencies]
+# The CLI cases answer the model from a deterministic OpenAI-compatible server
+# running in the test process, so the real codec and transport are exercised
+# with no key and no network.
+axum = "0.8"
+tokio = { version = "1.49.0", features = ["net"] }
+trycmd = "1.2.1"
+twin-openai = { git = "https://github.com/lithoscomputer/twins", rev = "8de27b346a73ccd3d4901490650b2257845fc6ed" }
+
+[lints]
+workspace = true

@@ -9,7 +9,7 @@ rust-version = "1.88"
 publish = false
 
 [workspace.dependencies]
-lithos-llm = { git = "ssh://git@github.com/lithoscomputer/lithos-llm", rev = "50669cb4125616db12a645a5d5bc7d355c979178", default-features = false }
+lithos-llm = { git = "ssh://git@github.com/lithoscomputer/lithos-llm", rev = "9c76245abff2517afd8ca2d018851defb854ab10", default-features = false }
 async-trait = "0.1.89"
 futures-util = "0.3.32"
 serde = { version = "1.0.228", features = ["derive"] }

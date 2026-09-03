@@ -1,0 +1,10 @@
+bin.name = "pebble"
+args = ["exec", "--model", "moonshot/kimi-k3", "--permission", "full", "do the work"]
+fs.sandbox = true
+status = "success"
+
+[env]
+inherit = false
+
+[env.add]
+MOONSHOT_API_KEY = "exec_uses_kimi_tools"

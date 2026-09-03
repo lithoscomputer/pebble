@@ -1,0 +1,15 @@
+[ask] gpt-5.4
+Running.
+[turn] 15 tokens, 1 tool call(s)
+[tool] shell {"command":"echo boom >&2; exit 3"}
+[exec] exit 3 in [..] ms
+[tool] shell failed: Termination: exited Exit code: 3 Duration: [..]ms stderr: boom
+[ask] gpt-5.4
+The build failed with exit 3.
+[turn] 15 tokens, 0 tool call(s)
+
+turns:  2
+tools:  1 call(s), 1 failed
+        shell x1
+tokens: 20 in, 10 out, 0 reasoning, 0 cached (30 total)
+cost:   $0.0002

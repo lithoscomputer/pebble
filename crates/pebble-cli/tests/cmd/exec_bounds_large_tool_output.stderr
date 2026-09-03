@@ -1,0 +1,14 @@
+[ask] gpt-5.4
+Printing.
+[turn] 15 tokens, 1 tool call(s)
+[tool] shell {"command":"head -c 1200000 /dev/zero | tr '//0' 'x'"}
+[exec] exit 0 in [..] ms
+[ask] gpt-5.4
+That was a lot of output.
+[turn] 15 tokens, 0 tool call(s)
+
+turns:  2
+tools:  1 call(s), 0 failed
+        shell x1
+tokens: 20 in, 10 out, 0 reasoning, 0 cached (30 total)
+cost:   $0.0002

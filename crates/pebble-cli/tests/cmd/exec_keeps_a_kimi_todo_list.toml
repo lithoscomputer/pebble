@@ -1,0 +1,10 @@
+bin.name = "pebble"
+args = ["exec", "--model", "moonshot/kimi-k3", "--quiet", "plan it"]
+fs.sandbox = true
+status = "success"
+
+[env]
+inherit = false
+
+[env.add]
+MOONSHOT_API_KEY = "exec_keeps_a_kimi_todo_list"

@@ -1,7 +1,9 @@
 # Pebble
 
-Pebble is a two-package agent library. `pebble-agent` is the provider-neutral
-agent loop. `pebble-coding-agent` builds a coding agent on top of it.
+Pebble is a two-package agent library with a small command-line front end.
+`pebble-agent` is the provider-neutral agent loop. `pebble-coding-agent`
+builds a coding agent on top of it. `pebble-cli` runs that coding agent from a
+terminal.
 
 It owns the turn loop between a model and a machine: it calls the model,
 streams what comes back, runs the tools the model asks for, keeps the history
@@ -130,6 +132,33 @@ Pass a token to `compact_with_cancellation`, or use
 `crates/pebble-coding-agent/examples/coding_agent.rs` is the same thing at full
 size. It renders the event stream, steers one prompt while it works, interrupts
 the next, and reports what the agent used. Run it with `mise run dev`.
+
+## The command line
+
+`pebble exec` runs one prompt to completion without a person in the loop: the
+prompt goes in, the tools the model asks for run, and the final answer comes
+out on standard output. Events are rendered to standard error as they happen,
+and the exit status says how the prompt ended: `0` for an answer, `1` for a
+failure, `130` when the prompt was interrupted or ran out of time.
+
+```sh
+pebble exec "add a --dry-run flag to bin/deploy"
+pebble exec --model gpt-5.6 --cwd ../service --permission full "run the tests and fix what fails"
+echo "summarize what this repository does" | pebble exec --quiet
+pebble exec --json "..."   # one JSON event per line on standard error
+```
+
+The permission flag chooses what the agent may do without asking:
+`read-only`, `read-write` (the default), or `full`, which enables commands.
+There is no approval path, so a tool the level does not allow is hidden from
+the model and refused if called anyway. Credentials come from the provider's
+usual environment variable, `ANTHROPIC_API_KEY` for the default model.
+`PEBBLE_<PROVIDER>_BASE_URL`, such as `PEBBLE_OPENAI_BASE_URL` or
+`PEBBLE_MOONSHOT_BASE_URL`, points a built-in provider at a compatible
+endpoint instead: a proxy, a self-hosted model, or a test double. `--subagents`
+lets the agent spawn children for independent work. The command is the
+smallest application pebble ships, and its source is a worked example of what
+an embedding application supplies.
 
 ## What an application has to supply
 
@@ -335,6 +364,7 @@ Use the repository tasks for development and verification:
 
 ```sh
 mise run dev     # run the coding-agent example (needs a provider key)
+mise run exec -- "write hello.txt"   # run `pebble exec` (needs a provider key)
 mise run test    # the test suite, which needs neither key nor network
 mise run check   # the complete routine gate
 ```
