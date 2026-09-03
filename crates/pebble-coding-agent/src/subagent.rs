@@ -1765,7 +1765,6 @@ mod tests {
 
     use futures_util::poll;
     use lithos_llm::types::{Role, ToolDefinitionKind};
-    use pebble_agent::ToolDescriptor;
     use serde_json::json;
     use tokio::task::yield_now;
     use tokio::time;
@@ -1776,12 +1775,9 @@ mod tests {
     use crate::runtime::testing::{TestSession, noop_tool};
     use crate::runtime::{ResumeMode, testing};
     use crate::test_support::{
-        MockEnvironment, ScriptedCall, message_text, scripted_client, text_response,
+        DenyTool, MockEnvironment, ScriptedCall, message_text, scripted_client, text_response,
     };
-    use crate::tool::{
-        PermissionMiddleware, ToolContext, ToolDefinitionWithSource, ToolPermission,
-        ToolPermissionPolicy,
-    };
+    use crate::tool::{PermissionMiddleware, ToolContext, ToolDefinitionWithSource};
     use crate::types::{CodingAgentEvent, PermissionLevel, ToolErrorKind};
 
     /// Reports the moment the task holding it is dropped, which is what an
@@ -1807,21 +1803,6 @@ mod tests {
             yield_now().await;
         }
         flag.load(Ordering::SeqCst)
-    }
-
-    /// A policy that refuses one tool by name and allows the rest.
-    struct DenyByName(&'static str);
-
-    impl ToolPermissionPolicy for DenyByName {
-        fn permission(&self, tool: &ToolDescriptor) -> ToolPermission {
-            if tool.id().as_str() == self.0 {
-                ToolPermission::Deny {
-                    reason: format!("{} is forbidden", tool.id()),
-                }
-            } else {
-                ToolPermission::Allow
-            }
-        }
     }
 
     /// The tools a session shows its model, by name, sorted so two sessions can
@@ -3142,7 +3123,7 @@ mod tests {
                 permission_level: Some(PermissionLevel::ReadOnly),
                 ..CodingAgentOptions::default()
             })
-            .tool_middleware(Arc::new(PermissionMiddleware::new(Arc::new(DenyByName(
+            .tool_middleware(Arc::new(PermissionMiddleware::new(Arc::new(DenyTool(
                 "forbidden",
             )))))
             .observe_children(observer)

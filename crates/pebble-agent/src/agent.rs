@@ -24,8 +24,8 @@ use crate::model::ModelService;
 #[cfg(test)]
 use crate::tool::ToolCallRequest;
 use crate::tool::{
-    StaticToolService, Tool, ToolCatalog, ToolDiscoveryContext, ToolErrorKind, ToolMiddleware,
-    ToolOutcome, ToolScheduling, ToolService, ToolSystem,
+    CANCELLED, StaticToolService, Tool, ToolCatalog, ToolErrorKind, ToolMiddleware, ToolOutcome,
+    ToolScheduling, ToolService, ToolSystem,
 };
 use crate::turn::{AfterAnswerAction, AgentLifecycle, ConversationUpdate, TurnContext};
 
@@ -796,7 +796,7 @@ impl Agent {
     async fn discover_tools(&self, turn: usize) -> Result<ToolCatalog> {
         let tools = self
             .tool_system
-            .discover(ToolDiscoveryContext::new(&self.model, turn, &self.messages))
+            .discover(TurnContext::new(&self.model, turn, &self.messages))
             .await
             .map_err(|source| AgentError::ToolSystem { source })?;
         let mut names = HashSet::new();
@@ -905,7 +905,7 @@ impl Agent {
         let message = message.into_message();
         self.messages.push(message.clone());
         if let Some(projection) = &self.conversation {
-            projection.user_message_committed_with_attribution(&message, attribution.as_ref());
+            projection.user_message_committed(&message, attribution.as_ref());
         }
         self.emit(AgentEvent::UserMessage { message });
     }
@@ -1056,12 +1056,12 @@ impl Agent {
         self.emit(AgentEvent::ToolStarted { call: call.clone() });
         let called = self
             .tool_system
-            .execute_observed(
+            .execute_with(
                 tools,
                 turn,
                 call.clone(),
                 cancel.child_token(),
-                self.events.clone(),
+                Some(self.events.clone()),
             )
             .await;
         match called {
@@ -1219,21 +1219,9 @@ fn nonempty_content(mut content: Vec<ContentPart>) -> Vec<ContentPart> {
     content
 }
 
-fn error_tool_result(call: &ToolCall, message: String) -> ToolResult {
-    ToolResult {
-        tool_call_id: call.id.clone(),
-        name:         Some(call.name.clone()),
-        content:      vec![ContentPart::Text { text: message }],
-        is_error:     true,
-    }
-}
-
-/// What a call that never started is told.
-const CANCELLED: &str = "Cancelled";
-
 /// The result of a call that was cancelled before it started.
 fn cancelled_tool_result(call: &ToolCall) -> ToolResult {
-    error_tool_result(call, CANCELLED.to_owned())
+    ToolOutcome::failure(ToolErrorKind::Cancelled, CANCELLED).into_result(call)
 }
 
 fn tool_calls(response: &Response) -> Vec<ToolCall> {
@@ -1408,7 +1396,7 @@ mod tests {
     impl ToolService for DynamicTools {
         async fn discover(
             &self,
-            context: ToolDiscoveryContext<'_>,
+            context: TurnContext<'_>,
         ) -> StdResult<ToolCatalog, crate::ToolSystemError> {
             let names = if context.turn() == 0 {
                 ["allowed", "hidden"].as_slice()
@@ -1440,7 +1428,7 @@ mod tests {
     impl ToolMiddleware for HideTool {
         async fn discover(
             &self,
-            context: ToolDiscoveryContext<'_>,
+            context: TurnContext<'_>,
             next: crate::ToolDiscoveryNext<'_>,
         ) -> StdResult<ToolCatalog, crate::ToolSystemError> {
             let mut catalog = next.run(context).await?;
@@ -1520,7 +1508,7 @@ mod tests {
     }
 
     impl ConversationProjection for RecordingConversation {
-        fn user_message_committed(&self, message: &Message) {
+        fn user_message_committed(&self, message: &Message, _attribution: Option<&Value>) {
             self.commits
                 .lock()
                 .expect("the commit lock is healthy")

@@ -8,8 +8,8 @@
 //! payloads.
 
 use std::error::Error as StdError;
-use std::fmt::{self, Write as _};
 use std::result::Result as StdResult;
+use std::{fmt, iter};
 
 use lithos_llm::types::{
     Error as LlmError, ErrorData as LlmErrorData, ErrorKind as LlmErrorKind, RequestBuildError,
@@ -372,13 +372,10 @@ impl From<&Error> for ErrorData {
 
 /// Renders `error` and each source once on one line.
 pub(crate) fn render_error(error: &(dyn StdError + 'static)) -> String {
-    let mut rendered = error.to_string();
-    let mut current = error.source();
-    while let Some(cause) = current {
-        let _ = write!(rendered, ": {cause}");
-        current = cause.source();
-    }
-    rendered
+    iter::once(error.to_string())
+        .chain(source_chain(error))
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 impl From<&LlmError> for ErrorData {
@@ -411,7 +408,7 @@ impl From<&LlmErrorData> for ErrorData {
 }
 
 /// Renders every cause below `error`, outermost first.
-fn source_chain(error: &(dyn StdError + 'static)) -> Vec<String> {
+pub(crate) fn source_chain(error: &(dyn StdError + 'static)) -> Vec<String> {
     let mut chain = Vec::new();
     let mut current = error.source();
     while let Some(cause) = current {

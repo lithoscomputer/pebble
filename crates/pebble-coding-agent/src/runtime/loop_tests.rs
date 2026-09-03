@@ -834,13 +834,13 @@ async fn every_tool_round_resolves_the_environment_again() {
         ScriptedCall::response(text_response("Done!")),
     ])
     .tools([record_env])
-    .build();
-    session.set_tool_env_provider(Arc::new(SequenceEnvProvider {
+    .tool_env_provider(Arc::new(SequenceEnvProvider {
         values: Mutex::new(VecDeque::from([
             HashMap::from([("TOKEN".to_owned(), "t1".to_owned())]),
             HashMap::from([("TOKEN".to_owned(), "t2".to_owned())]),
         ])),
-    }));
+    }))
+    .build();
 
     session
         .prompt("Use tools")

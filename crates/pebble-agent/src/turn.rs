@@ -25,6 +25,8 @@ pub enum AfterAnswerAction {
 }
 
 /// An immutable view of the conversation at one model turn.
+///
+/// Lifecycle stages and tool discovery both receive one.
 #[derive(Clone, Copy, Debug)]
 pub struct TurnContext<'a> {
     model:    &'a str,
@@ -33,7 +35,9 @@ pub struct TurnContext<'a> {
 }
 
 impl<'a> TurnContext<'a> {
-    pub(crate) const fn new(model: &'a str, turn: usize, messages: &'a [Message]) -> Self {
+    /// Creates a context for one model turn.
+    #[must_use]
+    pub const fn new(model: &'a str, turn: usize, messages: &'a [Message]) -> Self {
         Self {
             model,
             turn,

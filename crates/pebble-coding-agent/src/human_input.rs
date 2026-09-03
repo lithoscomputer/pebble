@@ -8,9 +8,10 @@
 //! Three rules hold wherever the provider comes from:
 //!
 //! - **One question tool per round.** The question tools are the point where a
-//!   prompt waits for a person, so the execution layer runs at most one of them
-//!   per tool round and refuses its peers. A model that wants to ask several
-//!   things asks them in one batch.
+//!   prompt waits for a person, so a tool marked
+//!   [`requires_human_input`](crate::tools::RegisteredTool::requires_human_input)
+//!   runs alone in its tool round and its peers are refused. A model that wants
+//!   to ask several things asks them in one batch.
 //! - **Root sessions only.** Child sessions never register a question tool;
 //!   they report back to their parent instead.
 //! - **The call is interruptible.**
@@ -28,20 +29,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::tool::{NativeTool, ToolError};
+use crate::tool::ToolError;
 use crate::types::ToolErrorKind;
-
-/// Whether `tool_name` names one of pebble's human-question tools.
-///
-/// Both tools keep their names in every vocabulary, so this answers the same
-/// way whichever profile is running.
-#[must_use]
-pub(crate) fn is_question_tool(tool_name: &str) -> bool {
-    matches!(
-        NativeTool::from_any_name(tool_name),
-        Some(NativeTool::AskUserQuestion | NativeTool::RequestUserInput)
-    )
-}
 
 /// What a question expects back.
 ///
@@ -253,7 +242,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::tool::ToolVocabulary;
 
     fn question(text: &str) -> Question {
         Question {
@@ -285,27 +273,6 @@ mod tests {
         ) -> Result<Vec<Answer>, HumanInputError> {
             Ok(self.answers.clone())
         }
-    }
-
-    #[test]
-    fn question_tools_are_recognized_under_every_name() {
-        assert!(is_question_tool("AskUserQuestion"));
-        assert!(is_question_tool("request_user_input"));
-        for vocabulary in ToolVocabulary::ALL.iter().copied() {
-            assert!(is_question_tool(
-                NativeTool::AskUserQuestion.name(vocabulary)
-            ));
-            assert!(is_question_tool(
-                NativeTool::RequestUserInput.name(vocabulary)
-            ));
-        }
-    }
-
-    #[test]
-    fn other_tools_are_not_question_tools() {
-        assert!(!is_question_tool("read_file"));
-        assert!(!is_question_tool("Bash"));
-        assert!(!is_question_tool("mcp__forms__ask_user_question"));
     }
 
     #[test]

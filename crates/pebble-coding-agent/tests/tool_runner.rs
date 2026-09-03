@@ -8,42 +8,17 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 use lithos_llm::types::{ContentPart, ToolCall, ToolDefinition, ToolResult};
-use pebble_agent::{
-    ToolCallNext, ToolCallRequest, ToolDescriptor, ToolMiddleware, ToolOutcome, ToolSystemError,
-};
+use pebble_agent::{ToolCallNext, ToolCallRequest, ToolMiddleware, ToolOutcome, ToolSystemError};
 use pebble_coding_agent::CodingAgentOptions;
 use pebble_coding_agent::environment::Environment;
 use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent};
-use pebble_coding_agent::test_support::MockEnvironment;
+use pebble_coding_agent::test_support::{DenyTool, FixedPermission, MockEnvironment};
 use pebble_coding_agent::tools::{
     ApprovalDecision, CodingToolSet, PermissionMiddleware, RegisteredTool, ToolApprovalService,
-    ToolError, ToolErrorKind, ToolPermission, ToolPermissionPolicy, ToolRunner, ToolSource,
+    ToolError, ToolErrorKind, ToolPermission, ToolRunner, ToolSource,
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
-
-/// A policy that denies exactly one tool.
-struct Denying(&'static str);
-
-impl ToolPermissionPolicy for Denying {
-    fn permission(&self, tool: &ToolDescriptor) -> ToolPermission {
-        if tool.id().as_str() == self.0 {
-            ToolPermission::Deny {
-                reason: format!("{} denied by tool permission policy", tool.id()),
-            }
-        } else {
-            ToolPermission::Allow
-        }
-    }
-}
-
-struct ApprovalRequired;
-
-impl ToolPermissionPolicy for ApprovalRequired {
-    fn permission(&self, _tool: &ToolDescriptor) -> ToolPermission {
-        ToolPermission::RequireApproval
-    }
-}
 
 struct RejectApproval;
 
@@ -264,7 +239,7 @@ async fn a_runner_reads_and_writes_through_the_environment_and_reports_each_call
 #[tokio::test]
 async fn a_runner_applies_the_policy_a_session_would() {
     let (runner, log) = runner_with(mock_environment(), CodingAgentOptions::default());
-    let runner = runner.tool_middleware(Arc::new(PermissionMiddleware::new(Arc::new(Denying(
+    let runner = runner.tool_middleware(Arc::new(PermissionMiddleware::new(Arc::new(DenyTool(
         "shell",
     )))));
 
@@ -328,7 +303,7 @@ async fn a_runner_calls_middleware_around_each_call() {
 async fn an_approval_that_blocks_a_call_answers_it_with_the_reason() {
     let (runner, _log) = runner_with(mock_environment(), CodingAgentOptions::default());
     let runner = runner.tool_middleware(Arc::new(
-        PermissionMiddleware::new(Arc::new(ApprovalRequired))
+        PermissionMiddleware::new(Arc::new(FixedPermission(ToolPermission::RequireApproval)))
             .with_approval(Arc::new(RejectApproval)),
     ));
 

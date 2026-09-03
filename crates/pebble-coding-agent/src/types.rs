@@ -43,14 +43,9 @@ use crate::record::StoredMessage;
 /// The concatenated text of one message's `Text` content parts.
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) fn message_text(message: &LlmMessage) -> String {
-    message
-        .content()
-        .iter()
-        .filter_map(|part| match part {
-            ContentPart::Text { text } => Some(text.as_str()),
-            _ => None,
-        })
-        .collect()
+    InputContent::from(message.content())
+        .text_content()
+        .to_owned()
 }
 
 /// Provider-neutral content supplied by a person or another input source.
@@ -164,6 +159,12 @@ impl From<&str> for InputContent {
 impl From<Vec<ContentPart>> for InputContent {
     fn from(parts: Vec<ContentPart>) -> Self {
         Self::new(parts)
+    }
+}
+
+impl From<&[ContentPart]> for InputContent {
+    fn from(parts: &[ContentPart]) -> Self {
+        Self::new(parts.iter().cloned())
     }
 }
 

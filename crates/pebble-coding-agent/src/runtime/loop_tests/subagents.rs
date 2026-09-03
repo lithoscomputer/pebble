@@ -819,24 +819,8 @@ async fn a_childs_events_reach_the_parents_durable_stream() {
 /// child: the child can never be shown more than its parent was.
 #[tokio::test]
 async fn a_child_inherits_only_marked_tools_and_its_parents_middleware() {
-    use pebble_agent::ToolDescriptor;
-
-    use crate::tool::{PermissionMiddleware, ToolPermission, ToolPermissionPolicy};
-
-    /// Denies the shell to the whole tree.
-    struct NoShell;
-
-    impl ToolPermissionPolicy for NoShell {
-        fn permission(&self, tool: &ToolDescriptor) -> ToolPermission {
-            if tool.id().as_str() == "shell" {
-                ToolPermission::Deny {
-                    reason: "shell is disabled".to_owned(),
-                }
-            } else {
-                ToolPermission::Allow
-            }
-        }
-    }
+    use crate::test_support::DenyTool;
+    use crate::tool::PermissionMiddleware;
 
     fn application_tool(name: &str) -> RegisteredTool {
         RegisteredTool::function(
@@ -875,7 +859,9 @@ async fn a_child_inherits_only_marked_tools_and_its_parents_middleware() {
                 .allow_in_subagents()
                 .requires_human_input(),
         ])
-        .tool_middleware(Arc::new(PermissionMiddleware::new(Arc::new(NoShell))))
+        .tool_middleware(Arc::new(PermissionMiddleware::new(Arc::new(DenyTool(
+            "shell",
+        )))))
         .observe_children(observer)
         .build()
         .expect("the parent builds");

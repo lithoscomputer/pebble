@@ -24,7 +24,7 @@ use lithos_llm::types::{ContentPart, Message, Request, Role};
 use crate::memory::MemoryDocument;
 use crate::profiles::{memory_prompt_suffix, skills_prompt_suffix};
 use crate::skills::Skill;
-use crate::tool::{ToolDefinitionWithSource, ToolVocabulary};
+use crate::tool::{AdvertisedTool, ToolVocabulary};
 use crate::types::{
     ContextWindowBreakdownItem, ContextWindowCategory, ContextWindowCountMethod,
     ContextWindowSnapshot, ContextWindowStaleness, ContextWindowWarning, TokenUsage, ToolSource,
@@ -49,7 +49,7 @@ pub(crate) struct ContextWindowInput<'a> {
     /// The request whose tokens are being counted.
     pub(crate) request: &'a Request,
     /// The tools the request advertises, with where each came from.
-    pub(crate) tools: &'a [ToolDefinitionWithSource],
+    pub(crate) tools: &'a [AdvertisedTool<'a>],
     /// The assembled system prompt, used to recognize the system message.
     pub(crate) system_prompt: &'a str,
     /// What the memory files contribute to the system prompt, from
@@ -227,10 +227,10 @@ fn add_message_breakdown(
 }
 
 /// Attributes every tool definition to the category its source implies.
-fn add_tool_breakdown(builder: &mut BreakdownBuilder, tools: &[ToolDefinitionWithSource]) {
+fn add_tool_breakdown(builder: &mut BreakdownBuilder, tools: &[AdvertisedTool<'_>]) {
     for tool in tools {
-        let tokens = tool_definition_tokens(&tool.definition);
-        let category = match &tool.source {
+        let tokens = tool_definition_tokens(tool.definition);
+        let category = match tool.source {
             ToolSource::Mcp { .. } => ContextWindowCategory::McpTools,
             ToolSource::Skill => ContextWindowCategory::Skills,
             _ => ContextWindowCategory::Tools,
@@ -433,15 +433,22 @@ mod tests {
             .expect("the request builds")
     }
 
-    fn tool(name: &str, source: ToolSource) -> ToolDefinitionWithSource {
-        ToolDefinitionWithSource {
-            definition: ToolDefinition::function(
+    fn tool(name: &str, source: ToolSource) -> (ToolDefinition, ToolSource) {
+        (
+            ToolDefinition::function(
                 name,
                 format!("{name} description"),
                 json!({ "type": "object" }),
             ),
             source,
-        }
+        )
+    }
+
+    fn advertised(tools: &[(ToolDefinition, ToolSource)]) -> Vec<AdvertisedTool<'_>> {
+        tools
+            .iter()
+            .map(|(definition, source)| AdvertisedTool { definition, source })
+            .collect()
     }
 
     fn memory() -> Vec<MemoryDocument> {
@@ -517,8 +524,12 @@ mod tests {
                 Message::text(Role::System, system_prompt.clone()),
                 Message::text(Role::User, "hello"),
             ],
-            tools.iter().map(|tool| tool.definition.clone()).collect(),
+            tools
+                .iter()
+                .map(|(definition, _)| definition.clone())
+                .collect(),
         );
+        let tools = advertised(&tools);
 
         let snapshot = build_local_snapshot(ContextWindowInput {
             request: &built,
@@ -577,8 +588,12 @@ mod tests {
                 Message::text(Role::System, system_prompt.clone()),
                 Message::text(Role::User, "hello"),
             ],
-            tools.iter().map(|tool| tool.definition.clone()).collect(),
+            tools
+                .iter()
+                .map(|(definition, _)| definition.clone())
+                .collect(),
         );
+        let tools = advertised(&tools);
 
         let snapshot = build_local_snapshot(ContextWindowInput {
             request: &built,

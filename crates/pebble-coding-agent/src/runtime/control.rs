@@ -64,24 +64,19 @@ fn attributed_message(content: InputContent, attribution: CodingAttribution) -> 
     }
 }
 
+/// The coding facts carried by generic message attribution, if it holds any.
+fn decode_attribution(attribution: Option<&Value>) -> Option<CodingAttribution> {
+    attribution.and_then(|value| CodingAttribution::deserialize(value).ok())
+}
+
 /// The coding-layer author carried by generic message attribution.
 pub(crate) fn actor_from_attribution(attribution: Option<&Value>) -> Option<Actor> {
-    attribution.and_then(|value| {
-        serde_json::from_value::<CodingAttribution>(value.clone())
-            .ok()
-            .and_then(|attribution| attribution.actor)
-            // Read the attribution shape emitted before the envelope existed.
-            .or_else(|| serde_json::from_value(value.clone()).ok())
-    })
+    decode_attribution(attribution).and_then(|attribution| attribution.actor)
 }
 
 /// The coding input source carried by generic message attribution.
 pub(crate) fn input_source_from_attribution(attribution: Option<&Value>) -> Option<InputSource> {
-    attribution.and_then(|value| {
-        serde_json::from_value::<CodingAttribution>(value.clone())
-            .ok()
-            .and_then(|attribution| attribution.source)
-    })
+    decode_attribution(attribution).and_then(|attribution| attribution.source)
 }
 
 #[cfg(test)]

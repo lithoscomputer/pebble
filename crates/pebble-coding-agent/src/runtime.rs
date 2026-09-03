@@ -1425,15 +1425,6 @@ impl CodingRuntime {
         }
     }
 
-    /// Changes where a tool call's extra environment variables come from.
-    #[cfg(test)]
-    pub(crate) fn set_tool_env_provider(&mut self, provider: Arc<dyn ToolEnvProvider>) {
-        self.tool_env_provider = Some(Arc::clone(&provider));
-        if let Some(bridge) = &self.coding_bridge {
-            bridge.set_tool_env_provider(provider);
-        }
-    }
-
     /// Processes one input to completion, answering with the assistant's final
     /// text when it ended with any.
     ///

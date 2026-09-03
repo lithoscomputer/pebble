@@ -26,7 +26,7 @@ use crate::context_window::{
     ContextWindowInput, build_local_snapshot, context_window_from_response_usage,
 };
 use crate::error::{Error, ErrorData, InterruptReason, Result};
-use crate::event::{Emitter, OutputCaptureStats};
+use crate::event::Emitter;
 use crate::file_tracker::FileTracker;
 use crate::history::History;
 use crate::loop_detection::detect_loop;
@@ -35,11 +35,7 @@ use crate::reasoning::ReasoningOutput;
 use crate::skills::{ExpandedInput, Skill, SkillExpansion, expand_skill};
 use crate::subagent::SubagentSupervisor;
 use crate::task_reminder::maybe_task_reminder;
-#[cfg(test)]
-use crate::tool::ToolEnvProvider;
-use crate::tool::{
-    CodingToolService, NativeTool, ToolRegistry, canonical_tool_name, output_value, result_text,
-};
+use crate::tool::{CodingToolService, NativeTool, ToolRegistry, canonical_tool_name};
 use crate::types::{
     CodingAgentState, CodingEvent, ContextWindowSnapshot, ContextWindowStaleness, CostSource,
     InputContent, InputSource, LlmOutputKind, LlmRetryPhase, Message, SkillActivationSource,
@@ -175,11 +171,6 @@ impl CodingAgentBridge {
         state.inference_start = None;
         state.tool_start = None;
         state.boundary_error = None;
-    }
-
-    #[cfg(test)]
-    pub(super) fn set_tool_env_provider(&self, provider: Arc<dyn ToolEnvProvider>) {
-        self.tools.set_tool_env_provider(provider);
     }
 
     /// The token that ends the prompt in progress.
@@ -329,7 +320,7 @@ impl CodingAgentBridge {
     }
 
     fn commit_user_message(&self, message: &LlmMessage, attribution: Option<&Value>) {
-        let content = InputContent::new(message.content().iter().cloned());
+        let content = InputContent::from(message.content());
         let text = content.text_content().to_owned();
         let source = input_source_from_attribution(attribution).unwrap_or(InputSource::Agent);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -347,7 +338,7 @@ impl CodingAgentBridge {
     }
 
     fn commit_steering(&self, message: &LlmMessage, attribution: Option<&Value>) {
-        let content = InputContent::new(message.content().iter().cloned());
+        let content = InputContent::from(message.content());
         let text = content.text_content().to_owned();
         let actor = actor_from_attribution(attribution);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -529,47 +520,19 @@ impl agent::EventProjection for CodingAgentBridge {
             }
             agent::AgentEvent::ToolStarted { call } => {
                 self.state_machine.transition(CodingAgentState::Executing);
-                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-                state.tool_start.get_or_insert_with(Instant::now);
-                self.emitter.emit_with_tool_call_id(
-                    &self.session_id,
-                    CodingEvent::ToolCallStarted {
-                        tool_name:    call.name.clone(),
-                        tool_call_id: call.id.clone(),
-                        arguments:    call.arguments.clone(),
-                    },
-                    Some(call.id.clone()),
-                );
+                self.state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .tool_start
+                    .get_or_insert_with(Instant::now);
+                self.tools.emit_started(call);
             }
             agent::AgentEvent::ToolCompleted {
                 result,
                 error_kind,
                 output_stats,
             } => {
-                let text = result_text(result).into_owned();
-                let stats =
-                    output_stats.unwrap_or_else(|| OutputCaptureStats::complete(text.len()));
-                self.emitter.emit_with_tool_call_id(
-                    &self.session_id,
-                    CodingEvent::ToolCallOutputDelta {
-                        delta: text.clone(),
-                    },
-                    Some(result.tool_call_id.clone()),
-                );
-                self.emitter.emit_with_tool_call_id(
-                    &self.session_id,
-                    CodingEvent::ToolCallCompleted {
-                        tool_name:             result.name.clone().unwrap_or_default(),
-                        tool_call_id:          result.tool_call_id.clone(),
-                        output:                output_value(result),
-                        is_error:              result.is_error,
-                        error_kind:            *error_kind,
-                        output_bytes_observed: stats.observed_bytes,
-                        output_bytes_retained: stats.retained_bytes,
-                        output_bytes_omitted:  stats.omitted_bytes,
-                    },
-                    Some(result.tool_call_id.clone()),
-                );
+                self.tools.emit_result(result, *output_stats, *error_kind);
             }
             agent::AgentEvent::TurnInterrupted { generation } => {
                 self.finish_inference();
@@ -640,7 +603,7 @@ impl agent::AgentLifecycle for CodingAgentBridge {
         _cancel: &CancellationToken,
     ) -> StdResult<agent::UserMessage, agent::LifecycleError> {
         let attribution = message.attribution().cloned();
-        let content = InputContent::new(message.content().iter().cloned());
+        let content = InputContent::from(message.content());
         let text = content.text_content();
         let expanded = if self.skills.is_empty() {
             ExpandedInput {
@@ -687,11 +650,7 @@ impl agent::AgentLifecycle for CodingAgentBridge {
 }
 
 impl agent::ConversationProjection for CodingAgentBridge {
-    fn user_message_committed_with_attribution(
-        &self,
-        message: &LlmMessage,
-        attribution: Option<&Value>,
-    ) {
+    fn user_message_committed(&self, message: &LlmMessage, attribution: Option<&Value>) {
         self.commit_user_message(message, attribution);
     }
 

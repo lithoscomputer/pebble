@@ -7,13 +7,17 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lithos_llm::types::{
-    ContentPart, Message, ToolCall, ToolCallKind, ToolDefinition, ToolDefinitionKind, ToolResult,
+    ContentPart, ToolCall, ToolCallKind, ToolDefinition, ToolDefinitionKind, ToolResult,
 };
 use tokio_util::sync::CancellationToken;
 
 use super::{ToolContext, ToolErrorKind, ToolOutput, ToolOutputStats};
-use crate::event::{AgentEvent, EventHub};
+use crate::event::EventHub;
+use crate::turn::TurnContext;
 use crate::validation::validate_tool_arguments;
+
+/// What a call that never ran, or was cancelled while it ran, is told.
+pub(crate) const CANCELLED: &str = "Cancelled";
 
 /// A stable tool identity that does not depend on its model-visible name.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -216,44 +220,6 @@ impl ToolCatalog {
     }
 }
 
-/// An immutable view of the conversation during tool discovery.
-#[derive(Clone, Copy, Debug)]
-pub struct ToolDiscoveryContext<'a> {
-    model:    &'a str,
-    turn:     usize,
-    messages: &'a [Message],
-}
-
-impl<'a> ToolDiscoveryContext<'a> {
-    /// Creates a discovery context for one model turn.
-    #[must_use]
-    pub const fn new(model: &'a str, turn: usize, messages: &'a [Message]) -> Self {
-        Self {
-            model,
-            turn,
-            messages,
-        }
-    }
-
-    /// The model selector for this turn.
-    #[must_use]
-    pub const fn model(&self) -> &str {
-        self.model
-    }
-
-    /// The zero-based model turn in the current prompt.
-    #[must_use]
-    pub const fn turn(&self) -> usize {
-        self.turn
-    }
-
-    /// The committed conversation at discovery time.
-    #[must_use]
-    pub const fn messages(&self) -> &[Message] {
-        self.messages
-    }
-}
-
 /// One resolved tool invocation passed through middleware.
 #[derive(Clone)]
 pub struct ToolCallRequest {
@@ -314,16 +280,11 @@ impl ToolCallRequest {
     ///
     /// This does not add the fragment to the result returned to the model.
     pub fn emit_output_delta(&self, delta: impl Into<String>) {
-        if let Some(events) = &self.events {
-            events.emit(AgentEvent::ToolOutputDelta {
-                tool_call_id: self.call.id.clone(),
-                delta:        delta.into(),
-            });
-        }
+        super::emit_output_delta(self.events.as_ref(), &self.call.id, delta.into());
     }
 
-    pub(crate) fn with_events(mut self, events: EventHub) -> Self {
-        self.events = Some(events);
+    pub(crate) fn with_events(mut self, events: Option<EventHub>) -> Self {
+        self.events = events;
         self
     }
 
@@ -508,10 +469,7 @@ impl StdError for ToolSystemError {
 #[async_trait]
 pub trait ToolService: Send + Sync {
     /// Returns the unfiltered tools available for one model turn.
-    async fn discover(
-        &self,
-        context: ToolDiscoveryContext<'_>,
-    ) -> StdResult<ToolCatalog, ToolSystemError>;
+    async fn discover(&self, context: TurnContext<'_>) -> StdResult<ToolCatalog, ToolSystemError>;
 
     /// Invokes one resolved tool.
     async fn call(&self, request: ToolCallRequest) -> StdResult<ToolOutcome, ToolSystemError>;
@@ -528,7 +486,7 @@ pub trait ToolMiddleware: Send + Sync {
     /// Filters or annotates the tools available for a model turn.
     async fn discover(
         &self,
-        context: ToolDiscoveryContext<'_>,
+        context: TurnContext<'_>,
         next: ToolDiscoveryNext<'_>,
     ) -> StdResult<ToolCatalog, ToolSystemError> {
         next.run(context).await
@@ -553,10 +511,7 @@ pub struct ToolDiscoveryNext<'a> {
 
 impl ToolDiscoveryNext<'_> {
     /// Runs the next middleware, or the terminal service at the end.
-    pub async fn run(
-        self,
-        context: ToolDiscoveryContext<'_>,
-    ) -> StdResult<ToolCatalog, ToolSystemError> {
+    pub async fn run(self, context: TurnContext<'_>) -> StdResult<ToolCatalog, ToolSystemError> {
         match self.remaining.split_first() {
             Some((middleware, remaining)) => {
                 middleware
@@ -642,7 +597,7 @@ impl ToolSystem {
     /// Discovers tools through the complete middleware chain.
     pub async fn discover(
         &self,
-        context: ToolDiscoveryContext<'_>,
+        context: TurnContext<'_>,
     ) -> StdResult<ToolCatalog, ToolSystemError> {
         ToolDiscoveryNext {
             remaining: &self.middleware,
@@ -670,36 +625,27 @@ impl ToolSystem {
         call: ToolCall,
         cancellation: CancellationToken,
     ) -> StdResult<ToolOutcome, ToolSystemError> {
-        let request = match catalog.resolve(turn, call, cancellation.clone()) {
-            Ok(request) => request,
-            Err(outcome) => return Ok(outcome),
-        };
-        self.execute_resolved(request, &cancellation).await
+        self.execute_with(catalog, turn, call, cancellation, None)
+            .await
     }
 
-    pub(crate) async fn execute_observed(
+    /// [`execute`](Self::execute), with `events` for the tool to stream
+    /// output fragments on.
+    pub(crate) async fn execute_with(
         &self,
         catalog: &ToolCatalog,
         turn: usize,
         call: ToolCall,
         cancellation: CancellationToken,
-        events: EventHub,
+        events: Option<EventHub>,
     ) -> StdResult<ToolOutcome, ToolSystemError> {
         let request = match catalog.resolve(turn, call, cancellation.clone()) {
             Ok(request) => request.with_events(events),
             Err(outcome) => return Ok(outcome),
         };
-        self.execute_resolved(request, &cancellation).await
-    }
-
-    async fn execute_resolved(
-        &self,
-        request: ToolCallRequest,
-        cancellation: &CancellationToken,
-    ) -> StdResult<ToolOutcome, ToolSystemError> {
         let outcome = self.call(request).await?;
         if cancellation.is_cancelled() {
-            Ok(ToolOutcome::failure(ToolErrorKind::Cancelled, "Cancelled"))
+            Ok(ToolOutcome::failure(ToolErrorKind::Cancelled, CANCELLED))
         } else {
             Ok(outcome)
         }
@@ -733,7 +679,7 @@ mod tests {
     impl ToolService for RecordingService {
         async fn discover(
             &self,
-            _context: ToolDiscoveryContext<'_>,
+            _context: TurnContext<'_>,
         ) -> StdResult<ToolCatalog, ToolSystemError> {
             self.calls
                 .lock()
@@ -760,7 +706,7 @@ mod tests {
     impl ToolMiddleware for RecordingMiddleware {
         async fn discover(
             &self,
-            context: ToolDiscoveryContext<'_>,
+            context: TurnContext<'_>,
             next: ToolDiscoveryNext<'_>,
         ) -> StdResult<ToolCatalog, ToolSystemError> {
             self.record(match self.name {
@@ -854,7 +800,7 @@ mod tests {
         }));
 
         let messages = [];
-        let context = ToolDiscoveryContext::new("test/model", 0, &messages);
+        let context = TurnContext::new("test/model", 0, &messages);
         let _ = system.discover(context).await.expect("discovery succeeds");
         let _ = system.call(request()).await.expect("the call succeeds");
 

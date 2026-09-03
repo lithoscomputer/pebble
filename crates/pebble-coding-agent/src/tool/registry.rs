@@ -428,6 +428,15 @@ impl RegisteredTool {
     }
 }
 
+/// One request's tool, borrowed from the request and the registry.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AdvertisedTool<'a> {
+    /// What the model was told about the tool.
+    pub(crate) definition: &'a ToolDefinition,
+    /// Where the tool came from.
+    pub(crate) source:     &'a ToolSource,
+}
+
 /// One registered tool's advertised half.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ToolDefinitionWithSource {
@@ -544,6 +553,11 @@ impl ToolRegistry {
         self.tools.get(tool.name(self.vocabulary))
     }
 
+    /// Every registered tool, in no particular order.
+    pub(crate) fn tools(&self) -> impl Iterator<Item = &RegisteredTool> {
+        self.tools.values()
+    }
+
     /// Every registered tool's definition, in no particular order.
     #[must_use]
     pub(crate) fn definitions(&self) -> Vec<ToolDefinition> {
@@ -567,19 +581,17 @@ impl ToolRegistry {
 
     /// The request's tool definitions paired with their registered origins.
     #[must_use]
-    pub(crate) fn sources_for(
-        &self,
-        definitions: &[ToolDefinition],
-    ) -> Vec<ToolDefinitionWithSource> {
+    pub(crate) fn sources_for<'a>(
+        &'a self,
+        definitions: &'a [ToolDefinition],
+    ) -> Vec<AdvertisedTool<'a>> {
         definitions
             .iter()
             .filter_map(|definition| {
-                self.tools
-                    .get(&definition.name)
-                    .map(|tool| ToolDefinitionWithSource {
-                        definition: definition.clone(),
-                        source:     tool.source.clone(),
-                    })
+                self.tools.get(&definition.name).map(|tool| AdvertisedTool {
+                    definition,
+                    source: &tool.source,
+                })
             })
             .collect()
     }
@@ -843,14 +855,18 @@ mod tests {
         let mut registry = ToolRegistry::new();
         registry.register(make_tool("visible"));
         registry.register(make_tool("hidden"));
-        let visible = ToolDefinition::function("visible", "Filtered view", json!({}));
+        let advertised = [ToolDefinition::function(
+            "visible",
+            "Filtered view",
+            json!({}),
+        )];
 
-        let tools = registry.sources_for(&[visible]);
+        let tools = registry.sources_for(&advertised);
 
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].definition.name, "visible");
         assert_eq!(tools[0].definition.description, "Filtered view");
-        assert_eq!(tools[0].source, ToolSource::Native);
+        assert_eq!(*tools[0].source, ToolSource::Native);
     }
 
     #[test]

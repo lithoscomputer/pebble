@@ -13,9 +13,14 @@
 //! session works on, and [`ScriptedProvider`] stands in for the model it talks
 //! to — registered on a real [`Client`](lithos_llm::Client), so everything
 //! between the session and the provider is the code that runs in production.
+//!
+//! [`DenyTool`] and [`FixedPermission`] are the two permission policies a
+//! test of tool middleware usually needs.
 
+mod policy;
 mod scripted;
 
+pub use self::policy::{DenyTool, FixedPermission};
 pub use self::scripted::{
     ScriptedCall, ScriptedCompletion, ScriptedFailure, ScriptedItem, ScriptedProvider,
     TEST_CATALOG, client_from, custom_tool_call_response, events_for, message_text,

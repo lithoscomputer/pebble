@@ -37,7 +37,7 @@ use crate::test_support::{
     MockEnvironment, ScriptedCall, ScriptedCompletion, ScriptedProvider, client_from,
     scripted_client_builder,
 };
-use crate::tool::{RegisteredTool, ToolError, ToolRegistry, ToolVocabulary};
+use crate::tool::{RegisteredTool, ToolEnvProvider, ToolError, ToolRegistry, ToolVocabulary};
 use crate::types::{AgentProfileKind, CodingAgentEvent, CodingEvent, Message, ToolSource};
 
 /// A profile that names a harness and contributes only what it is given.
@@ -115,6 +115,7 @@ pub(crate) struct TestSession {
     observer:        Option<ChildObserver>,
     limits:          SubagentLimits,
     human_input:     Option<Arc<dyn HumanInputProvider>>,
+    tool_env:        Option<Arc<dyn ToolEnvProvider>>,
     redactor:        Option<Arc<dyn Redactor>>,
     search_provider: Option<Arc<dyn SearchProvider>>,
 }
@@ -137,6 +138,7 @@ impl TestSession {
             observer: None,
             limits: SubagentLimits::default(),
             human_input: None,
+            tool_env: None,
             redactor: None,
             search_provider: None,
         }
@@ -170,6 +172,12 @@ impl TestSession {
     /// Gives the session someone to ask, which only a root ever has.
     pub(crate) fn human_input(mut self, provider: Arc<dyn HumanInputProvider>) -> Self {
         self.human_input = Some(provider);
+        self
+    }
+
+    /// Sets where a tool call's extra environment variables come from.
+    pub(crate) fn tool_env_provider(mut self, provider: Arc<dyn ToolEnvProvider>) -> Self {
+        self.tool_env = Some(provider);
         self
     }
 
@@ -284,6 +292,9 @@ impl TestSession {
         }
         if let Some(provider) = self.human_input {
             builder = builder.human_input(provider);
+        }
+        if let Some(provider) = self.tool_env {
+            builder = builder.tool_env_provider(provider);
         }
         if let Some(redactor) = self.redactor {
             builder = builder.redactor(redactor);

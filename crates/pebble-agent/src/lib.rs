@@ -65,9 +65,9 @@ pub use self::event::{AgentEvent, EventProjection, FirstOutputKind};
 pub use self::model::ModelService;
 pub use self::tool::{
     Tool, ToolCallNext, ToolCallRequest, ToolCatalog, ToolContext, ToolDescriptor,
-    ToolDiscoveryContext, ToolDiscoveryNext, ToolError, ToolErrorKind, ToolExecutor, ToolId,
-    ToolIdError, ToolMiddleware, ToolOutcome, ToolOutput, ToolOutputStats, ToolScheduling,
-    ToolService, ToolSystem, ToolSystemError,
+    ToolDiscoveryNext, ToolError, ToolErrorKind, ToolExecutor, ToolId, ToolIdError, ToolMiddleware,
+    ToolOutcome, ToolOutput, ToolOutputStats, ToolScheduling, ToolService, ToolSystem,
+    ToolSystemError,
 };
 pub use self::turn::{
     AfterAnswerAction, AgentLifecycle, ConversationUpdate, LifecycleError, TurnContext,

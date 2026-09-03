@@ -746,7 +746,7 @@ impl SteeringMessage {
     /// was given.
     fn from_user_message(message: &UserMessage) -> Self {
         Self {
-            content: InputContent::new(message.content().iter().cloned()),
+            content: InputContent::from(message.content()),
             actor:   actor_from_attribution(message.attribution()),
         }
     }

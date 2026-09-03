@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lithos_llm::types::{Message, ToolCall, ToolDefinition, ToolResult};
-use pebble_agent::{ToolDiscoveryContext, ToolMiddleware, ToolOutcome, ToolSystem};
+use pebble_agent::{ToolMiddleware, ToolOutcome, ToolSystem, TurnContext};
 use tokio_util::sync::CancellationToken;
 
 use super::execution::CodingToolService;
@@ -269,34 +269,29 @@ impl ToolRunner {
         }
 
         let messages: [Message; 0] = [];
-        let (outcome, call_started) = match system
-            .discover(ToolDiscoveryContext::new("standalone", 0, &messages))
+        let result = match system
+            .discover(TurnContext::new("standalone", 0, &messages))
             .await
         {
             Ok(catalog) => {
                 service.begin_standalone(call);
-                (
-                    system.execute(&catalog, 0, call.clone(), cancel).await,
-                    true,
-                )
-            }
-            Err(error) => (Err(error), false),
-        };
-
-        let result = match outcome {
-            Ok(outcome) => Ok(service.complete_standalone(call, outcome)),
-            Err(error) => {
-                if call_started {
-                    let _ = service.complete_standalone(
-                        call,
-                        ToolOutcome::failure(
-                            pebble_agent::ToolErrorKind::Execution,
-                            error.message(),
-                        ),
-                    );
+                match system.execute(&catalog, 0, call.clone(), cancel).await {
+                    Ok(outcome) => Ok(service.complete_standalone(call, outcome)),
+                    // The started event is out, so the failure is answered
+                    // before it ends the run.
+                    Err(error) => {
+                        let _ = service.complete_standalone(
+                            call,
+                            ToolOutcome::failure(
+                                pebble_agent::ToolErrorKind::Execution,
+                                error.message(),
+                            ),
+                        );
+                        Err(error)
+                    }
                 }
-                Err(error)
             }
+            Err(error) => Err(error),
         };
 
         // Closing the pipeline publishes everything queued, so the callback has

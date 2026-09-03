@@ -92,9 +92,9 @@ impl FileTracker {
 
     /// Records the file work in one round of answered tool calls.
     ///
-    /// Calls and results are paired in order, which is the order
-    /// [`ToolDispatch`](crate::tools::ToolDispatch) answers them in. A call
-    /// whose result reports an error is skipped: the file was not touched.
+    /// Calls and results are paired in order, which is the order the agent
+    /// loop answers them in. A call whose result reports an error is skipped:
+    /// the file was not touched.
     pub(crate) fn record_from_tool_calls(
         &mut self,
         tool_calls: &[ToolCall],

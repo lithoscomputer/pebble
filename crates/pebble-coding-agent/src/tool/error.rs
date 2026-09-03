@@ -4,7 +4,7 @@ use std::error::Error as StdError;
 use std::fmt::Write as _;
 
 use crate::environment::{EnvironmentError, EnvironmentErrorKind};
-use crate::error::render_error;
+use crate::error::{render_error, source_chain};
 use crate::types::ToolErrorKind;
 
 /// A failed tool call.
@@ -175,10 +175,8 @@ impl ToolError {
         if self.causes_in_message {
             return rendered;
         }
-        let mut current = StdError::source(self);
-        while let Some(cause) = current {
+        for cause in source_chain(self) {
             let _ = write!(rendered, "\n  caused by: {cause}");
-            current = cause.source();
         }
         rendered
     }

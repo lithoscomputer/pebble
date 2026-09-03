@@ -14,12 +14,14 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+pub(crate) use self::system::CANCELLED;
 pub use self::system::{
-    ToolCallNext, ToolCallRequest, ToolCatalog, ToolDescriptor, ToolDiscoveryContext,
-    ToolDiscoveryNext, ToolId, ToolIdError, ToolMiddleware, ToolOutcome, ToolScheduling,
-    ToolService, ToolSystem, ToolSystemError,
+    ToolCallNext, ToolCallRequest, ToolCatalog, ToolDescriptor, ToolDiscoveryNext, ToolId,
+    ToolIdError, ToolMiddleware, ToolOutcome, ToolScheduling, ToolService, ToolSystem,
+    ToolSystemError,
 };
 use crate::event::{AgentEvent, EventHub};
+use crate::turn::TurnContext;
 
 /// Why a tool call failed.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -117,12 +119,17 @@ impl ToolContext {
     ///
     /// This does not add the fragment to the result returned to the model.
     pub fn emit_output_delta(&self, delta: impl Into<String>) {
-        if let Some(events) = &self.events {
-            events.emit(AgentEvent::ToolOutputDelta {
-                tool_call_id: self.tool_call_id.clone(),
-                delta:        delta.into(),
-            });
-        }
+        emit_output_delta(self.events.as_ref(), &self.tool_call_id, delta.into());
+    }
+}
+
+/// Publishes one output fragment when there is a hub to publish it on.
+fn emit_output_delta(events: Option<&EventHub>, tool_call_id: &str, delta: String) {
+    if let Some(events) = events {
+        events.emit(AgentEvent::ToolOutputDelta {
+            tool_call_id: tool_call_id.to_owned(),
+            delta,
+        });
     }
 }
 
@@ -240,10 +247,7 @@ impl StaticToolService {
 
 #[async_trait]
 impl ToolService for StaticToolService {
-    async fn discover(
-        &self,
-        _context: ToolDiscoveryContext<'_>,
-    ) -> StdResult<ToolCatalog, ToolSystemError> {
+    async fn discover(&self, _context: TurnContext<'_>) -> StdResult<ToolCatalog, ToolSystemError> {
         Ok(ToolCatalog::new(
             self.tools.iter().map(|tool| tool.descriptor.clone()),
         ))

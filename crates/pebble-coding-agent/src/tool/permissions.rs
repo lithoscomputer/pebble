@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use pebble_agent::{
-    ToolCallNext, ToolCallRequest, ToolCatalog, ToolDiscoveryContext, ToolDiscoveryNext,
-    ToolErrorKind, ToolMiddleware, ToolOutcome, ToolSystemError,
+    ToolCallNext, ToolCallRequest, ToolCatalog, ToolDiscoveryNext, ToolErrorKind, ToolMiddleware,
+    ToolOutcome, ToolSystemError, TurnContext,
 };
 
 use super::native::NativeTool;
@@ -97,7 +97,7 @@ impl PermissionMiddleware {
 impl ToolMiddleware for PermissionMiddleware {
     async fn discover(
         &self,
-        context: ToolDiscoveryContext<'_>,
+        context: TurnContext<'_>,
         next: ToolDiscoveryNext<'_>,
     ) -> StdResult<ToolCatalog, ToolSystemError> {
         let mut catalog = next.run(context).await?;
@@ -256,14 +256,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::*;
-
-    struct FixedPolicy(ToolPermission);
-
-    impl ToolPermissionPolicy for FixedPolicy {
-        fn permission(&self, _tool: &ToolDescriptor) -> ToolPermission {
-            self.0.clone()
-        }
-    }
+    use crate::test_support::FixedPermission;
 
     struct RecordingApproval {
         arguments: Mutex<Vec<Value>>,
@@ -291,7 +284,7 @@ mod tests {
     impl ToolService for CountingService {
         async fn discover(
             &self,
-            _context: ToolDiscoveryContext<'_>,
+            _context: TurnContext<'_>,
         ) -> StdResult<ToolCatalog, ToolSystemError> {
             Ok(ToolCatalog::new([descriptor()]))
         }
@@ -332,12 +325,12 @@ mod tests {
         let system = ToolSystem::new(Arc::new(CountingService {
             calls: Arc::clone(&calls),
         }))
-        .middleware(Arc::new(PermissionMiddleware::new(Arc::new(FixedPolicy(
-            ToolPermission::RequireApproval,
-        )))));
+        .middleware(Arc::new(PermissionMiddleware::new(Arc::new(
+            FixedPermission(ToolPermission::RequireApproval),
+        ))));
         let messages = [];
         let catalog = system
-            .discover(ToolDiscoveryContext::new("test/model", 0, &messages))
+            .discover(TurnContext::new("test/model", 0, &messages))
             .await
             .expect("discovery succeeds");
 
@@ -368,12 +361,12 @@ mod tests {
             calls: Arc::clone(&calls),
         }))
         .middleware(Arc::new(
-            PermissionMiddleware::new(Arc::new(FixedPolicy(ToolPermission::RequireApproval)))
+            PermissionMiddleware::new(Arc::new(FixedPermission(ToolPermission::RequireApproval)))
                 .with_approval(approval.clone()),
         ));
         let messages = [];
         let catalog = system
-            .discover(ToolDiscoveryContext::new("test/model", 0, &messages))
+            .discover(TurnContext::new("test/model", 0, &messages))
             .await
             .expect("discovery succeeds");
         let descriptor = catalog

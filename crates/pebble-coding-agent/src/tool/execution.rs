@@ -1,13 +1,13 @@
 //! Running the tools a model asked for.
 //!
-//! One round of tool calls goes through a [`ToolDispatch`], which answers every
-//! call it is given — including the ones it refuses — so a conversation never
-//! carries a call without its result.
+//! [`CodingToolService`] is the terminal of a session's tool system and its
+//! fixed output envelope. The generic agent loop resolves and schedules each
+//! call and publishes its lifecycle; this module runs the tool and answers
+//! with a result the session is willing to carry.
 //!
 //! Each call runs through one tool service and its middleware. Application
 //! middleware may continue or refuse, the terminal runs the tool, and the
-//! fixed outer layer bounds the result. The generic agent loop owns call
-//! lifecycle events. History sees a further-truncated copy.
+//! fixed outer layer bounds the result. History sees a further-truncated copy.
 //!
 //! Output is bounded twice, by
 //! [`CodingAgentOptions::tool_output_retention_bytes`] and
@@ -15,22 +15,19 @@
 //! tool's own character and line limits second. See
 //! [`crate::truncate_tool_output`].
 //!
-//! Human-question tools are the one exception to running calls together: they
-//! park a prompt until a person answers, so at most one of them runs per round
-//! and its peers are refused with an explanation the model can act on.
+//! A tool that parks a prompt on a person's answer is discovered as
+//! [`ExclusiveRound`](agent::ToolScheduling::ExclusiveRound), so the agent
+//! loop runs it alone and refuses its peers with an explanation the model can
+//! act on.
 
 use std::borrow::Cow;
 use std::mem;
 use std::result::Result as StdResult;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 use async_trait::async_trait;
-#[cfg(test)]
-use futures_util::future::join_all;
 use lithos_llm::types::{ContentPart, ToolCall, ToolResult};
 use pebble_agent as agent;
-#[cfg(test)]
-use pebble_agent::integration::validate_tool_arguments;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -42,29 +39,13 @@ use super::registry::{
 use crate::config::CodingAgentOptions;
 use crate::environment::Environment;
 use crate::event::{Emitter, OutputCaptureStats, SessionBoundEmitter};
-use crate::human_input::{HumanInputProvider, is_question_tool};
+use crate::human_input::HumanInputProvider;
 use crate::redact::Redactor;
 use crate::truncation::{
     OutputBudgets, ToolOutputLimits, preview_tool_output, serialized_json_bytes,
     truncate_tool_output,
 };
 use crate::types::{CodingEvent, ToolErrorKind};
-
-/// What a second human-question call in one round is told.
-#[cfg(test)]
-const ONE_QUESTION_PER_ROUND: &str = "Only one human-question tool call may be used in a tool \
-                                      round. Combine all questions into a single questions[] \
-                                      batch and call the question tool once.";
-
-/// What a call that shared a round with a human-question call is told.
-#[cfg(test)]
-const QUESTIONS_RUN_ALONE: &str = "This tool call was not executed because human-question tools \
-                                   must run alone in a tool round. Retry non-question tools in a \
-                                   later round after the user answers.";
-
-/// What a call that never started is told.
-#[cfg(test)]
-const CANCELLED: &str = "Cancelled";
 
 /// The coding-tool terminal and its fixed output envelope.
 ///
@@ -74,13 +55,25 @@ const CANCELLED: &str = "Cancelled";
 #[derive(Clone)]
 pub(crate) struct CodingToolService {
     registry:          Arc<ToolRegistry>,
+    /// What every turn discovers, described once: the registry is frozen
+    /// before the first prompt.
+    descriptors:       StdResult<Vec<agent::ToolDescriptor>, String>,
     env:               Arc<dyn Environment>,
     config:            Arc<CodingAgentOptions>,
     emitter:           Emitter,
     session_id:        String,
+    /// Equal to `session_id` in a root session; a child carries the root of
+    /// its tree, which is how a root-only tool knows it is running somewhere
+    /// it should not.
     root_session_id:   String,
-    tool_env_provider: Arc<Mutex<Option<Arc<dyn ToolEnvProvider>>>>,
+    tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
+    /// Absent in a child session and wherever the application installed no
+    /// provider, which is what makes a question tool report that it cannot
+    /// ask.
     human_input:       Option<Arc<dyn HumanInputProvider>>,
+    /// Strips secrets out of the process output a tool publishes and out of
+    /// the message of every failed call, which can carry an OS error naming a
+    /// path the model asked for.
     redactor:          Arc<dyn Redactor>,
 }
 
@@ -96,13 +89,14 @@ impl CodingToolService {
         redactor: Arc<dyn Redactor>,
     ) -> Self {
         Self {
+            descriptors: describe(&registry),
             registry,
             env,
             config,
             emitter,
             session_id,
             root_session_id,
-            tool_env_provider: Arc::new(Mutex::new(None)),
+            tool_env_provider: None,
             human_input: None,
             redactor,
         }
@@ -111,7 +105,7 @@ impl CodingToolService {
     /// Sets where a call gets its extra environment variables.
     #[must_use]
     pub(crate) fn with_tool_env_provider(mut self, provider: Arc<dyn ToolEnvProvider>) -> Self {
-        self.tool_env_provider = Arc::new(Mutex::new(Some(provider)));
+        self.tool_env_provider = Some(provider);
         self
     }
 
@@ -122,30 +116,9 @@ impl CodingToolService {
         self
     }
 
-    /// Replaces the provider used by later calls.
-    #[cfg(test)]
-    pub(crate) fn set_tool_env_provider(&self, provider: Arc<dyn ToolEnvProvider>) {
-        *self
-            .tool_env_provider
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(provider);
-    }
-
-    fn dispatch(&self) -> ToolDispatch<'_> {
-        ToolDispatch::new(
-            self.registry.as_ref(),
-            &self.env,
-            self.config.as_ref(),
-            &self.emitter,
-            &self.session_id,
-            &self.root_session_id,
-        )
-        .with_redactor(&self.redactor)
-    }
-
     /// Publishes the start of one standalone call.
     pub(crate) fn begin_standalone(&self, call: &ToolCall) {
-        self.dispatch().emit_started(call);
+        self.emit_started(call);
     }
 
     /// Applies output policy and publishes one standalone result.
@@ -157,261 +130,27 @@ impl CodingToolService {
         let outcome = if outcome.output_stats().is_some() {
             outcome
         } else {
-            self.dispatch()
-                .finish_terminal(&call.id, &call.name, outcome)
+            self.finish_terminal(&call.id, &call.name, outcome)
         };
-        let stats = outcome
-            .output_stats()
-            .unwrap_or_else(|| OutputCaptureStats::complete(0));
+        let stats = outcome.output_stats();
         let error_kind = outcome.error_kind();
         let result = outcome.into_result(call);
-        self.dispatch()
-            .emit_result(call, &result, stats, error_kind);
+        self.emit_result(&result, stats, error_kind);
         result
-    }
-}
-
-#[async_trait]
-impl agent::ToolService for CodingToolService {
-    async fn discover(
-        &self,
-        _context: agent::ToolDiscoveryContext<'_>,
-    ) -> StdResult<agent::ToolCatalog, agent::ToolSystemError> {
-        let tools = self
-            .registry
-            .definitions_with_source()
-            .into_iter()
-            .map(|tool| {
-                let name = tool.definition.name.clone();
-                let id = agent::ToolId::try_new(canonical_tool_name(&name)).map_err(|source| {
-                    agent::ToolSystemError::with_source(
-                        format!("tool `{name}` has no stable identity"),
-                        source,
-                    )
-                })?;
-                let scheduling = if is_question_tool(&name) {
-                    agent::ToolScheduling::ExclusiveRound
-                } else {
-                    agent::ToolScheduling::Concurrent
-                };
-                Ok(agent::ToolDescriptor::new(id, tool.definition).with_scheduling(scheduling))
-            })
-            .collect::<StdResult<Vec<_>, agent::ToolSystemError>>()?;
-        Ok(agent::ToolCatalog::new(tools))
-    }
-
-    async fn call(
-        &self,
-        request: agent::ToolCallRequest,
-    ) -> StdResult<agent::ToolOutcome, agent::ToolSystemError> {
-        let tool_env_provider = self
-            .tool_env_provider
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        let mut dispatch = self.dispatch();
-        if let Some(provider) = tool_env_provider.as_ref() {
-            dispatch = dispatch.with_tool_env_provider(provider);
-        }
-        if let Some(provider) = self.human_input.as_ref() {
-            dispatch = dispatch.with_human_input(provider);
-        }
-        Ok(dispatch.execute_terminal(request).await)
-    }
-}
-
-#[async_trait]
-impl agent::ToolMiddleware for CodingToolService {
-    async fn call(
-        &self,
-        request: agent::ToolCallRequest,
-        next: agent::ToolCallNext<'_>,
-    ) -> StdResult<agent::ToolOutcome, agent::ToolSystemError> {
-        let call_id = request.call().id.clone();
-        let tool_name = request.call().name.clone();
-        let dispatch = self.dispatch();
-        let outcome = next.run(request).await;
-        match outcome {
-            Ok(outcome) => Ok(dispatch.finish_terminal(&call_id, &tool_name, outcome)),
-            Err(error) => Err(error),
-        }
-    }
-}
-
-/// One session's tool dispatch: the registry, the environment, and everything
-/// a call is answered with.
-///
-/// Built per round and borrowed from the session, so nothing here outlives the
-/// round it belongs to. Construct it with [`new`](Self::new) and add the
-/// optional seams with the `with_*` methods.
-#[derive(Clone, Copy)]
-pub(crate) struct ToolDispatch<'a> {
-    registry:          &'a ToolRegistry,
-    env:               &'a Arc<dyn Environment>,
-    config:            &'a CodingAgentOptions,
-    emitter:           &'a Emitter,
-    session_id:        &'a str,
-    root_session_id:   &'a str,
-    tool_env_provider: Option<&'a Arc<dyn ToolEnvProvider>>,
-    human_input:       Option<&'a Arc<dyn HumanInputProvider>>,
-    redactor:          Option<&'a Arc<dyn Redactor>>,
-}
-
-impl<'a> ToolDispatch<'a> {
-    /// Dispatch for one session.
-    ///
-    /// `root_session_id` equals `session_id` in a root session; a child
-    /// session passes the root of its tree, which is how a root-only tool
-    /// knows it is running somewhere it should not.
-    #[must_use]
-    pub(crate) fn new(
-        registry: &'a ToolRegistry,
-        env: &'a Arc<dyn Environment>,
-        config: &'a CodingAgentOptions,
-        emitter: &'a Emitter,
-        session_id: &'a str,
-        root_session_id: &'a str,
-    ) -> Self {
-        Self {
-            registry,
-            env,
-            config,
-            emitter,
-            session_id,
-            root_session_id,
-            tool_env_provider: None,
-            human_input: None,
-            redactor: None,
-        }
-    }
-
-    /// Sets where a call's extra environment variables come from.
-    #[must_use]
-    pub(crate) fn with_tool_env_provider(mut self, provider: &'a Arc<dyn ToolEnvProvider>) -> Self {
-        self.tool_env_provider = Some(provider);
-        self
-    }
-
-    /// Sets where a question tool asks the person.
-    ///
-    /// Absent in a child session and wherever the application installed no
-    /// provider, which is what makes a question tool report that it cannot ask.
-    #[must_use]
-    pub(crate) fn with_human_input(mut self, provider: &'a Arc<dyn HumanInputProvider>) -> Self {
-        self.human_input = Some(provider);
-        self
-    }
-
-    /// Sets what strips secrets out of text a tool publishes.
-    ///
-    /// It runs over process output a tool puts on the event stream and over
-    /// the message of every failed call, which can carry an OS error naming a
-    /// path. Without one, both reach the model and the event stream exactly
-    /// as they were written.
-    #[must_use]
-    pub(crate) fn with_redactor(mut self, redactor: &'a Arc<dyn Redactor>) -> Self {
-        self.redactor = Some(redactor);
-        self
-    }
-
-    /// Answers every call in one round, in call order.
-    ///
-    /// `parallel` lets independent calls run together; a round holding a
-    /// human-question call ignores it and runs sequentially, because the
-    /// question runs alone. A call that finds `cancel` already fired is
-    /// answered without being started, so the round still pairs a result with
-    /// every call.
-    #[cfg(test)]
-    pub(crate) async fn execute(
-        &self,
-        calls: &[ToolCall],
-        parallel: bool,
-        cancel: &CancellationToken,
-    ) -> Vec<ToolResult> {
-        self.execute_round(calls, parallel, cancel).await
-    }
-
-    #[cfg(test)]
-    async fn execute_round(
-        &self,
-        calls: &[ToolCall],
-        parallel: bool,
-        cancel: &CancellationToken,
-    ) -> Vec<ToolResult> {
-        // A round that opens after its cancellation fired — the prompt was
-        // ended while the turn was being committed — answers every call without
-        // starting one, whichever way it would have run. The sequential paths
-        // below check again per call for a cancellation that lands mid-round.
-        if cancel.is_cancelled() {
-            return calls
-                .iter()
-                .map(|call| self.cancelled_result(call))
-                .collect();
-        }
-
-        if calls.iter().any(|call| is_question_tool(&call.name)) {
-            return self.execute_question_round(calls, cancel).await;
-        }
-
-        if parallel && calls.len() > 1 {
-            self.execute_parallel(calls, cancel).await
-        } else {
-            self.execute_sequential(calls, cancel).await
-        }
-    }
-
-    /// Answers one call without application middleware.
-    #[cfg(test)]
-    pub(crate) async fn execute_one(
-        &self,
-        call: &ToolCall,
-        cancel: CancellationToken,
-    ) -> ToolResult {
-        self.emit_started(call);
-        let mut owned_call = call.clone();
-        let executed = match self.registry.get(&call.name) {
-            Some(tool) => match validate_tool_arguments(&tool.definition.kind, &call.arguments) {
-                Ok(()) => self.run_tool(&mut owned_call, Some(tool), cancel).await,
-                Err(error) => self.failed(call, &ToolError::invalid_arguments(error.to_string())),
-            },
-            None => self.run_tool(&mut owned_call, None, cancel).await,
-        };
-        let retained = self.retain(executed.result, executed.output_stats);
-        self.emit_result(
-            call,
-            &retained.result,
-            retained.output_stats,
-            executed.error_kind,
-        );
-        self.truncate_for_history(retained.result, &call.name)
     }
 
     /// Runs one call after the shared agent middleware approved it.
-    pub(crate) async fn execute_terminal(
-        &self,
-        request: agent::ToolCallRequest,
-    ) -> agent::ToolOutcome {
+    async fn execute_terminal(&self, request: agent::ToolCallRequest) -> agent::ToolOutcome {
         let tool_id = request.descriptor().id().clone();
         let (mut call, cancellation) = request.into_call();
         let executed = self
             .run_tool(&mut call, self.registry.get_by_id(&tool_id), cancellation)
             .await;
-        let outcome = if executed.result.is_error {
-            agent::ToolOutcome::failure(
-                executed.error_kind.unwrap_or(ToolErrorKind::Execution),
-                result_text(&executed.result).into_owned(),
-            )
-        } else {
-            agent::ToolOutcome::success(agent::ToolOutput::new(executed.result.content))
-        };
-        match executed.output_stats {
-            Some(stats) => outcome.with_output_stats(stats),
-            None => outcome,
-        }
+        outcome_from_result(executed.result, executed.error_kind, executed.output_stats)
     }
 
     /// Applies coding output policy to the final call result.
-    pub(crate) fn finish_terminal(
+    fn finish_terminal(
         &self,
         call_id: &str,
         tool_name: &str,
@@ -442,82 +181,8 @@ impl<'a> ToolDispatch<'a> {
             ),
         };
         let retained = self.retain(result, previous);
-        let output_stats = retained.output_stats;
         let result = self.truncate_for_history(retained.result, tool_name);
-        if result.is_error {
-            agent::ToolOutcome::failure(
-                error_kind.unwrap_or(ToolErrorKind::Execution),
-                result_text(&result).into_owned(),
-            )
-            .with_output_stats(output_stats)
-        } else {
-            agent::ToolOutcome::success(agent::ToolOutput::new(result.content))
-                .with_output_stats(output_stats)
-        }
-    }
-
-    #[cfg(test)]
-    async fn execute_sequential(
-        &self,
-        calls: &[ToolCall],
-        cancel: &CancellationToken,
-    ) -> Vec<ToolResult> {
-        let mut results = Vec::with_capacity(calls.len());
-        for call in calls {
-            if cancel.is_cancelled() {
-                results.push(self.cancelled_result(call));
-                continue;
-            }
-            results.push(self.execute_one(call, cancel.child_token()).await);
-        }
-        results
-    }
-
-    #[cfg(test)]
-    async fn execute_parallel(
-        &self,
-        calls: &[ToolCall],
-        cancel: &CancellationToken,
-    ) -> Vec<ToolResult> {
-        join_all(
-            calls
-                .iter()
-                .map(|call| self.execute_one(call, cancel.child_token())),
-        )
-        .await
-    }
-
-    /// Runs the first human-question call and refuses the rest of the round.
-    ///
-    /// A question parks the prompt until a person answers, so running its peers
-    /// would either race the answer or waste work the answer invalidates. Both
-    /// refusals name what to do instead, and the results stay in call order.
-    #[cfg(test)]
-    async fn execute_question_round(
-        &self,
-        calls: &[ToolCall],
-        cancel: &CancellationToken,
-    ) -> Vec<ToolResult> {
-        let first_question = calls.iter().position(|call| is_question_tool(&call.name));
-        let mut results = Vec::with_capacity(calls.len());
-
-        for (index, call) in calls.iter().enumerate() {
-            if cancel.is_cancelled() {
-                results.push(self.cancelled_result(call));
-                continue;
-            }
-
-            let result = if Some(index) == first_question {
-                self.execute_one(call, cancel.child_token()).await
-            } else if is_question_tool(&call.name) {
-                self.refuse(call, &ToolError::denied(ONE_QUESTION_PER_ROUND))
-            } else {
-                self.refuse(call, &ToolError::denied(QUESTIONS_RUN_ALONE))
-            };
-            results.push(result);
-        }
-
-        results
+        outcome_from_result(result, error_kind, Some(retained.output_stats))
     }
 
     /// Runs one resolved tool.
@@ -536,28 +201,29 @@ impl<'a> ToolDispatch<'a> {
 
         let bound = Arc::new(SessionBoundEmitter::new(
             self.emitter.clone(),
-            self.session_id,
+            &self.session_id,
             Some(call.id.clone()),
         ));
-        let mut context = ToolContext::new(Arc::clone(self.env))
+        let mut context = ToolContext::new(Arc::clone(&self.env))
             .with_cancel(cancel)
-            .with_session(self.session_id, self.root_session_id)
+            .with_session(&self.session_id, &self.root_session_id)
             .with_tool_call_id(call.id.clone())
-            .with_coding_event_emitter(Arc::clone(&bound) as Arc<dyn CodingEventEmitter>);
-        if let Some(provider) = self.tool_env_provider {
+            .with_coding_event_emitter(Arc::clone(&bound) as Arc<dyn CodingEventEmitter>)
+            .with_redactor(Arc::clone(&self.redactor));
+        if let Some(provider) = &self.tool_env_provider {
             context = context.with_tool_env_provider(Arc::clone(provider));
         }
-        if let Some(provider) = self.human_input {
+        if let Some(provider) = &self.human_input {
             context = context.with_human_input(Arc::clone(provider));
-        }
-        if let Some(redactor) = self.redactor {
-            context = context.with_redactor(Arc::clone(redactor));
         }
 
         let arguments = mem::take(&mut call.arguments);
         let (result, error_kind) = match (tool.executor)(arguments, context).await {
             Ok(output) => (text_result(call, output, false), None),
-            Err(error) => (self.error_result(call, &error), Some(error.kind())),
+            Err(error) => (
+                self.error_result_for(&call.id, &call.name, &error),
+                Some(error.kind()),
+            ),
         };
 
         ExecutedTool {
@@ -570,7 +236,7 @@ impl<'a> ToolDispatch<'a> {
     /// A failure the tool never got to see.
     fn failed(&self, call: &ToolCall, error: &ToolError) -> ExecutedTool {
         ExecutedTool {
-            result:       self.error_result(call, error),
+            result:       self.error_result_for(&call.id, &call.name, error),
             error_kind:   Some(error.kind()),
             output_stats: None,
         }
@@ -582,42 +248,9 @@ impl<'a> ToolDispatch<'a> {
     /// written without secrets, but an environment failure carries an OS
     /// error under it, and the path in that error is whatever the model
     /// asked for.
-    fn error_result(&self, call: &ToolCall, error: &ToolError) -> ToolResult {
-        self.error_result_for(&call.id, &call.name, error)
-    }
-
     fn error_result_for(&self, call_id: &str, tool_name: &str, error: &ToolError) -> ToolResult {
-        let message = match self.redactor {
-            Some(redactor) => redactor.redact(error.message()).into_owned(),
-            None => error.message().to_owned(),
-        };
+        let message = self.redactor.redact(error.message()).into_owned();
         text_result_for(call_id, tool_name, message, true)
-    }
-
-    /// A call that was cancelled before it started.
-    #[cfg(test)]
-    fn cancelled_result(&self, call: &ToolCall) -> ToolResult {
-        self.error_result(call, &ToolError::cancelled(CANCELLED))
-    }
-
-    /// Publishes the started event this call never got, then refuses it.
-    #[cfg(test)]
-    fn refuse(&self, call: &ToolCall, error: &ToolError) -> ToolResult {
-        self.emit_started(call);
-        self.finish_error(call, error)
-    }
-
-    /// Bounds, publishes, and truncates a failure whose started event is out.
-    #[cfg(test)]
-    fn finish_error(&self, call: &ToolCall, error: &ToolError) -> ToolResult {
-        let retained = self.retain(self.error_result(call, error), None);
-        self.emit_result(
-            call,
-            &retained.result,
-            retained.output_stats,
-            Some(error.kind()),
-        );
-        self.truncate_for_history(retained.result, &call.name)
     }
 
     /// Cuts a tool's output down to what the session is willing to carry.
@@ -665,47 +298,114 @@ impl<'a> ToolDispatch<'a> {
         result
     }
 
-    fn emit_started(&self, call: &ToolCall) {
-        self.emit(call, CodingEvent::ToolCallStarted {
+    /// Publishes that a call started.
+    pub(crate) fn emit_started(&self, call: &ToolCall) {
+        self.emit(&call.id, CodingEvent::ToolCallStarted {
             tool_name:    call.name.clone(),
             tool_call_id: call.id.clone(),
             arguments:    call.arguments.clone(),
         });
     }
 
-    fn emit_result(
+    /// Publishes a call's result.
+    ///
+    /// `output_stats` is what the output envelope counted. A call the kernel
+    /// refused before the envelope ran carries none, and is counted as its
+    /// message.
+    pub(crate) fn emit_result(
         &self,
-        call: &ToolCall,
         result: &ToolResult,
-        output_stats: OutputCaptureStats,
+        output_stats: Option<OutputCaptureStats>,
         error_kind: Option<ToolErrorKind>,
     ) {
+        let output = output_value(result);
+        let text = result_text(result);
+        let stats = output_stats.unwrap_or_else(|| OutputCaptureStats::complete(text.len()));
         // The same bounded output goes out twice on purpose: the delta is the
         // live-streaming feed and `ToolCallCompleted` is the durable record,
         // so a store keeps the completed event and drops deltas as ephemeral.
         // No tool streams incremental deltas yet, which makes the two payloads
         // equal today.
-        self.emit(call, CodingEvent::ToolCallOutputDelta {
-            delta: result_text(result).into_owned(),
+        self.emit(&result.tool_call_id, CodingEvent::ToolCallOutputDelta {
+            delta: text.into_owned(),
         });
-        self.emit(call, CodingEvent::ToolCallCompleted {
-            tool_name: call.name.clone(),
-            tool_call_id: call.id.clone(),
-            output: output_value(result),
+        self.emit(&result.tool_call_id, CodingEvent::ToolCallCompleted {
+            tool_name: result.name.clone().unwrap_or_default(),
+            tool_call_id: result.tool_call_id.clone(),
+            output,
             is_error: result.is_error,
             error_kind,
-            output_bytes_observed: output_stats.observed_bytes,
-            output_bytes_retained: output_stats.retained_bytes,
-            output_bytes_omitted: output_stats.omitted_bytes,
+            output_bytes_observed: stats.observed_bytes,
+            output_bytes_retained: stats.retained_bytes,
+            output_bytes_omitted: stats.omitted_bytes,
         });
     }
 
     /// Publishes an event about one call, stamping the call on the envelope so
     /// a fragment with no identity of its own is still attributable.
-    fn emit(&self, call: &ToolCall, event: CodingEvent) {
+    fn emit(&self, tool_call_id: &str, event: CodingEvent) {
         self.emitter
-            .emit_with_tool_call_id(self.session_id, event, Some(call.id.clone()));
+            .emit_with_tool_call_id(&self.session_id, event, Some(tool_call_id.to_owned()));
     }
+}
+
+#[async_trait]
+impl agent::ToolService for CodingToolService {
+    async fn discover(
+        &self,
+        _context: agent::TurnContext<'_>,
+    ) -> StdResult<agent::ToolCatalog, agent::ToolSystemError> {
+        match &self.descriptors {
+            Ok(tools) => Ok(agent::ToolCatalog::new(tools.iter().cloned())),
+            Err(message) => Err(agent::ToolSystemError::with_source(
+                message.clone(),
+                agent::ToolIdError,
+            )),
+        }
+    }
+
+    async fn call(
+        &self,
+        request: agent::ToolCallRequest,
+    ) -> StdResult<agent::ToolOutcome, agent::ToolSystemError> {
+        Ok(self.execute_terminal(request).await)
+    }
+}
+
+#[async_trait]
+impl agent::ToolMiddleware for CodingToolService {
+    async fn call(
+        &self,
+        request: agent::ToolCallRequest,
+        next: agent::ToolCallNext<'_>,
+    ) -> StdResult<agent::ToolOutcome, agent::ToolSystemError> {
+        let call_id = request.call().id.clone();
+        let tool_name = request.call().name.clone();
+        let outcome = next.run(request).await?;
+        Ok(self.finish_terminal(&call_id, &tool_name, outcome))
+    }
+}
+
+/// Describes every registered tool to the generic agent.
+///
+/// A tool's stable identity is its canonical name, so policy written against
+/// pebble's names holds whichever vocabulary the model sees. A tool that parks
+/// the prompt on a person runs alone in its round.
+fn describe(registry: &ToolRegistry) -> StdResult<Vec<agent::ToolDescriptor>, String> {
+    registry
+        .tools()
+        .map(|tool| {
+            let name = &tool.definition.name;
+            let id = agent::ToolId::try_new(canonical_tool_name(name))
+                .map_err(|_| format!("tool `{name}` has no stable identity"))?;
+            let scheduling = if tool.needs_human_input() {
+                agent::ToolScheduling::ExclusiveRound
+            } else {
+                agent::ToolScheduling::Concurrent
+            };
+            Ok(agent::ToolDescriptor::new(id, tool.definition.clone()).with_scheduling(scheduling))
+        })
+        .collect()
 }
 
 /// What a tool produced, before any budget applied.
@@ -720,6 +420,26 @@ struct ExecutedTool {
 struct Retained {
     result:       ToolResult,
     output_stats: OutputCaptureStats,
+}
+
+/// The logical outcome of a result the coding layer built.
+fn outcome_from_result(
+    result: ToolResult,
+    error_kind: Option<ToolErrorKind>,
+    output_stats: Option<OutputCaptureStats>,
+) -> agent::ToolOutcome {
+    let outcome = if result.is_error {
+        agent::ToolOutcome::failure(
+            error_kind.unwrap_or(ToolErrorKind::Execution),
+            result_text(&result).into_owned(),
+        )
+    } else {
+        agent::ToolOutcome::success(agent::ToolOutput::new(result.content))
+    };
+    match output_stats {
+        Some(stats) => outcome.with_output_stats(stats),
+        None => outcome,
+    }
 }
 
 /// A result carrying one block of text, which is what every pebble tool
@@ -765,7 +485,7 @@ pub(crate) fn result_text(result: &ToolResult) -> Cow<'_, str> {
 }
 
 /// A result's output as the JSON its completion event carries.
-pub(crate) fn output_value(result: &ToolResult) -> Value {
+fn output_value(result: &ToolResult) -> Value {
     match result.content.as_slice() {
         [ContentPart::Text { text }] => Value::String(text.clone()),
         other => serde_json::to_value(other).unwrap_or(Value::Null),
@@ -777,8 +497,7 @@ mod tests {
     use std::io;
     use std::sync::{Mutex, PoisonError};
 
-    use async_trait::async_trait;
-    use lithos_llm::types::ToolDefinition;
+    use lithos_llm::types::{Message, ToolDefinition};
     use serde_json::json;
     use tokio::sync::broadcast;
     use tokio::task::JoinHandle;
@@ -787,11 +506,11 @@ mod tests {
     use crate::environment::EnvironmentError;
     use crate::error::Result as PebbleResult;
     use crate::event::{EventOptions, EventPump};
-    use crate::human_input::{Answer, AnswerStatus, HumanInputError, Question, QuestionKind};
+    use crate::redact::NoRedaction;
     use crate::test_support::MockEnvironment;
     use crate::types::{CodingAgentEvent, CommandTermination, ToolSource};
 
-    /// An event pipeline whose events can be read once the round is over.
+    /// An event pipeline whose events can be read once the call is over.
     struct Events {
         emitter:  Emitter,
         pump:     JoinHandle<PebbleResult<()>>,
@@ -810,13 +529,16 @@ mod tests {
         }
 
         /// Stops the pipeline and returns everything it published.
+        ///
+        /// The service under test holds its own emitter clone, so the pump is
+        /// closed explicitly rather than by dropping the last sender.
         async fn drain(self) -> Vec<CodingAgentEvent> {
             let Self {
                 emitter,
                 pump,
                 mut received,
             } = self;
-            drop(emitter);
+            emitter.close().await.expect("the pump closes");
             pump.await
                 .expect("the pump task joins")
                 .expect("the pump finishes");
@@ -843,8 +565,59 @@ mod tests {
         }
     }
 
-    fn environment() -> Arc<dyn Environment> {
-        Arc::new(MockEnvironment::default())
+    /// The service a session builds, over `tools`, publishing on `events`.
+    fn service(
+        tools: impl IntoIterator<Item = RegisteredTool>,
+        events: &Events,
+        redactor: Arc<dyn Redactor>,
+    ) -> Arc<CodingToolService> {
+        let mut registry = ToolRegistry::new();
+        for tool in tools {
+            registry.register(tool);
+        }
+        Arc::new(CodingToolService::new(
+            Arc::new(registry),
+            Arc::new(MockEnvironment::default()),
+            Arc::new(CodingAgentOptions::default()),
+            events.emitter.clone(),
+            "ses_1".to_owned(),
+            "ses_1".to_owned(),
+            redactor,
+        ))
+    }
+
+    fn plain_service(
+        tools: impl IntoIterator<Item = RegisteredTool>,
+        events: &Events,
+    ) -> Arc<CodingToolService> {
+        service(tools, events, Arc::new(NoRedaction))
+    }
+
+    /// Answers one call the way a session does: through the service as both
+    /// terminal and output envelope, with the kernel resolving the call.
+    async fn run(
+        service: &Arc<CodingToolService>,
+        call: &ToolCall,
+        cancel: CancellationToken,
+    ) -> ToolResult {
+        let system = agent::ToolSystem::new(service.clone()).middleware(service.clone());
+        let catalog = discover(service).await;
+        service.begin_standalone(call);
+        let outcome = system
+            .execute(&catalog, 0, call.clone(), cancel)
+            .await
+            .expect("the call completes");
+        service.complete_standalone(call, outcome)
+    }
+
+    async fn discover(service: &Arc<CodingToolService>) -> agent::ToolCatalog {
+        let messages: [Message; 0] = [];
+        agent::ToolService::discover(
+            service.as_ref(),
+            agent::TurnContext::new("test/model", 0, &messages),
+        )
+        .await
+        .expect("discovery succeeds")
     }
 
     fn call(name: &str, id: &str, arguments: Value) -> ToolCall {
@@ -883,7 +656,7 @@ mod tests {
     }
 
     /// A tool shaped like the shell tool: it reports its subprocess itself,
-    /// through the context, before the dispatch layer completes the call.
+    /// through the context, before the service completes the call.
     fn process_tool(exit_code: i32) -> RegisteredTool {
         RegisteredTool::new(
             ToolDefinition::function("shell", "Runs a command", json!({})),
@@ -911,78 +684,6 @@ mod tests {
         .with_source(ToolSource::Native)
     }
 
-    /// The smallest tool that asks a person something: it answers through
-    /// whatever provider the context carries, so what is under test here is
-    /// the dispatch path rather than any shipped question tool's schema.
-    fn question_tool() -> RegisteredTool {
-        RegisteredTool::new(
-            ToolDefinition::function(
-                "request_user_input",
-                "Ask the person a question",
-                json!({"type": "object"}),
-            ),
-            Arc::new(|_arguments, context: ToolContext| {
-                Box::pin(async move {
-                    let provider = context
-                        .human_input
-                        .clone()
-                        .ok_or_else(|| ToolError::unavailable("No one is available to ask"))?;
-                    let answers = provider
-                        .ask_questions(
-                            context.tool_call_id.as_deref().unwrap_or_default(),
-                            vec![Question {
-                                original_id:       Some("q1".to_owned()),
-                                original_question: "Ship it?".to_owned(),
-                                header:            None,
-                                text:              "Ship it?".to_owned(),
-                                kind:              QuestionKind::MultipleChoice,
-                                options:           Vec::new(),
-                                allow_freeform:    true,
-                            }],
-                            context.cancel.clone(),
-                        )
-                        .await?;
-                    Ok(answers
-                        .into_iter()
-                        .flat_map(|answer| answer.answers)
-                        .collect::<Vec<_>>()
-                        .join(", "))
-                })
-            }),
-        )
-        .with_source(ToolSource::Native)
-    }
-
-    struct StubHumanInput;
-
-    #[async_trait]
-    impl HumanInputProvider for StubHumanInput {
-        async fn ask_questions(
-            &self,
-            _tool_call_id: &str,
-            questions: Vec<Question>,
-            _cancel_token: CancellationToken,
-        ) -> Result<Vec<Answer>, HumanInputError> {
-            Ok(questions
-                .into_iter()
-                .map(|question| Answer {
-                    original_id:       question.original_id,
-                    original_question: question.original_question,
-                    answers:           vec!["Ship".to_owned()],
-                    status:            AnswerStatus::Answered,
-                })
-                .collect())
-        }
-    }
-
-    fn registry_with(tools: impl IntoIterator<Item = RegisteredTool>) -> ToolRegistry {
-        let mut registry = ToolRegistry::new();
-        for tool in tools {
-            registry.register(tool);
-        }
-        registry
-    }
-
     fn text_of(result: &ToolResult) -> String {
         result_text(result).into_owned()
     }
@@ -997,20 +698,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_tool_runs_and_reports_its_output() {
-        let registry = registry_with([echo_tool()]);
-        let environment = environment();
-        let config = CodingAgentOptions::default();
         let events = Events::new();
+        let service = plain_service([echo_tool()], &events);
 
-        let result = ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .execute_one(
+        let result = run(
+            &service,
             &call("echo", "call_1", json!({"text": "hello"})),
             CancellationToken::new(),
         )
@@ -1040,20 +732,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_failing_tool_reports_only_its_safe_message() {
-        let registry = registry_with([failing_tool()]);
-        let environment = environment();
-        let config = CodingAgentOptions::default();
         let events = Events::new();
+        let service = plain_service([failing_tool()], &events);
 
-        let result = ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .execute_one(
+        let result = run(
+            &service,
             &call("fail_tool", "call_1", json!({})),
             CancellationToken::new(),
         )
@@ -1099,22 +782,11 @@ mod tests {
             }),
         )
         .with_source(ToolSource::Native);
-        let registry = registry_with([tool]);
-        let environment = environment();
-        let config = CodingAgentOptions::default();
         let events = Events::new();
-        let redactor: Arc<dyn Redactor> = Arc::new(DropKeys);
+        let service = service([tool], &events, Arc::new(DropKeys));
 
-        let result = ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .with_redactor(&redactor)
-        .execute_one(
+        let result = run(
+            &service,
             &call("read_secret", "call_1", json!({})),
             CancellationToken::new(),
         )
@@ -1139,24 +811,18 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_tool_is_reported_as_unavailable() {
-        let registry = ToolRegistry::new();
-        let environment = environment();
-        let config = CodingAgentOptions::default();
         let events = Events::new();
+        let service = plain_service([], &events);
 
-        let result = ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
+        let result = run(
+            &service,
+            &call("nope", "call_1", json!({})),
+            CancellationToken::new(),
         )
-        .execute_one(&call("nope", "call_1", json!({})), CancellationToken::new())
         .await;
 
         assert!(result.is_error);
-        assert_eq!(text_of(&result), "Unknown tool: nope");
+        assert_eq!(text_of(&result), "unknown tool `nope`");
         assert!(matches!(
             completion(&events.drain().await),
             CodingEvent::ToolCallCompleted {
@@ -1178,20 +844,14 @@ mod tests {
                 Ok("ran".to_owned())
             })
         });
-        let registry = registry_with([tool]);
-        let environment = environment();
-        let config = CodingAgentOptions::default();
         let events = Events::new();
+        let service = plain_service([tool], &events);
 
-        let result = ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
+        let result = run(
+            &service,
+            &call("echo", "call_1", json!({})),
+            CancellationToken::new(),
         )
-        .execute_one(&call("echo", "call_1", json!({})), CancellationToken::new())
         .await;
 
         assert!(result.is_error);
@@ -1212,22 +872,13 @@ mod tests {
 
     #[tokio::test]
     async fn tool_output_is_bounded_before_events_and_history() {
-        let registry = registry_with([echo_tool()]);
-        let environment = environment();
-        let config = CodingAgentOptions::default();
-        let budget = config.tool_output_retention_bytes;
+        let budget = CodingAgentOptions::default().tool_output_retention_bytes;
         let text = "x".repeat(budget + 100);
         let events = Events::new();
+        let service = plain_service([echo_tool()], &events);
 
-        let result = ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .execute_one(
+        let result = run(
+            &service,
             &call("echo", "call_large", json!({"text": text})),
             CancellationToken::new(),
         )
@@ -1264,8 +915,6 @@ mod tests {
 
     #[tokio::test]
     async fn serialized_tool_output_stays_within_the_serialized_budget() {
-        let registry = registry_with([echo_tool()]);
-        let environment = environment();
         let config = CodingAgentOptions::default();
         // Output made almost entirely of characters JSON escapes: it fits the
         // retained budget as text and blows past it once serialized.
@@ -1274,16 +923,10 @@ mod tests {
             "\0".repeat(config.tool_output_retention_bytes - "echo: HEADTAIL".len())
         );
         let events = Events::new();
+        let service = plain_service([echo_tool()], &events);
 
-        let result = ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .execute_one(
+        let result = run(
+            &service,
             &call("echo", "call_escaped", json!({"text": text})),
             CancellationToken::new(),
         )
@@ -1309,20 +952,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_tool_that_runs_a_process_reports_it_before_its_own_completion() {
-        let registry = registry_with([process_tool(7)]);
-        let environment = environment();
-        let config = CodingAgentOptions::default();
         let events = Events::new();
+        let service = plain_service([process_tool(7)], &events);
 
-        let result = ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .execute_one(
+        let result = run(
+            &service,
             &call("shell", "call_1", json!({"command": "make test"})),
             CancellationToken::new(),
         )
@@ -1347,20 +981,11 @@ mod tests {
 
     #[tokio::test]
     async fn what_a_tool_reported_about_its_own_output_reaches_the_counters() {
-        let registry = registry_with([process_tool(0)]);
-        let environment = environment();
-        let config = CodingAgentOptions::default();
         let events = Events::new();
+        let service = plain_service([process_tool(0)], &events);
 
-        ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .execute_one(
+        run(
+            &service,
             &call("shell", "call_1", json!({})),
             CancellationToken::new(),
         )
@@ -1379,246 +1004,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_question_round_runs_one_question_and_refuses_its_peers() {
-        let registry = registry_with([question_tool(), echo_tool()]);
-        let environment = environment();
-        let config = CodingAgentOptions::default();
-        let provider: Arc<dyn HumanInputProvider> = Arc::new(StubHumanInput);
-        let events = Events::new();
-        let calls = [
-            call("request_user_input", "call_question", json!({})),
-            call("echo", "call_echo", json!({"text": "hello"})),
-        ];
-
-        let results = ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .with_human_input(&provider)
-        .execute(&calls, true, &CancellationToken::new())
-        .await;
-
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].tool_call_id, "call_question");
-        assert!(!results[0].is_error);
-        assert_eq!(text_of(&results[0]), "Ship");
-        assert_eq!(results[1].tool_call_id, "call_echo");
-        assert!(results[1].is_error);
-        assert!(text_of(&results[1]).contains("human-question tools must run alone"));
-        drop(events.drain().await);
-    }
-
-    #[tokio::test]
-    async fn only_the_first_of_several_question_calls_runs() {
-        let registry = registry_with([question_tool()]);
-        let environment = environment();
-        let config = CodingAgentOptions::default();
-        let provider: Arc<dyn HumanInputProvider> = Arc::new(StubHumanInput);
-        let events = Events::new();
-        let calls = [
-            call("request_user_input", "call_first", json!({})),
-            call("request_user_input", "call_second", json!({})),
-        ];
-
-        let results = ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .with_human_input(&provider)
-        .execute(&calls, true, &CancellationToken::new())
-        .await;
-
-        assert!(!results[0].is_error);
-        assert!(results[1].is_error);
-        assert!(
-            text_of(&results[1]).contains("Combine all questions into a single questions[] batch")
-        );
-        drop(events.drain().await);
-    }
-
-    #[tokio::test]
-    async fn a_cancelled_round_answers_every_call_without_starting_one() {
-        let registry = registry_with([echo_tool()]);
-        let environment = environment();
-        let config = CodingAgentOptions::default();
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-        let events = Events::new();
-        let calls = [
-            call("echo", "call_1", json!({"text": "one"})),
-            call("echo", "call_2", json!({"text": "two"})),
-        ];
-
-        let results = ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .execute(&calls, false, &cancel)
-        .await;
-
-        assert_eq!(results.len(), 2);
-        for result in &results {
-            assert!(result.is_error);
-            assert_eq!(text_of(result), "Cancelled");
-        }
-        assert!(
-            events.drain().await.is_empty(),
-            "a call that never started publishes nothing"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_cancelled_parallel_round_answers_every_call_without_starting_one() {
-        // A parallel round starts all its calls at once, so the check that a
-        // sequential round makes per call has to happen before any of them.
-        let registry = registry_with([echo_tool()]);
-        let environment = environment();
-        let config = CodingAgentOptions::default();
-        let cancel = CancellationToken::new();
-        cancel.cancel();
-        let events = Events::new();
-        let calls = [
-            call("echo", "call_1", json!({"text": "one"})),
-            call("echo", "call_2", json!({"text": "two"})),
-        ];
-
-        let results = ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .execute(&calls, true, &cancel)
-        .await;
-
-        assert_eq!(
-            results
-                .iter()
-                .map(|result| result.tool_call_id.as_str())
-                .collect::<Vec<_>>(),
-            ["call_1", "call_2"]
-        );
-        for result in &results {
-            assert!(result.is_error);
-            assert_eq!(text_of(result), "Cancelled");
-        }
-        assert!(
-            events.drain().await.is_empty(),
-            "a call that never started publishes nothing"
-        );
-    }
-
-    #[tokio::test]
-    async fn parallel_calls_come_back_in_call_order() {
-        let registry = registry_with([echo_tool()]);
-        let environment = environment();
-        let config = CodingAgentOptions::default();
-        let events = Events::new();
-        let calls = [
-            call("echo", "call_1", json!({"text": "one"})),
-            call("echo", "call_2", json!({"text": "two"})),
-            call("echo", "call_3", json!({"text": "three"})),
-        ];
-
-        let results = ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .execute(&calls, true, &CancellationToken::new())
-        .await;
-
-        assert_eq!(
-            results
-                .iter()
-                .map(|result| result.tool_call_id.clone())
-                .collect::<Vec<_>>(),
-            ["call_1", "call_2", "call_3"]
-        );
-        assert_eq!(results.iter().map(text_of).collect::<Vec<_>>(), [
-            "echo: one",
-            "echo: two",
-            "echo: three"
-        ]);
-        drop(events.drain().await);
-    }
-
-    #[tokio::test]
-    async fn history_keeps_a_smaller_copy_than_the_events_carried() {
-        let registry = registry_with([RegisteredTool::new(
-            ToolDefinition::function("shell", "Runs a command", json!({})),
-            Arc::new(|_arguments, _context| Box::pin(async { Ok("x".repeat(60_000)) })),
-        )
-        .with_source(ToolSource::Native)]);
-        let environment = environment();
-        let config = CodingAgentOptions::default();
-        let events = Events::new();
-
-        let result = ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .execute_one(
-            &call("shell", "call_1", json!({})),
-            CancellationToken::new(),
-        )
-        .await;
-
-        // The shell tool's history limit is 30,000 characters; the retention
-        // budget is far larger, so the event kept the whole output.
-        assert!(text_of(&result).len() < 60_000);
-        assert_eq!(result.tool_call_id, "call_1");
-
-        let published = events.drain().await;
-        let CodingEvent::ToolCallCompleted { output, .. } = completion(&published) else {
-            panic!("a completion event");
-        };
-        assert_eq!(output.as_str().map(str::len), Some(60_000));
-    }
-
-    #[tokio::test]
     async fn truncation_preserves_the_call_id_and_the_error_state() {
-        let registry = registry_with([RegisteredTool::new(
+        let tool = RegisteredTool::new(
             ToolDefinition::function("shell", "Runs a command", json!({})),
             Arc::new(|_arguments, _context| {
                 Box::pin(async { Err(ToolError::execution("x".repeat(60_000))) })
             }),
         )
-        .with_source(ToolSource::Native)]);
-        let environment = environment();
-        let config = CodingAgentOptions::default();
+        .with_source(ToolSource::Native);
         let events = Events::new();
+        let service = plain_service([tool], &events);
 
-        let result = ToolDispatch::new(
-            &registry,
-            &environment,
-            &config,
-            &events.emitter,
-            "ses_1",
-            "ses_1",
-        )
-        .execute_one(
+        let result = run(
+            &service,
             &call("shell", "call_1", json!({})),
             CancellationToken::new(),
         )
@@ -1627,6 +1025,33 @@ mod tests {
         assert_eq!(result.tool_call_id, "call_1");
         assert!(result.is_error);
         assert!(text_of(&result).len() < 60_000);
+        drop(events.drain().await);
+    }
+
+    /// The agent loop runs an exclusive tool alone in its round, and the
+    /// service marks the tools that need a person that way.
+    #[tokio::test]
+    async fn a_tool_that_needs_a_person_is_discovered_as_exclusive() {
+        let asks = RegisteredTool::function(
+            "asks",
+            "Asks a person",
+            json!({"type": "object"}),
+            |_context, _arguments| async { Ok("asked".to_owned()) },
+        )
+        .requires_human_input();
+        let events = Events::new();
+        let service = plain_service([asks, echo_tool()], &events);
+
+        let catalog = discover(&service).await;
+
+        let scheduling = |name: &str| {
+            catalog
+                .find_by_name(name)
+                .unwrap_or_else(|| panic!("{name} is discovered"))
+                .scheduling()
+        };
+        assert_eq!(scheduling("asks"), agent::ToolScheduling::ExclusiveRound);
+        assert_eq!(scheduling("echo"), agent::ToolScheduling::Concurrent);
         drop(events.drain().await);
     }
 }
