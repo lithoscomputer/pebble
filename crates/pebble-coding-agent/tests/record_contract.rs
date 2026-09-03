@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use lithos_llm::types::{
     ContentPart, Message as LlmMessage, ReasoningContent, Role, ToolCall, ToolCallKind, ToolResult,
 };
-use pebble_coding_agent::events::TokenUsage;
+use pebble_coding_agent::events::{CompactionReason, TokenUsage};
 use pebble_coding_agent::state::{
     History, Message, SESSION_RECORD_FORMAT_VERSION, SessionRecord, StoredMessage,
 };
@@ -79,9 +79,18 @@ fn every_turn() -> Vec<Message> {
             }],
             timestamp: moment(),
         },
-        Message::System {
-            content:   "[Context Summary]\nThe session read the crate root.".into(),
-            timestamp: moment(),
+        Message::Compaction {
+            summary:                 "[Context Summary]\nThe session read the crate root.".into(),
+            reason:                  CompactionReason::Manual,
+            original_turn_count:     8,
+            preserved_turn_count:    2,
+            estimated_tokens_before: 12_000,
+            summary_token_estimate:  24,
+            tracked_file_count:      1,
+            summary_truncated:       false,
+            usage:                   usage(),
+            cost_usd_micros:         Some(1_250),
+            timestamp:               moment(),
         },
         Message::Steering {
             content:   "also update the changelog".into(),
@@ -119,11 +128,9 @@ fn the_stored_version_one_record_still_resumes() {
     assert!(record.is_supported());
     assert_eq!(record.session_id, "ses_root");
     assert_eq!(record.last_event_seq, 41);
-    assert_eq!(
-        record,
-        sample_record(),
-        "the frozen version 1 document no longer matches what this build writes"
-    );
+    let migrated = record.clone().migrate().expect("version 1 migrates");
+    assert_eq!(migrated.format_version, SESSION_RECORD_FORMAT_VERSION);
+    assert_eq!(migrated.messages, record.messages);
 
     let history = History::from_stored_messages(&record.messages);
     assert_eq!(history.len(), 5);
@@ -175,8 +182,10 @@ fn a_record_with_unknown_members_still_parses() {
 
     let record: SessionRecord =
         serde_json::from_value(document).expect("unknown members are ignored");
+    let expected: SessionRecord =
+        serde_json::from_str(SAMPLE_RECORD_V1).expect("the fixture still parses");
 
-    assert_eq!(record, sample_record());
+    assert_eq!(record, expected);
 }
 
 #[test]
@@ -188,7 +197,15 @@ fn a_record_missing_its_optional_members_still_parses() {
     }))
     .expect("a minimal record parses");
 
-    assert_eq!(record.format_version, SESSION_RECORD_FORMAT_VERSION);
+    assert_eq!(record.format_version, 1);
+    assert_eq!(
+        record
+            .clone()
+            .migrate()
+            .expect("the implicit version migrates")
+            .format_version,
+        SESSION_RECORD_FORMAT_VERSION
+    );
     assert_eq!(record.last_event_seq, 0);
     assert!(record.messages.is_empty());
     assert!(History::from_stored_messages(&record.messages).is_empty());

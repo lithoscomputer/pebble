@@ -14,10 +14,13 @@ use pebble_agent as agent;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
-use super::control::actor_from_attribution;
+use super::control::{actor_from_attribution, input_message, input_source_from_attribution};
 use super::retry::RetryEventBridge;
 use super::{CodingRuntime, PromptTotals, StateMachine};
-use crate::compaction::{CompactionRequest, check_context_usage, compact_context};
+use crate::coding_agent::CodingInput;
+use crate::compaction::{
+    CompactionControl, CompactionReason, CompactionRequest, check_context_usage, compact_context,
+};
 use crate::config::CodingAgentOptions;
 use crate::context_window::{
     ContextWindowInput, build_local_snapshot, context_window_from_response_usage,
@@ -38,8 +41,9 @@ use crate::tool::{
     CodingToolService, NativeTool, ToolRegistry, canonical_tool_name, output_value, result_text,
 };
 use crate::types::{
-    CodingAgentState, CodingEvent, ContextWindowSnapshot, CostSource, LlmOutputKind, LlmRetryPhase,
-    Message, SkillActivationSource, TokenUsage, message_text,
+    CodingAgentState, CodingEvent, ContextWindowSnapshot, ContextWindowStaleness, CostSource,
+    InputContent, InputSource, LlmOutputKind, LlmRetryPhase, Message, SkillActivationSource,
+    TokenUsage,
 };
 
 /// How many failed response streams Pebble replays after the first attempt.
@@ -72,6 +76,7 @@ pub(super) struct CodingAgentBridge {
     /// terminal token, so it also fires when the session is shut down, and set
     /// afresh by [`begin_prompt`](Self::begin_prompt) for every prompt.
     prompt_cancel:  Arc<Mutex<CancellationToken>>,
+    compaction:     CompactionControl,
     subagents:      Option<SubagentSupervisor>,
     skills:         Vec<Skill>,
 }
@@ -87,6 +92,7 @@ pub(super) struct ConversationState {
     pub(super) file_tracker: FileTracker,
     pub(super) totals: PromptTotals,
     pub(super) activated_skill_context_observed: bool,
+    pub(super) context_window: Option<ContextWindowSnapshot>,
     compaction_failed: bool,
     pending_task_reminder: Option<Message>,
     local_context_window: Option<ContextWindowSnapshot>,
@@ -103,6 +109,7 @@ impl ConversationState {
             file_tracker: FileTracker::default(),
             totals: PromptTotals::default(),
             activated_skill_context_observed: false,
+            context_window: None,
             compaction_failed: false,
             pending_task_reminder: None,
             local_context_window: None,
@@ -149,6 +156,7 @@ impl CodingAgentBridge {
             skills_tokens: runtime.skills_tokens,
             state_machine: runtime.state.clone(),
             prompt_cancel: Arc::new(Mutex::new(runtime.cancel_token.clone())),
+            compaction: runtime.compaction.clone(),
             subagents: runtime.subagents.clone(),
             skills: runtime.skills.clone(),
         }
@@ -248,11 +256,16 @@ impl CodingAgentBridge {
             let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             (state.history.clone(), state.file_tracker.clone())
         };
+        let prompt_cancel = self.prompt_cancel();
+        let operation = self.compaction.begin(&prompt_cancel);
         let request = CompactionRequest {
             model: &self.model_selector,
             facts: self.facts,
             preserve_turns: self.config.compaction_preserve_turns,
             estimate,
+            reason: CompactionReason::Threshold,
+            instructions: None,
+            cancel: operation.token(),
         };
         if let Err(error) = compact_context(
             &mut history,
@@ -264,9 +277,11 @@ impl CodingAgentBridge {
         )
         .await
         {
-            self.emit(CodingEvent::Error {
-                error: ErrorData::from(&error),
-            });
+            if !matches!(error, Error::Interrupted(InterruptReason::Cancelled)) {
+                self.emit(CodingEvent::Error {
+                    error: ErrorData::from(&error),
+                });
+            }
             return true;
         }
         self.state
@@ -313,28 +328,39 @@ impl CodingAgentBridge {
         agent::ConversationUpdate::replace(messages)
     }
 
-    fn commit_user_message(&self, message: &LlmMessage) {
-        let text = message_text(message);
+    fn commit_user_message(&self, message: &LlmMessage, attribution: Option<&Value>) {
+        let content = InputContent::new(message.content().iter().cloned());
+        let text = content.text_content().to_owned();
+        let source = input_source_from_attribution(attribution).unwrap_or(InputSource::Agent);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.compaction_failed = false;
         state.history.push(Message::User {
-            content:   text.clone(),
+            content:   content.clone(),
             timestamp: SystemTime::now(),
         });
         drop(state);
-        self.emit(CodingEvent::UserInput { text });
+        self.emit(CodingEvent::UserInput {
+            text,
+            content: content.event_content(),
+            source,
+        });
     }
 
     fn commit_steering(&self, message: &LlmMessage, attribution: Option<&Value>) {
-        let text = message_text(message);
+        let content = InputContent::new(message.content().iter().cloned());
+        let text = content.text_content().to_owned();
         let actor = actor_from_attribution(attribution);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.history.push(Message::Steering {
-            content:   text.clone(),
+            content:   content.clone(),
             timestamp: SystemTime::now(),
         });
         drop(state);
-        self.emit(CodingEvent::SteeringInjected { text, actor });
+        self.emit(CodingEvent::SteeringInjected {
+            text,
+            content: content.event_content(),
+            actor,
+        });
     }
 
     fn commit_assistant(&self, response: &Response) {
@@ -349,6 +375,11 @@ impl CodingAgentBridge {
             .local_context_window
             .take()
             .map(|local| context_window_from_response_usage(&local, usage));
+        if let Some(context_window) = &context_window {
+            let mut stored = context_window.clone();
+            stored.staleness = ContextWindowStaleness::Stored;
+            state.context_window = Some(stored);
+        }
 
         state.totals.usage = state.totals.usage.saturating_add(usage);
         if let Some(cost) = response.cost {
@@ -412,7 +443,7 @@ impl CodingAgentBridge {
             && detect_loop(&state.history, self.config.loop_detection_window);
         if loop_detected {
             state.history.push(Message::Steering {
-                content:   LOOP_WARNING.to_owned(),
+                content:   LOOP_WARNING.into(),
                 timestamp: SystemTime::now(),
             });
         }
@@ -608,27 +639,34 @@ impl agent::AgentLifecycle for CodingAgentBridge {
         message: agent::UserMessage,
         _cancel: &CancellationToken,
     ) -> StdResult<agent::UserMessage, agent::LifecycleError> {
-        let text = message.text_content();
+        let attribution = message.attribution().cloned();
+        let content = InputContent::new(message.content().iter().cloned());
+        let text = content.text_content();
         let expanded = if self.skills.is_empty() {
             ExpandedInput {
-                text,
+                text:       text.to_owned(),
                 skill_name: None,
             }
         } else {
-            expand_skill(&self.skills, &text)
+            expand_skill(&self.skills, text)
                 .map_err(|source| self.record_boundary_error(Error::SkillExpansion(source)))?
         };
-        if let Some(name) = expanded.skill_name {
+        if let Some(name) = &expanded.skill_name {
             self.state
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .activated_skill_context_observed = true;
             self.emit(CodingEvent::SkillActivated {
-                skill_name: name,
+                skill_name: name.clone(),
                 source:     SkillActivationSource::Slash,
             });
         }
-        Ok(agent::UserMessage::text(expanded.text))
+        let content = content_after_skill_expansion(content, &expanded);
+        let message = agent::UserMessage::new(content.into_parts());
+        Ok(match attribution {
+            Some(attribution) => message.with_attribution(attribution),
+            None => message,
+        })
     }
 
     async fn after_answer(
@@ -649,8 +687,12 @@ impl agent::AgentLifecycle for CodingAgentBridge {
 }
 
 impl agent::ConversationProjection for CodingAgentBridge {
-    fn user_message_committed(&self, message: &LlmMessage) {
-        self.commit_user_message(message);
+    fn user_message_committed_with_attribution(
+        &self,
+        message: &LlmMessage,
+        attribution: Option<&Value>,
+    ) {
+        self.commit_user_message(message, attribution);
     }
 
     fn steering_message_committed(&self, message: &LlmMessage, attribution: Option<&Value>) {
@@ -700,7 +742,7 @@ impl CodingRuntime {
     /// apart afterwards, because only the terminal one closes the session.
     pub(super) async fn process_input(
         &mut self,
-        input: &str,
+        input: CodingInput,
         skill_expansion: SkillExpansion,
         prompt_cancel: &CancellationToken,
     ) -> Result<Option<String>> {
@@ -710,7 +752,9 @@ impl CodingRuntime {
         self.check_pump().await?;
         self.state.transition(CodingAgentState::Thinking);
 
-        let expanded = self.expand_input(input, skill_expansion)?;
+        let source = input.source();
+        let content = input.content().clone();
+        let expanded = self.expand_input(content.text_content(), skill_expansion)?;
         if let Some(name) = &expanded.skill_name {
             self.conversation().activated_skill_context_observed = true;
             self.emit(CodingEvent::SkillActivated {
@@ -731,7 +775,10 @@ impl CodingRuntime {
             .ok_or_else(|| Error::InvalidState("the coding agent was not built".to_owned()))?;
 
         let result = agent
-            .prompt_with_cancellation(expanded.text, prompt_cancel)
+            .prompt_with_cancellation(
+                input_message(content_after_skill_expansion(content, &expanded), source),
+                prompt_cancel,
+            )
             .await;
         self.coding_agent = Some(agent);
         bridge.finish_inference();
@@ -837,6 +884,24 @@ impl CodingRuntime {
             .or_else(from_catalog)
             .filter(|tokens| *tokens > 0)
     }
+}
+
+/// Keeps attachments unchanged when a slash command replaces readable text.
+fn content_after_skill_expansion(content: InputContent, expanded: &ExpandedInput) -> InputContent {
+    if expanded.skill_name.is_none() {
+        return content;
+    }
+
+    let mut parts = vec![ContentPart::Text {
+        text: expanded.text.clone(),
+    }];
+    parts.extend(
+        content
+            .into_parts()
+            .into_iter()
+            .filter(|part| !matches!(part, ContentPart::Text { .. })),
+    );
+    InputContent::new(parts)
 }
 
 fn tool_calls_of(response: &Response) -> Vec<ToolCall> {

@@ -16,20 +16,24 @@
 use std::fmt;
 use std::fmt::Write as _;
 use std::io::{Error as IoError, Result as IoResult, Write};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use lithos_llm::client::Client;
 use lithos_llm::types::Request;
+use serde::{Deserialize, Serialize};
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::char_boundary::floor_char_boundary;
-use crate::error::{CompactionError, Result};
+use crate::error::{CompactionError, Error, ErrorData, InterruptReason, Result};
 use crate::event::Emitter;
 use crate::file_tracker::FileTracker;
 use crate::history::{APPROX_CHARS_PER_TOKEN, History};
 use crate::profile::ModelFacts;
 use crate::tool::result_text;
 use crate::truncation::serialized_json_bytes;
-use crate::types::{CodingEvent, Message};
+use crate::types::{CodingEvent, Message, TokenUsage};
 
 /// The output budget for the summary text itself.
 const SUMMARY_MAX_TOKENS: u32 = 4_096;
@@ -43,6 +47,279 @@ const REASONING_HEADROOM_TOKENS: u32 = 16_384;
 
 /// How much of a rendered turn the summarization transcript keeps.
 const TRANSCRIPT_FIELD_BYTES: usize = 500;
+
+/// Why a conversation compaction ran.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum CompactionReason {
+    /// The context threshold was crossed.
+    #[default]
+    Threshold,
+    /// The application requested compaction.
+    Manual,
+    /// A provider rejected the context as too large.
+    Overflow,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if callback receives a reference"
+)]
+pub(crate) const fn is_threshold_reason(reason: &CompactionReason) -> bool {
+    matches!(reason, CompactionReason::Threshold)
+}
+
+/// Options for a manual compaction.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompactionOptions {
+    instructions:   Option<String>,
+    preserve_turns: Option<usize>,
+}
+
+impl CompactionOptions {
+    /// Creates options with the session's normal compaction policy.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            instructions:   None,
+            preserve_turns: None,
+        }
+    }
+
+    /// Adds instructions for this summary only.
+    #[must_use]
+    pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.instructions = Some(instructions.into());
+        self
+    }
+
+    /// Overrides how many recent turns remain verbatim.
+    #[must_use]
+    pub const fn preserve_turns(mut self, preserve_turns: usize) -> Self {
+        self.preserve_turns = Some(preserve_turns);
+        self
+    }
+
+    pub(crate) fn instructions_ref(&self) -> Option<&str> {
+        self.instructions.as_deref()
+    }
+
+    pub(crate) const fn preserve_turns_value(&self) -> Option<usize> {
+        self.preserve_turns
+    }
+}
+
+/// What one completed compaction recorded.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactionResult {
+    summary:                 String,
+    reason:                  CompactionReason,
+    original_turn_count:     usize,
+    preserved_turn_count:    usize,
+    estimated_tokens_before: usize,
+    summary_token_estimate:  usize,
+    tracked_file_count:      usize,
+    summary_truncated:       bool,
+    usage:                   TokenUsage,
+    cost_usd_micros:         Option<u64>,
+}
+
+impl CompactionResult {
+    /// The model-visible handoff summary.
+    #[must_use]
+    pub fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    /// Why the compaction ran.
+    #[must_use]
+    pub const fn reason(&self) -> CompactionReason {
+        self.reason
+    }
+
+    /// Turns present before compaction.
+    #[must_use]
+    pub const fn original_turn_count(&self) -> usize {
+        self.original_turn_count
+    }
+
+    /// Turns preserved verbatim.
+    #[must_use]
+    pub const fn preserved_turn_count(&self) -> usize {
+        self.preserved_turn_count
+    }
+
+    /// Estimated context tokens before compaction.
+    #[must_use]
+    pub const fn estimated_tokens_before(&self) -> usize {
+        self.estimated_tokens_before
+    }
+
+    /// Estimated tokens in the generated summary.
+    #[must_use]
+    pub const fn summary_token_estimate(&self) -> usize {
+        self.summary_token_estimate
+    }
+
+    /// Files represented in the compaction prompt.
+    #[must_use]
+    pub const fn tracked_file_count(&self) -> usize {
+        self.tracked_file_count
+    }
+
+    /// Whether Pebble truncated the generated summary to its visible budget.
+    #[must_use]
+    pub const fn summary_was_truncated(&self) -> bool {
+        self.summary_truncated
+    }
+
+    /// Provider-reported token usage for the summarization call.
+    #[must_use]
+    pub const fn usage(&self) -> TokenUsage {
+        self.usage
+    }
+
+    /// Provider-reported or catalog-derived cost in USD micros.
+    #[must_use]
+    pub const fn cost_usd_micros(&self) -> Option<u64> {
+        self.cost_usd_micros
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_history(summary: String) -> Self {
+        Self {
+            summary,
+            reason: CompactionReason::Threshold,
+            original_turn_count: 0,
+            preserved_turn_count: 0,
+            estimated_tokens_before: 0,
+            summary_token_estimate: 0,
+            tracked_file_count: 0,
+            summary_truncated: false,
+            usage: TokenUsage::default(),
+            cost_usd_micros: None,
+        }
+    }
+}
+
+/// The result of asking Pebble to compact now.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum CompactionOutcome {
+    /// There was not enough safely compactable history.
+    Unchanged,
+    /// Older history was replaced with this summary.
+    Compacted(CompactionResult),
+}
+
+/// Shared cancellation for the one compaction a session can run at a time.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CompactionControl {
+    inner: Arc<CompactionControlInner>,
+}
+
+#[derive(Debug, Default)]
+struct CompactionControlInner {
+    state: Mutex<CompactionControlState>,
+    idle:  Notify,
+}
+
+#[derive(Debug, Default)]
+struct CompactionControlState {
+    next_generation: u64,
+    active:          Option<(u64, CancellationToken)>,
+}
+
+impl CompactionControl {
+    pub(crate) fn begin(&self, parent: &CancellationToken) -> CompactionRun {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        debug_assert!(state.active.is_none(), "compactions must not overlap");
+        state.next_generation = state.next_generation.saturating_add(1);
+        let generation = state.next_generation;
+        let cancel = parent.child_token();
+        state.active = Some((generation, cancel.clone()));
+        CompactionRun {
+            control: self.clone(),
+            generation,
+            cancel,
+        }
+    }
+
+    pub(crate) fn cancel(&self) -> bool {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let Some((_, cancel)) = &state.active else {
+            return false;
+        };
+        cancel.cancel();
+        true
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.inner
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .active
+            .is_some()
+    }
+
+    pub(crate) async fn wait_for_idle(&self) {
+        loop {
+            let notified = self.inner.idle.notified();
+            if !self.is_active() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+pub(crate) struct CompactionRun {
+    control:    CompactionControl,
+    generation: u64,
+    cancel:     CancellationToken,
+}
+
+impl CompactionRun {
+    pub(crate) const fn token(&self) -> &CancellationToken {
+        &self.cancel
+    }
+}
+
+impl Drop for CompactionRun {
+    fn drop(&mut self) {
+        let cleared = {
+            let mut state = self
+                .control
+                .inner
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if state
+                .active
+                .as_ref()
+                .is_some_and(|(generation, _)| *generation == self.generation)
+            {
+                state.active = None;
+                true
+            } else {
+                false
+            }
+        };
+        if cleared {
+            self.control.inner.idle.notify_waiters();
+        }
+    }
+}
 
 /// How the size of the active conversation was arrived at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -103,6 +380,12 @@ pub(crate) struct CompactionRequest<'a> {
     pub(crate) preserve_turns: usize,
     /// The estimate that triggered this run, reported on the started event.
     pub(crate) estimate:       ContextEstimate,
+    /// Why this run started.
+    pub(crate) reason:         CompactionReason,
+    /// Additional instructions for the generated summary.
+    pub(crate) instructions:   Option<&'a str>,
+    /// Cancels this compaction without cancelling its surrounding prompt.
+    pub(crate) cancel:         &'a CancellationToken,
 }
 
 /// Whether the session has crossed the compaction threshold, and by how much.
@@ -172,31 +455,33 @@ pub(crate) async fn compact_context(
     request: CompactionRequest<'_>,
     emitter: &Emitter,
     session_id: &str,
-) -> Result<()> {
+) -> Result<CompactionOutcome> {
     let original_turn_count = history.len();
     // The newest turn stays whatever the caller asked for: it may be an
     // assistant turn whose tool calls are about to be answered, and its
     // results are pushed after this point.
     let preserve_start = history.compact_preserve_start(request.preserve_turns.max(1));
     if preserve_start == 0 {
-        return Ok(());
+        return Ok(CompactionOutcome::Unchanged);
     }
     let preserved_turn_count = original_turn_count - preserve_start;
 
     emitter.emit(session_id.to_owned(), CodingEvent::CompactionStarted {
         estimated_tokens:    request.estimate.tokens,
         context_window_size: request.facts.context_window_tokens,
+        reason:              request.reason,
     });
 
     let max_tokens = summary_max_tokens(
         request.facts.reasons_by_default,
         request.facts.max_output_tokens,
     );
-    let summary_request = Request::builder()
+    let summary_request = match Request::builder()
         .model(request.model)
         .system(summarization_prompt(
             SUMMARY_MAX_TOKENS.min(max_tokens),
             file_tracker,
+            request.instructions,
         ))
         .user(format!(
             "Here is the conversation to summarize:\n\n{}",
@@ -204,12 +489,42 @@ pub(crate) async fn compact_context(
         ))
         .max_output_tokens(max_tokens)
         .build()
-        .map_err(CompactionError::Request)?;
+        .map_err(CompactionError::Request)
+    {
+        Ok(request) => request,
+        Err(source) => {
+            let error = Error::from(source);
+            emit_compaction_failure(emitter, session_id, request.reason, &error);
+            return Err(error);
+        }
+    };
 
-    let response = client
-        .complete(summary_request)
-        .await
-        .map_err(CompactionError::Llm)?;
+    let response = tokio::select! {
+        biased;
+        () = request.cancel.cancelled() => {
+            emitter.emit(session_id.to_owned(), CodingEvent::CompactionCancelled {
+                reason: request.reason,
+            });
+            return Err(Error::Interrupted(InterruptReason::Cancelled));
+        }
+        response = client.complete(summary_request) => {
+            match response.map_err(CompactionError::Llm) {
+                Ok(response) => response,
+                Err(source) => {
+                    let error = Error::from(source);
+                    emit_compaction_failure(emitter, session_id, request.reason, &error);
+                    return Err(error);
+                }
+            }
+        }
+    };
+
+    if request.cancel.is_cancelled() {
+        emitter.emit(session_id.to_owned(), CodingEvent::CompactionCancelled {
+            reason: request.reason,
+        });
+        return Err(Error::Interrupted(InterruptReason::Cancelled));
+    }
 
     // `compact_from` discards the summarized turns for good, so an empty
     // summary is refused before history is touched. Trimming first stops a
@@ -217,10 +532,11 @@ pub(crate) async fn compact_context(
     let response_text = response.text();
     let summary = response_text.trim();
     if summary.is_empty() {
-        return Err(CompactionError::EmptySummary {
+        let error = Error::from(CompactionError::EmptySummary {
             summarized_turn_count: preserve_start,
-        }
-        .into());
+        });
+        emit_compaction_failure(emitter, session_id, request.reason, &error);
+        return Err(error);
     }
 
     let (summary, summary_truncated) = truncate_summary_text(summary);
@@ -235,23 +551,53 @@ pub(crate) async fn compact_context(
     );
     let summary_token_estimate = local_tokens(content.len());
 
-    history.compact_from(preserve_start, content);
+    let result = CompactionResult {
+        summary: content,
+        reason: request.reason,
+        original_turn_count,
+        preserved_turn_count,
+        estimated_tokens_before: request.estimate.tokens,
+        summary_token_estimate,
+        tracked_file_count: file_tracker.file_count(),
+        summary_truncated,
+        usage: TokenUsage::from(response.usage),
+        cost_usd_micros: response.cost.map(|cost| cost.usd_micros),
+    };
+
+    history.compact_from(preserve_start, &result);
 
     emitter.emit(session_id.to_owned(), CodingEvent::CompactionCompleted {
         original_turn_count,
         preserved_turn_count,
         summary_token_estimate,
         tracked_file_count: file_tracker.file_count(),
+        reason: request.reason,
     });
 
-    Ok(())
+    Ok(CompactionOutcome::Compacted(result))
+}
+
+fn emit_compaction_failure(
+    emitter: &Emitter,
+    session_id: &str,
+    reason: CompactionReason,
+    error: &Error,
+) {
+    emitter.emit(session_id.to_owned(), CodingEvent::CompactionFailed {
+        reason,
+        error: ErrorData::from(error),
+    });
 }
 
 /// The instructions the summarizing call is given.
 ///
 /// The file list is asked for verbatim because it is the part of a session a
 /// summary most reliably loses, and the part the next assistant most needs.
-fn summarization_prompt(visible_max_tokens: u32, file_tracker: &FileTracker) -> String {
+fn summarization_prompt(
+    visible_max_tokens: u32,
+    file_tracker: &FileTracker,
+    instructions: Option<&str>,
+) -> String {
     let file_operations = if file_tracker.is_empty() {
         String::new()
     } else {
@@ -260,6 +606,12 @@ fn summarization_prompt(visible_max_tokens: u32, file_tracker: &FileTracker) -> 
             file_tracker.render()
         )
     };
+
+    let custom_instructions = instructions
+        .filter(|instructions| !instructions.trim().is_empty())
+        .map_or_else(String::new, |instructions| {
+            format!("\n\n## Additional Instructions\n{}", instructions.trim())
+        });
 
     format!(
         "You are creating a handoff document for a different coding assistant that will take over \
@@ -275,7 +627,7 @@ Write a summary using EXACTLY these sections:\n\n\
 Keep the entire response under {visible_max_tokens} tokens.\n\n\
 Be thorough and specific — the assistant taking over has no prior context. Include file paths, \
 function names, error messages, and exact values. Omit pleasantries and conversational filler.\
-{file_operations}"
+{file_operations}{custom_instructions}"
     )
 }
 
@@ -367,9 +719,11 @@ fn turn_chars(turns: &[Message]) -> usize {
 /// The characters one turn contributes to the prompt.
 fn single_turn_chars(turn: &Message) -> usize {
     match turn {
-        Message::User { content, .. }
-        | Message::System { content, .. }
-        | Message::Steering { content, .. } => content.len(),
+        Message::User { content, .. } | Message::Steering { content, .. } => {
+            content.text_content().len()
+        }
+        Message::System { content, .. } => content.len(),
+        Message::Compaction { summary, .. } => summary.len(),
         Message::Assistant {
             content,
             tool_calls,
@@ -429,6 +783,9 @@ pub(crate) fn render_turns_for_summary(turns: &[Message]) -> String {
             }
             Message::System { content, .. } => {
                 let _ = writeln!(out, "System: {content}");
+            }
+            Message::Compaction { summary, .. } => {
+                let _ = writeln!(out, "Compaction: {summary}");
             }
             Message::Steering { content, .. } => {
                 let _ = writeln!(out, "Steering: {content}");
@@ -501,7 +858,7 @@ fn clipped_arguments(arguments: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, LazyLock};
     use std::time::SystemTime;
 
     use lithos_llm::Client;
@@ -518,6 +875,8 @@ mod tests {
         test_catalog, text_response,
     };
     use crate::types::{CodingAgentEvent, TokenUsage};
+
+    static NEVER_CANCEL: LazyLock<CancellationToken> = LazyLock::new(CancellationToken::new);
 
     /// A summarization call that answers with `text`.
     fn summary(text: &str) -> ScriptedCompletion {
@@ -544,7 +903,7 @@ mod tests {
 
     fn user(content: &str) -> Message {
         Message::User {
-            content:   content.to_owned(),
+            content:   content.into(),
             timestamp: now(),
         }
     }
@@ -626,6 +985,9 @@ mod tests {
                 tokens: estimate_tokens,
                 method: ContextEstimateMethod::LocalEstimate,
             },
+            reason:         CompactionReason::Threshold,
+            instructions:   None,
+            cancel:         &NEVER_CANCEL,
         }
     }
 
@@ -712,7 +1074,7 @@ mod tests {
                 timestamp: now(),
             },
             Message::Steering {
-                content:   "focus".to_owned(),
+                content:   "focus".into(),
                 timestamp: now(),
             },
         ];
@@ -814,7 +1176,7 @@ mod tests {
             tool_results("call_1", "1234"),
             user(&"u".repeat(16)),
             Message::Steering {
-                content:   "s".repeat(8),
+                content:   "s".repeat(8).into(),
                 timestamp: now(),
             },
         ]);
@@ -924,7 +1286,7 @@ mod tests {
     // --- compaction ---
 
     struct Compacted {
-        result:  Result<()>,
+        result:  Result<CompactionOutcome>,
         history: History,
         before:  Vec<StoredMessage>,
         events:  Vec<CodingEvent>,
@@ -965,7 +1327,7 @@ mod tests {
             .turns()
             .iter()
             .find_map(|turn| match turn {
-                Message::System { content, .. } => Some(content.as_str()),
+                Message::Compaction { summary, .. } => Some(summary.as_str()),
                 _ => None,
             })
             .expect("a compacted history carries a summary turn")
@@ -1013,11 +1375,19 @@ mod tests {
                 "the attempt is still recorded"
             );
             assert!(
-                !compacted
+                compacted
                     .events
                     .iter()
-                    .any(|event| matches!(event, CodingEvent::CompactionCompleted { .. })),
-                "a refused summary must not complete"
+                    .any(|event| matches!(event, CodingEvent::CompactionFailed { .. })),
+                "a refused summary has a terminal failure event"
+            );
+            assert!(
+                !compacted.events.iter().any(|event| matches!(
+                    event,
+                    CodingEvent::CompactionCompleted { .. }
+                        | CodingEvent::CompactionCancelled { .. }
+                )),
+                "a refused summary has exactly one terminal outcome"
             );
         }
     }
@@ -1032,6 +1402,12 @@ mod tests {
             "unexpected error: {error}"
         );
         assert_eq!(compacted.history.to_stored_messages(), compacted.before);
+        assert!(
+            compacted
+                .events
+                .iter()
+                .any(|event| matches!(event, CodingEvent::CompactionFailed { .. }))
+        );
     }
 
     #[tokio::test]

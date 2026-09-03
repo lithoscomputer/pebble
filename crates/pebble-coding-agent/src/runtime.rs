@@ -33,11 +33,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 pub use self::control::SteeringLease;
-pub(crate) use self::control::{actor_from_attribution, steering_message};
+pub(crate) use self::control::{actor_from_attribution, input_message, steering_message};
 pub use self::retry::RetryEventObserver;
 use self::turn::{CodingAgentBridge, ConversationState};
 pub(crate) use crate::coding_agent::{
-    CodingAgentBuildError, PromptTiming, ResumeMode, ShutdownReason,
+    CodingAgentBuildError, CodingInput, PromptTiming, ResumeMode, ShutdownReason,
+};
+use crate::compaction::{
+    CompactionControl, CompactionOptions, CompactionOutcome, CompactionReason, CompactionRequest,
+    compact_context, estimate_active_context_usage,
 };
 use crate::config::CodingAgentOptions;
 use crate::context_window::{memory_prompt_tokens, skills_prompt_tokens};
@@ -68,8 +72,8 @@ use crate::tools::{WebFetchSummarizer, make_question_tool, make_web_search_tool}
 #[cfg(test)]
 use crate::types::PermissionLevel;
 use crate::types::{
-    AgentProfileKind, CodingAgentEvent, CodingAgentState, CodingEvent, Message, TokenUsage,
-    rfc3339_millis,
+    AgentProfileKind, CodingAgentEvent, CodingAgentState, CodingEvent, ContextWindowSnapshot,
+    MemoryFileSummary, Message, SkillSummary, TokenUsage, ToolSummary, rfc3339_millis,
 };
 
 /// The catalog metadata namespace pebble reads.
@@ -88,10 +92,12 @@ pub(crate) struct WarmState {
     pub(crate) record: SessionRecord,
     pub(crate) system_prompt: String,
     pub(crate) skills: Vec<Skill>,
+    pub(crate) memory_summaries: Vec<MemoryFileSummary>,
     pub(crate) memory_tokens: u64,
     pub(crate) skills_tokens: u64,
     pub(crate) file_tracker: FileTracker,
     pub(crate) activated_skill_context_observed: bool,
+    pub(crate) context_window: Option<ContextWindowSnapshot>,
 }
 
 /// What one prompt accumulated across every input it processed.
@@ -536,7 +542,9 @@ impl CodingRuntimeBuilder {
             agent_control: AgentControlHandle::detached(),
             cancel_token: CancellationToken::new(),
             interrupt_reason: Arc::new(Mutex::new(None)),
+            compaction: CompactionControl::default(),
             skills: Vec::new(),
+            memory_summaries: Vec::new(),
             memory_tokens: 0,
             skills_tokens: 0,
             system_prompt: String::new(),
@@ -736,7 +744,9 @@ pub(crate) struct CodingRuntime {
     /// turn.
     cancel_token:      CancellationToken,
     interrupt_reason:  Arc<Mutex<Option<InterruptReason>>>,
+    compaction:        CompactionControl,
     skills:            Vec<Skill>,
+    memory_summaries:  Vec<MemoryFileSummary>,
     /// What the memory files and the skills section contribute to the system
     /// prompt, measured once at initialization: both are fixed for the
     /// session's life, and every round's context snapshot reads them.
@@ -886,6 +896,7 @@ impl CodingRuntime {
                 ));
         }
         session.skills = state.skills;
+        session.memory_summaries = state.memory_summaries;
         session.system_prompt = state.system_prompt;
         session.memory_tokens = state.memory_tokens;
         session.skills_tokens = state.skills_tokens;
@@ -893,6 +904,7 @@ impl CodingRuntime {
             let mut conversation = session.conversation();
             conversation.file_tracker = state.file_tracker;
             conversation.activated_skill_context_observed = state.activated_skill_context_observed;
+            conversation.context_window = state.context_window;
         }
         Ok(session)
     }
@@ -920,10 +932,12 @@ impl CodingRuntime {
             record,
             system_prompt: self.system_prompt.clone(),
             skills: self.skills.clone(),
+            memory_summaries: self.memory_summaries.clone(),
             memory_tokens: self.memory_tokens,
             skills_tokens: self.skills_tokens,
             file_tracker: conversation.file_tracker.clone(),
             activated_skill_context_observed: conversation.activated_skill_context_observed,
+            context_window: conversation.context_window.clone(),
         }
     }
 
@@ -997,6 +1011,7 @@ impl CodingRuntime {
         // carry the bytes of a project's own instructions. The same
         // descriptions are what a prompt transform is shown.
         let memory_summaries: Vec<_> = memory.iter().map(MemoryDocument::to_summary).collect();
+        self.memory_summaries.clone_from(&memory_summaries);
         self.emit(CodingEvent::MemoryLoaded {
             profile:            profile.clone(),
             files:              memory_summaries.clone(),
@@ -1165,15 +1180,34 @@ impl CodingRuntime {
     /// stream, and stored records all key on this, so a session that could
     /// be re-rooted afterwards could be detached from the tree that owns
     /// it.
-    #[cfg(test)]
     pub(crate) fn root_session_id(&self) -> &str {
         &self.root_session_id
     }
 
     /// Which harness this session runs.
-    #[cfg(test)]
     pub(crate) fn profile_kind(&self) -> AgentProfileKind {
         self.profile.profile_kind()
+    }
+
+    /// Descriptions of the memory files loaded into the system prompt.
+    pub(crate) fn memory_summaries(&self) -> &[MemoryFileSummary] {
+        &self.memory_summaries
+    }
+
+    /// Descriptions of the skills available to this session.
+    pub(crate) fn skill_summaries(&self) -> Vec<SkillSummary> {
+        self.skills.iter().map(Skill::to_summary).collect()
+    }
+
+    /// Descriptions of registered tools in stable name order.
+    pub(crate) fn tool_summaries(&self) -> Vec<ToolSummary> {
+        let mut tools: Vec<_> = self
+            .registered_tools()
+            .iter()
+            .map(ToolDefinitionWithSource::to_tool_summary)
+            .collect();
+        tools.sort_by(|left, right| left.name.cmp(&right.name));
+        tools
     }
 
     /// The provider the session resolved to.
@@ -1217,14 +1251,23 @@ impl CodingRuntime {
 
     /// The state machine itself, for a test that reads it while a prompt has
     /// the session borrowed.
-    #[cfg(test)]
     pub(crate) fn state_machine(&self) -> StateMachine {
         self.state.clone()
+    }
+
+    /// Shared cancellation for the session's current compaction.
+    pub(crate) fn compaction_control(&self) -> CompactionControl {
+        self.compaction.clone()
     }
 
     /// A snapshot of the conversation so far.
     pub(crate) fn history(&self) -> History {
         self.conversation().history.clone()
+    }
+
+    /// The latest context-window measurement, when a model has answered.
+    pub(crate) fn context_window(&self) -> Option<ContextWindowSnapshot> {
+        self.conversation().context_window.clone()
     }
 
     /// The most recent assistant message, without cloning the full history.
@@ -1402,8 +1445,82 @@ impl CodingRuntime {
     /// [`Error::Interrupted`] when the prompt was cancelled or ran out of
     /// wall-clock time, [`Error::Llm`] when the model call failed for good, and
     /// [`Error::EventSink`] when the configured sink refused an event.
-    pub(crate) async fn prompt(&mut self, input: &str) -> Result<Option<String>> {
+    pub(crate) async fn prompt(&mut self, input: impl Into<CodingInput>) -> Result<Option<String>> {
         self.prompt_with_cancellation(input, None).await
+    }
+
+    /// Compacts older history while the session is idle.
+    pub(crate) async fn compact(
+        &mut self,
+        options: CompactionOptions,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<CompactionOutcome> {
+        match self.state.current() {
+            CodingAgentState::Closed => return Err(Error::SessionClosed),
+            CodingAgentState::Idle => {}
+            state => {
+                return Err(Error::InvalidState(format!(
+                    "cannot compact while the session is {state:?}"
+                )));
+            }
+        }
+
+        let (mut history, file_tracker) = {
+            let state = self.conversation();
+            (state.history.clone(), state.file_tracker.clone())
+        };
+        let preserve_turns = options
+            .preserve_turns_value()
+            .unwrap_or(self.config.compaction_preserve_turns)
+            .max(1);
+        if history.compact_preserve_start(preserve_turns) == 0 {
+            return Ok(CompactionOutcome::Unchanged);
+        }
+
+        let estimate = estimate_active_context_usage(&self.system_prompt, &history);
+        let compaction_cancel = self.cancel_token.child_token();
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            compaction_cancel.cancel();
+        }
+        let caller_link = cancel.map(|caller| link_cancellation(caller, &compaction_cancel));
+        let operation = self.compaction.begin(&compaction_cancel);
+        self.state.transition(CodingAgentState::Compacting);
+        let request = CompactionRequest {
+            model: &self.model_selector,
+            facts: self.facts,
+            preserve_turns,
+            estimate,
+            reason: CompactionReason::Manual,
+            instructions: options.instructions_ref(),
+            cancel: operation.token(),
+        };
+        let result = compact_context(
+            &mut history,
+            &self.client,
+            &file_tracker,
+            request,
+            &self.emitter,
+            &self.id,
+        )
+        .await;
+        drop(operation);
+        if let Some(link) = caller_link {
+            link.abort();
+        }
+
+        if result.is_ok() {
+            self.conversation().history = history;
+        }
+        if self.state.current() == CodingAgentState::Closed {
+            self.shutdown(ShutdownReason::Cancelled).await?;
+        } else {
+            self.state.transition(CodingAgentState::Idle);
+            if let Err(error) = self.flush_events().await {
+                let _ = self.shutdown(ShutdownReason::Error).await;
+                return Err(error);
+            }
+        }
+        result
     }
 
     /// Processes one input until it completes or `cancel` fires.
@@ -1416,7 +1533,7 @@ impl CodingRuntime {
     /// returns; a call the model asked for that has not started yet — the
     /// cancellation landed while the assistant turn was being committed or
     /// compacted — is answered `Cancelled` without running, so history stays
-    /// paired. Only a shutdown closes the session.
+    /// paired. Only close or shutdown closes the session.
     ///
     /// # Errors
     ///
@@ -1427,15 +1544,15 @@ impl CodingRuntime {
         fields(
             session_id = %self.id,
             provider = %self.provider,
-            model = %self.model,
-            input_len = input.len()
+            model = %self.model
         )
     )]
     pub(crate) async fn prompt_with_cancellation(
         &mut self,
-        input: &str,
+        input: impl Into<CodingInput>,
         cancel: Option<&CancellationToken>,
     ) -> Result<Option<String>> {
+        let input = input.into();
         self.conversation().totals = PromptTotals::default();
         if self.state.current() == CodingAgentState::Closed {
             return Err(Error::SessionClosed);
@@ -1757,7 +1874,8 @@ impl StateMachine {
     /// cycle where one ends.
     ///
     /// Valid moves: Idle or Executing to Thinking, Thinking to Executing or
-    /// Idle, anything to Closed. Ending the session belongs to
+    /// Idle, Idle to Compacting, Compacting to Idle, and anything to Closed.
+    /// Ending the session belongs to
     /// [`CodingRuntime::shutdown`], never here.
     pub(super) fn transition(&self, to: CodingAgentState) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1775,7 +1893,9 @@ impl StateMachine {
                 ) | (
                     CodingAgentState::Thinking,
                     CodingAgentState::Executing | CodingAgentState::Idle
-                ) | (_, CodingAgentState::Closed)
+                ) | (CodingAgentState::Idle, CodingAgentState::Compacting)
+                    | (CodingAgentState::Compacting, CodingAgentState::Idle)
+                    | (_, CodingAgentState::Closed)
             ),
             "invalid session state transition: {from:?} -> {to:?}"
         );
@@ -1784,7 +1904,7 @@ impl StateMachine {
         drop(state);
         if matches!(
             from,
-            CodingAgentState::Thinking | CodingAgentState::Executing
+            CodingAgentState::Thinking | CodingAgentState::Executing | CodingAgentState::Compacting
         ) && to == CodingAgentState::Idle
         {
             self.emitter

@@ -567,9 +567,7 @@ impl Agent {
         };
 
         self.emit(AgentEvent::PromptStarted);
-        let result = self
-            .process_prompt(message.into_message(), &prompt_cancel)
-            .await;
+        let result = self.process_prompt(message, &prompt_cancel).await;
         match &result {
             Ok(outcome) => self.emit(AgentEvent::PromptCompleted {
                 response: outcome.response.clone(),
@@ -594,7 +592,7 @@ impl Agent {
 
     async fn process_prompt(
         &mut self,
-        first_message: Message,
+        first_message: UserMessage,
         prompt_cancel: &CancellationToken,
     ) -> Result<PromptOutcome> {
         let mut next_message = first_message;
@@ -753,7 +751,6 @@ impl Agent {
                             AfterAnswerAction::Complete => {}
                             AfterAnswerAction::Continue => continue,
                             AfterAnswerAction::ContinueWith(message) => {
-                                let message = message.into_message();
                                 self.commit_user_message(message);
                                 continue;
                             }
@@ -822,15 +819,14 @@ impl Agent {
         message: UserMessage,
         turn: usize,
         cancel: &CancellationToken,
-    ) -> Result<Message> {
+    ) -> Result<UserMessage> {
         let Some(lifecycle) = self.lifecycle.clone() else {
-            return Ok(message.into_message());
+            return Ok(message);
         };
         let context = TurnContext::new(&self.model, turn, &self.messages);
         lifecycle
             .prepare_follow_up(context, message, cancel)
             .await
-            .map(UserMessage::into_message)
             .map_err(|source| AgentError::Lifecycle { source })
     }
 
@@ -904,10 +900,12 @@ impl Agent {
             .results
     }
 
-    fn commit_user_message(&mut self, message: Message) {
+    fn commit_user_message(&mut self, message: UserMessage) {
+        let attribution = message.attribution().cloned();
+        let message = message.into_message();
         self.messages.push(message.clone());
         if let Some(projection) = &self.conversation {
-            projection.user_message_committed(&message);
+            projection.user_message_committed_with_attribution(&message, attribution.as_ref());
         }
         self.emit(AgentEvent::UserMessage { message });
     }

@@ -17,10 +17,11 @@ mod todo;
 mod tool;
 
 use std::fmt;
+use std::ops::Deref;
 use std::time::SystemTime;
 
 use lithos_llm::types::{ContentPart, Message as LlmMessage, Role, ToolCall, ToolResult};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub use self::actor::Actor;
 pub use self::context_window::{
@@ -34,11 +35,13 @@ pub use self::todo::{
     TodoStatus, TodoUpdatedProps,
 };
 pub use self::tool::{PermissionLevel, ToolCategory, ToolErrorKind, ToolSource, ToolSummary};
+use crate::compaction::{CompactionReason, CompactionResult, is_threshold_reason};
 use crate::error::ErrorData;
 use crate::reasoning::ReasoningOutput;
 use crate::record::StoredMessage;
 
 /// The concatenated text of one message's `Text` content parts.
+#[cfg(any(test, feature = "test-util"))]
 pub(crate) fn message_text(message: &LlmMessage) -> String {
     message
         .content()
@@ -48,6 +51,166 @@ pub(crate) fn message_text(message: &LlmMessage) -> String {
             _ => None,
         })
         .collect()
+}
+
+/// Provider-neutral content supplied by a person or another input source.
+///
+/// The readable text is cached for renderers and skill expansion. The full
+/// ordered content remains available for model replay, including images,
+/// audio, and documents.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct InputContent {
+    parts: Vec<ContentPart>,
+    text:  String,
+}
+
+impl InputContent {
+    /// Creates input from provider-neutral content parts.
+    #[must_use]
+    pub fn new(parts: impl IntoIterator<Item = ContentPart>) -> Self {
+        let parts: Vec<_> = parts.into_iter().collect();
+        let text = parts
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        Self { parts, text }
+    }
+
+    /// Creates plain text input.
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::new([ContentPart::Text { text: text.into() }])
+    }
+
+    /// The ordered content sent to the model.
+    #[must_use]
+    pub fn parts(&self) -> &[ContentPart] {
+        &self.parts
+    }
+
+    /// The concatenated readable text parts.
+    #[must_use]
+    pub fn text_content(&self) -> &str {
+        &self.text
+    }
+
+    /// Consumes the value and returns its ordered content parts.
+    #[must_use]
+    pub fn into_parts(self) -> Vec<ContentPart> {
+        self.parts
+    }
+
+    /// Rich content for an additive event field.
+    ///
+    /// Plain text is already present in the event's stable `text` member, so
+    /// it does not need to be repeated.
+    pub(crate) fn event_content(&self) -> Option<Self> {
+        let plain = matches!(
+            self.parts.as_slice(),
+            [ContentPart::Text { text }] if text == &self.text
+        );
+        (!plain).then(|| self.clone())
+    }
+}
+
+impl fmt::Display for InputContent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.text_content())
+    }
+}
+
+/// Treats string operations as operations on the readable text projection.
+impl Deref for InputContent {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.text_content()
+    }
+}
+
+impl PartialEq<str> for InputContent {
+    fn eq(&self, other: &str) -> bool {
+        self.text == other
+    }
+}
+
+impl PartialEq<&str> for InputContent {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
+impl PartialEq<String> for InputContent {
+    fn eq(&self, other: &String) -> bool {
+        self.text == *other
+    }
+}
+
+impl From<String> for InputContent {
+    fn from(text: String) -> Self {
+        Self::text(text)
+    }
+}
+
+impl From<&str> for InputContent {
+    fn from(text: &str) -> Self {
+        Self::text(text)
+    }
+}
+
+impl From<Vec<ContentPart>> for InputContent {
+    fn from(parts: Vec<ContentPart>) -> Self {
+        Self::new(parts)
+    }
+}
+
+impl Serialize for InputContent {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.parts.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for InputContent {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum StoredInputContent {
+            Text(String),
+            Parts(Vec<ContentPart>),
+        }
+
+        match StoredInputContent::deserialize(deserializer)? {
+            StoredInputContent::Text(text) => Ok(Self::text(text)),
+            StoredInputContent::Parts(parts) => Ok(Self::new(parts)),
+        }
+    }
+}
+
+/// Where an ordinary user-role turn came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum InputSource {
+    /// Input submitted through the main prompt operation.
+    #[default]
+    Prompt,
+    /// Input queued to run after an answer.
+    FollowUp,
+    /// Input synthesized by the agent runtime.
+    Agent,
+    /// Input submitted by another application integration.
+    External,
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if callback receives a reference"
+)]
+pub(crate) const fn is_prompt_source(source: &InputSource) -> bool {
+    matches!(source, InputSource::Prompt)
 }
 
 /// The generation of a subagent's first turn.
@@ -302,8 +465,8 @@ pub(crate) mod rfc3339_millis {
 pub enum Message {
     /// Input from the person or system driving the session.
     User {
-        /// The input text.
-        content:   String,
+        /// The input content.
+        content:   InputContent,
         /// When the turn was recorded.
         timestamp: SystemTime,
     },
@@ -337,19 +500,61 @@ pub enum Message {
         /// When the turn was recorded.
         timestamp: SystemTime,
     },
+    /// A handoff summary that replaced older conversation turns.
+    Compaction {
+        /// The model-visible summary.
+        summary:                 String,
+        /// Why the compaction ran.
+        reason:                  CompactionReason,
+        /// Turns present before compaction.
+        original_turn_count:     usize,
+        /// Turns preserved verbatim.
+        preserved_turn_count:    usize,
+        /// Estimated context tokens before compaction.
+        estimated_tokens_before: usize,
+        /// Estimated tokens in the summary.
+        summary_token_estimate:  usize,
+        /// Files represented in the compaction prompt.
+        tracked_file_count:      usize,
+        /// Whether Pebble truncated the generated summary.
+        summary_truncated:       bool,
+        /// Usage from the summarization call.
+        usage:                   TokenUsage,
+        /// Cost of the summarization call in USD micros.
+        cost_usd_micros:         Option<u64>,
+        /// When the summary was recorded.
+        timestamp:               SystemTime,
+    },
     /// Injected steering sent to the model with the user role.
     ///
     /// Steering guides the assistant mid-conversation without appearing as
     /// actual user input.
     Steering {
-        /// The steering text.
-        content:   String,
+        /// The steering content.
+        content:   InputContent,
         /// When the turn was recorded.
         timestamp: SystemTime,
     },
 }
 
 impl Message {
+    /// Builds the durable turn for a completed compaction.
+    pub(crate) fn from_compaction(result: &CompactionResult) -> Self {
+        Self::Compaction {
+            summary:                 result.summary().to_owned(),
+            reason:                  result.reason(),
+            original_turn_count:     result.original_turn_count(),
+            preserved_turn_count:    result.preserved_turn_count(),
+            estimated_tokens_before: result.estimated_tokens_before(),
+            summary_token_estimate:  result.summary_token_estimate(),
+            tracked_file_count:      result.tracked_file_count(),
+            summary_truncated:       result.summary_was_truncated(),
+            usage:                   result.usage(),
+            cost_usd_micros:         result.cost_usd_micros(),
+            timestamp:               SystemTime::now(),
+        }
+    }
+
     /// When this turn was recorded.
     #[must_use]
     pub fn timestamp(&self) -> SystemTime {
@@ -358,6 +563,7 @@ impl Message {
             | Self::Assistant { timestamp, .. }
             | Self::ToolResults { timestamp, .. }
             | Self::System { timestamp, .. }
+            | Self::Compaction { timestamp, .. }
             | Self::Steering { timestamp, .. } => *timestamp,
         }
     }
@@ -380,7 +586,9 @@ impl Message {
     #[must_use]
     pub fn to_llm_message(&self) -> LlmMessage {
         match self {
-            Self::User { content, .. } => LlmMessage::text(Role::User, content.clone()),
+            Self::User { content, .. } => {
+                LlmMessage::new(Role::User, content.parts().iter().cloned())
+            }
             Self::Assistant {
                 content,
                 tool_calls,
@@ -407,11 +615,14 @@ impl Message {
                 }
             }
             Self::System { content, .. } => LlmMessage::text(Role::System, content.clone()),
+            Self::Compaction { summary, .. } => LlmMessage::text(Role::System, summary.clone()),
             #[expect(
                 clippy::match_same_arms,
                 reason = "steering is its own turn kind that happens to share the user role"
             )]
-            Self::Steering { content, .. } => LlmMessage::text(Role::User, content.clone()),
+            Self::Steering { content, .. } => {
+                LlmMessage::new(Role::User, content.parts().iter().cloned())
+            }
         }
     }
 
@@ -452,6 +663,31 @@ impl Message {
                 content:   content.clone(),
                 timestamp: *timestamp,
             },
+            Self::Compaction {
+                summary,
+                reason,
+                original_turn_count,
+                preserved_turn_count,
+                estimated_tokens_before,
+                summary_token_estimate,
+                tracked_file_count,
+                summary_truncated,
+                usage,
+                cost_usd_micros,
+                timestamp,
+            } => StoredMessage::Compaction {
+                summary:                 summary.clone(),
+                reason:                  *reason,
+                original_turn_count:     *original_turn_count,
+                preserved_turn_count:    *preserved_turn_count,
+                estimated_tokens_before: *estimated_tokens_before,
+                summary_token_estimate:  *summary_token_estimate,
+                tracked_file_count:      *tracked_file_count,
+                summary_truncated:       *summary_truncated,
+                usage:                   *usage,
+                cost_usd_micros:         *cost_usd_micros,
+                timestamp:               *timestamp,
+            },
             Self::Steering { content, timestamp } => StoredMessage::Steering {
                 content:   content.clone(),
                 timestamp: *timestamp,
@@ -490,6 +726,31 @@ impl Message {
                 content:   content.clone(),
                 timestamp: *timestamp,
             },
+            StoredMessage::Compaction {
+                summary,
+                reason,
+                original_turn_count,
+                preserved_turn_count,
+                estimated_tokens_before,
+                summary_token_estimate,
+                tracked_file_count,
+                summary_truncated,
+                usage,
+                cost_usd_micros,
+                timestamp,
+            } => Self::Compaction {
+                summary:                 summary.clone(),
+                reason:                  *reason,
+                original_turn_count:     *original_turn_count,
+                preserved_turn_count:    *preserved_turn_count,
+                estimated_tokens_before: *estimated_tokens_before,
+                summary_token_estimate:  *summary_token_estimate,
+                tracked_file_count:      *tracked_file_count,
+                summary_truncated:       *summary_truncated,
+                usage:                   *usage,
+                cost_usd_micros:         *cost_usd_micros,
+                timestamp:               *timestamp,
+            },
             StoredMessage::Steering { content, timestamp } => Self::Steering {
                 content:   content.clone(),
                 timestamp: *timestamp,
@@ -508,6 +769,8 @@ pub enum CodingAgentState {
     Thinking,
     /// Running tools.
     Executing,
+    /// Summarizing older conversation history.
+    Compacting,
     /// Shut down.
     Closed,
 }
@@ -628,7 +891,13 @@ pub enum CodingEvent {
     /// Input arrived from the caller.
     UserInput {
         /// The input text.
-        text: String,
+        text:    String,
+        /// The ordered content when the input was not plain text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<InputContent>,
+        /// Where this input came from.
+        #[serde(default, skip_serializing_if = "is_prompt_source")]
+        source:  InputSource,
     },
     /// An inference request is about to be dispatched for this round.
     ///
@@ -779,10 +1048,13 @@ pub enum CodingEvent {
     /// Steering was injected into the conversation.
     SteeringInjected {
         /// The steering text.
-        text:  String,
+        text:    String,
+        /// The ordered content when the steer was not plain text.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content: Option<InputContent>,
         /// Who authored the steer.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        actor: Option<Actor>,
+        actor:   Option<Actor>,
     },
     /// The cancelled round has fully unwound.
     ///
@@ -797,6 +1069,9 @@ pub enum CodingEvent {
         estimated_tokens:    usize,
         /// The model's context window, in tokens.
         context_window_size: usize,
+        /// Why this compaction ran.
+        #[serde(default, skip_serializing_if = "is_threshold_reason")]
+        reason:              CompactionReason,
     },
     /// Compaction of conversation history finished.
     CompactionCompleted {
@@ -808,6 +1083,21 @@ pub enum CodingEvent {
         summary_token_estimate: usize,
         /// How many tracked files survived compaction.
         tracked_file_count:     usize,
+        /// Why this compaction ran.
+        #[serde(default, skip_serializing_if = "is_threshold_reason")]
+        reason:                 CompactionReason,
+    },
+    /// Compaction ended without changing history.
+    CompactionFailed {
+        /// Why this compaction ran.
+        reason: CompactionReason,
+        /// The failure projected for transport.
+        error:  ErrorData,
+    },
+    /// Compaction was cancelled before it changed history.
+    CompactionCancelled {
+        /// Why this compaction ran.
+        reason: CompactionReason,
     },
     /// An attempt failed to open **or sustain** a stream and the turn is being
     /// replayed.
@@ -970,8 +1260,13 @@ impl CodingEvent {
             Self::ProcessingEnd => {
                 debug!(session_id, "Processing cycle finished, session idle");
             }
-            Self::UserInput { text } => {
-                debug!(session_id, text_len = text.len(), "User input received");
+            Self::UserInput { text, source, .. } => {
+                debug!(
+                    session_id,
+                    text_len = text.len(),
+                    source = ?source,
+                    "User input received"
+                );
             }
             Self::LlmRequestStarted { requested_model } => {
                 debug!(
@@ -1094,10 +1389,14 @@ impl CodingEvent {
             Self::CompactionStarted {
                 estimated_tokens,
                 context_window_size,
+                reason,
             } => {
                 info!(
                     session_id,
-                    estimated_tokens, context_window_size, "Context compaction started"
+                    estimated_tokens,
+                    context_window_size,
+                    reason = ?reason,
+                    "Context compaction started"
                 );
             }
             Self::CompactionCompleted {
@@ -1105,6 +1404,7 @@ impl CodingEvent {
                 preserved_turn_count,
                 summary_token_estimate,
                 tracked_file_count,
+                reason,
             } => {
                 info!(
                     session_id,
@@ -1112,8 +1412,20 @@ impl CodingEvent {
                     preserved_turn_count,
                     summary_token_estimate,
                     tracked_file_count,
+                    reason = ?reason,
                     "Context compaction completed"
                 );
+            }
+            Self::CompactionFailed { reason, error } => {
+                warn!(
+                    session_id,
+                    reason = ?reason,
+                    error = error.message.as_str(),
+                    "Context compaction failed"
+                );
+            }
+            Self::CompactionCancelled { reason } => {
+                info!(session_id, reason = ?reason, "Context compaction cancelled");
             }
             Self::LlmRetry {
                 provider,
@@ -1366,7 +1678,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::{Duration, UNIX_EPOCH};
 
-    use lithos_llm::types::ReasoningContent;
+    use lithos_llm::types::{ImageContent, MediaSource, ReasoningContent};
     use serde_json::json;
 
     use super::*;
@@ -1378,6 +1690,40 @@ mod tests {
 
     fn coding_agent_event(event: CodingEvent) -> CodingAgentEvent {
         CodingAgentEvent::new("ses_1", event, moment()).with_seq(1)
+    }
+
+    // --- Input content ---
+
+    #[test]
+    fn input_content_keeps_ordered_parts_and_readable_text() {
+        let parts = vec![
+            ContentPart::Text {
+                text: "look at ".into(),
+            },
+            ContentPart::Image(ImageContent::new(MediaSource::url(
+                "https://example.test/image.png",
+            ))),
+            ContentPart::Text {
+                text: "this".into(),
+            },
+        ];
+
+        let content = InputContent::new(parts.clone());
+
+        assert_eq!(content.parts(), parts);
+        assert_eq!(content.text_content(), "look at this");
+        assert_eq!(content.into_parts(), parts);
+    }
+
+    #[test]
+    fn input_content_reads_legacy_text_and_writes_parts() {
+        let legacy: InputContent =
+            serde_json::from_value(json!("hello")).expect("legacy text parses");
+        assert_eq!(legacy.text_content(), "hello");
+        assert_eq!(
+            serde_json::to_value(legacy).expect("content serializes"),
+            json!([{"type": "text", "text": "hello"}])
+        );
     }
 
     // --- Timestamps ---
@@ -1743,7 +2089,11 @@ mod tests {
 
         let quiet = [
             CodingEvent::SessionEnded,
-            CodingEvent::UserInput { text: "hi".into() },
+            CodingEvent::UserInput {
+                text:    "hi".into(),
+                content: None,
+                source:  InputSource::Prompt,
+            },
             CodingEvent::LoopDetected,
         ];
         for event in &quiet {
@@ -1946,8 +2296,9 @@ mod tests {
     #[test]
     fn steering_records_who_authored_it() {
         let event = CodingEvent::SteeringInjected {
-            text:  "also update the changelog".into(),
-            actor: Some(Actor::User {
+            text:    "also update the changelog".into(),
+            content: None,
+            actor:   Some(Actor::User {
                 id:           Some("u_1".into()),
                 display_name: None,
             }),
@@ -1962,8 +2313,9 @@ mod tests {
     #[test]
     fn steering_without_an_author_omits_the_field() {
         let event = CodingEvent::SteeringInjected {
-            text:  "keep going".into(),
-            actor: None,
+            text:    "keep going".into(),
+            content: None,
+            actor:   None,
         };
         assert_eq!(
             serde_json::to_value(&event).expect("serializes"),
@@ -2080,7 +2432,11 @@ mod tests {
             "UserInput": {"text": "hi", "future_field": 7},
         }))
         .expect("parses");
-        assert_eq!(event, CodingEvent::UserInput { text: "hi".into() });
+        assert_eq!(event, CodingEvent::UserInput {
+            text:    "hi".into(),
+            content: None,
+            source:  InputSource::Prompt,
+        });
     }
 
     #[test]
@@ -2092,7 +2448,11 @@ mod tests {
             },
             CodingEvent::SessionEnded,
             CodingEvent::ProcessingEnd,
-            CodingEvent::UserInput { text: "hi".into() },
+            CodingEvent::UserInput {
+                text:    "hi".into(),
+                content: None,
+                source:  InputSource::Prompt,
+            },
             CodingEvent::LlmRequestStarted {
                 requested_model: "claude-sonnet-5".into(),
             },
@@ -2116,12 +2476,21 @@ mod tests {
             CodingEvent::CompactionStarted {
                 estimated_tokens:    5_000,
                 context_window_size: 8_000,
+                reason:              CompactionReason::Threshold,
             },
             CodingEvent::CompactionCompleted {
                 original_turn_count:    20,
                 preserved_turn_count:   6,
                 summary_token_estimate: 500,
                 tracked_file_count:     3,
+                reason:                 CompactionReason::Threshold,
+            },
+            CodingEvent::CompactionFailed {
+                reason: CompactionReason::Manual,
+                error:  ErrorData::new(ErrorKind::Compaction, "summary failed"),
+            },
+            CodingEvent::CompactionCancelled {
+                reason: CompactionReason::Manual,
             },
             CodingEvent::SubAgentSpawned {
                 agent_id:   "sa-1".into(),

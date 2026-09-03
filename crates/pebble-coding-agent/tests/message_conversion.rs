@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use lithos_llm::types::{
     ContentPart, Message as LlmMessage, ReasoningContent, Role, ToolCall, ToolCallKind, ToolResult,
 };
-use pebble_coding_agent::events::TokenUsage;
+use pebble_coding_agent::events::{CompactionReason, TokenUsage};
 use pebble_coding_agent::state::{History, Message};
 use serde_json::json;
 
@@ -32,6 +32,7 @@ fn variant_of(turn: &Message) -> &'static str {
         Message::Assistant { .. } => "assistant",
         Message::ToolResults { .. } => "tool_results",
         Message::System { .. } => "system",
+        Message::Compaction { .. } => "compaction",
         Message::Steering { .. } => "steering",
         _ => panic!("a turn kind this test does not know: add it to `every_variant`"),
     }
@@ -107,6 +108,23 @@ fn every_variant() -> Vec<Message> {
             content:   "[Context Summary]\nThe suite was failing.".into(),
             timestamp: moment(),
         },
+        Message::Compaction {
+            summary:                 "[Context Summary]\nContinue with the parser.".into(),
+            reason:                  CompactionReason::Manual,
+            original_turn_count:     12,
+            preserved_turn_count:    4,
+            estimated_tokens_before: 180_000,
+            summary_token_estimate:  800,
+            tracked_file_count:      3,
+            summary_truncated:       false,
+            usage:                   TokenUsage {
+                input: 180_000,
+                output: 800,
+                ..TokenUsage::default()
+            },
+            cost_usd_micros:         Some(9_500),
+            timestamp:               moment(),
+        },
         Message::Steering {
             content:   "also update the changelog".into(),
             timestamp: moment(),
@@ -123,6 +141,7 @@ fn every_turn_kind_is_covered() {
         "assistant",
         "tool_results",
         "system",
+        "compaction",
         "steering",
     ]);
 }
@@ -237,7 +256,7 @@ fn a_tool_results_turn_keeps_every_result_and_its_error_flag() {
 
 #[test]
 fn steering_reaches_the_model_as_user_input_but_stays_its_own_turn() {
-    let steering = &every_variant()[4];
+    let steering = &every_variant()[5];
 
     assert_eq!(steering.to_llm_message().role(), Role::User);
     assert!(

@@ -116,8 +116,8 @@ async fn crossing_the_threshold_summarizes_the_older_turns() {
     );
     assert!(
         session.history().turns().iter().any(|turn| {
-            matches!(turn, Message::System { content, .. }
-                if content.contains("A different assistant began this task"))
+            matches!(turn, Message::Compaction { summary, .. }
+                if summary.contains("A different assistant began this task"))
         }),
         "the summarized turns are replaced by the summary"
     );
@@ -145,6 +145,7 @@ async fn the_reported_usage_of_the_last_turn_is_the_baseline() {
         CodingEvent::CompactionStarted {
             estimated_tokens,
             context_window_size,
+            ..
         } => Some((*estimated_tokens, *context_window_size)),
         _ => None,
     });
@@ -161,12 +162,7 @@ async fn the_reported_usage_of_the_last_turn_is_the_baseline() {
 }
 
 #[tokio::test]
-async fn a_summary_that_never_arrives_outlasts_an_interrupt() {
-    // Summarization has no cancellation of its own — fabro's had none either —
-    // so a call that never answers holds the prompt open however the session is
-    // ended. This pins the contract rather than endorsing it: an application
-    // that must stop while a summary is in flight needs the model call itself
-    // to time out.
+async fn cancelling_a_prompt_cancels_its_pending_summary() {
     let (mut session, _provider) = TestSession::new(vec![ScriptedCall::response(with_usage(
         text_response("OK"),
         TokenCounts::default(),
@@ -191,14 +187,21 @@ async fn a_summary_that_never_arrives_outlasts_an_interrupt() {
         .await
         .expect("the summarizing call starts");
         cancel.cancel();
+        wait_for_event(&mut events, |event| {
+            matches!(event, CodingEvent::CompactionCancelled { .. })
+        })
+        .await;
     });
 
     let outcome = timeout(Duration::from_millis(200), session.prompt(&large_input())).await;
     controller.await.expect("the controller finishes");
 
     assert!(
-        outcome.is_err(),
-        "a cancelled session still waits on the summarizing call it started"
+        matches!(
+            outcome,
+            Ok(Err(Error::Interrupted(InterruptReason::Cancelled)))
+        ),
+        "cancellation ends a pending summarization call: {outcome:?}"
     );
 }
 

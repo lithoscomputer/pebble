@@ -266,6 +266,39 @@ pub struct AgentControlSnapshot {
     pending_follow_ups: usize,
 }
 
+/// An owned view of the input waiting outside the active conversation.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AgentPendingInput {
+    steering:   Vec<UserMessage>,
+    follow_ups: Vec<UserMessage>,
+}
+
+impl AgentPendingInput {
+    /// Steering waiting for the next turn boundary, oldest first.
+    #[must_use]
+    pub fn steering(&self) -> &[UserMessage] {
+        &self.steering
+    }
+
+    /// Follow-up input waiting for a natural answer, oldest first.
+    #[must_use]
+    pub fn follow_ups(&self) -> &[UserMessage] {
+        &self.follow_ups
+    }
+
+    /// Whether neither queue contains input.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.steering.is_empty() && self.follow_ups.is_empty()
+    }
+
+    /// Consumes the snapshot and returns both queues, oldest first.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<UserMessage>, Vec<UserMessage>) {
+        (self.steering, self.follow_ups)
+    }
+}
+
 impl AgentControlSnapshot {
     /// Whether a prompt is running.
     #[must_use]
@@ -583,6 +616,37 @@ impl AgentControlHandle {
         self.control.pop_follow_up()
     }
 
+    /// Clones the input currently waiting in both queues.
+    #[must_use]
+    pub fn pending_input(&self) -> AgentPendingInput {
+        let state = self
+            .control
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        AgentPendingInput {
+            steering:   state.steering.iter().cloned().collect(),
+            follow_ups: state.follow_up.iter().cloned().collect(),
+        }
+    }
+
+    /// Removes and returns the input currently waiting in both queues.
+    ///
+    /// If an earlier steer already interrupted the current round, removing
+    /// that steer can leave the prompt parked at its next boundary. A caller
+    /// restoring queued input to an editor normally aborts the prompt first.
+    pub fn take_pending_input(&self) -> AgentPendingInput {
+        let mut state = self
+            .control
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        AgentPendingInput {
+            steering:   state.steering.drain(..).collect(),
+            follow_ups: state.follow_up.drain(..).collect(),
+        }
+    }
+
     /// Returns one consistent view of the control state.
     #[must_use]
     pub fn snapshot(&self) -> AgentControlSnapshot {
@@ -663,6 +727,21 @@ mod tests {
         assert_eq!(outcome, QueueOutcome::Evicted(UserMessage::text("first")));
         assert_eq!(handle.snapshot().pending_follow_ups(), 1);
         assert_eq!(handle.take_follow_up(), Some(UserMessage::text("second")));
+    }
+
+    #[test]
+    fn pending_input_can_be_cloned_or_drained_atomically() {
+        let handle = AgentControlHandle::detached();
+        assert!(handle.enqueue_steering("steer"));
+        assert!(handle.follow_up("follow up"));
+
+        let pending = handle.pending_input();
+        assert_eq!(pending.steering(), &[UserMessage::text("steer")]);
+        assert_eq!(pending.follow_ups(), &[UserMessage::text("follow up")]);
+        assert_eq!(handle.take_pending_input(), pending);
+        assert!(handle.pending_input().is_empty());
+        assert_eq!(handle.snapshot().pending_steering(), 0);
+        assert_eq!(handle.snapshot().pending_follow_ups(), 0);
     }
 
     #[test]

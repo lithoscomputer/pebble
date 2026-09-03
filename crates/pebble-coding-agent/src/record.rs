@@ -24,10 +24,11 @@ use std::time::SystemTime;
 use lithos_llm::types::{ContentPart, ToolCall, ToolResult};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::types::{TokenUsage, rfc3339_millis};
+use crate::compaction::CompactionReason;
+use crate::types::{InputContent, TokenUsage, rfc3339_millis};
 
 /// The record format version this build writes.
-pub const SESSION_RECORD_FORMAT_VERSION: u32 = 1;
+pub const SESSION_RECORD_FORMAT_VERSION: u32 = 2;
 
 /// The version assumed for a record that names none.
 ///
@@ -153,6 +154,10 @@ impl SessionRecord {
     pub fn migrate(self) -> Result<Self, RecordMigrationError> {
         match self.format_version {
             SESSION_RECORD_FORMAT_VERSION => Ok(self),
+            1 => Ok(Self {
+                format_version: SESSION_RECORD_FORMAT_VERSION,
+                ..self
+            }),
             version => Err(RecordMigrationError::UnsupportedVersion {
                 version,
                 supported: SESSION_RECORD_FORMAT_VERSION,
@@ -192,8 +197,8 @@ pub enum RecordMigrationError {
 pub enum StoredMessage {
     /// Input from the person or system driving the session.
     User {
-        /// The input text.
-        content:   String,
+        /// The input content.
+        content:   InputContent,
         /// When the turn was recorded.
         #[serde(with = "rfc3339_millis")]
         timestamp: SystemTime,
@@ -238,10 +243,45 @@ pub enum StoredMessage {
         #[serde(with = "rfc3339_millis")]
         timestamp: SystemTime,
     },
+    /// A handoff summary that replaced older turns.
+    Compaction {
+        /// The model-visible summary.
+        summary:                 String,
+        /// Why the compaction ran.
+        #[serde(default)]
+        reason:                  CompactionReason,
+        /// Turns present before compaction.
+        #[serde(default)]
+        original_turn_count:     usize,
+        /// Turns preserved verbatim.
+        #[serde(default)]
+        preserved_turn_count:    usize,
+        /// Estimated context tokens before compaction.
+        #[serde(default)]
+        estimated_tokens_before: usize,
+        /// Estimated tokens in the summary.
+        #[serde(default)]
+        summary_token_estimate:  usize,
+        /// Files represented in the compaction prompt.
+        #[serde(default)]
+        tracked_file_count:      usize,
+        /// Whether Pebble truncated the generated summary.
+        #[serde(default)]
+        summary_truncated:       bool,
+        /// Usage from the summarization call.
+        #[serde(default, deserialize_with = "null_as_default")]
+        usage:                   TokenUsage,
+        /// Cost of the summarization call in USD micros.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd_micros:         Option<u64>,
+        /// When the summary was recorded.
+        #[serde(with = "rfc3339_millis")]
+        timestamp:               SystemTime,
+    },
     /// Injected steering sent to the model with the user role.
     Steering {
-        /// The steering text.
-        content:   String,
+        /// The steering content.
+        content:   InputContent,
         /// When the turn was recorded.
         #[serde(with = "rfc3339_millis")]
         timestamp: SystemTime,
@@ -257,6 +297,7 @@ impl StoredMessage {
             | Self::Assistant { timestamp, .. }
             | Self::ToolResults { timestamp, .. }
             | Self::System { timestamp, .. }
+            | Self::Compaction { timestamp, .. }
             | Self::Steering { timestamp, .. } => *timestamp,
         }
     }

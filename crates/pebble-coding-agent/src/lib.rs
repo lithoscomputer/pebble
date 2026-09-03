@@ -65,10 +65,15 @@ mod readme {}
 
 pub use self::coding_agent::{
     CodingAgent, CodingAgentBuildError, CodingAgentBuilder, CodingAgentControlHandle,
-    CodingAgentExport, ControlSnapshot, PromptOutcome, PromptTiming, ResumeMode, ShutdownReason,
-    SteeringMessage, SteeringOutcome,
+    CodingAgentExport, CodingAgentObservation, CodingAgentSnapshot, CodingInput, ControlSnapshot,
+    PendingInput, PromptOutcome, PromptTiming, ResumeMode, ShutdownReason, SteeringMessage,
+    SteeringOutcome,
+};
+pub use self::compaction::{
+    CompactionOptions, CompactionOutcome, CompactionReason, CompactionResult,
 };
 pub use self::config::CodingAgentOptions;
 pub use self::error::{CompactionError, Error, InterruptReason, Result, TaskKind};
 pub use self::runtime::SteeringLease;
 pub use self::skills::SkillExpansionError;
+pub use self::types::{InputContent, InputSource};

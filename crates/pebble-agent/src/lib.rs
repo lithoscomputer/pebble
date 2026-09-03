@@ -56,7 +56,9 @@ mod validation;
 pub use self::agent::{
     Agent, AgentBuilder, AgentConfig, AgentSnapshot, AgentState, PromptOutcome, UserMessage,
 };
-pub use self::control::{AgentControlHandle, AgentControlSnapshot, CompletionLease, QueueOutcome};
+pub use self::control::{
+    AgentControlHandle, AgentControlSnapshot, AgentPendingInput, CompletionLease, QueueOutcome,
+};
 pub use self::conversation::ConversationProjection;
 pub use self::error::{AgentBuildError, AgentError, Result};
 pub use self::event::{AgentEvent, EventProjection, FirstOutputKind};

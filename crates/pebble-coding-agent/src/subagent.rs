@@ -51,6 +51,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 pub(crate) use self::tools::{subagent_tools, tree_position};
+use crate::coding_agent::CodingInput;
 use crate::config::CodingAgentOptions;
 use crate::environment::Environment;
 use crate::error::{Error, ErrorData, ErrorKind, InterruptReason, Result, TaskKind};
@@ -60,7 +61,9 @@ use crate::redact::Redactor;
 use crate::runtime::{CodingAgentBuildError, CodingRuntime, ShutdownReason};
 use crate::search::SearchProvider;
 use crate::tool::{RegisteredTool, ToolEnvProvider, ToolError};
-use crate::types::{CodingAgentState, CodingEvent, INITIAL_SUBAGENT_GENERATION, ToolErrorKind};
+use crate::types::{
+    CodingAgentState, CodingEvent, INITIAL_SUBAGENT_GENERATION, InputSource, ToolErrorKind,
+};
 
 /// How long a closing child has to stop on its own before it is aborted.
 const SUBAGENT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
@@ -894,7 +897,7 @@ async fn run_subagent_session(
 
         loop {
             let result = session
-                .prompt(&prompt)
+                .prompt(CodingInput::text(&prompt).with_source(InputSource::Agent))
                 .await
                 .and_then(|output| {
                     output.ok_or_else(|| {

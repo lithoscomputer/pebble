@@ -12,10 +12,12 @@
 
 use std::collections::HashSet;
 use std::mem;
+#[cfg(test)]
 use std::time::SystemTime;
 
 use lithos_llm::types::{ContentPart, Message as LlmMessage};
 
+use crate::compaction::CompactionResult;
 use crate::record::StoredMessage;
 use crate::types::{Message, TokenUsage};
 
@@ -110,7 +112,8 @@ impl History {
     #[cfg(test)]
     pub(crate) fn compact(&mut self, preserve_count: usize, summary: String) {
         let preserve_start = self.compact_preserve_start(preserve_count);
-        self.compact_from(preserve_start, summary);
+        let result = CompactionResult::for_history(summary);
+        self.compact_from(preserve_start, &result);
     }
 
     /// The earliest turn index that can be preserved without separating a tool
@@ -124,7 +127,7 @@ impl History {
     ///
     /// Does nothing when the index would preserve everything (`0`) or lies
     /// past the end.
-    pub(crate) fn compact_from(&mut self, preserve_start: usize, summary: String) {
+    pub(crate) fn compact_from(&mut self, preserve_start: usize, compaction: &CompactionResult) {
         if preserve_start == 0 || preserve_start > self.turns.len() {
             return;
         }
@@ -133,10 +136,7 @@ impl History {
         let discarded = mem::take(&mut self.turns);
         let carried_forward =
             extract_recent_user_messages(discarded, COMPACTION_USER_MESSAGE_TOKEN_BUDGET);
-        self.turns.push(Message::System {
-            content:   summary,
-            timestamp: SystemTime::now(),
-        });
+        self.turns.push(Message::from_compaction(compaction));
         self.turns.extend(carried_forward);
         self.turns.extend(preserved);
         self.strip_stale_provider_parts();
@@ -241,7 +241,7 @@ mod tests {
 
     fn user(content: &str) -> Message {
         Message::User {
-            content:   content.to_owned(),
+            content:   content.into(),
             timestamp: now(),
         }
     }
@@ -323,7 +323,7 @@ mod tests {
         history.compact(4, "Summary".into());
 
         let turns = history.turns();
-        assert!(matches!(&turns[0], Message::System { .. }));
+        assert!(matches!(&turns[0], Message::Compaction { .. }));
         for (offset, index) in (0..8).enumerate() {
             assert!(
                 matches!(&turns[offset + 1], Message::User { content, .. } if content == &format!("msg {index}")),
@@ -890,7 +890,7 @@ mod tests {
         history.compact(1, "Summary".into());
 
         assert_eq!(history.len(), 3);
-        assert!(matches!(&history.turns()[0], Message::System { .. }));
+        assert!(matches!(&history.turns()[0], Message::Compaction { .. }));
         assert!(
             matches!(&history.turns()[1], Message::User { content, .. } if content == "user msg")
         );
@@ -904,8 +904,9 @@ mod tests {
         let mut history = History::default();
         history.push(user("only"));
 
-        history.compact_from(0, "Summary".into());
-        history.compact_from(9, "Summary".into());
+        let result = CompactionResult::for_history("Summary".to_owned());
+        history.compact_from(0, &result);
+        history.compact_from(9, &result);
 
         assert_eq!(history.len(), 1);
     }

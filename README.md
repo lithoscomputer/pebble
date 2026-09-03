@@ -94,9 +94,38 @@ tool runner are in `pebble_coding_agent::tools`. Durable session state is in
 `pebble_coding_agent::subagents`. The internal runtime is not public.
 
 Take a `CodingAgentControlHandle` before calling `prompt` when another task
-must `steer`, `follow_up`, `abort`, or `wait_for_idle` while the prompt holds
-the mutable agent borrow. These are the same control verbs as the generic
-agent API.
+must steer, follow up, cancel compaction, abort a prompt, close the agent, or
+wait for idle while the prompt holds the mutable agent borrow. `abort` ends the
+active prompt and leaves the agent reusable. `close` is permanent. The task
+that owns the agent then calls `shutdown` to publish the terminal event and
+join owned tasks.
+
+The control handle also exposes queued input. `pending_input` clones steering
+and follow-ups in queue order. `take_pending_input` removes and returns them.
+An application can use this to restore unsent text to an editor after it aborts
+a prompt.
+
+`CodingInput` and `SteeringMessage::from_content` accept ordered
+`lithos_llm::types::ContentPart` values. Pebble keeps those parts in history,
+stored records, queued input, and input events. This includes images, audio,
+and documents. The stable `text` event member remains available to text-only
+renderers. `InputSource` distinguishes a direct prompt, a follow-up,
+agent-generated input, and input from another application integration.
+
+Use `CodingAgent::observe` when a view needs a complete starting point and
+live updates. It returns a `CodingAgentSnapshot` and an event receiver at one
+committed event cursor. Apply the snapshot first. Discard queued events at or
+below `snapshot.committed_event_seq()`. Then apply later events in sequence.
+The snapshot includes history, pending input, state, route, profile, memory,
+skills, tools, and the latest context-window measurement.
+
+Automatic context compaction remains policy-driven. An application can also
+call `CodingAgent::compact(CompactionOptions)` while the agent is idle. The
+operation returns a structured `CompactionOutcome`. A completed summary is a
+dedicated `Message::Compaction` turn with its reason, counts, usage, and cost.
+Each started compaction ends with a completed, failed, or cancelled event.
+Pass a token to `compact_with_cancellation`, or use
+`CodingAgentControlHandle::cancel_compaction` from another task.
 
 `crates/pebble-coding-agent/examples/coding_agent.rs` is the same thing at full
 size. It renders the event stream, steers one prompt while it works, interrupts
@@ -236,7 +265,8 @@ println!("{}", outcome.text());
 
 The public verbs are `prompt`, `steer`, `follow_up`, `abort`, and
 `wait_for_idle`. `Agent::snapshot` returns an owned immutable view instead of
-exposing mutable agent state.
+exposing mutable agent state. Its control handle can also close the agent and
+clone or drain pending steering and follow-ups.
 
 The coding layer has the same concise path for application tools:
 
@@ -273,10 +303,14 @@ is a build error, not a session that runs with the wrong prompt.
 ## Stability
 
 The serialized form of `pebble_coding_agent::events::CodingAgentEvent` and
-`pebble_coding_agent::events::CodingEvent` is public API. So is
-`pebble_coding_agent::state::SessionRecord`, which carries a format version. Evolution
-is additive: new variants and new optional fields. Consumers should ignore
-members they do not know and tolerate variants they do not know.
+`pebble_coding_agent::events::CodingEvent` is public API. Event evolution is
+additive: new variants and new optional fields. Consumers should ignore members
+they do not know and tolerate variants they do not know.
+
+`pebble_coding_agent::state::SessionRecord` is also public API. Its format
+version changes when a stored shape changes. Version 2 stores user and steering
+content as ordered content parts and stores compaction as its own turn kind.
+`SessionRecord::migrate` upgrades version 1 records before resume.
 
 Ignoring an unknown member is free; tolerating an unknown *variant* is the
 reader's own work, because a variant a build has never heard of fails the whole

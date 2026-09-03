@@ -7,6 +7,7 @@
 //! [`CodingAgent::subscribe`](crate::CodingAgent::subscribe). The serialized
 //! form of both event types is public API.
 
+pub use crate::compaction::CompactionReason;
 pub use crate::error::{ErrorData, ErrorKind};
 pub use crate::event::{
     DEFAULT_EVENT_CAPACITY, DEFAULT_EVENT_SINK_TIMEOUT, EventCapacity, EventSink, EventSinkError,
@@ -18,8 +19,9 @@ pub use crate::types::{
     Actor, AgentProfileKind, CodingAgentEvent, CodingAgentState, CodingEvent, CommandTermination,
     ContextWindowBreakdownItem, ContextWindowCategory, ContextWindowCountMethod,
     ContextWindowSnapshot, ContextWindowStaleness, ContextWindowWarning, CostSource,
-    ExecOutputTail, ExecOutputTailTrace, INITIAL_SUBAGENT_GENERATION, LlmOutputKind, LlmRetryPhase,
-    MemoryFileSummary, PermissionLevel, SkillActivationSource, SkillSummary, TodoCreatedProps,
-    TodoDeletedProps, TodoListKind, TodoListProjection, TodoProjection, TodoStatus,
-    TodoUpdatedProps, TokenUsage, ToolCategory, ToolErrorKind, ToolSource, ToolSummary,
+    ExecOutputTail, ExecOutputTailTrace, INITIAL_SUBAGENT_GENERATION, InputContent, InputSource,
+    LlmOutputKind, LlmRetryPhase, MemoryFileSummary, PermissionLevel, SkillActivationSource,
+    SkillSummary, TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoListProjection,
+    TodoProjection, TodoStatus, TodoUpdatedProps, TokenUsage, ToolCategory, ToolErrorKind,
+    ToolSource, ToolSummary,
 };

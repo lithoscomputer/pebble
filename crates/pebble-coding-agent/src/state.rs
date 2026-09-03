@@ -11,4 +11,4 @@ pub use crate::history::History;
 pub use crate::record::{
     RecordMigrationError, SESSION_RECORD_FORMAT_VERSION, SessionRecord, StoredMessage,
 };
-pub use crate::types::Message;
+pub use crate::types::{InputContent, Message};

@@ -12,6 +12,19 @@ pub trait ConversationProjection: Send + Sync {
     /// A prompt, follow-up, or lifecycle-produced user message was committed.
     fn user_message_committed(&self, _message: &Message) {}
 
+    /// A user message and its optional application attribution were committed.
+    ///
+    /// The default preserves implementations of
+    /// [`user_message_committed`](Self::user_message_committed) that do not
+    /// need attribution.
+    fn user_message_committed_with_attribution(
+        &self,
+        message: &Message,
+        _attribution: Option<&Value>,
+    ) {
+        self.user_message_committed(message);
+    }
+
     /// A queued steering message was committed.
     fn steering_message_committed(&self, _message: &Message, _attribution: Option<&Value>) {}
 

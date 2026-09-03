@@ -1,9 +1,9 @@
 ---
-source: tests/record_contract.rs
+source: crates/pebble-coding-agent/tests/record_contract.rs
 expression: rendered
 ---
 {
-  "format_version": 1,
+  "format_version": 2,
   "session_id": "ses_root",
   "provider": "anthropic",
   "model": "claude-sonnet-5",
@@ -13,7 +13,12 @@ expression: rendered
   "messages": [
     {
       "kind": "user",
-      "content": "read the crate root",
+      "content": [
+        {
+          "type": "text",
+          "text": "read the crate root"
+        }
+      ],
       "timestamp": "2026-01-01T00:00:00.500Z"
     },
     {
@@ -78,13 +83,33 @@ expression: rendered
       "timestamp": "2026-01-01T00:00:00.500Z"
     },
     {
-      "kind": "system",
-      "content": "[Context Summary]\nThe session read the crate root.",
+      "kind": "compaction",
+      "summary": "[Context Summary]\nThe session read the crate root.",
+      "reason": "manual",
+      "original_turn_count": 8,
+      "preserved_turn_count": 2,
+      "estimated_tokens_before": 12000,
+      "summary_token_estimate": 24,
+      "tracked_file_count": 1,
+      "summary_truncated": false,
+      "usage": {
+        "input": 1200,
+        "output": 340,
+        "reasoning": 96,
+        "cache_read": 800,
+        "cache_write": 64
+      },
+      "cost_usd_micros": 1250,
       "timestamp": "2026-01-01T00:00:00.500Z"
     },
     {
       "kind": "steering",
-      "content": "also update the changelog",
+      "content": [
+        {
+          "type": "text",
+          "text": "also update the changelog"
+        }
+      ],
       "timestamp": "2026-01-01T00:00:00.500Z"
     }
   ]

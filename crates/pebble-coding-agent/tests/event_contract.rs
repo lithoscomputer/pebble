@@ -12,15 +12,18 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lithos_llm::catalog::ProviderId;
-use lithos_llm::types::{Error as LlmError, ErrorKind as LlmErrorKind, RetryClassification};
+use lithos_llm::types::{
+    ContentPart, Error as LlmError, ErrorKind as LlmErrorKind, ImageContent, MediaSource,
+    RetryClassification,
+};
 use pebble_coding_agent::events::{
-    Actor, AgentProfileKind, CodingAgentEvent, CodingEvent, CommandTermination,
+    Actor, AgentProfileKind, CodingAgentEvent, CodingEvent, CommandTermination, CompactionReason,
     ContextWindowBreakdownItem, ContextWindowCategory, ContextWindowCountMethod,
     ContextWindowSnapshot, ContextWindowStaleness, ContextWindowWarning, CostSource, ErrorData,
-    ErrorKind, EventSinkError, ExecOutputTail, LlmOutputKind, LlmRetryPhase, MemoryFileSummary,
-    PermissionLevel, ReasoningOutput, SkillActivationSource, SkillSummary, TodoCreatedProps,
-    TodoDeletedProps, TodoListKind, TodoStatus, TodoUpdatedProps, TokenUsage, ToolCategory,
-    ToolErrorKind, ToolSource, ToolSummary,
+    ErrorKind, EventSinkError, ExecOutputTail, InputContent, InputSource, LlmOutputKind,
+    LlmRetryPhase, MemoryFileSummary, PermissionLevel, ReasoningOutput, SkillActivationSource,
+    SkillSummary, TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoStatus, TodoUpdatedProps,
+    TokenUsage, ToolCategory, ToolErrorKind, ToolSource, ToolSummary,
 };
 use pebble_coding_agent::{Error, InterruptReason};
 use serde::Serialize;
@@ -93,7 +96,9 @@ fn every_variant() -> Vec<CodingEvent> {
         CodingEvent::SessionEnded,
         CodingEvent::ProcessingEnd,
         CodingEvent::UserInput {
-            text: "fix the failing test".into(),
+            text:    "fix the failing test".into(),
+            content: None,
+            source:  InputSource::Prompt,
         },
         CodingEvent::LlmRequestStarted {
             requested_model: "claude-sonnet-5".into(),
@@ -174,8 +179,9 @@ fn every_variant() -> Vec<CodingEvent> {
         },
         CodingEvent::LoopDetected,
         CodingEvent::SteeringInjected {
-            text:  "also update the changelog".into(),
-            actor: Some(Actor::User {
+            text:    "also update the changelog".into(),
+            content: None,
+            actor:   Some(Actor::User {
                 id:           Some("u_1".into()),
                 display_name: Some("Ada".into()),
             }),
@@ -184,12 +190,21 @@ fn every_variant() -> Vec<CodingEvent> {
         CodingEvent::CompactionStarted {
             estimated_tokens:    180_000,
             context_window_size: 200_000,
+            reason:              CompactionReason::Threshold,
         },
         CodingEvent::CompactionCompleted {
             original_turn_count:    64,
             preserved_turn_count:   12,
             summary_token_estimate: 900,
             tracked_file_count:     7,
+            reason:                 CompactionReason::Threshold,
+        },
+        CodingEvent::CompactionFailed {
+            reason: CompactionReason::Manual,
+            error:  ErrorData::new(ErrorKind::Compaction, "summary request failed"),
+        },
+        CodingEvent::CompactionCancelled {
+            reason: CompactionReason::Manual,
         },
         CodingEvent::LlmRetry {
             provider:   "openai".into(),
@@ -286,6 +301,38 @@ fn every_variant() -> Vec<CodingEvent> {
 #[test]
 fn every_coding_event_variant_keeps_its_serialized_shape() {
     insta::assert_snapshot!("coding_event_variants", render(&every_variant()));
+}
+
+#[test]
+fn rich_input_is_additive_to_the_stable_text_event() {
+    let content = InputContent::new([
+        ContentPart::Text {
+            text: "describe this".into(),
+        },
+        ContentPart::Image(ImageContent::new(MediaSource::url(
+            "https://example.test/image.png",
+        ))),
+    ]);
+    let event = CodingEvent::UserInput {
+        text:    "describe this".into(),
+        content: Some(content),
+        source:  InputSource::External,
+    };
+
+    assert_eq!(
+        serde_json::to_value(event).expect("the event serializes"),
+        json!({"UserInput": {
+            "text": "describe this",
+            "content": [
+                {"type": "text", "text": "describe this"},
+                {
+                    "type": "image",
+                    "source": {"type": "url", "url": "https://example.test/image.png"},
+                },
+            ],
+            "source": "external",
+        }})
+    );
 }
 
 #[test]
@@ -405,7 +452,7 @@ fn an_event_with_unknown_members_still_parses() {
     assert_eq!(envelope.parent_session_id, None);
     assert!(matches!(
         envelope.event,
-        CodingEvent::UserInput { text } if text == "fix the failing test"
+        CodingEvent::UserInput { text, .. } if text == "fix the failing test"
     ));
 }
 

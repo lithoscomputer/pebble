@@ -71,6 +71,15 @@ limits = { context_tokens = 200000, max_output_tokens = 32000 }
 profile = "anthropic"
 knowledge_cutoff = "May 2026"
 
+[providers.test.models.vision]
+display_name = "Test vision model"
+api_model = "vision"
+capabilities = { text = true, images = true, tools = true }
+limits = { context_tokens = 200000, max_output_tokens = 32000 }
+
+[providers.test.models.vision.metadata.pebble]
+profile = "anthropic"
+
 [providers.test.models.thinking]
 display_name = "Thinking model"
 api_model = "thinking"

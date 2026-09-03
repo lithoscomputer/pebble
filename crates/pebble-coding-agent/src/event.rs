@@ -782,6 +782,7 @@ mod tests {
 
     use super::*;
     use crate::error::{ErrorData, ErrorKind};
+    use crate::types::InputSource;
 
     /// Records every event it is handed, and can be told to fail once it has
     /// seen a given number of them.
@@ -883,12 +884,14 @@ mod tests {
         let mut receiver = emitter.subscribe();
 
         emitter.emit("ses_2", CodingEvent::UserInput {
-            text: "fix the failing test".into(),
+            text:    "fix the failing test".into(),
+            content: None,
+            source:  InputSource::Prompt,
         });
 
         let event = receiver.recv().await.unwrap();
         assert!(
-            matches!(&event.event, CodingEvent::UserInput { text } if text == "fix the failing test")
+            matches!(&event.event, CodingEvent::UserInput { text, .. } if text == "fix the failing test")
         );
     }
 
@@ -967,8 +970,16 @@ mod tests {
             ..EventOptions::default()
         });
 
-        emitter.emit("ses_1", CodingEvent::UserInput { text: "one".into() });
-        emitter.emit("ses_1", CodingEvent::UserInput { text: "two".into() });
+        emitter.emit("ses_1", CodingEvent::UserInput {
+            text:    "one".into(),
+            content: None,
+            source:  InputSource::Prompt,
+        });
+        emitter.emit("ses_1", CodingEvent::UserInput {
+            text:    "two".into(),
+            content: None,
+            source:  InputSource::Prompt,
+        });
         drop(emitter);
         pump.await.unwrap().unwrap();
 
@@ -995,7 +1006,9 @@ mod tests {
             tasks.push(tokio::spawn(async move {
                 for index in 0..EVENTS_PER_PRODUCER {
                     child.emit(format!("ses_child_{producer}"), CodingEvent::UserInput {
-                        text: format!("{producer}:{index}"),
+                        text:    format!("{producer}:{index}"),
+                        content: None,
+                        source:  InputSource::Prompt,
                     });
                     yield_now().await;
                 }
@@ -1028,7 +1041,7 @@ mod tests {
         let payloads: HashSet<_> = recorded
             .iter()
             .filter_map(|event| match &event.event {
-                CodingEvent::UserInput { text } => Some(text.as_str()),
+                CodingEvent::UserInput { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect();
@@ -1117,8 +1130,16 @@ mod tests {
         });
         let mut receiver = emitter.subscribe();
 
-        emitter.emit("ses_1", CodingEvent::UserInput { text: "one".into() });
-        emitter.emit("ses_1", CodingEvent::UserInput { text: "two".into() });
+        emitter.emit("ses_1", CodingEvent::UserInput {
+            text:    "one".into(),
+            content: None,
+            source:  InputSource::Prompt,
+        });
+        emitter.emit("ses_1", CodingEvent::UserInput {
+            text:    "two".into(),
+            content: None,
+            source:  InputSource::Prompt,
+        });
 
         let error = pump.await.unwrap().expect_err("the sink refused an event");
         assert_eq!(error.kind(), ErrorKind::EventStream);
@@ -1177,9 +1198,17 @@ mod tests {
             ..EventOptions::default()
         });
 
-        emitter.emit("ses_1", CodingEvent::UserInput { text: "one".into() });
+        emitter.emit("ses_1", CodingEvent::UserInput {
+            text:    "one".into(),
+            content: None,
+            source:  InputSource::Prompt,
+        });
         emitter.close().await.unwrap();
-        emitter.emit("ses_1", CodingEvent::UserInput { text: "two".into() });
+        emitter.emit("ses_1", CodingEvent::UserInput {
+            text:    "two".into(),
+            content: None,
+            source:  InputSource::Prompt,
+        });
 
         pump.await.unwrap().unwrap();
 
