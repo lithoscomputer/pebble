@@ -1546,6 +1546,8 @@ impl CodingRuntime {
             compaction_cancel.cancel();
         }
         let caller_link = cancel.map(|caller| link_cancellation(caller, &compaction_cancel));
+        let event_failure = self.emitter.failure_token();
+        let event_link = link_cancellation(&event_failure, &compaction_cancel);
         let operation = self.compaction.begin(&compaction_cancel);
         self.state.transition(CodingAgentState::Compacting);
         let request = CompactionRequest {
@@ -1567,6 +1569,7 @@ impl CodingRuntime {
         )
         .await;
         drop(operation);
+        event_link.stop().await;
         if let Some(link) = caller_link {
             link.stop().await;
         }
