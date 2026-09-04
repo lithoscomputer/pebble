@@ -1589,7 +1589,7 @@ impl CodingRuntime {
         cancel: Option<&CancellationToken>,
     ) -> Result<Option<String>> {
         let input = input.into();
-        self.conversation().totals = PromptTotals::default();
+        self.conversation().begin_prompt();
         if self.state.current() == CodingAgentState::Closed {
             return Err(Error::SessionClosed);
         }

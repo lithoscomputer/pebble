@@ -104,7 +104,7 @@ pub(super) struct CodingAgentBridge {
 /// One copy of coding history, shared by the runtime and the bridge: the
 /// runtime reads it for records, exports, and the public history, and the
 /// bridge writes it as the loop commits turns. The first four members outlive a
-/// prompt; the rest are reset by [`CodingAgentBridge::begin_prompt`].
+/// prompt; the rest are reset by [`ConversationState::begin_prompt`].
 pub(super) struct ConversationState {
     pub(super) history: History,
     /// Earliest canonical turn whose model-facing projection needs replacement.
@@ -147,6 +147,132 @@ impl ConversationState {
         }
     }
 
+    /// Resets prompt-local bookkeeping while retaining history and its
+    /// projection.
+    pub(super) fn begin_prompt(&mut self) {
+        self.totals = PromptTotals::default();
+        self.compaction_failed = false;
+        self.pending_task_reminder = None;
+        self.local_context_window = None;
+        self.inference_start = None;
+        self.tool_start = None;
+        self.boundary_error = None;
+        self.output_limit_continuations = 0;
+    }
+
+    fn begin_inference(&mut self, local: ContextWindowSnapshot) {
+        self.local_context_window = Some(local);
+        self.inference_start = Some(Instant::now());
+    }
+
+    fn finish_inference(&mut self) {
+        if let Some(started) = self.inference_start.take() {
+            self.totals.timing.inference = self
+                .totals
+                .timing
+                .inference
+                .saturating_add(started.elapsed());
+        }
+    }
+
+    fn begin_tools(&mut self) {
+        self.tool_start.get_or_insert_with(Instant::now);
+    }
+
+    fn finish_tools(&mut self, calls: &[ToolCall], results: &[ToolResult]) {
+        if let Some(started) = self.tool_start.take() {
+            self.totals.timing.tool = self.totals.timing.tool.saturating_add(started.elapsed());
+        }
+        if activated_a_skill(calls, results) {
+            self.activated_skill_context_observed = true;
+        }
+        self.file_tracker.record_from_tool_calls(calls, results);
+        self.push(Message::ToolResults {
+            results:   results.to_vec(),
+            timestamp: SystemTime::now(),
+        });
+    }
+
+    fn interrupt_round(&mut self) {
+        self.finish_inference();
+        self.pending_task_reminder = None;
+    }
+
+    fn continue_after_output_limit(&mut self) -> bool {
+        if self.output_limit_continuations >= MAX_OUTPUT_LIMIT_CONTINUATIONS {
+            return false;
+        }
+        self.output_limit_continuations += 1;
+        true
+    }
+
+    fn record_response_usage(
+        &mut self,
+        usage: TokenUsage,
+        cost: Option<u64>,
+    ) -> Option<ContextWindowSnapshot> {
+        let context_window = self
+            .local_context_window
+            .take()
+            .map(|local| context_window_from_response_usage(&local, usage));
+        if let Some(context_window) = &context_window {
+            let mut stored = context_window.clone();
+            stored.staleness = ContextWindowStaleness::Stored;
+            self.context_window = Some(stored);
+        }
+        self.totals.usage = self.totals.usage.saturating_add(usage);
+        if let Some(cost) = cost {
+            self.totals.cost_usd_micros = Some(
+                self.totals
+                    .cost_usd_micros
+                    .unwrap_or(0)
+                    .saturating_add(cost),
+            );
+        }
+        context_window
+    }
+
+    fn push_assistant(&mut self, message: Message) {
+        if let Some(reminder) = self.pending_task_reminder.take() {
+            self.push(reminder);
+        }
+        self.push(message);
+    }
+
+    fn stage_task_reminder(&mut self, tools: &agent::ToolCatalog) {
+        let names = tools
+            .visible_tools()
+            .map(|tool| tool.definition().name.as_str())
+            .collect::<Vec<_>>();
+        self.pending_task_reminder =
+            maybe_task_reminder(&self.history, &names).map(|content| Message::System {
+                content,
+                timestamp: SystemTime::now(),
+            });
+    }
+
+    fn conversation_update(&self, include_reminder: bool) -> agent::ConversationUpdate {
+        let has_reminder = include_reminder && self.pending_task_reminder.is_some();
+        let mut start = self.dirty_from;
+        if self.projected_reminder || has_reminder {
+            let end = self.history.len();
+            start = Some(start.map_or(end, |dirty| dirty.min(end)));
+        }
+        let Some(start) = start else {
+            return agent::ConversationUpdate::unchanged();
+        };
+        let mut messages = self.history.turns()[start..]
+            .iter()
+            .map(Message::to_llm_message)
+            .collect::<Vec<_>>();
+        if has_reminder && let Some(reminder) = &self.pending_task_reminder {
+            messages.push(reminder.to_llm_message());
+        }
+        // Clear dirtiness only when the generic loop acknowledges applying
+        // this update. Cancellation may discard a prepared lifecycle result.
+        agent::ConversationUpdate::replace_tail(start, messages)
+    }
+
     fn push(&mut self, message: Message) {
         let start = self.history.len();
         self.dirty_from = Some(self.dirty_from.map_or(start, |dirty| dirty.min(start)));
@@ -156,6 +282,10 @@ impl ConversationState {
     pub(super) fn replace_history(&mut self, history: History) {
         self.history = history;
         self.dirty_from = Some(0);
+    }
+
+    fn acknowledge_projection(&mut self, messages: &[LlmMessage]) {
+        self.projected(messages.len() > self.history.len());
     }
 
     fn projected(&mut self, has_reminder: bool) {
@@ -211,15 +341,6 @@ impl CodingAgentBridge {
             .prompt_cancel
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = prompt_cancel;
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.totals = PromptTotals::default();
-        state.compaction_failed = false;
-        state.pending_task_reminder = None;
-        state.local_context_window = None;
-        state.inference_start = None;
-        state.tool_start = None;
-        state.boundary_error = None;
-        state.output_limit_continuations = 0;
     }
 
     /// Asks the model to finish an answer its output limit cut short.
@@ -229,14 +350,11 @@ impl CodingAgentBridge {
     /// the first [`MAX_OUTPUT_LIMIT_CONTINUATIONS`] in a prompt earn a
     /// continuation, and after that the answer stands as it is.
     fn continue_after_output_limit(&self) -> Option<agent::UserMessage> {
-        let continued = {
-            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-            let continued = state.output_limit_continuations < MAX_OUTPUT_LIMIT_CONTINUATIONS;
-            if continued {
-                state.output_limit_continuations += 1;
-            }
-            continued
-        };
+        let continued = self
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .continue_after_output_limit();
         self.emit(CodingEvent::Warning {
             kind:    OUTPUT_LIMIT_WARNING.to_owned(),
             message: if continued {
@@ -294,14 +412,10 @@ impl CodingAgentBridge {
     }
 
     pub(super) fn finish_inference(&self) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(started) = state.inference_start.take() {
-            state.totals.timing.inference = state
-                .totals
-                .timing
-                .inference
-                .saturating_add(started.elapsed());
-        }
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .finish_inference();
     }
 
     async fn compact_if_needed(&self) -> bool {
@@ -383,39 +497,17 @@ impl CodingAgentBridge {
     }
 
     fn stage_task_reminder(&self, tools: &agent::ToolCatalog) {
-        let names = tools
-            .visible_tools()
-            .map(|tool| tool.definition().name.as_str())
-            .collect::<Vec<_>>();
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.pending_task_reminder =
-            maybe_task_reminder(&state.history, &names).map(|content| Message::System {
-                content,
-                timestamp: SystemTime::now(),
-            });
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .stage_task_reminder(tools);
     }
 
     fn conversation_update(&self, include_reminder: bool) -> agent::ConversationUpdate {
-        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let has_reminder = include_reminder && state.pending_task_reminder.is_some();
-        let mut start = state.dirty_from;
-        if state.projected_reminder || has_reminder {
-            let end = state.history.len();
-            start = Some(start.map_or(end, |dirty| dirty.min(end)));
-        }
-        let Some(start) = start else {
-            return agent::ConversationUpdate::unchanged();
-        };
-        let mut messages = state.history.turns()[start..]
-            .iter()
-            .map(Message::to_llm_message)
-            .collect::<Vec<_>>();
-        if has_reminder && let Some(reminder) = &state.pending_task_reminder {
-            messages.push(reminder.to_llm_message());
-        }
-        // Clear dirtiness only when the generic loop acknowledges applying
-        // this update. Cancellation may discard a prepared lifecycle result.
-        agent::ConversationUpdate::replace_tail(start, messages)
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .conversation_update(include_reminder)
     }
 
     fn commit_user_message(&self, message: &LlmMessage, attribution: Option<&Value>) {
@@ -461,30 +553,9 @@ impl CodingAgentBridge {
         let provider_parts = provider_parts_of(response);
         let usage = TokenUsage::from(response.usage);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let context_window = state
-            .local_context_window
-            .take()
-            .map(|local| context_window_from_response_usage(&local, usage));
-        if let Some(context_window) = &context_window {
-            let mut stored = context_window.clone();
-            stored.staleness = ContextWindowStaleness::Stored;
-            state.context_window = Some(stored);
-        }
-
-        state.totals.usage = state.totals.usage.saturating_add(usage);
-        if let Some(cost) = response.cost {
-            state.totals.cost_usd_micros = Some(
-                state
-                    .totals
-                    .cost_usd_micros
-                    .unwrap_or(0)
-                    .saturating_add(cost.usd_micros),
-            );
-        }
-        if let Some(reminder) = state.pending_task_reminder.take() {
-            state.push(reminder);
-        }
-        state.push(Message::Assistant {
+        let context_window =
+            state.record_response_usage(usage, response.cost.map(|cost| cost.usd_micros));
+        state.push_assistant(Message::Assistant {
             content: text.clone(),
             tool_calls: tool_calls.clone(),
             provider_parts,
@@ -525,17 +596,7 @@ impl CodingAgentBridge {
     fn commit_tool_results(&self, calls: &[ToolCall], results: &[ToolResult], cancelled: bool) {
         self.state_machine.transition(CodingAgentState::Thinking);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(started) = state.tool_start.take() {
-            state.totals.timing.tool = state.totals.timing.tool.saturating_add(started.elapsed());
-        }
-        if activated_a_skill(calls, results) {
-            state.activated_skill_context_observed = true;
-        }
-        state.file_tracker.record_from_tool_calls(calls, results);
-        state.push(Message::ToolResults {
-            results:   results.to_vec(),
-            timestamp: SystemTime::now(),
-        });
+        state.finish_tools(calls, results);
 
         if cancelled || self.prompt_cancel().is_cancelled() {
             return;
@@ -581,8 +642,7 @@ impl agent::EventProjection for CodingAgentBridge {
             agent::AgentEvent::ModelRequestStarted { request, .. } => {
                 let local = self.measure_request(request);
                 let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-                state.local_context_window = Some(local);
-                state.inference_start = Some(Instant::now());
+                state.begin_inference(local);
                 drop(state);
                 self.emit(CodingEvent::LlmRequestStarted {
                     requested_model: self.model.clone(),
@@ -633,8 +693,7 @@ impl agent::EventProjection for CodingAgentBridge {
                 self.state
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .tool_start
-                    .get_or_insert_with(Instant::now);
+                    .begin_tools();
                 self.tools.emit_started(call);
             }
             agent::AgentEvent::ToolCompleted {
@@ -645,11 +704,10 @@ impl agent::EventProjection for CodingAgentBridge {
                 self.tools.emit_result(result, *output_stats, *error_kind);
             }
             agent::AgentEvent::TurnInterrupted { generation } => {
-                self.finish_inference();
                 self.state
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .pending_task_reminder = None;
+                    .interrupt_round();
                 self.emit(CodingEvent::RoundInterrupted {
                     generation: *generation,
                 });
@@ -767,8 +825,7 @@ impl agent::AgentLifecycle for CodingAgentBridge {
 impl agent::ConversationProjection for CodingAgentBridge {
     fn conversation_replaced(&self, messages: &[LlmMessage]) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let has_reminder = messages.len() > state.history.len();
-        state.projected(has_reminder);
+        state.acknowledge_projection(messages);
     }
 
     fn user_message_committed(&self, message: &LlmMessage, attribution: Option<&Value>) {
