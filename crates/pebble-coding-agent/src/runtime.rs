@@ -64,16 +64,15 @@ use crate::subagent::{
     SubagentOptions, SubagentSupervisor,
 };
 use crate::tool::{
-    NativeTool, RegisteredTool, StaticEnvProvider, ToolDefinitionWithSource, ToolEnvProvider,
-    ToolRegistry,
+    NativeTool, PermissionLevelPolicy, PermissionMiddleware, RegisteredTool, StaticEnvProvider,
+    ToolDefinitionWithSource, ToolEnvProvider, ToolRegistry,
 };
 use crate::tools::skill::make_use_skill_tool_for_vocabulary;
 use crate::tools::{WebFetchSummarizer, make_question_tool, make_web_search_tool};
-#[cfg(test)]
-use crate::types::PermissionLevel;
 use crate::types::{
     AgentProfileKind, CodingAgentEvent, CodingAgentState, CodingEvent, ContextWindowSnapshot,
-    MemoryFileSummary, Message, SkillSummary, TokenUsage, ToolSummary, rfc3339_millis,
+    MemoryFileSummary, Message, PermissionLevel, SkillSummary, TokenUsage, ToolSummary,
+    rfc3339_millis,
 };
 
 /// The catalog metadata namespace pebble reads.
@@ -144,6 +143,7 @@ pub(crate) struct CodingRuntimeBuilder {
     web_fetch_summarizer: Option<String>,
     search_provider:      Option<Arc<dyn SearchProvider>>,
     options:              CodingAgentOptions,
+    permission_level:     Option<PermissionLevel>,
     events:               EventOptions,
     profile:              Option<Arc<dyn AgentProfile>>,
     prompt_transform:     Option<Arc<dyn SystemPromptTransform>>,
@@ -168,6 +168,7 @@ impl CodingRuntimeBuilder {
             web_fetch_summarizer: None,
             search_provider: None,
             options: CodingAgentOptions::default(),
+            permission_level: None,
             events: EventOptions::default(),
             profile: None,
             prompt_transform: None,
@@ -220,6 +221,12 @@ impl CodingRuntimeBuilder {
     /// the name that model expects.
     pub(crate) fn tools(mut self, tools: impl IntoIterator<Item = RegisteredTool>) -> Self {
         self.tools.extend(tools);
+        self
+    }
+
+    /// Selects the built-in policy and records its level at build time.
+    pub(crate) fn permission_level(mut self, level: PermissionLevel) -> Self {
+        self.permission_level = Some(level);
         self
     }
 
@@ -385,10 +392,17 @@ impl CodingRuntimeBuilder {
     }
 
     fn build_with_id(
-        self,
+        mut self,
         id: String,
         created_at: SystemTime,
     ) -> StdResult<CodingRuntime, CodingAgentBuildError> {
+        if let Some(level) = self.permission_level {
+            self.options.permission_level = Some(level);
+            self.tool_middleware
+                .push(Arc::new(PermissionMiddleware::new(Arc::new(
+                    PermissionLevelPolicy::new(level),
+                ))));
+        }
         self.options
             .validate()
             .map_err(|source| CodingAgentBuildError::InvalidOptions { source })?;

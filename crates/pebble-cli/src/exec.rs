@@ -17,7 +17,7 @@ use lithos_llm::middleware::{RetryMiddleware, RetryPolicy};
 use pebble_coding_agent::environment::LocalEnvironment;
 use pebble_coding_agent::events::RetryEventObserver;
 use pebble_coding_agent::subagents::SubagentOptions;
-use pebble_coding_agent::tools::{PermissionLevel, PermissionLevelPolicy, PermissionMiddleware};
+use pebble_coding_agent::tools::PermissionLevel;
 use pebble_coding_agent::{
     CodingAgent, CodingAgentOptions, Error as AgentError, InterruptReason, PromptOutcome,
     ShutdownReason,
@@ -136,21 +136,18 @@ async fn exec(args: ExecArgs, style: Style) -> Result<Ending> {
         .await
         .with_context(|| format!("preparing the working directory {}", args.cwd.display()))?;
 
-    let mut options = CodingAgentOptions::default()
-        .with_permission_level(level)
-        .with_turn_replay(replay);
+    let mut options = CodingAgentOptions::default().with_turn_replay(replay);
     if let Some(timeout) = args.timeout {
         options = options.with_wall_clock_timeout(timeout);
     }
     if let Some(instructions) = args.instructions {
         options = options.with_user_instructions(instructions);
     }
-    let permissions = PermissionMiddleware::new(Arc::new(PermissionLevelPolicy::new(level)));
 
     let mut builder = CodingAgent::builder(client, Arc::new(environment))
         .model(&args.model)
         .options(options)
-        .tool_middleware(Arc::new(permissions));
+        .permission_level(level);
     if args.subagents {
         builder = builder.subagents(SubagentOptions::enabled());
     }

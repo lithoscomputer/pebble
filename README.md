@@ -238,29 +238,17 @@ The call check sees the validated arguments. Several permission layers compose
 by narrowing access.
 
 ```rust
-# use std::sync::Arc;
-# use pebble_coding_agent::{CodingAgentBuilder, CodingAgentOptions};
-use pebble_coding_agent::tools::{
-    PermissionLevel, PermissionLevelPolicy, PermissionMiddleware,
-};
+# use pebble_coding_agent::CodingAgentBuilder;
+use pebble_coding_agent::tools::PermissionLevel;
 
 # fn configure(builder: CodingAgentBuilder) -> CodingAgentBuilder {
-let level = PermissionLevel::ReadWrite;
-let permissions = PermissionMiddleware::new(Arc::new(
-    PermissionLevelPolicy::new(level),
-));
-
-builder
-    .options(CodingAgentOptions::default().with_permission_level(level))
-    .tool_middleware(Arc::new(permissions))
+builder.permission_level(PermissionLevel::ReadWrite)
 # }
 ```
 
-`CodingAgentOptions::with_permission_level` records the selected value in the
-session. The middleware enforces it. Add a `ToolApprovalService` with
-`PermissionMiddleware::with_approval` when calls that are not auto-approved
-should remain visible and ask for approval. Without an approval service, those
-tools are hidden and direct attempts are denied.
+`CodingAgentBuilder::permission_level` installs the built-in permission policy and records its level together. The last call selects the level, regardless of where `.options(...)` appears. Subagents inherit the policy.
+
+For a custom policy or approval flow, install `PermissionMiddleware` directly. `CodingAgentOptions::with_recorded_permission_level` records metadata only; it does not enforce permissions. Add a `ToolApprovalService` with `PermissionMiddleware::with_approval` when calls that are not auto-approved should remain visible and ask for approval. Without an approval service, those tools are hidden and direct attempts are denied.
 
 Optional seams follow the same rule. Pebble ships no implementation and
 advertises no tool without one: an `extensions::HumanInputProvider` (no

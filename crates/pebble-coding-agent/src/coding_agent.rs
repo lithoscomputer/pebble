@@ -34,7 +34,8 @@ use crate::subagent::SubagentOptions;
 use crate::tool::{RegisteredTool, ToolEnvProvider};
 use crate::types::{
     Actor, AgentProfileKind, CodingAgentEvent, CodingAgentState, ContextWindowSnapshot,
-    InputContent, InputSource, MemoryFileSummary, Message, SkillSummary, TokenUsage, ToolSummary,
+    InputContent, InputSource, MemoryFileSummary, Message, PermissionLevel, SkillSummary,
+    TokenUsage, ToolSummary,
 };
 
 /// Why a coding agent is being shut down.
@@ -436,6 +437,19 @@ impl CodingAgentBuilder {
     /// Adds tools on top of the selected coding profile.
     pub fn tools(mut self, tools: impl IntoIterator<Item = RegisteredTool>) -> Self {
         self.inner = self.inner.tools(tools);
+        self
+    }
+
+    /// Installs the built-in permission policy and records its level together.
+    ///
+    /// The last call selects the level, regardless of where `options` is set.
+    /// The policy runs inside application middleware and is inherited by
+    /// subagents. Calls requiring approval are hidden and denied. To request
+    /// approval or use a custom policy, install
+    /// [`PermissionMiddleware`](crate::tools::PermissionMiddleware) through
+    /// [`tool_middleware`](Self::tool_middleware) instead.
+    pub fn permission_level(mut self, level: PermissionLevel) -> Self {
+        self.inner = self.inner.permission_level(level);
         self
     }
 
@@ -1566,6 +1580,57 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn permission_level_records_and_enforces_the_last_selection() {
+        for level in [PermissionLevel::ReadOnly, PermissionLevel::ReadWrite] {
+            let (client, provider) = scripted_client(vec![
+                ScriptedCall::response(tool_call_response(
+                    "write_file",
+                    "write",
+                    json!({"file_path": "/home/test/new.txt", "content": "hello"}),
+                )),
+                ScriptedCall::response(text_response("done")),
+            ]);
+            let environment = Arc::new(MockEnvironment::linux());
+            let mut agent = CodingAgent::builder(client, environment.clone())
+                .model("test/model")
+                .permission_level(PermissionLevel::ReadOnly)
+                .permission_level(level)
+                .options(
+                    CodingAgentOptions::default()
+                        .with_recorded_permission_level(PermissionLevel::Full),
+                )
+                .build()
+                .await
+                .expect("builds");
+            assert_eq!(agent.inner.permission_level(), Some(level));
+            agent.prompt("write the file").await.expect("answers");
+            let allowed = level == PermissionLevel::ReadWrite;
+            assert_eq!(
+                provider.requests()[0]
+                    .tools()
+                    .iter()
+                    .any(|tool| tool.name == "write_file"),
+                allowed
+            );
+            assert_eq!(
+                !environment
+                    .written_files
+                    .lock()
+                    .expect("healthy lock")
+                    .is_empty(),
+                allowed
+            );
+            assert!(agent.history().turns().iter().any(|turn| matches!(turn,
+                Message::ToolResults { results, .. } if results.iter().any(|result| result.tool_call_id == "write" && result.is_error != allowed)
+            )));
+            agent
+                .shutdown(ShutdownReason::Completed)
+                .await
+                .expect("shutdown");
+        }
     }
 
     #[tokio::test]

@@ -363,9 +363,12 @@ impl CodingAgentOptions {
     }
 
     /// Records the permission level the session started under, for an
-    /// application that builds its policy from pebble's table.
+    /// application that builds its policy from pebble's table. This only
+    /// records metadata. Use
+    /// [`CodingAgentBuilder::permission_level`](crate::CodingAgentBuilder::permission_level)
+    /// to install enforcement and record its level together.
     #[must_use]
-    pub const fn with_permission_level(mut self, level: PermissionLevel) -> Self {
+    pub const fn with_recorded_permission_level(mut self, level: PermissionLevel) -> Self {
         self.permission_level = Some(level);
         self
     }
