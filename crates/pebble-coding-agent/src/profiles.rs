@@ -45,8 +45,10 @@ use crate::tools::{
 pub(crate) mod anthropic;
 pub(crate) mod claude5;
 pub(crate) mod claude5_tools;
+mod codex_tools;
 pub(crate) mod gemini;
 pub(crate) mod gpt56;
+pub(crate) mod gpt6;
 pub(crate) mod kimi;
 pub(crate) mod kimi_tools;
 pub(crate) mod openai;
@@ -54,6 +56,7 @@ pub(crate) mod openai;
 pub(crate) use self::anthropic::AnthropicProfile;
 pub(crate) use self::claude5::Claude5Profile;
 pub(crate) use self::gemini::GeminiProfile;
+pub(crate) use self::gpt6::Gpt6Profile;
 pub(crate) use self::gpt56::Gpt56Profile;
 pub(crate) use self::kimi::KimiProfile;
 pub(crate) use self::openai::OpenAiProfile;
@@ -142,8 +145,8 @@ impl FileEditToolKind {
     /// What the model calls this editor.
     ///
     /// A template input as well as a tool name: `openai.md.j2` and
-    /// `gpt56.md.j2` both compare it against a string literal, so these two
-    /// spellings are part of the prompt contract.
+    /// `gpt56.md.j2` and `gpt6.md.j2` compare it against a string literal, so
+    /// these two spellings are part of the prompt contract.
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::ApplyPatch => "apply_patch",
@@ -641,11 +644,12 @@ pub(crate) mod tests {
         const KIMI_EDIT_MARKER: &str = "DO NOT call Edit from memory";
 
         let kimi: Arc<dyn AgentProfile> = Arc::new(KimiProfile::new(&ProfileDeps::default()));
-        let others: [Arc<dyn AgentProfile>; 5] = [
+        let others: [Arc<dyn AgentProfile>; 6] = [
             Arc::new(AnthropicProfile::new(&ProfileDeps::default())),
             Arc::new(Claude5Profile::new(&ProfileDeps::default())),
             Arc::new(GeminiProfile::new(&ProfileDeps::default())),
             Arc::new(Gpt56Profile::new(&ProfileDeps::default())),
+            Arc::new(Gpt6Profile::new(&ProfileDeps::default())),
             Arc::new(OpenAiProfile::new(&ProfileDeps::default())),
         ];
 

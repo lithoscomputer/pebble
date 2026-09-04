@@ -180,9 +180,10 @@ impl NativeToolOptions {
         let default_command_timeout_ms = match profile_kind {
             AgentProfileKind::Anthropic | AgentProfileKind::Claude5 => 120_000,
             AgentProfileKind::Kimi => 60_000,
-            AgentProfileKind::OpenAi | AgentProfileKind::Gemini | AgentProfileKind::Gpt56 => {
-                defaults.default_command_timeout_ms
-            }
+            AgentProfileKind::OpenAi
+            | AgentProfileKind::Gemini
+            | AgentProfileKind::Gpt56
+            | AgentProfileKind::Gpt6 => defaults.default_command_timeout_ms,
         };
         Self {
             default_command_timeout_ms,
@@ -669,6 +670,7 @@ mod tests {
         let openai = NativeToolOptions::for_profile(AgentProfileKind::OpenAi);
         let gemini = NativeToolOptions::for_profile(AgentProfileKind::Gemini);
         let gpt56 = NativeToolOptions::for_profile(AgentProfileKind::Gpt56);
+        let gpt6 = NativeToolOptions::for_profile(AgentProfileKind::Gpt6);
         let anthropic = NativeToolOptions::for_profile(AgentProfileKind::Anthropic);
         let claude5 = NativeToolOptions::for_profile(AgentProfileKind::Claude5);
         let kimi = NativeToolOptions::for_profile(AgentProfileKind::Kimi);
@@ -676,10 +678,11 @@ mod tests {
         assert_eq!(openai.default_command_timeout_ms, 10_000);
         assert_eq!(gemini.default_command_timeout_ms, 10_000);
         assert_eq!(gpt56.default_command_timeout_ms, 10_000);
+        assert_eq!(gpt6.default_command_timeout_ms, 10_000);
         assert_eq!(anthropic.default_command_timeout_ms, 120_000);
         assert_eq!(claude5.default_command_timeout_ms, 120_000);
         assert_eq!(kimi.default_command_timeout_ms, 60_000);
-        for options in [openai, gemini, gpt56, anthropic, claude5, kimi] {
+        for options in [openai, gemini, gpt56, gpt6, anthropic, claude5, kimi] {
             assert_eq!(options.max_command_timeout_ms, 600_000);
         }
     }

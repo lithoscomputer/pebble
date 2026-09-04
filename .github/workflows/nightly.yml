@@ -32,10 +32,33 @@ jobs:
           persist-credentials: false
 
       - name: Install locked tools
+        id: install_mise
         uses: jdx/mise-action@dad1bfd3df957f44999b559dd69dc1671cb4e9ea # v4.2.1
         with:
           version: 2026.6.11
           install_args: --locked --jobs=1
+
+      # mise-action caches Mise's Rust symlinks, but not the Rustup toolchains
+      # behind them. Refresh Rust so its configured components are present.
+      - name: Refresh cached Rust toolchains
+        if: steps.install_mise.outputs.cache-hit == 'true'
+        run: mise install --locked --force --jobs=1 rust
+
+      - name: Configure lithos-llm access
+        env:
+          LITHOS_LLM_DEPLOY_KEY: ${{ secrets.LITHOS_LLM_DEPLOY_KEY }}
+        run: |
+          install -d -m 700 "$RUNNER_TEMP/pebble-ci-ssh"
+          curl --fail --silent --show-error https://api.github.com/meta |
+            jq -r '.ssh_keys[] | "github.com " + .' \
+              > "$RUNNER_TEMP/pebble-ci-ssh/known_hosts"
+          eval "$(ssh-agent -s)"
+          ssh-add - <<< "$LITHOS_LLM_DEPLOY_KEY"
+          {
+            echo "SSH_AUTH_SOCK=$SSH_AUTH_SOCK"
+            echo "SSH_AGENT_PID=$SSH_AGENT_PID"
+            echo "GIT_SSH_COMMAND=ssh -o BatchMode=yes -o UserKnownHostsFile=$RUNNER_TEMP/pebble-ci-ssh/known_hosts -o StrictHostKeyChecking=yes"
+          } >> "$GITHUB_ENV"
 
       - name: Restore Rust build cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1

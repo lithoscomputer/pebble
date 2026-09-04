@@ -51,8 +51,10 @@ const ROOT_SESSION_REQUIRED_ERROR: &str =
 #[must_use]
 pub fn make_question_tool(profile: AgentProfileKind) -> Option<RegisteredTool> {
     match profile {
-        // Codex names this tool `request_user_input` for GPT-5.6 too.
-        AgentProfileKind::OpenAi | AgentProfileKind::Gpt56 => Some(make_openai_question_tool()),
+        // Codex names this tool `request_user_input` for GPT-5.6 and GPT-6.
+        AgentProfileKind::OpenAi | AgentProfileKind::Gpt56 | AgentProfileKind::Gpt6 => {
+            Some(make_openai_question_tool())
+        }
         // Kimi Code names it `AskUserQuestion` with the same question and
         // option shape, so the Anthropic tool is the match.
         AgentProfileKind::Anthropic | AgentProfileKind::Kimi => {
@@ -851,6 +853,10 @@ mod tests {
         let gpt56 = registered(AgentProfileKind::Gpt56, ToolVocabulary::Codex);
         assert!(gpt56.get("request_user_input").is_some());
         assert!(gpt56.get("AskUserQuestion").is_none());
+
+        let gpt6 = registered(AgentProfileKind::Gpt6, ToolVocabulary::Codex);
+        assert!(gpt6.get("request_user_input").is_some());
+        assert!(gpt6.get("AskUserQuestion").is_none());
 
         let anthropic = registered(AgentProfileKind::Anthropic, ToolVocabulary::Canonical);
         assert!(anthropic.get("AskUserQuestion").is_some());
