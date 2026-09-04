@@ -19,7 +19,8 @@ use super::retry::RetryEventBridge;
 use super::{CodingRuntime, PromptTotals, StateMachine};
 use crate::coding_agent::CodingInput;
 use crate::compaction::{
-    CompactionControl, CompactionReason, CompactionRequest, check_context_usage, compact_context,
+    CompactionControl, CompactionOutcome, CompactionReason, CompactionRequest, check_context_usage,
+    compact_context,
 };
 use crate::config::CodingAgentOptions;
 use crate::context_window::{
@@ -96,12 +97,20 @@ pub(super) struct CodingAgentBridge {
 
 /// The conversation and what one prompt accumulates around it.
 ///
-/// One copy, shared by the runtime and the bridge: the runtime reads it for
-/// records, exports, and the public history, and the bridge writes it as the
-/// loop commits turns. The first four members outlive a prompt; the rest are
-/// reset by [`CodingAgentBridge::begin_prompt`].
+/// The authoritative coding history is shared by the runtime and the bridge.
+/// The generic loop holds a derived model-facing view, updated from the first
+/// changed turn and rebuilt in full only when history is replaced.
+///
+/// One copy of coding history, shared by the runtime and the bridge: the
+/// runtime reads it for records, exports, and the public history, and the
+/// bridge writes it as the loop commits turns. The first four members outlive a
+/// prompt; the rest are reset by [`CodingAgentBridge::begin_prompt`].
 pub(super) struct ConversationState {
     pub(super) history: History,
+    /// Earliest canonical turn whose model-facing projection needs replacement.
+    dirty_from: Option<usize>,
+    /// Whether the last applied projection includes a transient task reminder.
+    projected_reminder: bool,
     pub(super) file_tracker: FileTracker,
     pub(super) totals: PromptTotals,
     pub(super) activated_skill_context_observed: bool,
@@ -122,6 +131,8 @@ impl ConversationState {
     pub(super) fn new(history: History) -> Self {
         Self {
             history,
+            dirty_from: None,
+            projected_reminder: false,
             file_tracker: FileTracker::default(),
             totals: PromptTotals::default(),
             activated_skill_context_observed: false,
@@ -134,6 +145,22 @@ impl ConversationState {
             boundary_error: None,
             output_limit_continuations: 0,
         }
+    }
+
+    fn push(&mut self, message: Message) {
+        let start = self.history.len();
+        self.dirty_from = Some(self.dirty_from.map_or(start, |dirty| dirty.min(start)));
+        self.history.push(message);
+    }
+
+    pub(super) fn replace_history(&mut self, history: History) {
+        self.history = history;
+        self.dirty_from = Some(0);
+    }
+
+    fn projected(&mut self, has_reminder: bool) {
+        self.dirty_from = None;
+        self.projected_reminder = has_reminder;
     }
 }
 
@@ -311,7 +338,7 @@ impl CodingAgentBridge {
             instructions: None,
             cancel: operation.token(),
         };
-        if let Err(error) = compact_context(
+        let result = compact_context(
             &mut history,
             &self.client,
             &file_tracker,
@@ -319,19 +346,24 @@ impl CodingAgentBridge {
             &self.emitter,
             &self.session_id,
         )
-        .await
-        {
-            if !matches!(error, Error::Interrupted(InterruptReason::Cancelled)) {
-                self.emit(CodingEvent::Error {
-                    error: ErrorData::from(&error),
-                });
+        .await;
+        match result {
+            Ok(CompactionOutcome::Compacted(_)) => {
+                self.state
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .replace_history(history);
             }
-            return true;
+            Ok(CompactionOutcome::Unchanged) => {}
+            Err(error) => {
+                if !matches!(error, Error::Interrupted(InterruptReason::Cancelled)) {
+                    self.emit(CodingEvent::Error {
+                        error: ErrorData::from(&error),
+                    });
+                }
+                return true;
+            }
         }
-        self.state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .history = history;
         false
     }
 
@@ -365,11 +397,25 @@ impl CodingAgentBridge {
 
     fn conversation_update(&self, include_reminder: bool) -> agent::ConversationUpdate {
         let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut messages = state.history.to_llm_messages();
-        if include_reminder && let Some(reminder) = &state.pending_task_reminder {
+        let has_reminder = include_reminder && state.pending_task_reminder.is_some();
+        let mut start = state.dirty_from;
+        if state.projected_reminder || has_reminder {
+            let end = state.history.len();
+            start = Some(start.map_or(end, |dirty| dirty.min(end)));
+        }
+        let Some(start) = start else {
+            return agent::ConversationUpdate::unchanged();
+        };
+        let mut messages = state.history.turns()[start..]
+            .iter()
+            .map(Message::to_llm_message)
+            .collect::<Vec<_>>();
+        if has_reminder && let Some(reminder) = &state.pending_task_reminder {
             messages.push(reminder.to_llm_message());
         }
-        agent::ConversationUpdate::replace(messages)
+        // Clear dirtiness only when the generic loop acknowledges applying
+        // this update. Cancellation may discard a prepared lifecycle result.
+        agent::ConversationUpdate::replace_tail(start, messages)
     }
 
     fn commit_user_message(&self, message: &LlmMessage, attribution: Option<&Value>) {
@@ -378,7 +424,7 @@ impl CodingAgentBridge {
         let source = input_source_from_attribution(attribution).unwrap_or(InputSource::Agent);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.compaction_failed = false;
-        state.history.push(Message::User {
+        state.push(Message::User {
             content:   content.clone(),
             timestamp: SystemTime::now(),
         });
@@ -395,7 +441,7 @@ impl CodingAgentBridge {
         let text = content.text_content().to_owned();
         let actor = actor_from_attribution(attribution);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.history.push(Message::Steering {
+        state.push(Message::Steering {
             content:   content.clone(),
             timestamp: SystemTime::now(),
         });
@@ -436,9 +482,9 @@ impl CodingAgentBridge {
             );
         }
         if let Some(reminder) = state.pending_task_reminder.take() {
-            state.history.push(reminder);
+            state.push(reminder);
         }
-        state.history.push(Message::Assistant {
+        state.push(Message::Assistant {
             content: text.clone(),
             tool_calls: tool_calls.clone(),
             provider_parts,
@@ -486,7 +532,7 @@ impl CodingAgentBridge {
             state.activated_skill_context_observed = true;
         }
         state.file_tracker.record_from_tool_calls(calls, results);
-        state.history.push(Message::ToolResults {
+        state.push(Message::ToolResults {
             results:   results.to_vec(),
             timestamp: SystemTime::now(),
         });
@@ -497,7 +543,7 @@ impl CodingAgentBridge {
         let loop_detected = self.config.enable_loop_detection
             && detect_loop(&state.history, self.config.loop_detection_window);
         if loop_detected {
-            state.history.push(Message::Steering {
+            state.push(Message::Steering {
                 content:   LOOP_WARNING.into(),
                 timestamp: SystemTime::now(),
             });
@@ -719,6 +765,12 @@ impl agent::AgentLifecycle for CodingAgentBridge {
 }
 
 impl agent::ConversationProjection for CodingAgentBridge {
+    fn conversation_replaced(&self, messages: &[LlmMessage]) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        let has_reminder = messages.len() > state.history.len();
+        state.projected(has_reminder);
+    }
+
     fn user_message_committed(&self, message: &LlmMessage, attribution: Option<&Value>) {
         self.commit_user_message(message, attribution);
     }
@@ -881,6 +933,11 @@ impl CodingRuntime {
         }
         let agent = builder.build().map_err(Error::AgentBuild)?;
 
+        bridge
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .projected(false);
         self.coding_bridge = Some(bridge);
         self.coding_agent = Some(agent);
         Ok(())
@@ -966,6 +1023,68 @@ mod tests {
     use lithos_llm::types::ReasoningContent;
 
     use super::*;
+
+    #[tokio::test]
+    async fn projection_updates_only_the_changed_tail_and_waits_for_acknowledgement() {
+        use agent::ConversationProjection as _;
+        use lithos_llm::types::Role;
+
+        let (client, _) = crate::test_support::scripted_client(vec![]);
+        let mut runtime = crate::runtime::testing::builder(client)
+            .build()
+            .expect("builds");
+        let bridge = CodingAgentBridge::from_runtime(&runtime);
+        let old = LlmMessage::text(Role::User, "old");
+        bridge.commit_user_message(&old, None);
+        bridge.conversation_replaced(std::slice::from_ref(&old));
+        assert_eq!(
+            bridge.conversation_update(false),
+            agent::ConversationUpdate::unchanged()
+        );
+
+        let new = LlmMessage::text(Role::User, "new");
+        bridge.commit_user_message(&new, None);
+        let expected = agent::ConversationUpdate::replace_tail(1, vec![new.clone()]);
+        assert_eq!(bridge.conversation_update(false), expected);
+        // Preparing an update does not acknowledge it: an interrupted stage
+        // must offer the same update at its next boundary.
+        assert_eq!(bridge.conversation_update(false), expected);
+        bridge.conversation_replaced(&[old, new]);
+        assert_eq!(
+            bridge.conversation_update(false),
+            agent::ConversationUpdate::unchanged()
+        );
+
+        bridge
+            .state
+            .lock()
+            .expect("healthy lock")
+            .pending_task_reminder = Some(Message::System {
+            content:   "remember".to_owned(),
+            timestamp: SystemTime::now(),
+        });
+        let reminder = LlmMessage::text(Role::System, "remember");
+        assert_eq!(
+            bridge.conversation_update(true),
+            agent::ConversationUpdate::replace_tail(2, vec![reminder.clone()])
+        );
+        let mut projected = bridge
+            .state
+            .lock()
+            .expect("healthy lock")
+            .history
+            .to_llm_messages();
+        projected.push(reminder);
+        bridge.conversation_replaced(&projected);
+        assert_eq!(
+            bridge.conversation_update(false),
+            agent::ConversationUpdate::replace_tail(2, vec![])
+        );
+        runtime
+            .shutdown(crate::coding_agent::ShutdownReason::Completed)
+            .await
+            .expect("shutdown");
+    }
 
     fn response_with(content: Vec<ContentPart>) -> Response {
         Response::new(ProviderId::new("test"), ModelId::new("model"), content)

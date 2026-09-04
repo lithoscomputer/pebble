@@ -27,7 +27,9 @@ use crate::tool::{
     CANCELLED, StaticToolService, Tool, ToolCatalog, ToolErrorKind, ToolMiddleware, ToolOutcome,
     ToolScheduling, ToolService, ToolSystem,
 };
-use crate::turn::{AfterAnswerAction, AgentLifecycle, ConversationUpdate, TurnContext};
+use crate::turn::{
+    AfterAnswerAction, AgentLifecycle, ConversationUpdate, LifecycleError, TurnContext,
+};
 
 /// The default number of lifecycle events held for each subscriber.
 const DEFAULT_EVENT_CAPACITY: usize = 256;
@@ -665,7 +667,8 @@ impl Agent {
                         continue;
                     }
                     let update = prepared.map_err(|source| AgentError::Lifecycle { source })?;
-                    self.apply_conversation_update(update);
+                    self.apply_conversation_update(update)
+                        .map_err(|source| AgentError::Lifecycle { source })?;
                 }
 
                 let tools = self.discover_tools(turn_count).await?;
@@ -682,7 +685,8 @@ impl Agent {
                         continue;
                     }
                     let update = prepared.map_err(|source| AgentError::Lifecycle { source })?;
-                    self.apply_conversation_update(update);
+                    self.apply_conversation_update(update)
+                        .map_err(|source| AgentError::Lifecycle { source })?;
                 }
                 self.emit(AgentEvent::TurnStarted { turn: turn_count });
                 let request = self.build_request(&tools)?;
@@ -719,8 +723,9 @@ impl Agent {
                     match lifecycle
                         .after_model(context, &response, &round_cancel)
                         .await
+                        .and_then(|update| self.apply_conversation_update(update))
                     {
-                        Ok(update) => self.apply_conversation_update(update),
+                        Ok(()) => {}
                         Err(source) => {
                             let calls = tool_calls(&response);
                             if !calls.is_empty() {
@@ -951,12 +956,16 @@ impl Agent {
         }
     }
 
-    fn apply_conversation_update(&mut self, update: ConversationUpdate) {
-        if update.apply(&mut self.messages)
+    fn apply_conversation_update(
+        &mut self,
+        update: ConversationUpdate,
+    ) -> StdResult<(), LifecycleError> {
+        if update.apply(&mut self.messages)?
             && let Some(projection) = &self.conversation
         {
             projection.conversation_replaced(&self.messages);
         }
+        Ok(())
     }
 
     fn commit_steering_message(&mut self, message: Message, attribution: Option<Value>) {

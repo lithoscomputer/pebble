@@ -67,14 +67,18 @@ impl<'a> TurnContext<'a> {
 /// A typed conversation change returned from a lifecycle stage.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ConversationUpdate {
-    replacement: Option<Vec<Message>>,
+    replacement:     Option<Vec<Message>>,
+    preserve_prefix: usize,
 }
 
 impl ConversationUpdate {
     /// Leaves the canonical conversation unchanged.
     #[must_use]
     pub const fn unchanged() -> Self {
-        Self { replacement: None }
+        Self {
+            replacement:     None,
+            preserve_prefix: 0,
+        }
     }
 
     /// Replaces the canonical conversation at a stable turn boundary.
@@ -83,17 +87,37 @@ impl ConversationUpdate {
     #[must_use]
     pub fn replace(messages: Vec<Message>) -> Self {
         Self {
-            replacement: Some(messages),
+            replacement:     Some(messages),
+            preserve_prefix: 0,
         }
     }
 
-    pub(crate) fn apply(self, messages: &mut Vec<Message>) -> bool {
-        if let Some(replacement) = self.replacement {
-            *messages = replacement;
-            true
-        } else {
-            false
+    /// Replaces only the tail after `preserve_prefix` committed messages.
+    ///
+    /// This lets a projection normalize new turns without copying older
+    /// messages. The prefix must fit the current conversation, and the result
+    /// must preserve tool-call and tool-result pairing. An invalid prefix
+    /// fails the lifecycle stage without changing the conversation.
+    #[must_use]
+    pub fn replace_tail(preserve_prefix: usize, messages: Vec<Message>) -> Self {
+        Self {
+            replacement: Some(messages),
+            preserve_prefix,
         }
+    }
+
+    pub(crate) fn apply(self, messages: &mut Vec<Message>) -> StdResult<bool, LifecycleError> {
+        let Some(replacement) = self.replacement else {
+            return Ok(false);
+        };
+        if self.preserve_prefix > messages.len() {
+            return Err(LifecycleError::new(
+                "conversation update prefix exceeds the current conversation",
+            ));
+        }
+        messages.truncate(self.preserve_prefix);
+        messages.extend(replacement);
+        Ok(true)
     }
 }
 
@@ -201,5 +225,38 @@ impl StdError for LifecycleError {
         self.source
             .as_deref()
             .map(|source| source as &(dyn StdError + 'static))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use lithos_llm::types::Role;
+
+    use super::*;
+
+    #[test]
+    fn replacing_a_tail_preserves_the_prefix_and_rejects_invalid_ranges_atomically() {
+        let prefix = Message::text(Role::User, "keep this allocation");
+        let mut messages = vec![prefix, Message::text(Role::User, "old tail")];
+        let allocation = messages[0].content().as_ptr();
+        let replacement = Message::text(Role::User, "new tail");
+        ConversationUpdate::replace_tail(1, vec![replacement.clone()])
+            .apply(&mut messages)
+            .expect("valid update");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].content().as_ptr(), allocation);
+        assert_eq!(messages[1], replacement);
+        let before = messages.clone();
+        assert!(
+            ConversationUpdate::replace_tail(3, vec![])
+                .apply(&mut messages)
+                .is_err()
+        );
+        assert_eq!(messages, before);
+        assert!(
+            !ConversationUpdate::unchanged()
+                .apply(&mut messages)
+                .expect("no change")
+        );
     }
 }

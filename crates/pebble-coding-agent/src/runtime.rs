@@ -878,7 +878,9 @@ impl CodingRuntime {
             }
         }
 
-        session.conversation().history = History::from_stored_messages(&record.messages);
+        session
+            .conversation()
+            .replace_history(History::from_stored_messages(&record.messages));
         // The parentage the record carries is restored, so storing a resumed
         // child again says the same thing. The tree itself is not: a resumed
         // child has no supervisor above it, and rebuilding one is the
@@ -1519,8 +1521,8 @@ impl CodingRuntime {
             link.stop().await;
         }
 
-        if result.is_ok() {
-            self.conversation().history = history;
+        if matches!(result, Ok(CompactionOutcome::Compacted(_))) {
+            self.conversation().replace_history(history);
         }
         if self.state.current() == CodingAgentState::Closed {
             self.shutdown(ShutdownReason::Cancelled).await?;
