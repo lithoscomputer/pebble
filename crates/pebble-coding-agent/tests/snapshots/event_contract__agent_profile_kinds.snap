@@ -8,5 +8,6 @@ expression: "render(&AgentProfileKind::ALL)"
   "openai",
   "gemini",
   "kimi",
-  "gpt56"
+  "gpt56",
+  "gpt6"
 ]

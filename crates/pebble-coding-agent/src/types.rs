@@ -823,7 +823,7 @@ pub enum AgentProfileKind {
     /// Claude 5 models, trained against Anthropic's current harness.
     #[serde(rename = "claude-5")]
     Claude5,
-    /// OpenAI models other than the GPT-5.6 family.
+    /// OpenAI models without a family-specific harness.
     #[serde(rename = "openai")]
     OpenAi,
     /// Gemini models.
@@ -832,6 +832,8 @@ pub enum AgentProfileKind {
     Kimi,
     /// GPT-5.6 models, which Codex drives with a narrower core tool set.
     Gpt56,
+    /// GPT-6 models, with Astra-specific behavior guidance.
+    Gpt6,
 }
 
 impl AgentProfileKind {
@@ -846,6 +848,7 @@ impl AgentProfileKind {
         Self::Gemini,
         Self::Kimi,
         Self::Gpt56,
+        Self::Gpt6,
     ];
 
     /// The catalog identifier of this profile.
@@ -858,6 +861,7 @@ impl AgentProfileKind {
             Self::Gemini => "gemini",
             Self::Kimi => "kimi",
             Self::Gpt56 => "gpt56",
+            Self::Gpt6 => "gpt6",
         }
     }
 }
@@ -2395,7 +2399,8 @@ mod tests {
             "openai",
             "gemini",
             "kimi",
-            "gpt56"
+            "gpt56",
+            "gpt6"
         ]);
     }
 

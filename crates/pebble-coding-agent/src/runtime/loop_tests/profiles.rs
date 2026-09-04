@@ -74,6 +74,7 @@ async fn every_profile_the_shipped_catalog_names_is_one_pebble_runs() {
         ("anthropic/claude-sonnet-5", AgentProfileKind::Claude5),
         ("openai/gpt-5.5", AgentProfileKind::OpenAi),
         ("openai/gpt-5.6-sol", AgentProfileKind::Gpt56),
+        ("openai/gpt-6-astra", AgentProfileKind::Gpt6),
         ("gemini/gemini-3.5-flash", AgentProfileKind::Gemini),
         ("moonshot/kimi-k3", AgentProfileKind::Kimi),
         // The same model through a gateway: a Kimi row names the Kimi harness
@@ -254,13 +255,13 @@ fn child_tool_names(child: &CodingRuntime) -> Vec<String> {
     names
 }
 
-/// The six harnesses pebble ships: a model that resolves to each, and whether
+/// The harnesses pebble ships: a model that resolves to each, and whether
 /// that harness's prompt has a section gated on the search tool.
 ///
 /// Kimi Code's prompt is the one with no conditionals at all — it keeps every
 /// piece of tool guidance in the tool descriptions — so its model learns it can
 /// search from the tool list alone.
-const SHIPPED: [(&str, AgentProfileKind, bool); 6] = [
+const SHIPPED: [(&str, AgentProfileKind, bool); 7] = [
     (
         "anthropic/pebble-test-inherits",
         AgentProfileKind::Anthropic,
@@ -269,6 +270,7 @@ const SHIPPED: [(&str, AgentProfileKind, bool); 6] = [
     ("anthropic/claude-sonnet-5", AgentProfileKind::Claude5, true),
     ("openai/gpt-5.5", AgentProfileKind::OpenAi, true),
     ("openai/gpt-5.6-sol", AgentProfileKind::Gpt56, true),
+    ("openai/gpt-6-astra", AgentProfileKind::Gpt6, true),
     ("gemini/gemini-3.5-flash", AgentProfileKind::Gemini, true),
     ("moonshot/kimi-k3", AgentProfileKind::Kimi, false),
 ];
