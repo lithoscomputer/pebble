@@ -277,7 +277,7 @@ const SHIPPED: [(&str, AgentProfileKind, bool); 7] = [
 
 /// What `session`'s model calls the search tool.
 fn search_tool_name(session: &CodingRuntime) -> &'static str {
-    NativeTool::WebSearch.name(session.registry.vocabulary())
+    NativeTool::WebSearch.name(session.resources.registry.vocabulary())
 }
 
 /// A prompt must never name a tool the session does not have, and must always
@@ -297,7 +297,7 @@ async fn a_prompt_advertises_a_search_tool_exactly_when_the_session_has_one() {
 
             assert_eq!(advertises(&session, name), search, "{kind}");
             assert_eq!(
-                session.system_prompt.contains(name),
+                session.resources.system_prompt.contains(name),
                 search && prompt_gates_search,
                 "{kind} prompt disagrees with its registry"
             );
@@ -317,6 +317,7 @@ async fn the_anthropic_prompt_mentions_subagents_exactly_when_the_session_can_sp
         assert_eq!(advertises(&session, "spawn_agent"), subagents);
         assert_eq!(
             session
+                .resources
                 .system_prompt
                 .contains("Subagents are valuable for independent work"),
             subagents
@@ -331,13 +332,13 @@ async fn the_route_decides_which_file_editor_the_openai_harness_offers() {
     let responses = initialized("openai/gpt-5.5", Configured::default()).await;
     assert!(advertises(&responses, "apply_patch"));
     assert!(!advertises(&responses, "edit_file"));
-    assert!(responses.system_prompt.contains("## apply_patch"));
+    assert!(responses.resources.system_prompt.contains("## apply_patch"));
 
     let compatible = initialized("openrouter/deepseek-v4-pro", Configured::default()).await;
     assert_eq!(compatible.profile_kind(), AgentProfileKind::OpenAi);
     assert!(advertises(&compatible, "edit_file"));
     assert!(!advertises(&compatible, "apply_patch"));
-    assert!(compatible.system_prompt.contains("## edit_file"));
+    assert!(compatible.resources.system_prompt.contains("## edit_file"));
     assert!(
         compatible
             .registered_tools()
@@ -373,6 +374,7 @@ async fn the_route_decides_which_file_editor_the_gpt56_harness_offers() {
     assert!(describe_shell(&responses).contains("`apply_patch`"));
     assert!(
         responses
+            .resources
             .system_prompt
             .contains("Use `apply_patch` for local file edits")
     );
@@ -384,6 +386,7 @@ async fn the_route_decides_which_file_editor_the_gpt56_harness_offers() {
     assert!(describe_shell(&compatible).contains("`edit_file`"));
     assert!(
         compatible
+            .resources
             .system_prompt
             .contains("Use `edit_file` for local file edits")
     );
@@ -708,7 +711,7 @@ async fn a_child_is_never_told_to_ask_the_user_a_question() {
     parent.initialize().await.expect("initialization succeeds");
     assert_eq!(parent.profile_kind(), AgentProfileKind::Claude5);
     assert!(
-        parent.system_prompt.contains("# Asking the user"),
+        parent.resources.system_prompt.contains("# Asking the user"),
         "the root has someone to ask, so its own prompt says so"
     );
 

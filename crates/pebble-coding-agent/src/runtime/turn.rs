@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::control::{actor_from_attribution, input_message, input_source_from_attribution};
 use super::retry::RetryEventBridge;
-use super::{CodingRuntime, PromptTotals, StateMachine};
+use super::{CodingRuntime, PromptResources, PromptTotals, SessionModel, StateMachine};
 use crate::coding_agent::CodingInput;
 use crate::compaction::{
     CompactionControl, CompactionOutcome, CompactionReason, CompactionRequest, check_context_usage,
@@ -33,10 +33,10 @@ use crate::history::History;
 use crate::loop_detection::detect_loop;
 use crate::profile::ModelFacts;
 use crate::reasoning::ReasoningOutput;
-use crate::skills::{ExpandedInput, Skill, SkillExpansion, expand_skill};
+use crate::skills::{ExpandedInput, SkillExpansion, expand_skill};
 use crate::subagent::SubagentSupervisor;
 use crate::task_reminder::maybe_task_reminder;
-use crate::tool::{CodingToolService, NativeTool, ToolRegistry, canonical_tool_name};
+use crate::tool::{CodingToolService, NativeTool, canonical_tool_name};
 use crate::types::{
     CodingAgentState, CodingEvent, ContextWindowSnapshot, ContextWindowStaleness, CostSource,
     InputContent, InputSource, LlmOutputKind, LlmRetryPhase, Message, SkillActivationSource,
@@ -69,30 +69,22 @@ const OUTPUT_LIMIT_WARNING: &str = "output_limit";
 
 #[derive(Clone)]
 pub(super) struct CodingAgentBridge {
-    state:          Arc<Mutex<ConversationState>>,
-    client:         lithos_llm::Client,
-    model_selector: String,
-    model:          String,
-    provider:       String,
-    system_prompt:  String,
-    facts:          ModelFacts,
-    config:         Arc<CodingAgentOptions>,
-    registry:       Arc<ToolRegistry>,
-    tools:          Arc<CodingToolService>,
-    emitter:        Emitter,
-    session_id:     String,
-    memory_tokens:  u64,
-    skills_tokens:  u64,
+    model_context: Arc<SessionModel>,
+    resources:     Arc<PromptResources>,
+    state:         Arc<Mutex<ConversationState>>,
+    config:        Arc<CodingAgentOptions>,
+    tools:         Arc<CodingToolService>,
+    emitter:       Emitter,
+    session_id:    String,
     /// The session's state, moved to `Executing` for the length of a tool
     /// round and back to `Thinking` after it.
-    state_machine:  StateMachine,
+    state_machine: StateMachine,
     /// The token that ends the prompt in progress. A child of the runtime's
     /// terminal token, so it also fires when the session is shut down, and set
     /// afresh by [`begin_prompt`](Self::begin_prompt) for every prompt.
-    prompt_cancel:  Arc<Mutex<CancellationToken>>,
-    compaction:     CompactionControl,
-    subagents:      Option<SubagentSupervisor>,
-    skills:         Vec<Skill>,
+    prompt_cancel: Arc<Mutex<CancellationToken>>,
+    compaction:    CompactionControl,
+    subagents:     Option<SubagentSupervisor>,
 }
 
 /// The conversation and what one prompt accumulates around it.
@@ -296,7 +288,7 @@ impl ConversationState {
 
 impl CodingAgentBridge {
     fn from_runtime(runtime: &CodingRuntime) -> Self {
-        let registry = Arc::new(runtime.registry.clone());
+        let registry = Arc::new(runtime.resources.registry.clone());
         let config = Arc::new(runtime.config.clone());
         let mut tools = CodingToolService::new(
             Arc::clone(&registry),
@@ -314,25 +306,17 @@ impl CodingAgentBridge {
             tools = tools.with_human_input(Arc::clone(provider));
         }
         Self {
+            model_context: runtime.model_context.clone(),
+            resources: runtime.resources.clone(),
             state: Arc::clone(&runtime.conversation),
-            client: runtime.client.clone(),
-            model_selector: runtime.model_selector.clone(),
-            model: runtime.model.clone(),
-            provider: runtime.provider.clone(),
-            system_prompt: runtime.system_prompt.clone(),
-            facts: runtime.facts,
             config,
-            registry,
             tools: Arc::new(tools),
             emitter: runtime.emitter.clone(),
             session_id: runtime.id.clone(),
-            memory_tokens: runtime.memory_tokens,
-            skills_tokens: runtime.skills_tokens,
             state_machine: runtime.state.clone(),
             prompt_cancel: Arc::new(Mutex::new(runtime.cancel_token.clone())),
             compaction: runtime.compaction.clone(),
             subagents: runtime.subagents.clone(),
-            skills: runtime.skills.clone(),
         }
     }
 
@@ -364,7 +348,7 @@ impl CodingAgentBridge {
                     .to_owned()
             },
             details: serde_json::json!({
-                "max_output_tokens": max_output_tokens(&self.config, &self.facts),
+                "max_output_tokens": max_output_tokens(&self.config, &self.model_context.facts),
                 "continued": continued,
             }),
         });
@@ -422,9 +406,9 @@ impl CodingAgentBridge {
         let estimate = {
             let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             check_context_usage(
-                &self.system_prompt,
+                &self.resources.system_prompt,
                 &state.history,
-                self.facts.context_window_tokens,
+                self.model_context.facts.context_window_tokens,
                 self.config.compaction_threshold_percent,
                 &self.emitter,
                 &self.session_id,
@@ -444,8 +428,8 @@ impl CodingAgentBridge {
         let prompt_cancel = self.prompt_cancel();
         let operation = self.compaction.begin(&prompt_cancel);
         let request = CompactionRequest {
-            model: &self.model_selector,
-            facts: self.facts,
+            model: &self.model_context.model_selector,
+            facts: self.model_context.facts,
             preserve_turns: self.config.compaction_preserve_turns,
             estimate,
             reason: CompactionReason::Threshold,
@@ -454,7 +438,7 @@ impl CodingAgentBridge {
         };
         let result = compact_context(
             &mut history,
-            &self.client,
+            &self.model_context.client,
             &file_tracker,
             request,
             &self.emitter,
@@ -580,7 +564,7 @@ impl CodingAgentBridge {
         self.emit(CodingEvent::AssistantMessage {
             text,
             model: if answering_model.is_empty() {
-                self.model.clone()
+                self.model_context.model.clone()
             } else {
                 answering_model.to_owned()
             },
@@ -616,7 +600,7 @@ impl CodingAgentBridge {
     }
 
     fn measure_request(&self, request: &Request) -> ContextWindowSnapshot {
-        let tools = self.registry.sources_for(request.tools());
+        let tools = self.resources.registry.sources_for(request.tools());
         let activated = self
             .state
             .lock()
@@ -625,13 +609,13 @@ impl CodingAgentBridge {
         build_local_snapshot(ContextWindowInput {
             request,
             tools: &tools,
-            system_prompt: &self.system_prompt,
-            memory_tokens: self.memory_tokens,
-            skills_tokens: self.skills_tokens,
+            system_prompt: &self.resources.system_prompt,
+            memory_tokens: self.resources.memory_tokens,
+            skills_tokens: self.resources.skills_tokens,
             activated_skill_context_observed: activated,
-            provider: &self.provider,
-            model: &self.model,
-            context_window_tokens: self.facts.context_window_tokens,
+            provider: &self.model_context.provider,
+            model: &self.model_context.model,
+            context_window_tokens: self.model_context.facts.context_window_tokens,
         })
     }
 }
@@ -645,7 +629,7 @@ impl agent::EventProjection for CodingAgentBridge {
                 state.begin_inference(local);
                 drop(state);
                 self.emit(CodingEvent::LlmRequestStarted {
-                    requested_model: self.model.clone(),
+                    requested_model: self.model_context.model.clone(),
                 });
             }
             agent::AgentEvent::FirstOutput { kind } => {
@@ -679,8 +663,8 @@ impl agent::EventProjection for CodingAgentBridge {
                 error,
             } => {
                 self.emit(CodingEvent::LlmRetry {
-                    provider:   self.provider.clone(),
-                    model:      self.model.clone(),
+                    provider:   self.model_context.provider.clone(),
+                    model:      self.model_context.model.clone(),
                     attempt:    usize::try_from(failed_attempt.saturating_sub(1))
                         .unwrap_or(usize::MAX),
                     delay_secs: *delay_seconds,
@@ -773,13 +757,13 @@ impl agent::AgentLifecycle for CodingAgentBridge {
         let attribution = message.attribution().cloned();
         let content = InputContent::from(message.content());
         let text = content.text_content();
-        let expanded = if self.skills.is_empty() {
+        let expanded = if self.resources.skills.is_empty() {
             ExpandedInput {
                 text:       text.to_owned(),
                 skill_name: None,
             }
         } else {
-            expand_skill(&self.skills, text)
+            expand_skill(&self.resources.skills, text)
                 .map_err(|source| self.record_boundary_error(Error::SkillExpansion(source)))?
         };
         if let Some(name) = &expanded.skill_name {
@@ -847,11 +831,9 @@ impl agent::ConversationProjection for CodingAgentBridge {
 
 #[derive(Clone)]
 struct CodingModelService {
-    client:     lithos_llm::Client,
-    emitter:    Emitter,
-    session_id: String,
-    provider:   String,
-    model:      String,
+    model_context: Arc<SessionModel>,
+    emitter:       Emitter,
+    session_id:    String,
 }
 
 #[async_trait]
@@ -864,10 +846,13 @@ impl agent::ModelService for CodingModelService {
         context.extensions_mut().insert(RetryEventBridge::new(
             self.emitter.clone(),
             self.session_id.clone(),
-            self.provider.clone(),
-            self.model.clone(),
+            self.model_context.provider.clone(),
+            self.model_context.model.clone(),
         ));
-        self.client.stream_with_context(request, context).await
+        self.model_context
+            .client
+            .stream_with_context(request, context)
+            .await
     }
 }
 
@@ -955,11 +940,9 @@ impl CodingRuntime {
 
         let bridge = Arc::new(CodingAgentBridge::from_runtime(self));
         let model_service = CodingModelService {
-            client:     self.client.clone(),
-            emitter:    self.emitter.clone(),
-            session_id: self.id.clone(),
-            provider:   self.provider.clone(),
-            model:      self.model.clone(),
+            model_context: self.model_context.clone(),
+            emitter:       self.emitter.clone(),
+            session_id:    self.id.clone(),
         };
         let messages = bridge
             .state
@@ -968,23 +951,24 @@ impl CodingRuntime {
             .history
             .to_llm_messages();
         let config = agent::AgentConfig {
-            max_output_tokens: max_output_tokens(&self.config, &self.facts),
+            max_output_tokens: max_output_tokens(&self.config, &self.model_context.facts),
             reasoning_effort: self.config.reasoning_effort,
             speed: self.config.speed,
             turn_replay: self.config.turn_replay,
             max_turn_replays: STREAM_CONSUME_RETRIES,
             ..agent::AgentConfig::default()
         };
-        let mut builder = agent::Agent::builder(model_service, self.model_selector.clone())
-            .system_prompt(self.system_prompt.clone())
-            .messages(messages)
-            .tool_service(bridge.tools.clone())
-            .tool_middleware(bridge.tools.clone())
-            .control_handle(self.agent_control.clone())
-            .lifecycle(bridge.clone())
-            .conversation_projection(bridge.clone())
-            .event_projection(bridge.clone())
-            .config(config);
+        let mut builder =
+            agent::Agent::builder(model_service, self.model_context.model_selector.clone())
+                .system_prompt(self.resources.system_prompt.clone())
+                .messages(messages)
+                .tool_service(bridge.tools.clone())
+                .tool_middleware(bridge.tools.clone())
+                .control_handle(self.agent_control.clone())
+                .lifecycle(bridge.clone())
+                .conversation_projection(bridge.clone())
+                .event_projection(bridge.clone())
+                .config(config);
         for middleware in &self.tool_middleware {
             builder = builder.tool_middleware(Arc::clone(middleware));
         }
@@ -1002,13 +986,13 @@ impl CodingRuntime {
 
     /// Expands a `/name` reference in the input, where one is allowed.
     fn expand_input(&self, input: &str, expansion: SkillExpansion) -> Result<ExpandedInput> {
-        if self.skills.is_empty() || expansion == SkillExpansion::Skip {
+        if self.resources.skills.is_empty() || expansion == SkillExpansion::Skip {
             return Ok(ExpandedInput {
                 text:       input.to_owned(),
                 skill_name: None,
             });
         }
-        expand_skill(&self.skills, input).map_err(Error::SkillExpansion)
+        expand_skill(&self.resources.skills, input).map_err(Error::SkillExpansion)
     }
 }
 

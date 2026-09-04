@@ -555,6 +555,20 @@ impl CodingRuntimeBuilder {
         let state = StateMachine::new(emitter.clone(), id.clone());
 
         let session = CodingRuntime {
+            model_context: Arc::new(SessionModel {
+                client: self.client,
+                provider: handle.provider().as_str().to_owned(),
+                model: handle.model().as_str().to_owned(),
+                model_selector: handle.to_string(),
+                facts,
+            }),
+            resources: Arc::new(PromptResources {
+                registry,
+                skills: Vec::new(),
+                system_prompt: String::new(),
+                memory_tokens: 0,
+                skills_tokens: 0,
+            }),
             root_session_id,
             parent_session_id,
             id,
@@ -566,14 +580,8 @@ impl CodingRuntimeBuilder {
             state,
             ended: false,
             end_emitted: false,
-            client: self.client,
             profile,
-            provider: handle.provider().as_str().to_owned(),
-            model: handle.model().as_str().to_owned(),
-            model_selector: handle.to_string(),
-            facts,
             knowledge_cutoff: metadata.knowledge_cutoff.unwrap_or_default(),
-            registry,
             tool_middleware: self.tool_middleware,
             env: environment,
             human_input: self.human_input,
@@ -583,11 +591,7 @@ impl CodingRuntimeBuilder {
             cancel_token: CancellationToken::new(),
             interrupt_reason: Arc::new(Mutex::new(None)),
             compaction: CompactionControl::default(),
-            skills: Vec::new(),
             memory_summaries: Vec::new(),
-            memory_tokens: 0,
-            skills_tokens: 0,
-            system_prompt: String::new(),
             subagents: supervisor,
             prompt_transform: self.prompt_transform,
             coding_agent: None,
@@ -733,6 +737,27 @@ impl InterruptReasonHandle {
     }
 }
 
+/// The resolved model and client for this session. Shared by the runtime,
+/// the lifecycle bridge, and the model service so all calls use one route.
+struct SessionModel {
+    client:         Client,
+    provider:       String,
+    model:          String,
+    model_selector: String,
+    facts:          ModelFacts,
+}
+
+/// Resources prepared at initialization and shared unchanged with the bridge.
+/// Token counts describe these exact prompt resources.
+#[derive(Clone)]
+struct PromptResources {
+    registry:      ToolRegistry,
+    skills:        Vec<Skill>,
+    system_prompt: String,
+    memory_tokens: u64,
+    skills_tokens: u64,
+}
+
 /// One conversation with one model.
 ///
 /// A session is used from one place at a time: [`CodingRuntime::prompt`]
@@ -741,6 +766,8 @@ impl InterruptReasonHandle {
 /// from a handle taken before the prompt starts.
 #[must_use = "call `shutdown` to stop the session and join what it owns"]
 pub(crate) struct CodingRuntime {
+    model_context:     Arc<SessionModel>,
+    resources:         Arc<PromptResources>,
     id:                String,
     /// The root of this session's tree. A root session names itself; a child
     /// inherits its parent's root, which is how root-scoped tools — one shared
@@ -761,17 +788,8 @@ pub(crate) struct CodingRuntime {
     state:             StateMachine,
     ended:             bool,
     end_emitted:       bool,
-    client:            Client,
     profile:           Arc<dyn AgentProfile>,
-    provider:          String,
-    model:             String,
-    /// What every request names, which is the resolved `provider/model` pair
-    /// rather than the selector the application gave, so no round can drift to
-    /// a different model than the one whose harness the session is running.
-    model_selector:    String,
-    facts:             ModelFacts,
     knowledge_cutoff:  String,
-    registry:          ToolRegistry,
     tool_middleware:   Vec<Arc<dyn ToolMiddleware>>,
     env:               Arc<dyn Environment>,
     human_input:       Option<Arc<dyn HumanInputProvider>>,
@@ -786,14 +804,7 @@ pub(crate) struct CodingRuntime {
     cancel_token:      CancellationToken,
     interrupt_reason:  Arc<Mutex<Option<InterruptReason>>>,
     compaction:        CompactionControl,
-    skills:            Vec<Skill>,
     memory_summaries:  Vec<MemoryFileSummary>,
-    /// What the memory files and the skills section contribute to the system
-    /// prompt, measured once at initialization: both are fixed for the
-    /// session's life, and every round's context snapshot reads them.
-    memory_tokens:     u64,
-    skills_tokens:     u64,
-    system_prompt:     String,
     subagents:         Option<SubagentSupervisor>,
     /// The application's adjustment to the system prompt, applied once when
     /// the session initializes.
@@ -811,8 +822,8 @@ impl fmt::Debug for CodingRuntime {
             .debug_struct("CodingRuntime")
             .field("id", &self.id)
             .field("root_session_id", &self.root_session_id)
-            .field("provider", &self.provider)
-            .field("model", &self.model)
+            .field("provider", &self.model_context.provider)
+            .field("model", &self.model_context.model)
             .field("profile", &self.profile.profile_kind())
             .field("state", &self.state.current())
             .field("ended", &self.ended)
@@ -894,7 +905,10 @@ impl CodingRuntime {
             (built, _) => built?,
         };
         if let Some(recorded) = recorded {
-            let resolved = format!("{}/{}", session.provider, session.model);
+            let resolved = format!(
+                "{}/{}",
+                session.model_context.provider, session.model_context.model
+            );
             if resolved != recorded {
                 return Err(CodingAgentBuildError::RecordedRouteMismatch { recorded, resolved });
             }
@@ -930,19 +944,16 @@ impl CodingRuntime {
     ) -> StdResult<Self, CodingAgentBuildError> {
         let mut session = Self::from_record(state.record, &ResumeMode::RecordedModel, deps)?;
         if !state.skills.is_empty() {
-            let vocabulary = session.registry.vocabulary();
-            session
-                .registry
-                .register(make_use_skill_tool_for_vocabulary(
-                    Arc::from(state.skills.clone()),
-                    vocabulary,
-                ))?;
+            let vocabulary = session.resources.registry.vocabulary();
+            Arc::make_mut(&mut session.resources).registry.register(
+                make_use_skill_tool_for_vocabulary(Arc::from(state.skills.clone()), vocabulary),
+            )?;
         }
-        session.skills = state.skills;
+        Arc::make_mut(&mut session.resources).skills = state.skills;
         session.memory_summaries = state.memory_summaries;
-        session.system_prompt = state.system_prompt;
-        session.memory_tokens = state.memory_tokens;
-        session.skills_tokens = state.skills_tokens;
+        Arc::make_mut(&mut session.resources).system_prompt = state.system_prompt;
+        Arc::make_mut(&mut session.resources).memory_tokens = state.memory_tokens;
+        Arc::make_mut(&mut session.resources).skills_tokens = state.skills_tokens;
         {
             let mut conversation = session.conversation();
             conversation.file_tracker = state.file_tracker;
@@ -959,8 +970,8 @@ impl CodingRuntime {
     /// warm state already carried what they produce.
     pub(crate) async fn start_from_warm_state(&mut self) -> Result<()> {
         self.emit(CodingEvent::SessionStarted {
-            provider: Some(self.provider.clone()),
-            model:    Some(self.model.clone()),
+            provider: Some(self.model_context.provider.clone()),
+            model:    Some(self.model_context.model.clone()),
         });
         self.flush_events().await.map(|_| ())
     }
@@ -973,11 +984,11 @@ impl CodingRuntime {
         let conversation = self.conversation();
         WarmState {
             record,
-            system_prompt: self.system_prompt.clone(),
-            skills: self.skills.clone(),
+            system_prompt: self.resources.system_prompt.clone(),
+            skills: self.resources.skills.clone(),
             memory_summaries: self.memory_summaries.clone(),
-            memory_tokens: self.memory_tokens,
-            skills_tokens: self.skills_tokens,
+            memory_tokens: self.resources.memory_tokens,
+            skills_tokens: self.resources.skills_tokens,
             file_tracker: conversation.file_tracker.clone(),
             activated_skill_context_observed: conversation.activated_skill_context_observed,
             context_window: conversation.context_window.clone(),
@@ -997,8 +1008,8 @@ impl CodingRuntime {
     pub(crate) fn to_record(&self) -> SessionRecord {
         let mut record = SessionRecord::new(self.id.clone());
         record.parent_session_id.clone_from(&self.parent_session_id);
-        record.provider = Some(self.provider.clone());
-        record.model = Some(self.model.clone());
+        record.provider = Some(self.model_context.provider.clone());
+        record.model = Some(self.model_context.model.clone());
         record.created_at = self.created_at;
         record.last_event_seq = self.emitter.committed_seq();
         record.messages = self.conversation().history.to_stored_messages();
@@ -1027,14 +1038,14 @@ impl CodingRuntime {
     #[tracing::instrument(
         name = "coding_session_initialize",
         skip_all,
-        fields(session_id = %self.id, provider = %self.provider, model = %self.model)
+        fields(session_id = %self.id, provider = %self.model_context.provider, model = %self.model_context.model)
     )]
     pub(crate) async fn initialize(&mut self) -> Result<()> {
         let cancel = self.cancel_token.clone();
 
         self.emit(CodingEvent::SessionStarted {
-            provider: Some(self.provider.clone()),
-            model:    Some(self.model.clone()),
+            provider: Some(self.model_context.provider.clone()),
+            model:    Some(self.model_context.model.clone()),
         });
         if cancel.is_cancelled() {
             return Err(Error::Interrupted(InterruptReason::Cancelled));
@@ -1062,28 +1073,35 @@ impl CodingRuntime {
             budget_bytes:       MEMORY_BUDGET_BYTES,
         });
 
-        self.skills = skills?;
+        Arc::make_mut(&mut self.resources).skills = skills?;
         self.emit(CodingEvent::SkillsDiscovered {
             profile,
             source_dirs: self.config.skill_dirs.clone(),
-            skills: self.skills.iter().map(Skill::to_summary).collect(),
+            skills: self
+                .resources
+                .skills
+                .iter()
+                .map(Skill::to_summary)
+                .collect(),
         });
         // The one tool that cannot be built by the builder: what it loads is
         // discovered here, and a session that discovered no skills advertises
         // no way to load one.
-        if !self.skills.is_empty() {
-            let vocabulary = self.registry.vocabulary();
-            self.registry.register(make_use_skill_tool_for_vocabulary(
-                Arc::from(self.skills.clone()),
+        if !self.resources.skills.is_empty() {
+            let vocabulary = self.resources.registry.vocabulary();
+            let tool = make_use_skill_tool_for_vocabulary(
+                Arc::from(self.resources.skills.clone()),
                 vocabulary,
-            ))?;
+            );
+            Arc::make_mut(&mut self.resources).registry.register(tool)?;
         }
 
         // Measured once: memory and skills never change again, and the context
         // snapshot built every round reads these numbers instead of
         // re-tokenizing the same text.
-        self.memory_tokens = memory_prompt_tokens(&memory);
-        self.skills_tokens = skills_prompt_tokens(&self.skills, self.registry.vocabulary());
+        Arc::make_mut(&mut self.resources).memory_tokens = memory_prompt_tokens(&memory);
+        Arc::make_mut(&mut self.resources).skills_tokens =
+            skills_prompt_tokens(&self.resources.skills, self.resources.registry.vocabulary());
 
         let env_context = self.build_env_context(&cancel).await?;
         debug!(
@@ -1102,24 +1120,29 @@ impl CodingRuntime {
         // tool above is the last addition — so a profile that gates a prompt
         // section on a tool reads the session's real answer.
         let default_prompt = self.profile.build_system_prompt(
-            &self.registry,
+            &self.resources.registry,
             &env_context,
             &memory,
             self.config.user_instructions.as_deref(),
-            &self.skills,
+            &self.resources.skills,
         );
         // The application's one chance to adjust the words the model reads
         // first. It sees the prompt as written and the session as the prompt
         // describes it. Tool summaries are the registered starting set;
         // per-turn middleware can narrow what the model sees later.
-        self.system_prompt = match &self.prompt_transform {
+        Arc::make_mut(&mut self.resources).system_prompt = match &self.prompt_transform {
             Some(transform) => {
                 let tools: Vec<_> = self
                     .registered_tools()
                     .iter()
                     .map(ToolDefinitionWithSource::to_tool_summary)
                     .collect();
-                let skills: Vec<_> = self.skills.iter().map(Skill::to_summary).collect();
+                let skills: Vec<_> = self
+                    .resources
+                    .skills
+                    .iter()
+                    .map(Skill::to_summary)
+                    .collect();
                 let context = SystemPromptContext::new(
                     &default_prompt,
                     &env_context,
@@ -1167,7 +1190,7 @@ impl CodingRuntime {
             git_status_short,
             git_recent_commits,
             current_date,
-            model: self.model.clone(),
+            model: self.model_context.model.clone(),
             knowledge_cutoff: self.knowledge_cutoff.clone(),
             ..EnvContext::from_environment(self.env.as_ref())
         })
@@ -1239,7 +1262,11 @@ impl CodingRuntime {
 
     /// Descriptions of the skills available to this session.
     pub(crate) fn skill_summaries(&self) -> Vec<SkillSummary> {
-        self.skills.iter().map(Skill::to_summary).collect()
+        self.resources
+            .skills
+            .iter()
+            .map(Skill::to_summary)
+            .collect()
     }
 
     /// Descriptions of registered tools in stable name order.
@@ -1255,18 +1282,18 @@ impl CodingRuntime {
 
     /// The provider the session resolved to.
     pub(crate) fn provider(&self) -> &str {
-        &self.provider
+        &self.model_context.provider
     }
 
     /// The catalog identifier of the model the session resolved to.
     pub(crate) fn model(&self) -> &str {
-        &self.model
+        &self.model_context.model
     }
 
     /// What the model is told about its context window and output budget.
     #[cfg(test)]
     pub(crate) fn model_facts(&self) -> ModelFacts {
-        self.facts
+        self.model_context.facts
     }
 
     /// Where this session's tools act, for the crate's own tests.
@@ -1355,7 +1382,7 @@ impl CodingRuntime {
 
     /// The tools registered for this session before middleware filters them.
     pub(crate) fn registered_tools(&self) -> Vec<ToolDefinitionWithSource> {
-        self.registry.definitions_with_source()
+        self.resources.registry.definitions_with_source()
     }
 
     /// Watches the session's events from here on.
@@ -1512,7 +1539,7 @@ impl CodingRuntime {
         }
 
         let mut operation_guard = OperationGuard::new(self);
-        let estimate = estimate_active_context_usage(&self.system_prompt, &history);
+        let estimate = estimate_active_context_usage(&self.resources.system_prompt, &history);
         let compaction_cancel = self.cancel_token.child_token();
         if cancel.is_some_and(CancellationToken::is_cancelled) {
             compaction_cancel.cancel();
@@ -1521,8 +1548,8 @@ impl CodingRuntime {
         let operation = self.compaction.begin(&compaction_cancel);
         self.state.transition(CodingAgentState::Compacting);
         let request = CompactionRequest {
-            model: &self.model_selector,
-            facts: self.facts,
+            model: &self.model_context.model_selector,
+            facts: self.model_context.facts,
             preserve_turns,
             estimate,
             reason: CompactionReason::Manual,
@@ -1531,7 +1558,7 @@ impl CodingRuntime {
         };
         let result = compact_context(
             &mut history,
-            &self.client,
+            &self.model_context.client,
             &file_tracker,
             request,
             &self.emitter,
@@ -1579,8 +1606,8 @@ impl CodingRuntime {
         skip_all,
         fields(
             session_id = %self.id,
-            provider = %self.provider,
-            model = %self.model
+            provider = %self.model_context.provider,
+            model = %self.model_context.model
         )
     )]
     pub(crate) async fn prompt_with_cancellation(
@@ -2220,7 +2247,7 @@ mod tests {
 
         assert_eq!(session.provider(), "test");
         assert_eq!(session.model(), "model");
-        assert_eq!(session.model_selector, "test/model");
+        assert_eq!(session.model_context.model_selector, "test/model");
         assert_eq!(session.profile_kind(), AgentProfileKind::Anthropic);
         assert_eq!(session.model_facts().context_window_tokens, 200_000);
         assert_eq!(session.state(), CodingAgentState::Idle);
@@ -2277,6 +2304,7 @@ mod tests {
         ));
         assert!(
             session
+                .resources
                 .system_prompt
                 .contains("test assistant working in /home/test")
         );
