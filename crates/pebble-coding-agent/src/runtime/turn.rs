@@ -921,7 +921,7 @@ fn content_after_skill_expansion(content: InputContent, expanded: &ExpandedInput
 fn max_output_tokens(config: &CodingAgentOptions, facts: &ModelFacts) -> Option<u32> {
     let configured = config
         .max_tokens
-        .and_then(|tokens| u32::try_from(tokens).ok());
+        .map(|tokens| u32::try_from(tokens).expect("token limits were validated at build"));
     let from_catalog = || {
         facts
             .max_output_tokens

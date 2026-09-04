@@ -18,6 +18,9 @@ pub enum AgentBuildError {
     /// The model selector was blank.
     #[error("the model selector must not be blank")]
     EmptyModel,
+    /// The model output budget cannot be zero.
+    #[error("max_output_tokens must be greater than zero")]
+    ZeroOutputTokens,
     /// The event buffer cannot hold an event.
     #[error("the event capacity must be greater than zero")]
     ZeroEventCapacity,

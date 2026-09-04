@@ -389,6 +389,9 @@ impl CodingRuntimeBuilder {
         id: String,
         created_at: SystemTime,
     ) -> StdResult<CodingRuntime, CodingAgentBuildError> {
+        self.options
+            .validate()
+            .map_err(|source| CodingAgentBuildError::InvalidOptions { source })?;
         let selector = self.model.ok_or(CodingAgentBuildError::MissingModel)?;
         let environment = self
             .environment

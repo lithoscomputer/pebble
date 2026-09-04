@@ -72,7 +72,7 @@ pub use self::coding_agent::{
 pub use self::compaction::{
     CompactionOptions, CompactionOutcome, CompactionReason, CompactionResult,
 };
-pub use self::config::CodingAgentOptions;
+pub use self::config::{CodingAgentOptions, CodingAgentOptionsError};
 pub use self::error::{CompactionError, Error, InterruptReason, Result, TaskKind};
 pub use self::runtime::SteeringLease;
 pub use self::skills::SkillExpansionError;

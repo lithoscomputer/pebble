@@ -64,6 +64,24 @@ impl Default for NativeToolOptions {
     }
 }
 
+/// An option outside the range the coding agent supports.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum CodingAgentOptionsError {
+    /// A token limit must fit the model request and be positive.
+    #[error("max_tokens must be between 1 and 4294967295, got {value}")]
+    MaxTokens {
+        /// The configured limit.
+        value: i64,
+    },
+    /// A compaction threshold must be a positive percentage.
+    #[error("compaction_threshold_percent must be between 1 and 100, got {value}")]
+    CompactionThreshold {
+        /// The configured percentage.
+        value: usize,
+    },
+}
+
 /// Everything one session's behavior is tuned by.
 ///
 /// Every setting has a default that runs a session, so start from
@@ -226,6 +244,20 @@ impl Default for CodingAgentOptions {
 }
 
 impl CodingAgentOptions {
+    /// Checks numeric limits before initialization or a model call.
+    pub(crate) fn validate(&self) -> Result<(), CodingAgentOptionsError> {
+        if let Some(value) = self.max_tokens
+            && !(1..=i64::from(u32::MAX)).contains(&value)
+        {
+            return Err(CodingAgentOptionsError::MaxTokens { value });
+        }
+        let value = self.compaction_threshold_percent;
+        if !(1..=100).contains(&value) {
+            return Err(CodingAgentOptionsError::CompactionThreshold { value });
+        }
+        Ok(())
+    }
+
     /// Sets how hard the model should think, where the provider offers a
     /// choice.
     #[must_use]
@@ -243,7 +275,8 @@ impl CodingAgentOptions {
     }
 
     /// Sets the most tokens the model may produce per turn. `None` takes the
-    /// catalog's default for the model.
+    /// catalog's default for the model. A supplied limit must be in
+    /// `1..=u32::MAX`; the builder rejects invalid values.
     #[must_use]
     pub const fn with_max_tokens(mut self, max_tokens: Option<i64>) -> Self {
         self.max_tokens = max_tokens;
@@ -345,6 +378,7 @@ impl CodingAgentOptions {
     }
 
     /// Sets the share of the context window that triggers compaction.
+    /// The builder rejects values outside `1..=100`.
     #[must_use]
     pub const fn with_compaction_threshold_percent(mut self, percent: usize) -> Self {
         self.compaction_threshold_percent = percent;

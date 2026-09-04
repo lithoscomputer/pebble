@@ -16,7 +16,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::compaction::{CompactionControl, CompactionOptions, CompactionOutcome};
-use crate::config::CodingAgentOptions;
+use crate::config::{CodingAgentOptions, CodingAgentOptionsError};
 use crate::environment::Environment;
 use crate::error::{Error, InterruptReason};
 use crate::event::{EventCapacity, EventSink, EventSinkTimeout};
@@ -69,6 +69,14 @@ pub struct PromptTiming {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CodingAgentBuildError {
+    /// An option is outside its supported range.
+    #[error("invalid coding agent options")]
+    InvalidOptions {
+        /// The invalid option and its value.
+        #[source]
+        source: CodingAgentOptionsError,
+    },
+
     /// Resource discovery or system-prompt construction failed.
     #[error("initializing the coding agent")]
     Initialization {

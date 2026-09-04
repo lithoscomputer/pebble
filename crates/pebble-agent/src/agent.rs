@@ -297,6 +297,9 @@ impl AgentBuilder {
         if self.model.trim().is_empty() {
             return Err(AgentBuildError::EmptyModel);
         }
+        if self.config.max_output_tokens == Some(0) {
+            return Err(AgentBuildError::ZeroOutputTokens);
+        }
         if self.config.event_capacity == 0 {
             return Err(AgentBuildError::ZeroEventCapacity);
         }
