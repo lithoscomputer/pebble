@@ -15,21 +15,12 @@
 //! directly, so this profile matches Codex's tool *contract* — names,
 //! parameters, and guidance — without that indirection.
 
-use std::sync::Arc;
-
-use lithos_llm::types::ToolDefinition;
-use serde_json::{Value, json};
-
+use super::codex_tools::codex_tools;
 use super::{EmbeddedPrompt, FileEditToolKind, ProfileDeps, assemble_system_prompt};
-use crate::config::NativeToolOptions;
 use crate::profile::{AgentProfile, EnvContext};
 use crate::skills::Skill;
-use crate::tool::{
-    NativeTool, RegisteredTool, ToolRegistry, ToolVocabulary, optional_integer_arg, required_str,
-};
-use crate::tools::shell::run_shell_command;
-use crate::tools::{TodoRuntime, make_update_plan_tool, make_web_search_tool};
-use crate::types::{AgentProfileKind, ToolSource};
+use crate::tool::{NativeTool, RegisteredTool, ToolRegistry, ToolVocabulary};
+use crate::types::AgentProfileKind;
 
 /// The system prompt this harness starts from.
 const CORE_PROMPT: &str = include_str!("prompts/gpt56.md.j2");
@@ -44,99 +35,12 @@ pub(crate) struct Gpt56Profile {
 impl Gpt56Profile {
     /// The harness for a session built from `deps`.
     pub(crate) fn new(deps: &ProfileDeps) -> Self {
-        let options = NativeToolOptions::for_profile(AgentProfileKind::Gpt56);
-        let mut tools = vec![
-            make_shell_command_tool(&options, deps.file_edit_tool),
-            deps.file_edit_tool.tool(),
-            // Codex's `update_plan` replaces a whole plan at once, so the list
-            // behind it belongs to this session rather than to the tree.
-            make_update_plan_tool(Arc::new(TodoRuntime::new())),
-        ];
-        if let Some(provider) = &deps.search_provider {
-            tools.push(make_web_search_tool(Arc::clone(provider)));
-        }
-
         Self {
-            tools,
+            tools:                 codex_tools(AgentProfileKind::Gpt56, deps),
             provider_display_name: deps.provider_display_name.clone(),
-            file_edit_tool: deps.file_edit_tool,
+            file_edit_tool:        deps.file_edit_tool,
         }
     }
-}
-
-/// Codex's `shell_command`: a shell script plus an explicit `workdir`.
-///
-/// Pebble's own `shell` tool has no `workdir`, and its description steers the
-/// model toward the dedicated read and search tools. Neither fits here: 5.6 has
-/// no dedicated tools to steer toward, and Codex tells it to set `workdir`
-/// rather than to `cd`.
-fn shell_command_description(
-    default_timeout_ms: u64,
-    max_timeout_ms: u64,
-    file_edit_tool: FileEditToolKind,
-) -> String {
-    let file_edit_tool = file_edit_tool.as_str();
-    format!(
-        "Runs a shell command and returns its output.
-- Always set the `workdir` param rather than using `cd`.
-- Reading and searching files goes through this tool: prefer `rg` and \
-`rg --files`, which are much faster than alternatives like `grep` and `find`.
-- Use `{file_edit_tool}` to edit files, not `cat`, heredocs, or other shell write tricks.
-- `timeout_ms` defaults to {default_timeout_ms} ms and is capped at {max_timeout_ms} ms. A command \
-that timed out once will time out again, so raise the timeout rather than retrying."
-    )
-}
-
-/// The shell this harness offers, describing the editor it was built beside.
-///
-/// The two arguments have to agree: the description points at the file editor
-/// by name, so a shell built for one route and a patch tool from another would
-/// name a tool the model was never given. Fabro registered a shell, swapped
-/// the editor, and then re-described the shell to catch up; here both come from
-/// one answer.
-fn make_shell_command_tool(
-    options: &NativeToolOptions,
-    file_edit_tool: FileEditToolKind,
-) -> RegisteredTool {
-    let default_timeout_ms = options.default_command_timeout_ms;
-    let max_timeout_ms = options.max_command_timeout_ms;
-
-    RegisteredTool::new(ToolDefinition::function(
-            // The canonical identity; the registry renames it to
-            // `shell_command` for the Codex vocabulary.
-            NativeTool::Shell.canonical_name(),
-            shell_command_description(default_timeout_ms, max_timeout_ms, file_edit_tool),
-            json!({
-                "type": "object",
-                "properties": {
-                    "command": {
-                        "type": "string",
-                        "description": "Bash source to evaluate, run by a non-login Bash shell."
-                    },
-                    "workdir": {
-                        "type": "string",
-                        "description": "Working directory for the command. Defaults to the turn cwd."
-                    },
-                    "timeout_ms": {
-                        "type": "integer",
-                        "description": format!(
-                            "Maximum command runtime. Defaults to {default_timeout_ms} ms."
-                        )
-                    }
-                },
-                "required": ["command"]
-            }),
-        ), Arc::new(move |arguments, context| {
-            Box::pin(async move {
-                let command = required_str(&arguments, "command")?;
-                let workdir = arguments.get("workdir").and_then(Value::as_str);
-                let timeout_ms = optional_integer_arg(&arguments, "timeout_ms")
-                    .unwrap_or(default_timeout_ms)
-                    .min(max_timeout_ms);
-
-                run_shell_command(&context, command, timeout_ms, workdir).await
-            })
-        })).with_source(ToolSource::Native)
 }
 
 impl AgentProfile for Gpt56Profile {
@@ -181,6 +85,8 @@ impl AgentProfile for Gpt56Profile {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
     use crate::profiles::tests::{
         advertises, search_provider, shell_timeout_ms, snapshot_context, system_prompt, tool_names,

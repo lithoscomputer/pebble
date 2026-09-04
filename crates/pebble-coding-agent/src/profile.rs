@@ -23,8 +23,8 @@ use lithos_llm::catalog::CatalogModel;
 
 use crate::environment::Environment;
 use crate::profiles::{
-    AnthropicProfile, Claude5Profile, GeminiProfile, Gpt56Profile, KimiProfile, OpenAiProfile,
-    ProfileDeps,
+    AnthropicProfile, Claude5Profile, GeminiProfile, Gpt6Profile, Gpt56Profile, KimiProfile,
+    OpenAiProfile, ProfileDeps,
 };
 use crate::skills::Skill;
 use crate::subagent::{SubagentSupervisor, subagent_tools};
@@ -318,7 +318,7 @@ pub(crate) trait AgentProfile: Send + Sync {
 /// harnesses read what the session is, and a later one may read more — without
 /// costing anything outside the crate.
 ///
-/// Every one of the six identifiers pebble knows is answered here; a catalog
+/// Every profile identifier pebble knows is answered here; a catalog
 /// row naming something else is refused earlier, when the identifier is parsed.
 pub(crate) fn builtin_profile(kind: AgentProfileKind, deps: &ProfileDeps) -> Arc<dyn AgentProfile> {
     match kind {
@@ -326,6 +326,7 @@ pub(crate) fn builtin_profile(kind: AgentProfileKind, deps: &ProfileDeps) -> Arc
         AgentProfileKind::Claude5 => Arc::new(Claude5Profile::new(deps)),
         AgentProfileKind::Gemini => Arc::new(GeminiProfile::new(deps)),
         AgentProfileKind::Gpt56 => Arc::new(Gpt56Profile::new(deps)),
+        AgentProfileKind::Gpt6 => Arc::new(Gpt6Profile::new(deps)),
         AgentProfileKind::Kimi => Arc::new(KimiProfile::new(deps)),
         AgentProfileKind::OpenAi => Arc::new(OpenAiProfile::new(deps)),
     }
@@ -506,9 +507,9 @@ mod tests {
     }
 
     /// Every harness gives its model a shell, whatever else it withholds. The
-    /// GPT-5.6 one has nothing but a shell and a patch tool, and Claude 5
-    /// drives its own searches through one, so this is the only tool all
-    /// six share.
+    /// Codex profiles have nothing but a shell and a patch tool, and Claude 5
+    /// drives its own searches through one, so this is the only tool every
+    /// harness shares.
     #[test]
     fn every_harness_pebble_ships_gives_its_model_a_way_to_run_a_command() {
         for kind in AgentProfileKind::ALL {
