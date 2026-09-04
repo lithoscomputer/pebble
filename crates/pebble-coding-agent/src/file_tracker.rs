@@ -105,23 +105,26 @@ impl FileTracker {
                 continue;
             }
 
+            let Ok(arguments) = call.input.to_value() else {
+                continue;
+            };
             match NativeTool::from_canonical_name(canonical_tool_name(&call.name)) {
                 Some(NativeTool::ReadFile) => {
-                    if let Some(path) = file_path(&call.arguments) {
+                    if let Some(path) = file_path(&arguments) {
                         self.record_read(path);
                     }
                 }
                 Some(NativeTool::WriteFile) => {
-                    if let Some(path) = file_path(&call.arguments) {
+                    if let Some(path) = file_path(&arguments) {
                         self.record_write(path);
                     }
                 }
                 Some(NativeTool::EditFile) => {
-                    if let Some(path) = file_path(&call.arguments) {
+                    if let Some(path) = file_path(&arguments) {
                         self.record_edit(path);
                     }
                 }
-                Some(NativeTool::ApplyPatch) => self.record_from_patch_arguments(&call.arguments),
+                Some(NativeTool::ApplyPatch) => self.record_from_patch_arguments(&arguments),
                 _ => {}
             }
         }

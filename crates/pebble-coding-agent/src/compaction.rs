@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use lithos_llm::client::Client;
 use lithos_llm::types::Request;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
@@ -32,7 +33,6 @@ use crate::file_tracker::FileTracker;
 use crate::history::{APPROX_CHARS_PER_TOKEN, History};
 use crate::profile::ModelFacts;
 use crate::tool::result_text;
-use crate::truncation::serialized_json_bytes;
 use crate::types::{CodingEvent, Message, TokenUsage};
 
 /// The output budget for the summary text itself.
@@ -764,7 +764,7 @@ fn single_turn_chars(turn: &Message) -> usize {
             let reasoning = turn.reasoning_text().map_or(0, str::len);
             let calls: usize = tool_calls
                 .iter()
-                .map(|call| call.name.len() + serialized_json_bytes(&call.arguments))
+                .map(|call| call.name.len() + call.input.raw().len())
                 .sum();
             content.len() + reasoning + calls
         }
@@ -799,7 +799,12 @@ pub(crate) fn render_turns_for_summary(turns: &[Message]) -> String {
                         out,
                         "[Tool call: {}] {}",
                         call.name,
-                        clipped_arguments(&call.arguments)
+                        clipped_arguments(
+                            &call
+                                .input
+                                .to_value()
+                                .unwrap_or_else(|_| Value::String(call.input.raw().to_owned()))
+                        )
                     );
                 }
             }

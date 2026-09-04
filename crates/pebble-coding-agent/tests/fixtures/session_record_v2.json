@@ -1,9 +1,5 @@
----
-source: crates/pebble-coding-agent/tests/record_contract.rs
-expression: rendered
----
 {
-  "format_version": 3,
+  "format_version": 2,
   "session_id": "ses_root",
   "provider": "anthropic",
   "model": "claude-sonnet-5",
@@ -28,13 +24,14 @@ expression: rendered
         {
           "id": "call_1",
           "name": "read_file",
-          "input": {
-            "type": "function",
-            "value": "{\"path\":\"src/lib.rs\"}"
+          "arguments": {
+            "path": "src/lib.rs"
           },
+          "kind": "function",
+          "raw_arguments": "{\"path\":\"src/lib.rs\"}",
           "provider_metadata": {
             "openai": {
-              "item_id": "fc_1"
+              "id": "fc_1"
             }
           }
         }

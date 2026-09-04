@@ -79,7 +79,11 @@ fn turn_signature(turn: &Message) -> Option<u64> {
 
     let mut hasher = DefaultHasher::new();
     for call in tool_calls {
-        tool_call_signature(&call.name, &call.arguments).hash(&mut hasher);
+        let arguments = call
+            .input
+            .to_value()
+            .unwrap_or_else(|_| Value::String(call.input.raw().to_owned()));
+        tool_call_signature(&call.name, &arguments).hash(&mut hasher);
     }
     Some(hasher.finish())
 }

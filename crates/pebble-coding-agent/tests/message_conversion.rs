@@ -11,7 +11,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lithos_llm::types::{
-    ContentPart, Message as LlmMessage, ReasoningContent, Role, ToolCall, ToolCallKind, ToolResult,
+    ContentPart, Message as LlmMessage, ReasoningContent, Role, ToolArguments, ToolCall, ToolInput,
+    ToolResult,
 };
 use pebble_coding_agent::events::{CompactionReason, TokenUsage};
 use pebble_coding_agent::state::{History, Message};
@@ -42,13 +43,13 @@ fn tool_call() -> ToolCall {
     ToolCall {
         id:                "call_1".into(),
         name:              "shell".into(),
-        arguments:         json!({ "command": "cargo test" }),
-        kind:              ToolCallKind::Function,
+        input:             ToolInput::Function(ToolArguments::from_json(
+            json!({ "command": "cargo test" }),
+        )),
         // Codecs replay this text rather than re-serializing `arguments`, so a
         // lost or reordered copy breaks provider prompt caching.
-        raw_arguments:     Some("{\"command\":\"cargo test\"}".into()),
         provider_metadata: BTreeMap::from([
-            ("openai".to_owned(), json!({ "id": "fc_1" })),
+            ("openai".to_owned(), json!({ "item_id": "fc_1" })),
             ("anthropic".to_owned(), json!({ "id": "toolu_1" })),
         ]),
     }
@@ -222,10 +223,7 @@ fn an_assistant_turn_replays_its_parts_in_provider_order() {
     let ContentPart::ToolCall(call) = &assistant.content()[4] else {
         panic!("expected the tool call last");
     };
-    assert_eq!(
-        call.raw_arguments.as_deref(),
-        Some("{\"command\":\"cargo test\"}")
-    );
+    assert_eq!(Some(call.input.raw()), Some("{\"command\":\"cargo test\"}"));
     assert_eq!(call.provider_metadata.len(), 2);
 
     let ContentPart::Reasoning(reasoning) = &assistant.content()[0] else {

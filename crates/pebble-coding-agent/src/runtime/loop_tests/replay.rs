@@ -199,7 +199,7 @@ async fn a_stream_that_ends_without_finishing_is_replayed_with_nothing_to_withdr
     assert_eq!(
         retries,
         [(0, LlmRetryPhase::Consume)],
-        "the one restart with no error behind it is still announced"
+        "the restart reports the incomplete stream error"
     );
 }
 
@@ -222,7 +222,7 @@ async fn a_stream_that_never_finishes_fails_once_its_replays_are_spent() {
     assert!(
         ErrorData::from(&error)
             .message
-            .contains("after every replay")
+            .contains("ended without completion")
     );
     assert_eq!(provider.call_count(), 4, "one attempt and three replays");
     assert_eq!(

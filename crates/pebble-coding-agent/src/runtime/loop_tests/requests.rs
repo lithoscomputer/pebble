@@ -66,7 +66,11 @@ impl ToolApprovalService for RecordingApproval {
     ) -> StdResult<ApprovalDecision, ToolSystemError> {
         *self.captured.lock().unwrap_or_else(PoisonError::into_inner) = Some((
             request.call().name.clone(),
-            request.call().arguments.clone(),
+            request
+                .call()
+                .input
+                .to_value()
+                .expect("valid fixture arguments"),
         ));
         Ok(ApprovalDecision::Allow)
     }

@@ -83,7 +83,8 @@ profile = "anthropic"
 [providers.test.models.thinking]
 display_name = "Thinking model"
 api_model = "thinking"
-capabilities = { text = true, tools = true, reasoning = true, reasoning_effort_levels = true }
+capabilities = { text = true, tools = true, reasoning = true }
+protocol_options = { reasoning_effort_levels = true }
 limits = { context_tokens = 200000, max_output_tokens = 32000 }
 
 [providers.test.models.thinking.metadata.pebble]
@@ -435,16 +436,18 @@ impl ProviderAdapter for ScriptedProvider {
         self.started.notify_one();
 
         match self.call_at(index) {
-            Some(ScriptedCall::Response(response)) => {
-                Ok(Box::pin(stream::iter(realize(events_for(&response)))))
+            Some(ScriptedCall::Response(response)) => Ok(ResponseStream::new(stream::iter(
+                realize(events_for(&response)),
+            ))),
+            Some(ScriptedCall::Events(events)) => {
+                Ok(ResponseStream::new(stream::iter(realize(events))))
             }
-            Some(ScriptedCall::Events(events)) => Ok(Box::pin(stream::iter(realize(events)))),
-            Some(ScriptedCall::EventsThenPending(events)) => Ok(Box::pin(
+            Some(ScriptedCall::EventsThenPending(events)) => Ok(ResponseStream::new(
                 stream::iter(realize(events)).chain(stream::pending()),
             )),
             Some(ScriptedCall::Failure(failure)) => Err(failure.to_error()),
             Some(ScriptedCall::PendingOpen) => pending().await,
-            None => Ok(Box::pin(stream::iter(Vec::new()))),
+            None => Ok(ResponseStream::new(stream::iter(Vec::new()))),
         }
     }
 }
@@ -504,7 +507,7 @@ pub fn tool_call_events(call: &ToolCall) -> Vec<ScriptedItem> {
         }),
         Ok(StreamEvent::ToolCallDelta {
             id:        block.clone(),
-            arguments: call.arguments.to_string(),
+            arguments: call.input.raw().to_owned(),
         }),
         Ok(StreamEvent::ContentBlockEnd {
             id:   block,

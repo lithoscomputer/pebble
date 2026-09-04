@@ -67,7 +67,7 @@ impl Observer for RetryEventObserver {
         delay: Duration,
         stage: RetryStage,
     ) {
-        if let Some(bridge) = call.context.extensions().get::<RetryEventBridge>() {
+        if let Some(bridge) = call.context().extensions().get::<RetryEventBridge>() {
             bridge.report(error, attempt, delay, stage);
         }
     }

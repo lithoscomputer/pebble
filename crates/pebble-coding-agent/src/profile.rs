@@ -200,7 +200,8 @@ impl ModelFacts {
     #[must_use]
     pub(crate) fn from_catalog_model(model: &CatalogModel) -> Self {
         let capabilities = model.capabilities();
-        let reasons_by_default = capabilities.reasoning && capabilities.reasoning_effort_levels;
+        let reasons_by_default = capabilities.reasoning().is_supported()
+            && model.protocol_options().reasoning_effort_levels;
         model.limits().map_or(
             Self {
                 reasons_by_default,
@@ -575,7 +576,8 @@ mod tests {
                 display_name = "Described"
                 api_model = "described"
                 limits = { context_tokens = 128000, max_output_tokens = 8192 }
-                capabilities = { text = true, reasoning = true, reasoning_effort_levels = true }
+                capabilities = { text = true, reasoning = true }
+                protocol_options = { reasoning_effort_levels = true }
 
                 [providers.mock.models.undescribed]
                 display_name = "Undescribed"
@@ -603,7 +605,7 @@ mod tests {
     }
 
     /// A catalog naming one model, with whatever capabilities the case needs.
-    fn catalog_with(capabilities: &str) -> Catalog {
+    fn catalog_with(capabilities: &str, effort_levels: bool) -> Catalog {
         Catalog::builder()
             .toml_layer(
                 "test",
@@ -623,6 +625,7 @@ mod tests {
                     api_model = "plain"
                     limits = {{ context_tokens = 8000, max_output_tokens = 1024 }}
                     capabilities = {{ {capabilities} }}
+                    protocol_options = {{ reasoning_effort_levels = {effort_levels} }}
                     "#
                 ),
             )
@@ -633,15 +636,15 @@ mod tests {
 
     /// Whether the one model of a catalog built from `capabilities` reasons
     /// without being asked to.
-    fn reasons_by_default(capabilities: &str) -> bool {
-        let catalog = catalog_with(capabilities);
+    fn reasons_by_default(capabilities: &str, effort_levels: bool) -> bool {
+        let catalog = catalog_with(capabilities, effort_levels);
         let model = catalog.model("mock", "plain").expect("a known model");
         ModelFacts::from_catalog_model(model).reasons_by_default
     }
 
     #[test]
     fn a_model_that_cannot_reason_says_so() {
-        assert!(!reasons_by_default("text = true"));
+        assert!(!reasons_by_default("text = true", false));
     }
 
     #[test]
@@ -650,12 +653,10 @@ mod tests {
         // reasons unless it is told not to, while one that only takes a
         // thinking budget reasons when it is asked to. The second case is the
         // one a `reasoning` capability alone gets wrong.
-        assert!(reasons_by_default(
-            "text = true, reasoning = true, reasoning_effort_levels = true"
-        ));
-        assert!(!reasons_by_default("text = true, reasoning = true"));
+        assert!(reasons_by_default("text = true, reasoning = true", true));
+        assert!(!reasons_by_default("text = true, reasoning = true", false));
         assert!(
-            !reasons_by_default("text = true, reasoning_effort_levels = true"),
+            !reasons_by_default("text = true", true),
             "an effort level means nothing without reasoning behind it"
         );
     }

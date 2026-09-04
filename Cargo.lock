@@ -1028,7 +1028,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 [[package]]
 name = "lithos-llm"
 version = "0.1.0"
-source = "git+ssh://git@github.com/lithoscomputer/lithos-llm?rev=d2d2b5078047625b968ef39cb5d194e1d046fc05#d2d2b5078047625b968ef39cb5d194e1d046fc05"
+source = "git+ssh://git@github.com/lithoscomputer/lithos-llm?rev=2e69dcfdde6d4c70014d1e405d6a3605b615502f#2e69dcfdde6d4c70014d1e405d6a3605b615502f"
 dependencies = [
  "async-trait",
  "futures-core",

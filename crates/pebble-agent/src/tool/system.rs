@@ -194,7 +194,7 @@ impl ToolCatalog {
             ));
         };
         let kind_matches = matches!(
-            (&descriptor.definition().kind, call.kind),
+            (&descriptor.definition().kind, call.input.kind()),
             (ToolDefinitionKind::Function { .. }, ToolCallKind::Function)
                 | (ToolDefinitionKind::Custom { .. }, ToolCallKind::Custom)
         );
@@ -204,8 +204,10 @@ impl ToolCatalog {
                 format!("tool call kind does not match `{}`", call.name),
             ));
         }
-        if let Err(error) = validate_tool_arguments(&descriptor.definition().kind, &call.arguments)
-        {
+        let arguments = call.input.to_value().map_err(|error| {
+            ToolOutcome::failure(ToolErrorKind::InvalidArguments, error.to_string())
+        })?;
+        if let Err(error) = validate_tool_arguments(&descriptor.definition().kind, &arguments) {
             return Err(ToolOutcome::failure(
                 ToolErrorKind::InvalidArguments,
                 error.to_string(),
@@ -215,6 +217,7 @@ impl ToolCatalog {
             turn,
             call,
             descriptor.clone(),
+            arguments,
             cancellation,
         ))
     }
@@ -223,6 +226,7 @@ impl ToolCatalog {
 /// One resolved tool invocation passed through middleware.
 #[derive(Clone)]
 pub struct ToolCallRequest {
+    arguments:    serde_json::Value,
     turn:         usize,
     call:         ToolCall,
     descriptor:   ToolDescriptor,
@@ -235,12 +239,14 @@ impl ToolCallRequest {
         turn: usize,
         call: ToolCall,
         descriptor: ToolDescriptor,
+        arguments: serde_json::Value,
         cancellation: CancellationToken,
     ) -> Self {
         Self {
             turn,
             call,
             descriptor,
+            arguments,
             cancellation,
             events: None,
         }
@@ -291,11 +297,11 @@ impl ToolCallRequest {
     pub(crate) fn into_context_and_arguments(self) -> (ToolContext, serde_json::Value) {
         let Self {
             call,
+            arguments,
             cancellation,
             events,
             ..
         } = self;
-        let arguments = call.arguments;
         let context = ToolContext::new(call.id, call.name, cancellation, events);
         (context, arguments)
     }
@@ -666,7 +672,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Mutex, PoisonError};
 
-    use lithos_llm::types::{ContentPart, ToolCallKind, ToolDefinition};
+    use lithos_llm::types::{ContentPart, ToolArguments, ToolDefinition, ToolInput};
     use serde_json::json;
 
     use super::*;
@@ -774,12 +780,11 @@ mod tests {
             ToolCall {
                 id:                "call_1".to_owned(),
                 name:              "inspect".to_owned(),
-                arguments:         json!({}),
-                kind:              ToolCallKind::Function,
-                raw_arguments:     None,
+                input:             ToolInput::Function(ToolArguments::from_json(json!({}))),
                 provider_metadata: BTreeMap::default(),
             },
             descriptor("inspect"),
+            json!({}),
             CancellationToken::new(),
         )
     }
@@ -852,6 +857,20 @@ mod tests {
             )
             .expect_err("a custom call cannot invoke a function descriptor");
 
+        assert!(matches!(outcome, ToolOutcome::Failure {
+            kind: ToolErrorKind::InvalidArguments,
+            ..
+        }));
+    }
+
+    #[test]
+    fn resolution_rejects_malformed_function_json() {
+        let catalog = ToolCatalog::new([descriptor("inspect")]);
+        let mut call = ToolCall::function("call_1", "inspect", json!({}));
+        call.input = ToolInput::Function(ToolArguments::from_raw("{broken".to_owned()));
+        let outcome = catalog
+            .resolve(0, call, CancellationToken::new())
+            .expect_err("malformed JSON cannot reach the tool");
         assert!(matches!(outcome, ToolOutcome::Failure {
             kind: ToolErrorKind::InvalidArguments,
             ..

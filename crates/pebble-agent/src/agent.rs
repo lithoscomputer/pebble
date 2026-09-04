@@ -1353,9 +1353,9 @@ mod tests {
                 .expect("the script lock is healthy")
                 .pop_front()
                 .expect("the script has another response");
-            Ok(Box::pin(stream::iter([Ok(StreamEvent::Completed {
-                response,
-            })])))
+            Ok(ResponseStream::new(stream::iter([Ok(
+                StreamEvent::Completed { response },
+            )])))
         }
     }
 

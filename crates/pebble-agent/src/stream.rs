@@ -302,7 +302,7 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .pop_front()
                 .expect("the script has another stream");
-            Ok(Box::pin(stream::iter(events)))
+            Ok(ResponseStream::new(stream::iter(events)))
         }
     }
 

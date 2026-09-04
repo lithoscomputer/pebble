@@ -21,6 +21,8 @@
 
 use std::time::SystemTime;
 
+mod tool_call;
+
 use lithos_llm::types::{ContentPart, ToolCall, ToolResult};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -28,7 +30,10 @@ use crate::compaction::CompactionReason;
 use crate::types::{InputContent, TokenUsage, rfc3339_millis};
 
 /// The record format version this build writes.
-pub const SESSION_RECORD_FORMAT_VERSION: u32 = 2;
+///
+/// Version 3 stores a single typed tool input. Formats 1 and 2 are converted
+/// on read; their raw function argument text takes precedence when present.
+pub const SESSION_RECORD_FORMAT_VERSION: u32 = 3;
 
 /// The version assumed for a record that names none.
 ///
@@ -154,7 +159,7 @@ impl SessionRecord {
     pub fn migrate(self) -> Result<Self, RecordMigrationError> {
         match self.format_version {
             SESSION_RECORD_FORMAT_VERSION => Ok(self),
-            1 => Ok(Self {
+            1 | 2 => Ok(Self {
                 format_version: SESSION_RECORD_FORMAT_VERSION,
                 ..self
             }),
@@ -208,7 +213,7 @@ pub enum StoredMessage {
         /// The assistant's text.
         content:        String,
         /// The tool calls the turn requested.
-        #[serde(default, deserialize_with = "null_as_default")]
+        #[serde(default, deserialize_with = "tool_call::deserialize")]
         tool_calls:     Vec<ToolCall>,
         /// Provider-native parts preserved for lossless replay.
         #[serde(default, deserialize_with = "null_as_default")]
@@ -322,7 +327,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::{Duration, UNIX_EPOCH};
 
-    use lithos_llm::types::{ReasoningContent, ToolCallKind};
+    use lithos_llm::types::{ReasoningContent, ToolArguments, ToolInput};
     use serde_json::json;
 
     use super::*;
@@ -346,10 +351,13 @@ mod tests {
         ToolCall {
             id:                "call_1".into(),
             name:              "read_file".into(),
-            arguments:         json!({ "path": "src/lib.rs" }),
-            kind:              ToolCallKind::Function,
-            raw_arguments:     Some("{\"path\":\"src/lib.rs\"}".into()),
-            provider_metadata: BTreeMap::from([("openai".to_owned(), json!({ "id": "fc_1" }))]),
+            input:             ToolInput::Function(ToolArguments::from_json(
+                json!({ "path": "src/lib.rs" }),
+            )),
+            provider_metadata: BTreeMap::from([(
+                "openai".to_owned(),
+                json!({ "item_id": "fc_1" }),
+            )]),
         }
     }
 

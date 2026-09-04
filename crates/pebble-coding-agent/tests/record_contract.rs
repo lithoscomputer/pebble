@@ -10,7 +10,8 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lithos_llm::types::{
-    ContentPart, Message as LlmMessage, ReasoningContent, Role, ToolCall, ToolCallKind, ToolResult,
+    ContentPart, Message as LlmMessage, ReasoningContent, Role, ToolArguments, ToolCall, ToolInput,
+    ToolResult,
 };
 use pebble_coding_agent::events::{CompactionReason, TokenUsage};
 use pebble_coding_agent::state::{
@@ -39,10 +40,10 @@ fn tool_call() -> ToolCall {
     ToolCall {
         id:                "call_1".into(),
         name:              "read_file".into(),
-        arguments:         json!({ "path": "src/lib.rs" }),
-        kind:              ToolCallKind::Function,
-        raw_arguments:     Some("{\"path\":\"src/lib.rs\"}".into()),
-        provider_metadata: BTreeMap::from([("openai".to_owned(), json!({ "id": "fc_1" }))]),
+        input:             ToolInput::Function(ToolArguments::from_json(
+            json!({ "path": "src/lib.rs" }),
+        )),
+        provider_metadata: BTreeMap::from([("openai".to_owned(), json!({ "item_id": "fc_1" }))]),
     }
 }
 
@@ -162,6 +163,17 @@ fn the_stored_version_one_record_still_resumes() {
         Role::User,
     ]);
     assert_eq!(messages[2].tool_call_id(), Some("call_1"));
+}
+
+#[test]
+fn the_stored_version_two_record_still_resumes() {
+    let record: SessionRecord =
+        serde_json::from_str(include_str!("fixtures/session_record_v2.json"))
+            .expect("a version 2 record still parses");
+    assert_eq!(record.format_version, 2);
+    let migrated = record.migrate().expect("version 2 migrates");
+    assert_eq!(migrated.format_version, SESSION_RECORD_FORMAT_VERSION);
+    assert_eq!(migrated.messages, sample_record().messages);
 }
 
 #[test]

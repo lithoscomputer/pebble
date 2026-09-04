@@ -21,7 +21,6 @@
 //! act on.
 
 use std::borrow::Cow;
-use std::mem;
 use std::result::Result as StdResult;
 use std::sync::Arc;
 
@@ -217,7 +216,12 @@ impl CodingToolService {
             context = context.with_human_input(Arc::clone(provider));
         }
 
-        let arguments = mem::take(&mut call.arguments);
+        let arguments = match call.input.to_value() {
+            Ok(arguments) => arguments,
+            Err(error) => {
+                return self.failed(call, &ToolError::invalid_arguments(error.to_string()));
+            }
+        };
         let (result, error_kind) = match (tool.executor)(arguments, context).await {
             Ok(output) => (text_result(call, output, false), None),
             Err(error) => (
@@ -303,7 +307,10 @@ impl CodingToolService {
         self.emit(&call.id, CodingEvent::ToolCallStarted {
             tool_name:    call.name.clone(),
             tool_call_id: call.id.clone(),
-            arguments:    call.arguments.clone(),
+            arguments:    call
+                .input
+                .to_value()
+                .unwrap_or_else(|_| Value::String(call.input.raw().to_owned())),
         });
     }
 

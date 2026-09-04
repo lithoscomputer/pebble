@@ -250,7 +250,7 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use lithos_llm::types::{ToolCall, ToolCallKind, ToolDefinition};
+    use lithos_llm::types::{ToolArguments, ToolCall, ToolDefinition, ToolInput};
     use pebble_agent::{ToolDescriptor, ToolId, ToolService, ToolSystem};
     use serde_json::{Value, json};
     use tokio_util::sync::CancellationToken;
@@ -271,7 +271,13 @@ mod tests {
             self.arguments
                 .lock()
                 .expect("the argument lock is healthy")
-                .push(request.call().arguments.clone());
+                .push(
+                    request
+                        .call()
+                        .input
+                        .to_value()
+                        .expect("valid fixture arguments"),
+                );
             Ok(ApprovalDecision::Allow)
         }
     }
@@ -309,9 +315,9 @@ mod tests {
                 ToolCall {
                     id:                "call_1".to_owned(),
                     name:              "shell".to_owned(),
-                    arguments:         json!({"command": "cargo test"}),
-                    kind:              ToolCallKind::Function,
-                    raw_arguments:     None,
+                    input:             ToolInput::Function(ToolArguments::from_json(
+                        json!({"command": "cargo test"}),
+                    )),
                     provider_metadata: BTreeMap::new(),
                 },
                 CancellationToken::new(),
