@@ -5,6 +5,7 @@ Editing.
 [tool] edit_file failed: old_string not found in file
 [ask] deepseek-v4-flash
 The text was not there.
+[warning] unsupported_control: this provider protocol does not support the tool result error flag
 [turn] 15 tokens, 0 tool call(s)
 
 turns:  2

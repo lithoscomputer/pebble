@@ -10,7 +10,9 @@
 use std::time::Duration;
 
 use lithos_llm::middleware::RetryPolicy;
-use lithos_llm::types::{ContentPart, FinishReason, RetryClassification, StreamEvent, ToolCall};
+use lithos_llm::types::{
+    ContentPart, FinishReason, RetryClassification, StreamEvent, ToolCall, Warning,
+};
 use tokio::time::timeout;
 
 use super::*;
@@ -1099,30 +1101,24 @@ async fn the_continuation_budget_is_per_prompt() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_tool_call_cut_at_the_output_limit_is_not_run() {
-    let response = with_finish_reason(
-        tool_call_response("echo", "call_1", json!({"text": "half"})),
-        FinishReason::Length,
+async fn a_model_layer_warning_is_reported_with_the_turn() {
+    let mut response = text_response("Answer");
+    response.warnings.push(Warning {
+        code:    "truncated_tool_call".to_owned(),
+        message: "the output limit cut off a call to write_note".to_owned(),
+    });
+    let (mut session, _provider) = TestSession::answering(vec![ScriptedCall::response(response)]);
+    let mut events = session.subscribe();
+
+    session.prompt("Hello").await.expect("the prompt succeeds");
+
+    let published = settled(&mut session, &mut events).await;
+    assert!(
+        published.iter().any(|event| matches!(
+            event,
+            CodingEvent::Warning { kind, message, .. }
+                if kind == "truncated_tool_call" && message.contains("write_note")
+        )),
+        "the response's warning reaches the event stream: {published:?}"
     );
-    let (mut session, provider) = TestSession::new(vec![
-        ScriptedCall::response(response),
-        ScriptedCall::response(text_response("never asked for")),
-    ])
-    .tools([echo_tool()])
-    .build();
-
-    let error = session
-        .prompt("Use the tool")
-        .await
-        .expect_err("a cut tool call ends the prompt");
-
-    assert_eq!(error.kind(), ErrorKind::ToolExecution, "{error}");
-    assert_eq!(provider.call_count(), 1);
-    let results = tool_results(&session, 2);
-    assert_eq!(results.len(), 1, "the call still has its result");
-    assert_eq!(result_text(&results[0]), "Cancelled");
-    session
-        .shutdown(ShutdownReason::Completed)
-        .await
-        .expect("the shutdown succeeds");
 }

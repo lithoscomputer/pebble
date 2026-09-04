@@ -2139,8 +2139,8 @@
       }
     },
     {
-      "scenario_id": "exec_refuses_a_cut_tool_call/1",
-      "namespace": "exec_refuses_a_cut_tool_call",
+      "scenario_id": "exec_drops_a_cut_tool_call/1",
+      "namespace": "exec_drops_a_cut_tool_call",
       "matcher": {
         "endpoint": "responses"
       },
@@ -2150,18 +2150,32 @@
           "input_tokens": 10,
           "output_tokens": 5
         },
-        "response_text": "Writing.",
+        "response_text": "Writing the notes",
         "finish_reason": "length",
         "tool_calls": [
           {
             "id": "call_cut",
             "name": "write_file",
-            "arguments": {
-              "file_path": "notes.txt",
-              "content": "half"
-            }
+            "arguments": {},
+            "raw_arguments": "{\"file_path\":\"notes.txt\",\"content\":\"half"
           }
         ]
+      }
+    },
+    {
+      "scenario_id": "exec_drops_a_cut_tool_call/2",
+      "namespace": "exec_drops_a_cut_tool_call",
+      "matcher": {
+        "endpoint": "responses",
+        "input_contains": "stopped at the output limit"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": " and done."
       }
     }
   ]

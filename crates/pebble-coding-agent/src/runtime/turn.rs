@@ -66,10 +66,6 @@ const MAX_OUTPUT_LIMIT_CONTINUATIONS: u32 = 1;
 /// The `kind` of the warning that reports an answer cut at the output limit.
 const OUTPUT_LIMIT_WARNING: &str = "output_limit";
 
-/// Why a turn whose tool calls were cut at the output limit is not run.
-const OUTPUT_LIMIT_CUT_TOOL_CALL: &str = "the model's output limit cut off its tool calls, \
-                                          so none of them can be trusted to run";
-
 #[derive(Clone)]
 pub(super) struct CodingAgentBridge {
     state:          Arc<Mutex<ConversationState>>,
@@ -452,6 +448,17 @@ impl CodingAgentBridge {
         });
         drop(state);
 
+        // The model layer's own warnings — a tool call the output limit cut
+        // short, an option the protocol could not carry — ride the response
+        // and are reported the way pebble reports its own.
+        for warning in &response.warnings {
+            self.emit(CodingEvent::Warning {
+                kind:    warning.code.clone(),
+                message: warning.message.clone(),
+                details: Value::Null,
+            });
+        }
+
         let answering_model = response.model.model().as_str();
         self.emit(CodingEvent::AssistantMessage {
             text,
@@ -642,18 +649,9 @@ impl agent::AgentLifecycle for CodingAgentBridge {
     async fn after_model(
         &self,
         _context: agent::TurnContext<'_>,
-        response: &Response,
+        _response: &Response,
         _cancel: &CancellationToken,
     ) -> StdResult<agent::ConversationUpdate, agent::LifecycleError> {
-        // A tool call the output limit cut short decodes as a call with
-        // whatever arguments survived, or none. Running it would act on a
-        // guess, so the turn fails and the loop answers its calls as
-        // cancelled.
-        if response.finish_reason == FinishReason::Length && !tool_calls_of(response).is_empty() {
-            return Err(self.record_boundary_error(Error::ToolExecution(
-                OUTPUT_LIMIT_CUT_TOOL_CALL.to_owned(),
-            )));
-        }
         // Do not run tools until the response that requested them is durable.
         self.flush_events().await?;
         self.compact_once_if_needed().await;

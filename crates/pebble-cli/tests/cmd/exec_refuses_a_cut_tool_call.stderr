@@ -1,5 +1,0 @@
-[ask] gpt-5.4
-Writing.
-[turn] 15 tokens, 1 tool call(s)
-error: running the prompt
-  caused by: tool execution error: the model's output limit cut off its tool calls, so none of them can be trusted to run
