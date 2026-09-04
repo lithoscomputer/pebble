@@ -122,6 +122,25 @@ impl From<&str> for UserMessage {
     }
 }
 
+/// Closes an abandoned prompt instead of exposing incomplete history as
+/// reusable.
+struct PromptRun {
+    control:  Arc<Control>,
+    events:   EventHub,
+    finished: bool,
+}
+
+impl Drop for PromptRun {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.control.close();
+            self.control.finish_prompt();
+            self.events.emit(AgentEvent::PromptAborted);
+            self.events.emit(AgentEvent::AgentClosed);
+        }
+    }
+}
+
 /// Turn-loop policy for an [`Agent`].
 #[derive(Clone, Debug)]
 pub struct AgentConfig {
@@ -518,6 +537,10 @@ impl Agent {
 
     /// Processes one input and every queued follow-up to completion.
     ///
+    /// Dropping this future after work starts permanently closes the agent.
+    /// Use [`prompt_with_cancellation`](Self::prompt_with_cancellation) to
+    /// cancel cooperatively and keep the agent reusable.
+    ///
     /// # Errors
     ///
     /// Returns an error when the input is empty, the agent is closed, the
@@ -540,7 +563,8 @@ impl Agent {
     /// prompt returns [`AgentError::Aborted`]; an `after_model` stage that
     /// fails is answered the same way before its error is returned. A call
     /// that was already running is cancelled through its own token and keeps
-    /// the result it returns.
+    /// the result it returns. Dropping this future permanently closes the
+    /// agent because incomplete history cannot safely be reused.
     pub async fn prompt_with_cancellation(
         &mut self,
         message: impl Into<UserMessage>,
@@ -566,6 +590,11 @@ impl Agent {
             return Err(AgentError::Closed);
         };
 
+        let mut run = PromptRun {
+            control:  Arc::clone(&self.control),
+            events:   self.events.clone(),
+            finished: false,
+        };
         self.emit(AgentEvent::PromptStarted);
         let result = self.process_prompt(message, &prompt_cancel).await;
         match &result {
@@ -576,6 +605,7 @@ impl Agent {
             Err(_) => {}
         }
         self.control.finish_prompt();
+        run.finished = true;
         result
     }
 
@@ -965,6 +995,7 @@ impl Agent {
         // A round that opens after either token fired runs already cancelled:
         // each call is answered as `Cancelled`, and every call stays paired.
         let cancel = CancellationToken::new();
+        let _cancel_on_drop = cancel.clone().drop_guard();
         if prompt_cancel.is_cancelled() || round_cancel.is_cancelled() {
             cancel.cancel();
         }

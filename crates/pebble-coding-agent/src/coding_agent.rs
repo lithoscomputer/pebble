@@ -1213,6 +1213,10 @@ impl CodingAgent {
 
     /// Processes one user prompt and every queued follow-up to completion.
     ///
+    /// Dropping the future after work starts closes the agent and cancels
+    /// active work. Call `shutdown` to finish joining tasks and flushing
+    /// events. Use token cancellation to keep the agent reusable.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::SessionClosed`] after shutdown,
@@ -1237,7 +1241,7 @@ impl CodingAgent {
     ///
     /// # Errors
     ///
-    /// As [`prompt`](Self::prompt).
+    /// As [`prompt`](Self::prompt), including its future-drop contract.
     pub async fn prompt_with_cancellation(
         &mut self,
         input: impl Into<CodingInput>,
@@ -1247,6 +1251,9 @@ impl CodingAgent {
     }
 
     /// Replaces older conversation turns with a model-generated summary.
+    ///
+    /// Dropping this future after compaction starts closes the agent. Call
+    /// `shutdown` to finish cleanup. Token cancellation keeps it reusable.
     ///
     /// This operation requires an idle agent. Use
     /// [`compact_with_cancellation`](Self::compact_with_cancellation) with a
@@ -1475,6 +1482,9 @@ impl CodingAgent {
     }
 
     /// Closes the agent and joins its owned tasks.
+    ///
+    /// If this future is dropped, call `shutdown` again to finish cleanup.
+    /// The terminal event is emitted once.
     pub async fn shutdown(&mut self, reason: ShutdownReason) -> Result<bool, Error> {
         self.inner.shutdown(reason).await
     }

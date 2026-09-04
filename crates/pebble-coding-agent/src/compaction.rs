@@ -297,6 +297,7 @@ impl CompactionRun {
 
 impl Drop for CompactionRun {
     fn drop(&mut self) {
+        self.cancel.cancel();
         let cleared = {
             let mut state = self
                 .control
@@ -499,9 +500,16 @@ pub(crate) async fn compact_context(
         }
     };
 
+    let mut drop_guard = CompactionDropGuard {
+        emitter,
+        session_id,
+        reason: request.reason,
+        finished: false,
+    };
     let response = tokio::select! {
         biased;
         () = request.cancel.cancelled() => {
+            drop_guard.finished = true;
             emitter.emit(session_id.to_owned(), CodingEvent::CompactionCancelled {
                 reason: request.reason,
             });
@@ -511,6 +519,7 @@ pub(crate) async fn compact_context(
             match response.map_err(CompactionError::Llm) {
                 Ok(response) => response,
                 Err(source) => {
+                    drop_guard.finished = true;
                     let error = Error::from(source);
                     emit_compaction_failure(emitter, session_id, request.reason, &error);
                     return Err(error);
@@ -519,6 +528,7 @@ pub(crate) async fn compact_context(
         }
     };
 
+    drop_guard.finished = true;
     if request.cancel.is_cancelled() {
         emitter.emit(session_id.to_owned(), CodingEvent::CompactionCancelled {
             reason: request.reason,
@@ -575,6 +585,28 @@ pub(crate) async fn compact_context(
     });
 
     Ok(CompactionOutcome::Compacted(result))
+}
+
+/// Pairs a started compaction with cancellation when its model future is
+/// dropped.
+struct CompactionDropGuard<'a> {
+    emitter:    &'a Emitter,
+    session_id: &'a str,
+    reason:     CompactionReason,
+    finished:   bool,
+}
+
+impl Drop for CompactionDropGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.emitter.emit(
+                self.session_id.to_owned(),
+                CodingEvent::CompactionCancelled {
+                    reason: self.reason,
+                },
+            );
+        }
+    }
 }
 
 fn emit_compaction_failure(

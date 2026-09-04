@@ -1696,6 +1696,14 @@ impl SubagentSupervisor {
         self.close(agent_id, true).await
     }
 
+    /// Signals every child without waiting; shutdown still owns joining them.
+    pub(crate) fn cancel_all(&self) {
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        for agent in state.agents.values() {
+            agent.cancel_token.cancel();
+        }
+    }
+
     /// Closes every child and waits for each to finish.
     ///
     /// The session calls this before it publishes its own end, so a child's

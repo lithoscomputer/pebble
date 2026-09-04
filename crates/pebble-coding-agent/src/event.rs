@@ -514,18 +514,22 @@ impl Emitter {
     /// having to drop every emitter clone first. Events queued afterwards are
     /// discarded, which is what emitting into a session that has ended means.
     pub(crate) async fn close(&self) -> StdResult<(), EventPipelineError> {
-        if self.state.closing.swap(true, Ordering::AcqRel) {
+        if self.state.closing.load(Ordering::Acquire) {
             return self.state.failure().map_or(Ok(()), Err);
         }
-        let send = self.outbox.send(Queued::Close);
-        tokio::pin!(send);
+        // Reserve before marking the pipeline closed. Dropping this future
+        // while the queue is full must leave a later close able to send.
         tokio::select! {
             biased;
             () = self.state.failed.cancelled() => {
                 Err(self.state.failure().unwrap_or(EventPipelineError::Stopped))
             }
-            result = &mut send => {
-                result.map_err(|_| self.state.failure().unwrap_or(EventPipelineError::Stopped))
+            permit = self.outbox.reserve() => {
+                let permit = permit.map_err(|_| self.state.failure().unwrap_or(EventPipelineError::Stopped))?;
+                if !self.state.closing.swap(true, Ordering::AcqRel) {
+                    permit.send(Queued::Close);
+                }
+                Ok(())
             }
         }
     }
@@ -859,6 +863,21 @@ mod tests {
             provider: Some("anthropic".into()),
             model:    Some("claude-sonnet-5".into()),
         }
+    }
+
+    #[tokio::test]
+    async fn dropping_close_while_the_queue_is_full_can_be_retried() {
+        let (emitter, pump) = EventPump::new(EventOptions {
+            capacity: EventCapacity::new(1),
+            ..EventOptions::default()
+        });
+        emitter.emit("session", session_started());
+        let mut closing = Box::pin(emitter.close());
+        assert!(futures_util::poll!(&mut closing).is_pending());
+        drop(closing);
+        let pump = tokio::spawn(pump.run());
+        emitter.close().await.expect("close can be retried");
+        pump.await.expect("pump joins").expect("stream drains");
     }
 
     #[tokio::test]

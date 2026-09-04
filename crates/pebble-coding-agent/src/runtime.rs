@@ -526,6 +526,7 @@ impl CodingRuntimeBuilder {
             pump,
             state,
             ended: false,
+            end_emitted: false,
             client: self.client,
             profile,
             provider: handle.provider().as_str().to_owned(),
@@ -720,6 +721,7 @@ pub(crate) struct CodingRuntime {
     /// round.
     state:             StateMachine,
     ended:             bool,
+    end_emitted:       bool,
     client:            Client,
     profile:           Arc<dyn AgentProfile>,
     provider:          String,
@@ -1468,6 +1470,7 @@ impl CodingRuntime {
             return Ok(CompactionOutcome::Unchanged);
         }
 
+        let mut operation_guard = OperationGuard::new(self);
         let estimate = estimate_active_context_usage(&self.system_prompt, &history);
         let compaction_cancel = self.cancel_token.child_token();
         if cancel.is_some_and(CancellationToken::is_cancelled) {
@@ -1496,7 +1499,7 @@ impl CodingRuntime {
         .await;
         drop(operation);
         if let Some(link) = caller_link {
-            link.abort();
+            link.stop().await;
         }
 
         if result.is_ok() {
@@ -1511,6 +1514,7 @@ impl CodingRuntime {
                 return Err(error);
             }
         }
+        operation_guard.finished = true;
         result
     }
 
@@ -1549,6 +1553,7 @@ impl CodingRuntime {
             return Err(Error::SessionClosed);
         }
 
+        let mut operation_guard = OperationGuard::new(self);
         // A child of the terminal token, so a shutdown ends the prompt too.
         // Caller cancellation and a failed durable stream are joined in by
         // tasks because a cancellation token has only one parent.
@@ -1563,9 +1568,9 @@ impl CodingRuntime {
             .await;
 
         if let Some(link) = caller_link {
-            link.abort();
+            link.stop().await;
         }
-        event_link.abort();
+        event_link.stop().await;
         let mut task_failure = stop_wall_clock_timer(timer).await;
         // The reason has been reported by now. Clearing it here rather than at
         // the start of the next prompt keeps a reason a watchdog records just
@@ -1606,6 +1611,7 @@ impl CodingRuntime {
             remember_failure(&mut task_failure, error);
         }
 
+        operation_guard.finished = true;
         // The durable stream is the record of every other outcome. If it is
         // incomplete, that is the failure the caller must act on even when the
         // model or a cleanup task also failed.
@@ -1683,22 +1689,23 @@ impl CodingRuntime {
         }
         if reason == ShutdownReason::Cancelled {
             self.set_interrupt_reason(InterruptReason::Cancelled);
-            self.cancel_token.cancel();
         }
         self.state.transition(CodingAgentState::Closed);
+        self.cancel_token.cancel();
+        self.agent_control.close();
         if let Some(supervisor) = &self.subagents {
             supervisor.shutdown_all().await;
         }
         if let Some(agent) = &mut self.coding_agent {
             let _ = agent.shutdown();
         }
-        // A session shut down before its first prompt never built its agent,
-        // so the control it handed out is closed here for it to read.
-        let _ = self.agent_control.close();
-        self.ended = true;
-        self.emit(CodingEvent::SessionEnded);
+        if !self.end_emitted {
+            self.emit(CodingEvent::SessionEnded);
+            self.end_emitted = true;
+        }
         let flushed = self.flush_events().await;
         let joined = self.join_pump().await;
+        self.ended = true;
         flushed?;
         joined?;
         Ok(true)
@@ -1724,11 +1731,13 @@ impl CodingRuntime {
 
     /// Publishes everything queued, then joins the pump.
     async fn join_pump(&mut self) -> Result<()> {
-        let Some(pump) = self.pump.take() else {
+        let Some(pump) = self.pump.as_mut() else {
             return Ok(());
         };
         let _ = self.emitter.close().await;
-        match pump.await {
+        let outcome = pump.await;
+        self.pump = None;
+        match outcome {
             Ok(result) => result,
             Err(source) => Err(Error::Task {
                 task: TaskKind::EventPump,
@@ -1904,6 +1913,56 @@ impl StateMachine {
     }
 }
 
+/// Closes a session when an operation is abandoned before its cleanup boundary.
+struct OperationGuard {
+    state:     StateMachine,
+    control:   AgentControlHandle,
+    cancel:    CancellationToken,
+    subagents: Option<SubagentSupervisor>,
+    finished:  bool,
+}
+
+impl OperationGuard {
+    fn new(runtime: &CodingRuntime) -> Self {
+        Self {
+            state:     runtime.state.clone(),
+            control:   runtime.agent_control.clone(),
+            cancel:    runtime.cancel_token.clone(),
+            subagents: runtime.subagents.clone(),
+            finished:  false,
+        }
+    }
+}
+
+impl Drop for OperationGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.cancel.cancel();
+            if let Some(supervisor) = &self.subagents {
+                supervisor.cancel_all();
+            }
+            self.control.close();
+            self.state.transition(CodingAgentState::Closed);
+        }
+    }
+}
+
+/// Owns a disposable cancellation forwarding task, including on future drop.
+struct CancellationLink(JoinHandle<()>);
+
+impl CancellationLink {
+    async fn stop(mut self) {
+        self.0.abort();
+        let _ = (&mut self.0).await;
+    }
+}
+
+impl Drop for CancellationLink {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Cancels `prompt_cancel` when `caller` fires.
 ///
 /// A token has one parent, and the prompt token's is the terminal token, so
@@ -1913,15 +1972,15 @@ impl StateMachine {
 fn link_cancellation(
     caller: &CancellationToken,
     prompt_cancel: &CancellationToken,
-) -> JoinHandle<()> {
+) -> CancellationLink {
     let caller = caller.clone();
     let prompt_cancel = prompt_cancel.clone();
-    tokio::spawn(async move {
+    CancellationLink(tokio::spawn(async move {
         tokio::select! {
             () = caller.cancelled() => prompt_cancel.cancel(),
             () = prompt_cancel.cancelled() => {}
         }
-    })
+    }))
 }
 
 /// Keeps the event-stream failure when cleanup finds more than one failure.
@@ -1942,11 +2001,18 @@ struct WallClockTimer {
     task: JoinHandle<()>,
 }
 
+impl Drop for WallClockTimer {
+    fn drop(&mut self) {
+        self.stop.cancel();
+        self.task.abort();
+    }
+}
+
 /// Stops the timer and joins it, reporting a task that failed outright.
 async fn stop_wall_clock_timer(timer: Option<WallClockTimer>) -> Option<Error> {
-    let timer = timer?;
+    let mut timer = timer?;
     timer.stop.cancel();
-    timer.task.await.err().map(|source| Error::Task {
+    (&mut timer.task).await.err().map(|source| Error::Task {
         task: TaskKind::WallClockTimer,
         source,
     })
