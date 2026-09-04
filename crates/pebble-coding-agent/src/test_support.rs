@@ -1,4 +1,4 @@
-//! Test doubles for code that embeds pebble.
+//! Test doubles and environment contract checks for code that embeds pebble.
 //!
 //! These are the doubles pebble's own tests run against, published so an
 //! application can drive its tools and middleware without a real machine
@@ -16,10 +16,15 @@
 //!
 //! [`DenyTool`] and [`FixedPermission`] are the two permission policies a
 //! test of tool middleware usually needs.
+//!
+//! [`EnvironmentContract`] checks an application's environment implementation
+//! against the file, search, and command behavior coding tools require.
 
+mod environment_contract;
 mod policy;
 mod scripted;
 
+pub use self::environment_contract::{EnvironmentContract, EnvironmentContractError};
 pub use self::policy::{DenyTool, FixedPermission};
 pub use self::scripted::{
     ScriptedCall, ScriptedCompletion, ScriptedFailure, ScriptedItem, ScriptedProvider,

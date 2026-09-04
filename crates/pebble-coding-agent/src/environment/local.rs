@@ -581,7 +581,10 @@ impl Environment for LocalEnvironment {
         builder
             .arg("-c")
             .arg(command)
-            .current_dir(working_dir.map_or_else(|| self.working_directory.clone(), PathBuf::from))
+            .current_dir(working_dir.map_or_else(
+                || self.working_directory.clone(),
+                |path| self.resolve_path(path),
+            ))
             .env_clear()
             .envs(self.command_env(env_vars))
             .kill_on_drop(true)
