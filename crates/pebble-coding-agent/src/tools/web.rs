@@ -6,6 +6,7 @@ use std::sync::Arc;
 use lithos_llm::Client;
 use lithos_llm::types::{Request, ToolDefinition};
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::char_boundary::floor_char_boundary;
 use crate::environment::ExecRequest;
@@ -56,7 +57,13 @@ impl WebFetchSummarizer {
     }
 
     /// Answers `prompt` about the content of `url`.
-    async fn summarize(&self, url: &str, content: &str, prompt: &str) -> Result<String, ToolError> {
+    async fn summarize(
+        &self,
+        url: &str,
+        content: &str,
+        prompt: &str,
+        cancel: &CancellationToken,
+    ) -> Result<String, ToolError> {
         let request = Request::builder()
             .model(self.model.clone())
             .user(format!(
@@ -66,11 +73,11 @@ impl WebFetchSummarizer {
             .build()
             .map_err(|error| self.failed(error))?;
 
-        let response = self
-            .client
-            .complete(request)
-            .await
-            .map_err(|error| self.failed(error))?;
+        let response = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(ToolError::cancelled("Cancelled")),
+            response = self.client.complete(request) => response.map_err(|error| self.failed(error))?,
+        };
         Ok(response.text())
     }
 
@@ -163,7 +170,7 @@ pub fn make_web_fetch_tool(summarizer: Option<Arc<WebFetchSummarizer>>) -> Regis
 
                 match (prompt, summarizer.as_ref()) {
                     (Some(prompt), Some(summarizer)) => {
-                        summarizer.summarize(url, &content, prompt).await
+                        summarizer.summarize(url, &content, prompt, &ctx.cancel).await
                     }
                     (Some(_), None) => Ok(format!(
                         "[Note: prompt summarization unavailable, returning full \
