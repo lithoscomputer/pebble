@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use lithos_llm::types::ToolDefinition;
+use pebble_agent::ToolScheduling;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -355,6 +356,7 @@ pub struct RegisteredTool {
     inheritable:           bool,
     /// Whether the tool parks a prompt on a person's answer.
     human_input:           bool,
+    scheduling:            ToolScheduling,
 }
 
 impl RegisteredTool {
@@ -383,6 +385,7 @@ impl RegisteredTool {
             source: ToolSource::Application,
             inheritable: false,
             human_input: false,
+            scheduling: ToolScheduling::Concurrent,
         }
     }
 
@@ -415,6 +418,28 @@ impl RegisteredTool {
     pub fn with_source(mut self, source: ToolSource) -> Self {
         self.source = source;
         self
+    }
+
+    /// Declares how the generic loop may schedule this tool within a round.
+    ///
+    /// Use `Sequential` when a call changes state that other calls may read or
+    /// write. This does not synchronize separate agents sharing an environment.
+    /// A tool requiring human input remains exclusive regardless of this
+    /// setting.
+    #[must_use]
+    pub const fn with_scheduling(mut self, scheduling: ToolScheduling) -> Self {
+        self.scheduling = scheduling;
+        self
+    }
+
+    /// The effective scheduling rule, including the human-input guarantee.
+    #[must_use]
+    pub const fn scheduling(&self) -> ToolScheduling {
+        if self.human_input {
+            ToolScheduling::ExclusiveRound
+        } else {
+            self.scheduling
+        }
     }
 
     /// Lets a child session be given this tool.

@@ -31,7 +31,6 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use super::error::ToolError;
-use super::native::NativeTool;
 use super::permissions::canonical_tool_name;
 use super::registry::{
     CodingEventEmitter, RegisteredTool, ToolContext, ToolEnvProvider, ToolRegistry,
@@ -395,27 +394,8 @@ fn describe(registry: &ToolRegistry) -> Vec<agent::ToolDescriptor> {
     registry
         .tools_with_ids()
         .map(|(id, tool)| {
-            let scheduling = if tool.needs_human_input() {
-                agent::ToolScheduling::ExclusiveRound
-            } else if matches!(
-                NativeTool::from_canonical_name(id.as_str()),
-                Some(
-                    NativeTool::WriteFile
-                        | NativeTool::EditFile
-                        | NativeTool::ApplyPatch
-                        | NativeTool::Shell
-                )
-            ) {
-                // A file edit reads and then writes. Run the whole round in
-                // model order so another call cannot overwrite that edit or
-                // read the file before it is written. Shell commands can also
-                // change files, even when their names do not say so.
-                agent::ToolScheduling::Sequential
-            } else {
-                agent::ToolScheduling::Concurrent
-            };
             agent::ToolDescriptor::new(id.clone(), tool.definition.clone())
-                .with_scheduling(scheduling)
+                .with_scheduling(tool.scheduling())
         })
         .collect()
 }

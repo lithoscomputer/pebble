@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use futures_util::{StreamExt as _, stream};
 use lithos_llm::types::ToolDefinition;
+use pebble_agent::ToolScheduling;
 use serde_json::Value;
 
 use crate::tool::{NativeTool, RegisteredTool, ToolError, optional_usize_arg, required_str};
@@ -81,6 +82,7 @@ pub fn make_write_file_tool() -> RegisteredTool {
         }),
     )
     .with_source(ToolSource::Native)
+    .with_scheduling(ToolScheduling::Sequential)
 }
 
 /// Replaces one exact string in a file.
@@ -139,7 +141,7 @@ pub fn make_edit_file_tool() -> RegisteredTool {
                 ctx.env.write_existing_file(file_path, &new_content).await?;
                 Ok(format!("Successfully edited {file_path}"))
             })
-        })).with_source(ToolSource::Native)
+        })).with_source(ToolSource::Native).with_scheduling(ToolScheduling::Sequential)
 }
 
 /// Reads several files in one call.

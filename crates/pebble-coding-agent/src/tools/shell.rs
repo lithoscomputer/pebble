@@ -12,6 +12,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use lithos_llm::types::ToolDefinition;
+use pebble_agent::ToolScheduling;
 use tokio::task;
 use tracing::{debug, warn};
 
@@ -66,7 +67,7 @@ pub fn make_shell_tool_with_options(options: &NativeToolOptions) -> RegisteredTo
 
                 run_shell_command(&ctx, command, timeout_ms, None).await
             })
-        })).with_source(ToolSource::Native)
+        })).with_source(ToolSource::Native).with_scheduling(ToolScheduling::Sequential)
 }
 
 /// Runs one command with the session's environment variables and

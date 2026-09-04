@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use pebble_agent::ToolScheduling;
 use serde_json::{Value, json};
 
 use super::definition;
@@ -160,6 +161,7 @@ explicitly asked. Never run commands requiring superuser privileges unless expli
         }),
     )
     .with_source(ToolSource::Native)
+    .with_scheduling(ToolScheduling::Sequential)
 }
 
 /// `Read`, where a negative `line_offset` reads from the end of the file.
@@ -333,7 +335,7 @@ contents have little continuity with the old contents.
                 }
                 Ok(format!("Wrote {path}"))
             })
-        })).with_source(ToolSource::Native)
+        })).with_source(ToolSource::Native).with_scheduling(ToolScheduling::Sequential)
 }
 
 /// `Edit`, whose target is named `path`.
@@ -377,6 +379,7 @@ pub(crate) fn make_kimi_edit_tool(description: &str) -> RegisteredTool {
         }),
     )
     .with_source(ToolSource::Native)
+    .with_scheduling(ToolScheduling::Sequential)
 }
 
 /// The shapes Kimi Code's `Grep` returns its results in.

@@ -27,6 +27,7 @@ use std::slice;
 use std::sync::Arc;
 
 use lithos_llm::types::ToolDefinition;
+use pebble_agent::ToolScheduling;
 
 use crate::environment::{Environment, EnvironmentError};
 use crate::tool::{NativeTool, RegisteredTool, ToolError};
@@ -620,6 +621,7 @@ pub fn make_apply_patch_tool() -> RegisteredTool {
         }),
     )
     .with_source(ToolSource::Native)
+    .with_scheduling(ToolScheduling::Sequential)
 }
 
 #[cfg(test)]

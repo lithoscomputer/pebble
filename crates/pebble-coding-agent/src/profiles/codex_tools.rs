@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use lithos_llm::types::ToolDefinition;
+use pebble_agent::ToolScheduling;
 use serde_json::{Value, json};
 
 use super::{FileEditToolKind, ProfileDeps};
@@ -105,5 +106,5 @@ fn make_shell_command_tool(
 
                 run_shell_command(&context, command, timeout_ms, workdir).await
             })
-        })).with_source(ToolSource::Native)
+        })).with_source(ToolSource::Native).with_scheduling(ToolScheduling::Sequential)
 }

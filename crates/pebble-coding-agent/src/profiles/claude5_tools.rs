@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use lithos_llm::types::ToolDefinitionKind;
+use pebble_agent::ToolScheduling;
 use serde_json::{Value, json};
 use tokio::time;
 
@@ -131,6 +132,7 @@ pub(crate) fn make_bash_tool(options: &NativeToolOptions) -> RegisteredTool {
         }),
     )
     .with_source(ToolSource::Native)
+    .with_scheduling(ToolScheduling::Sequential)
 }
 
 /// `WebSearch`, which takes a query and nothing else.
