@@ -50,8 +50,8 @@ use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-pub(crate) use self::tools::{subagent_tools, tree_position};
-use crate::SessionIdentity;
+pub(crate) use self::tools::{require_session_scope, subagent_tools};
+use crate::SessionScope;
 use crate::coding_agent::CodingInput;
 use crate::config::CodingAgentOptions;
 use crate::environment::Environment;
@@ -273,7 +273,7 @@ pub(crate) type ChildObserver = Arc<dyn Fn(&CodingRuntime) + Send + Sync>;
 /// inheritable. Nothing else can be handed to it.
 fn build_child(
     deps: &Arc<ChildDeps>,
-    parent: SessionIdentity,
+    parent: SessionScope,
     depth: usize,
 ) -> StdResult<CodingRuntime, CodingAgentBuildError> {
     // A child is given a task, not the application's integrations: an
@@ -358,7 +358,7 @@ pub(crate) struct ChildDeps {
 pub(crate) struct ChildIdentity {
     /// This child's view of the tree's shared event pipeline.
     pub(crate) event_emitter: Emitter,
-    pub(crate) parent:        SessionIdentity,
+    pub(crate) parent:        SessionScope,
     pub(crate) depth:         usize,
     pub(crate) open_sessions: Arc<OpenSessions>,
     /// What sees this child's own children as they are built, inherited
@@ -1067,7 +1067,7 @@ impl SubagentSupervisor {
     /// the child.
     pub(crate) fn spawn(
         &self,
-        parent: &SessionIdentity,
+        parent: &SessionScope,
         task_prompt: String,
     ) -> StdResult<String, ToolError> {
         self.spawn_inner(parent, task_prompt, None)
@@ -1077,7 +1077,7 @@ impl SubagentSupervisor {
     /// at the next input boundary.
     pub(crate) fn spawn_with_parent_notification(
         &self,
-        parent: &SessionIdentity,
+        parent: &SessionScope,
         task_prompt: String,
         description: String,
     ) -> StdResult<String, ToolError> {
@@ -1086,7 +1086,7 @@ impl SubagentSupervisor {
 
     fn spawn_inner(
         &self,
-        parent: &SessionIdentity,
+        parent: &SessionScope,
         task_prompt: String,
         parent_notification_description: Option<String>,
     ) -> StdResult<String, ToolError> {
@@ -1845,8 +1845,8 @@ mod tests {
                 .build()
                 .expect("parent builds");
             let supervisor = supervisor_of(&parent);
-            let mut child =
-                build_child(&supervisor.deps, parent.identity().clone(), 1).expect("child builds");
+            let mut child = build_child(&supervisor.deps, parent.session_scope().clone(), 1)
+                .expect("child builds");
             let tools = child.registered_tools();
             let inherited = tools.iter().find(|tool| tool.definition.name == "inspect");
             assert_eq!(inherited.is_some(), inheritable);
@@ -1922,7 +1922,7 @@ mod tests {
 
     fn spawn(supervisor: &SubagentSupervisor, parent: &CodingRuntime, task: &str) -> String {
         supervisor
-            .spawn(parent.identity(), task.to_owned())
+            .spawn(parent.session_scope(), task.to_owned())
             .expect("the spawn succeeds")
     }
 
@@ -1934,7 +1934,7 @@ mod tests {
     ) -> String {
         supervisor
             .spawn_with_parent_notification(
-                parent.identity(),
+                parent.session_scope(),
                 task.to_owned(),
                 description.to_owned(),
             )
@@ -2953,7 +2953,7 @@ mod tests {
             .supervisor
             .spawn(
                 &parent
-                    .identity()
+                    .session_scope()
                     .child(crate::SessionId::new(child.id.clone())),
                 "the leaf task".to_owned(),
             )
@@ -3046,7 +3046,7 @@ mod tests {
             .map(|index| spawn(&supervisor, &session, &format!("task {index}")))
             .collect();
         let refused = supervisor
-            .spawn(session.identity(), "one too many".to_owned())
+            .spawn(session.session_scope(), "one too many".to_owned())
             .expect_err("the tree is full");
 
         assert_eq!(refused.kind(), ToolErrorKind::Denied);
@@ -3082,7 +3082,7 @@ mod tests {
         supervisor.wait(&agent_id).await.expect("the child answers");
 
         let refused = supervisor
-            .spawn(session.identity(), "another".to_owned())
+            .spawn(session.session_scope(), "another".to_owned())
             .expect_err("a finished child still holds its session");
         assert_eq!(refused.kind(), ToolErrorKind::Denied);
 
@@ -3478,7 +3478,7 @@ mod tests {
         let tools = subagent_tools(&supervisor);
         let context = || {
             ToolContext::new(Arc::new(MockEnvironment::linux()))
-                .with_session(parent.identity().clone())
+                .with_session(parent.session_scope().clone())
         };
 
         let agent_id = (tool_named(&tools, "spawn_agent").executor)(

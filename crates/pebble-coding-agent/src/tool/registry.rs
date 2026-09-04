@@ -20,7 +20,7 @@ use crate::event::{OutputCaptureStats, SessionBoundEmitter};
 use crate::human_input::HumanInputProvider;
 use crate::redact::{NoRedaction, Redactor};
 use crate::types::{CodingEvent, ToolCategory, ToolSource, ToolSummary};
-use crate::{SessionId, SessionIdentity};
+use crate::{SessionId, SessionScope};
 
 /// The narrow handle a running tool publishes events through.
 ///
@@ -86,31 +86,31 @@ impl ToolEnvProvider for StaticEnvProvider {
 /// Everything a tool is given besides its arguments.
 ///
 /// Built once per call by the execution layer. Outside a session — an
-/// application exercising one tool directly, a test — the identity members are
-/// absent, and tools that need them say so rather than assuming a session.
+/// application exercising one tool directly, a test — the session scope is
+/// absent, and tools that need it say so rather than assuming a session.
 ///
 /// New members appear here as tools gain capabilities, so build a context with
 /// [`new`](Self::new) and the `with_*` methods rather than a struct literal,
 /// and read it through its accessors.
 pub struct ToolContext {
     /// Where the tool's work lands.
-    pub(crate) env: Arc<dyn Environment>,
+    pub(crate) env:                  Arc<dyn Environment>,
     /// Fires when this call should stop. Composed from the session's terminal
     /// cancellation and the current model turn's interrupt, so a tool that
     /// watches it observes both.
-    pub(crate) cancel: CancellationToken,
+    pub(crate) cancel:               CancellationToken,
     /// Extra environment variables for a command this call runs.
-    pub(crate) tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
-    /// The session that called the tool.
-    identity: Option<SessionIdentity>,
+    pub(crate) tool_env_provider:    Option<Arc<dyn ToolEnvProvider>>,
+    /// The calling session and the root shared by its tree.
+    session_scope:                   Option<SessionScope>,
     /// The model-native identifier of this call.
-    pub(crate) tool_call_id: Option<String>,
+    pub(crate) tool_call_id:         Option<String>,
     /// Where the tool publishes events.
     pub(crate) coding_event_emitter: Option<Arc<dyn CodingEventEmitter>>,
     /// Where the tool asks the person a question.
-    pub(crate) human_input: Option<Arc<dyn HumanInputProvider>>,
+    pub(crate) human_input:          Option<Arc<dyn HumanInputProvider>>,
     /// What strips secrets out of text the tool publishes.
-    pub(crate) redactor: Arc<dyn Redactor>,
+    pub(crate) redactor:             Arc<dyn Redactor>,
 }
 
 impl ToolContext {
@@ -143,7 +143,7 @@ impl ToolContext {
     /// The session that called the tool, when the call runs inside one.
     #[must_use]
     pub fn session_id(&self) -> Option<&SessionId> {
-        self.identity.as_ref().map(SessionIdentity::session_id)
+        self.session_scope.as_ref().map(SessionScope::session_id)
     }
 
     /// The root of the session tree this call belongs to. Equal to
@@ -151,7 +151,9 @@ impl ToolContext {
     /// its parent's root.
     #[must_use]
     pub fn root_session_id(&self) -> Option<&SessionId> {
-        self.identity.as_ref().map(SessionIdentity::root_session_id)
+        self.session_scope
+            .as_ref()
+            .map(SessionScope::root_session_id)
     }
 
     /// The model-native identifier of this call.
@@ -186,7 +188,7 @@ impl ToolContext {
             env,
             cancel: CancellationToken::new(),
             tool_env_provider: None,
-            identity: None,
+            session_scope: None,
             tool_call_id: None,
             coding_event_emitter: None,
             human_input: None,
@@ -203,15 +205,15 @@ impl ToolContext {
 
     /// Sets the calling session and the root of its session tree.
     #[must_use]
-    pub fn with_session(mut self, identity: SessionIdentity) -> Self {
-        self.identity = Some(identity);
+    pub fn with_session(mut self, session_scope: SessionScope) -> Self {
+        self.session_scope = Some(session_scope);
         self
     }
 
     /// The calling session and its tree, absent for a call outside a session.
     #[must_use]
-    pub const fn identity(&self) -> Option<&SessionIdentity> {
-        self.identity.as_ref()
+    pub const fn session_scope(&self) -> Option<&SessionScope> {
+        self.session_scope.as_ref()
     }
 
     /// Sets the model-native identifier of this call.
@@ -285,7 +287,9 @@ impl ToolContext {
     /// session to be root of.
     #[must_use]
     pub fn is_root_session(&self) -> bool {
-        self.identity.as_ref().is_some_and(SessionIdentity::is_root)
+        self.session_scope
+            .as_ref()
+            .is_some_and(SessionScope::is_root)
     }
 }
 
@@ -1150,7 +1154,7 @@ mod tests {
         assert!(
             context()
                 .with_session(
-                    crate::SessionIdentity::root(crate::SessionId::new("ses_1"))
+                    crate::SessionScope::root(crate::SessionId::new("ses_1"))
                         .child(crate::SessionId::new("ses_1"))
                 )
                 .is_root_session()
@@ -1158,7 +1162,7 @@ mod tests {
         assert!(
             !context()
                 .with_session(
-                    crate::SessionIdentity::root(crate::SessionId::new("ses_1"))
+                    crate::SessionScope::root(crate::SessionId::new("ses_1"))
                         .child(crate::SessionId::new("ses_2"))
                 )
                 .is_root_session()

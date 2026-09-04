@@ -705,7 +705,7 @@ mod tests {
     fn root_context(provider: Arc<dyn HumanInputProvider>) -> ToolContext {
         context(MockEnvironment::default())
             .with_session(
-                crate::SessionIdentity::root(crate::SessionId::new("root"))
+                crate::SessionScope::root(crate::SessionId::new("root"))
                     .child(crate::SessionId::new("root")),
             )
             .with_tool_call_id("call_1")
@@ -1077,7 +1077,7 @@ mod tests {
         let tool = make_claude5_question_tool();
         let child = context(MockEnvironment::default())
             .with_session(
-                crate::SessionIdentity::root(crate::SessionId::new("root"))
+                crate::SessionScope::root(crate::SessionId::new("root"))
                     .child(crate::SessionId::new("child")),
             )
             .with_tool_call_id("call")
@@ -1102,7 +1102,7 @@ mod tests {
         let tool = make_anthropic_question_tool();
         let context = context(MockEnvironment::default())
             .with_session(
-                crate::SessionIdentity::root(crate::SessionId::new("root"))
+                crate::SessionScope::root(crate::SessionId::new("root"))
                     .child(crate::SessionId::new("root")),
             )
             .with_tool_call_id("call");

@@ -40,7 +40,7 @@ impl CodingEventEmitter for CollectingEmitter {
 pub(super) fn context_for(session: &str, root: &str) -> ToolContext {
     context(MockEnvironment::default())
         .with_session(
-            crate::SessionIdentity::root(crate::SessionId::new(root))
+            crate::SessionScope::root(crate::SessionId::new(root))
                 .child(crate::SessionId::new(session)),
         )
         .with_coding_event_emitter(Arc::new(CollectingEmitter::default()))
@@ -50,7 +50,7 @@ pub(super) fn context_for(session: &str, root: &str) -> ToolContext {
 pub(super) fn context_emitting(emitter: Arc<CollectingEmitter>) -> ToolContext {
     context(MockEnvironment::default())
         .with_session(
-            crate::SessionIdentity::root(crate::SessionId::new("ses_a"))
+            crate::SessionScope::root(crate::SessionId::new("ses_a"))
                 .child(crate::SessionId::new("ses_a")),
         )
         .with_coding_event_emitter(emitter)

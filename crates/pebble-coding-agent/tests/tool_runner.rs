@@ -16,7 +16,7 @@ use pebble_coding_agent::tools::{
     ApprovalDecision, CodingToolSet, PermissionMiddleware, RegisteredTool, ToolApprovalService,
     ToolError, ToolErrorKind, ToolPermission, ToolRunner, ToolSource,
 };
-use pebble_coding_agent::{CodingAgentOptions, SessionId, SessionIdentity};
+use pebble_coding_agent::{CodingAgentOptions, SessionId, SessionScope};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -435,9 +435,9 @@ async fn an_event_callback_failure_fails_the_run() {
 }
 
 #[tokio::test]
-async fn a_runner_delivers_session_identity_separately_from_the_tool_call_id() {
-    let identity = SessionIdentity::root(SessionId::new("runner/session"));
-    let expected = identity.clone();
+async fn a_runner_delivers_session_scope_separately_from_the_tool_call_id() {
+    let scope = SessionScope::root(SessionId::new("runner/session"));
+    let expected = scope.clone();
     let tool = RegisteredTool::function(
         "inspect_identity",
         "Inspect context",
@@ -445,7 +445,7 @@ async fn a_runner_delivers_session_identity_separately_from_the_tool_call_id() {
         move |context, _| {
             let expected = expected.clone();
             async move {
-                assert_eq!(context.identity(), Some(&expected));
+                assert_eq!(context.session_scope(), Some(&expected));
                 assert_eq!(context.session_id(), Some(expected.session_id()));
                 assert_eq!(context.root_session_id(), Some(expected.root_session_id()));
                 assert_eq!(context.tool_call_id(), Some("model-call"));
@@ -457,7 +457,7 @@ async fn a_runner_delivers_session_identity_separately_from_the_tool_call_id() {
         .with_tool(tool)
         .expect("tool registered");
     let result = ToolRunner::new(tools, mock_environment())
-        .session_id(identity.session_id().clone())
+        .session_id(scope.session_id().clone())
         .run(
             &ToolCall::function("model-call", "inspect_identity", json!({})),
             CancellationToken::new(),

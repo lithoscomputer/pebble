@@ -31,7 +31,7 @@ use crate::tools::{
     make_shell_tool_with_options, make_web_fetch_tool, make_web_search_tool, make_write_file_tool,
 };
 use crate::types::{CodingAgentEvent, ToolSummary};
-use crate::{SessionId, SessionIdentity};
+use crate::{SessionId, SessionScope};
 
 /// The session identifier a runner stamps on its events when the application
 /// names none.
@@ -279,7 +279,7 @@ impl ToolRunner {
             Arc::clone(&self.environment),
             Arc::clone(&self.options),
             emitter.clone(),
-            SessionIdentity::root(self.session_id.clone()),
+            SessionScope::root(self.session_id.clone()),
             redactor,
         );
         if let Some(provider) = self.tool_env_provider.as_ref() {

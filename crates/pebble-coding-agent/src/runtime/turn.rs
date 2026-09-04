@@ -296,7 +296,7 @@ impl CodingAgentBridge {
             Arc::clone(&runtime.env),
             Arc::clone(&config),
             runtime.emitter.clone(),
-            runtime.identity.clone(),
+            runtime.session_scope.clone(),
             Arc::clone(&runtime.redactor),
         );
         if let Some(provider) = runtime.tool_env_provider.as_ref() {
@@ -312,7 +312,7 @@ impl CodingAgentBridge {
             config,
             tools: Arc::new(tools),
             emitter: runtime.emitter.clone(),
-            session_id: runtime.identity.session_id().clone(),
+            session_id: runtime.session_scope.session_id().clone(),
             state_machine: runtime.state.clone(),
             prompt_cancel: Arc::new(Mutex::new(runtime.cancel_token.clone())),
             compaction: runtime.compaction.clone(),
@@ -942,7 +942,7 @@ impl CodingRuntime {
         let model_service = CodingModelService {
             model_context: self.model_context.clone(),
             emitter:       self.emitter.clone(),
-            session_id:    self.identity.session_id().clone(),
+            session_id:    self.session_scope.session_id().clone(),
         };
         let messages = bridge
             .state

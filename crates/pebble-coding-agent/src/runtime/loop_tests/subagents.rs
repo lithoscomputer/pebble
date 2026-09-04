@@ -176,7 +176,7 @@ async fn background_agent_notifications_are_batched_into_one_parent_turn() {
     // a time so each takes the script entry meant for it.
     let first = supervisor
         .spawn_with_parent_notification(
-            parent.identity(),
+            parent.session_scope(),
             "first task".to_owned(),
             "Inspect first".to_owned(),
         )
@@ -187,7 +187,7 @@ async fn background_agent_notifications_are_batched_into_one_parent_turn() {
         .expect("the first child answers");
     let second = supervisor
         .spawn_with_parent_notification(
-            parent.identity(),
+            parent.session_scope(),
             "second task".to_owned(),
             "Inspect second".to_owned(),
         )
@@ -254,7 +254,7 @@ async fn background_agent_output_is_not_parsed_for_skill_references() {
         .clone();
     let child = supervisor
         .spawn_with_parent_notification(
-            parent.identity(),
+            parent.session_scope(),
             "clean up".to_owned(),
             "Clean scratch files".to_owned(),
         )
@@ -390,7 +390,7 @@ async fn shutdown_cleans_up_subagents_before_emitting_session_ended() {
         .expect("the test session was given a factory")
         .clone();
     let agent_id = supervisor
-        .spawn(session.identity(), "task".to_owned())
+        .spawn(session.session_scope(), "task".to_owned())
         .expect("the spawn succeeds");
     let mut events = session.subscribe();
 
@@ -474,7 +474,7 @@ async fn a_child_cannot_ask_a_person_a_question() {
         .await
         .expect("the parent's prompt succeeds");
     let agent_id = supervisor
-        .spawn(parent.identity(), "probe too".to_owned())
+        .spawn(parent.session_scope(), "probe too".to_owned())
         .expect("the spawn succeeds");
     supervisor
         .wait_with_cancel(&agent_id, &CancellationToken::new())
@@ -558,14 +558,14 @@ async fn a_grandchilds_news_reaches_the_root_stream() {
     let mut events = parent.subscribe();
 
     let child_id = supervisor
-        .spawn(parent.identity(), "delegate".to_owned())
+        .spawn(parent.session_scope(), "delegate".to_owned())
         .expect("the spawn succeeds");
     let child = first_child(&children);
     let grandchild = child
         .supervisor
         .spawn(
             &parent
-                .identity()
+                .session_scope()
                 .child(crate::SessionId::new(child.id.clone())),
             "the leaf task".to_owned(),
         )
@@ -577,7 +577,7 @@ async fn a_grandchilds_news_reaches_the_root_stream() {
         .supervisor
         .spawn(
             &parent
-                .identity()
+                .session_scope()
                 .child(crate::SessionId::new(grandchild_session.id.clone())),
             "the deepest task".to_owned(),
         )
@@ -662,14 +662,14 @@ async fn a_shutdown_joins_every_task_in_a_tree() {
         .expect("the test session was given a factory")
         .clone();
     let child_id = supervisor
-        .spawn(parent.identity(), "delegate".to_owned())
+        .spawn(parent.session_scope(), "delegate".to_owned())
         .expect("the spawn succeeds");
     let child = first_child(&children);
     let grandchild = child
         .supervisor
         .spawn(
             &parent
-                .identity()
+                .session_scope()
                 .child(crate::SessionId::new(child.id.clone())),
             "the leaf task".to_owned(),
         )
@@ -776,7 +776,7 @@ async fn a_childs_events_reach_the_parents_durable_stream() {
         .clone();
 
     let agent_id = supervisor
-        .spawn(parent.identity(), "task".to_owned())
+        .spawn(parent.session_scope(), "task".to_owned())
         .expect("the spawn succeeds");
     supervisor
         .wait_with_cancel(&agent_id, &CancellationToken::new())
@@ -868,7 +868,7 @@ async fn a_child_inherits_only_marked_tools_and_its_parents_middleware() {
         .clone();
 
     let agent_id = supervisor
-        .spawn(parent.identity(), "work".to_owned())
+        .spawn(parent.session_scope(), "work".to_owned())
         .expect("the spawn succeeds");
     supervisor
         .wait_with_cancel(&agent_id, &CancellationToken::new())
@@ -944,7 +944,7 @@ async fn parent_parked_on_a_background_child() -> (CodingRuntime, Arc<ScriptedPr
         .clone();
     supervisor
         .spawn_with_parent_notification(
-            parent.identity(),
+            parent.session_scope(),
             "take your time".to_owned(),
             "Slow task".to_owned(),
         )

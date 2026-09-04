@@ -1,4 +1,4 @@
-//! Session identities, distinct from model-native tool-call identifiers.
+//! Session identifiers and the scope shared by tools in a session tree.
 
 use std::fmt;
 
@@ -38,17 +38,20 @@ impl fmt::Display for SessionId {
     }
 }
 
-/// A session's identity and the root of the tree it belongs to.
+/// The acting session and the root it shares with the rest of its tree.
 ///
-/// Start a tree with [`root`](Self::root). Derive a child's identity with
+/// Session-scoped tools use the session ID. Root-scoped tools, such as the
+/// shared task list, use the root session ID.
+///
+/// Start a tree with [`root`](Self::root). Derive a child's scope with
 /// [`child`](Self::child); descendants retain the same root automatically.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SessionIdentity {
+pub struct SessionScope {
     session_id:      SessionId,
     root_session_id: SessionId,
 }
 
-impl SessionIdentity {
+impl SessionScope {
     /// Starts a tree whose root is this session.
     #[must_use]
     pub fn root(session_id: SessionId) -> Self {
@@ -67,7 +70,7 @@ impl SessionIdentity {
         }
     }
 
-    /// The session whose tools and events carry this identity.
+    /// The session acting in this scope.
     #[must_use]
     pub const fn session_id(&self) -> &SessionId {
         &self.session_id
@@ -93,7 +96,7 @@ mod tests {
     #[test]
     fn descendants_keep_the_original_root_and_ids_round_trip_as_strings() {
         let root_id: SessionId = serde_json::from_str("\"legacy/session\"").unwrap();
-        let root = SessionIdentity::root(root_id);
+        let root = SessionScope::root(root_id);
         let child = root.child(SessionId::new("child"));
         let grandchild = child.child(SessionId::new("grandchild"));
         assert!(root.is_root());

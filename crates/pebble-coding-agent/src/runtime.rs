@@ -74,7 +74,7 @@ use crate::types::{
     MemoryFileSummary, Message, PermissionLevel, SkillSummary, TokenUsage, ToolSummary,
     rfc3339_millis,
 };
-use crate::{SessionId, SessionIdentity};
+use crate::{SessionId, SessionScope};
 
 /// The catalog metadata namespace pebble reads.
 const METADATA_NAMESPACE: &str = "pebble";
@@ -570,7 +570,7 @@ impl CodingRuntimeBuilder {
                 memory_tokens: 0,
                 skills_tokens: 0,
             }),
-            identity: SessionIdentity::root(root_session_id).child(id),
+            session_scope: SessionScope::root(root_session_id).child(id),
             parent_session_id,
             created_at,
             config: self.options,
@@ -768,7 +768,7 @@ struct PromptResources {
 pub(crate) struct CodingRuntime {
     model_context:     Arc<SessionModel>,
     resources:         Arc<PromptResources>,
-    identity:          SessionIdentity,
+    session_scope:     SessionScope,
     /// The session that spawned this one, for a child. A root has none.
     parent_session_id: Option<SessionId>,
     created_at:        SystemTime,
@@ -816,8 +816,8 @@ impl fmt::Debug for CodingRuntime {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CodingRuntime")
-            .field("id", &self.identity.session_id())
-            .field("root_session_id", &self.identity.root_session_id())
+            .field("id", &self.session_scope.session_id())
+            .field("root_session_id", &self.session_scope.root_session_id())
             .field("provider", &self.model_context.provider)
             .field("model", &self.model_context.model)
             .field("profile", &self.profile.profile_kind())
@@ -1003,7 +1003,7 @@ impl CodingRuntime {
     /// Public callers take records between prompts, after the prompt's event
     /// barrier has committed its complete history.
     pub(crate) fn to_record(&self) -> SessionRecord {
-        let mut record = SessionRecord::new(self.identity.session_id().to_string());
+        let mut record = SessionRecord::new(self.session_scope.session_id().to_string());
         record.parent_session_id = self.parent_session_id.as_ref().map(ToString::to_string);
         record.provider = Some(self.model_context.provider.clone());
         record.model = Some(self.model_context.model.clone());
@@ -1035,7 +1035,7 @@ impl CodingRuntime {
     #[tracing::instrument(
         name = "coding_session_initialize",
         skip_all,
-        fields(session_id = %self.identity.session_id(), provider = %self.model_context.provider, model = %self.model_context.model)
+        fields(session_id = %self.session_scope.session_id(), provider = %self.model_context.provider, model = %self.model_context.model)
     )]
     pub(crate) async fn initialize(&mut self) -> Result<()> {
         let cancel = self.cancel_token.clone();
@@ -1231,7 +1231,7 @@ impl CodingRuntime {
 
     /// This session's identifier.
     pub(crate) fn id(&self) -> &str {
-        self.identity.session_id().as_str()
+        self.session_scope.session_id().as_str()
     }
 
     /// The session and root identities that place this session in its tree.
@@ -1242,13 +1242,13 @@ impl CodingRuntime {
     /// stream, and stored records all key on this, so a session that could
     /// be re-rooted afterwards could be detached from the tree that owns
     /// it.
-    pub(crate) const fn identity(&self) -> &SessionIdentity {
-        &self.identity
+    pub(crate) const fn session_scope(&self) -> &SessionScope {
+        &self.session_scope
     }
 
     /// The root identity as text for event and snapshot boundaries.
     pub(crate) fn root_session_id(&self) -> &str {
-        self.identity.root_session_id().as_str()
+        self.session_scope.root_session_id().as_str()
     }
 
     /// Which harness this session runs.
@@ -1451,7 +1451,7 @@ impl CodingRuntime {
     /// parent's session identity on that same pipeline.
     pub(crate) fn sub_agent_event_callback(&self) -> SubagentEventCallback {
         let emitter = self.emitter.clone();
-        let parent_session_id = self.identity.session_id().to_string();
+        let parent_session_id = self.session_scope.session_id().to_string();
         Arc::new(move |event| {
             emitter.emit(parent_session_id.clone(), event);
         })
@@ -1563,7 +1563,7 @@ impl CodingRuntime {
             &file_tracker,
             request,
             &self.emitter,
-            self.identity.session_id().as_str(),
+            self.session_scope.session_id().as_str(),
         )
         .await;
         drop(operation);
@@ -1606,7 +1606,7 @@ impl CodingRuntime {
         name = "coding_session_prompt",
         skip_all,
         fields(
-            session_id = %self.identity.session_id(),
+            session_id = %self.session_scope.session_id(),
             provider = %self.model_context.provider,
             model = %self.model_context.model
         )
@@ -1750,7 +1750,7 @@ impl CodingRuntime {
     #[tracing::instrument(
         name = "coding_session_shutdown",
         skip_all,
-        fields(session_id = %self.identity.session_id(), reason = ?reason)
+        fields(session_id = %self.session_scope.session_id(), reason = ?reason)
     )]
     pub(crate) async fn shutdown(&mut self, reason: ShutdownReason) -> Result<bool> {
         if self.ended {
@@ -1888,7 +1888,7 @@ impl CodingRuntime {
     /// Publishes one event on this session's stream.
     fn emit(&self, event: CodingEvent) {
         self.emitter
-            .emit(self.identity.session_id().to_string(), event);
+            .emit(self.session_scope.session_id().to_string(), event);
     }
 
     /// Publishes a model failure, closing the session when the credential is
