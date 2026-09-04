@@ -75,7 +75,7 @@ impl Control {
         state.paused = false;
         state.prompt_cancel =
             parent_cancel.map_or_else(CancellationToken::new, CancellationToken::child_token);
-        state.round_cancel = CancellationToken::new();
+        state.round_cancel = state.prompt_cancel.child_token();
         Some(state.prompt_cancel.clone())
     }
 
@@ -92,7 +92,10 @@ impl Control {
 
     pub(crate) fn begin_round(&self) -> (CancellationToken, Vec<UserMessage>) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.round_cancel = CancellationToken::new();
+        // Caller cancellation must reach lifecycle hooks as well as the
+        // model and tools. Cancelling this child still interrupts only the
+        // round, leaving its prompt available for steering.
+        state.round_cancel = state.prompt_cancel.child_token();
         let cancel = state.round_cancel.clone();
         let steering = state.steering.drain(..).collect();
         (cancel, steering)
