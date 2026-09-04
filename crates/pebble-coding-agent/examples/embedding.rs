@@ -20,6 +20,7 @@
 //! log is an error. Cursor reconciliation prevents duplicate sequence numbers;
 //! it does not replay side effects or recover history newer than a checkpoint.
 //! Applications that need those guarantees must coordinate their own storage.
+//! Log repair and deduplication of application retries also belong there.
 
 #![expect(
     clippy::print_stderr,
@@ -212,6 +213,8 @@ impl Store {
         })
     }
 
+    /// The previous checkpoint stays authoritative until replacement. Loading
+    /// never promotes a leftover temporary file, including after a first save.
     async fn save(&self, record: &SessionRecord) -> AppResult {
         let temporary = self.directory.join("session.json.tmp");
         let mut file = File::create(&temporary).await?;
@@ -223,6 +226,8 @@ impl Store {
         sync_directory(&self.directory).await
     }
 
+    /// Acknowledgment may have been lost after an event was synced. Reconcile
+    /// the cursor from disk without inventing newer conversation messages.
     async fn load(&self) -> AppResult<SessionRecord> {
         let mut record: SessionRecord =
             serde_json::from_slice(&fs::read(self.directory.join("session.json")).await?)?;
@@ -371,6 +376,10 @@ async fn run(root: &Path) -> AppResult {
     closed?;
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "embedding/recovery.rs"]
+mod recovery;
 
 #[cfg(test)]
 mod tests {
