@@ -60,3 +60,7 @@ tokio = { version = "1.49.0", features = ["rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true
+
+[[example]]
+name = "embedding"
+required-features = ["test-util"]
