@@ -1826,22 +1826,6 @@
       }
     },
     {
-      "scenario_id": "exec_keeps_a_truncated_answer/1",
-      "namespace": "exec_keeps_a_truncated_answer",
-      "matcher": {
-        "endpoint": "responses"
-      },
-      "script": {
-        "kind": "success",
-        "usage": {
-          "input_tokens": 10,
-          "output_tokens": 5
-        },
-        "response_text": "half an ans",
-        "finish_reason": "length"
-      }
-    },
-    {
       "scenario_id": "exec_patches_a_file_as_gpt56/1",
       "namespace": "exec_patches_a_file_as_gpt56",
       "matcher": {
@@ -2087,6 +2071,97 @@
           "output_tokens": 5
         },
         "response_text": "The background agent failed."
+      }
+    },
+    {
+      "scenario_id": "exec_continues_a_cut_answer/1",
+      "namespace": "exec_continues_a_cut_answer",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "The answer begins here and",
+        "finish_reason": "length"
+      }
+    },
+    {
+      "scenario_id": "exec_continues_a_cut_answer/2",
+      "namespace": "exec_continues_a_cut_answer",
+      "matcher": {
+        "endpoint": "responses",
+        "input_contains": "stopped at the output limit"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": " ends here."
+      }
+    },
+    {
+      "scenario_id": "exec_leaves_a_twice_cut_answer/1",
+      "namespace": "exec_leaves_a_twice_cut_answer",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Part one,",
+        "finish_reason": "length"
+      }
+    },
+    {
+      "scenario_id": "exec_leaves_a_twice_cut_answer/2",
+      "namespace": "exec_leaves_a_twice_cut_answer",
+      "matcher": {
+        "endpoint": "responses",
+        "input_contains": "stopped at the output limit"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": " part two,",
+        "finish_reason": "length"
+      }
+    },
+    {
+      "scenario_id": "exec_refuses_a_cut_tool_call/1",
+      "namespace": "exec_refuses_a_cut_tool_call",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Writing.",
+        "finish_reason": "length",
+        "tool_calls": [
+          {
+            "id": "call_cut",
+            "name": "write_file",
+            "arguments": {
+              "file_path": "notes.txt",
+              "content": "half"
+            }
+          }
+        ]
       }
     }
   ]

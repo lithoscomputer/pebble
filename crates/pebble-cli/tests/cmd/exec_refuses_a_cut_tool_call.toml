@@ -1,0 +1,10 @@
+bin.name = "pebble"
+args = ["exec", "--model", "openai/gpt-5.4", "write notes"]
+fs.sandbox = true
+status = "failed"
+
+[env]
+inherit = false
+
+[env.add]
+OPENAI_API_KEY = "exec_refuses_a_cut_tool_call"

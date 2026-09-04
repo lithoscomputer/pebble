@@ -19,7 +19,7 @@ use crate::test_support::{
     reasoning_delta_events, reasoning_response, responses_reasoning_response, text_delta_events,
     tool_call_events, with_finish_reason,
 };
-use crate::types::LlmRetryPhase;
+use crate::types::{InputSource, LlmRetryPhase};
 
 /// The failure a stream that dropped mid-turn reports.
 ///
@@ -972,4 +972,157 @@ async fn a_turn_that_only_calls_a_tool_reports_a_tool_call_first() {
         2,
         "one bracket per round"
     );
+}
+
+// --- An answer the output limit cut short ---
+//
+// A `Length` finish is not a broken stream: the model used its whole output
+// budget, and the same request would stop at the same place. The answer as far
+// as it got is kept, and the model is asked once to continue it.
+
+#[tokio::test(start_paused = true)]
+async fn an_answer_cut_at_the_output_limit_is_continued_once() {
+    let (mut session, provider) = TestSession::answering(vec![
+        ScriptedCall::response(with_finish_reason(
+            text_response("The answer begins and"),
+            FinishReason::Length,
+        )),
+        ScriptedCall::response(text_response(" ends here.")),
+    ]);
+    let mut events = session.subscribe();
+
+    let answer = session.prompt("Hello").await.expect("the prompt succeeds");
+
+    assert_eq!(answer.as_deref(), Some(" ends here."));
+    assert_eq!(provider.call_count(), 2);
+    let turns = session.history().turns().to_vec();
+    assert!(
+        matches!(&turns[1], Message::Assistant { content, .. } if content == "The answer begins and"),
+        "the cut answer is committed as it stood: {turns:?}"
+    );
+    assert!(
+        matches!(
+            &turns[2],
+            Message::User { content, .. } if content.text_content().contains("stopped at the output limit")
+        ),
+        "the continuation request follows it: {turns:?}"
+    );
+
+    let published = settled(&mut session, &mut events).await;
+    assert_eq!(
+        count(&published, |event| matches!(
+            event,
+            CodingEvent::Warning { kind, .. } if kind == "output_limit"
+        )),
+        1
+    );
+    assert!(
+        published
+            .iter()
+            .any(|event| matches!(event, CodingEvent::UserInput {
+                source: InputSource::Agent,
+                ..
+            })),
+        "the continuation is agent input, not the user's"
+    );
+    assert_eq!(
+        count(&published, |event| matches!(
+            event,
+            CodingEvent::AssistantOutputReplace { .. }
+        )),
+        0,
+        "nothing the model showed is withdrawn"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_answer_cut_twice_is_left_as_it_stands() {
+    let (mut session, provider) = TestSession::answering(vec![
+        ScriptedCall::response(with_finish_reason(
+            text_response("Part one,"),
+            FinishReason::Length,
+        )),
+        ScriptedCall::response(with_finish_reason(
+            text_response(" part two,"),
+            FinishReason::Length,
+        )),
+        ScriptedCall::response(text_response("never asked for")),
+    ]);
+    let mut events = session.subscribe();
+
+    let answer = session.prompt("Hello").await.expect("the prompt succeeds");
+
+    assert_eq!(answer.as_deref(), Some(" part two,"));
+    assert_eq!(provider.call_count(), 2, "one continuation per prompt");
+
+    let published = settled(&mut session, &mut events).await;
+    assert_eq!(
+        count(&published, |event| matches!(
+            event,
+            CodingEvent::Warning { kind, .. } if kind == "output_limit"
+        )),
+        2,
+        "every cut is reported, whether or not it is continued"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_continuation_budget_is_per_prompt() {
+    let (mut session, provider) = TestSession::answering(vec![
+        ScriptedCall::response(with_finish_reason(
+            text_response("first,"),
+            FinishReason::Length,
+        )),
+        ScriptedCall::response(text_response(" done.")),
+        ScriptedCall::response(with_finish_reason(
+            text_response("second,"),
+            FinishReason::Length,
+        )),
+        ScriptedCall::response(text_response(" also done.")),
+    ]);
+
+    session
+        .prompt("One")
+        .await
+        .expect("the first prompt succeeds");
+    let answer = session
+        .prompt("Two")
+        .await
+        .expect("the second prompt succeeds");
+
+    assert_eq!(answer.as_deref(), Some(" also done."));
+    assert_eq!(provider.call_count(), 4);
+    session
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the shutdown succeeds");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_tool_call_cut_at_the_output_limit_is_not_run() {
+    let response = with_finish_reason(
+        tool_call_response("echo", "call_1", json!({"text": "half"})),
+        FinishReason::Length,
+    );
+    let (mut session, provider) = TestSession::new(vec![
+        ScriptedCall::response(response),
+        ScriptedCall::response(text_response("never asked for")),
+    ])
+    .tools([echo_tool()])
+    .build();
+
+    let error = session
+        .prompt("Use the tool")
+        .await
+        .expect_err("a cut tool call ends the prompt");
+
+    assert_eq!(error.kind(), ErrorKind::ToolExecution, "{error}");
+    assert_eq!(provider.call_count(), 1);
+    let results = tool_results(&session, 2);
+    assert_eq!(results.len(), 1, "the call still has its result");
+    assert_eq!(result_text(&results[0]), "Cancelled");
+    session
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the shutdown succeeds");
 }

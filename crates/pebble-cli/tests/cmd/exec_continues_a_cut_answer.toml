@@ -7,4 +7,4 @@ status = "success"
 inherit = false
 
 [env.add]
-OPENAI_API_KEY = "exec_keeps_a_truncated_answer"
+OPENAI_API_KEY = "exec_continues_a_cut_answer"

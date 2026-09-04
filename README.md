@@ -173,6 +173,14 @@ replay, doubles the wait each time, caps a wait at sixty seconds, and jitters
 each wait. The two policies can share settings, but they have different
 ownership and do not have to match.
 
+An answer that stops at the model's output limit is not replayed: the same
+request would stop at the same place. Pebble keeps the answer as far as it got,
+emits an `output_limit` warning, and asks the model once, in a user turn the
+event stream attributes to the agent, to continue from where it stopped. A
+second cut in the same prompt is reported and left as it stands. A turn whose
+tool calls were cut at the limit fails instead, with its calls answered as
+cancelled, because a call with truncated arguments cannot be trusted to run.
+
 Applications use `lithos-llm` directly to build clients and use its public
 model types. The Pebble packages do not re-export their dependencies.
 

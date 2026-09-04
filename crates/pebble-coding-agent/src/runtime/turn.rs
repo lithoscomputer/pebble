@@ -7,8 +7,8 @@ use std::time::{Instant, SystemTime};
 use async_trait::async_trait;
 use lithos_llm::middleware::CallContext;
 use lithos_llm::types::{
-    ContentPart, Error as LlmError, Message as LlmMessage, Request, Response, ResponseStream,
-    ToolCall, ToolResult,
+    ContentPart, Error as LlmError, FinishReason, Message as LlmMessage, Request, Response,
+    ResponseStream, ToolCall, ToolResult,
 };
 use pebble_agent as agent;
 use serde_json::Value;
@@ -48,6 +48,27 @@ const STREAM_CONSUME_RETRIES: u32 = 3;
 /// What the model is told when it keeps making the same calls.
 const LOOP_WARNING: &str = "WARNING: Loop detected. You appear to be repeating the same tool \
                             calls. Please try a different approach or ask for clarification.";
+
+/// The turn that asks the model to finish an answer its output limit cut short.
+///
+/// Model-visible API: the model reads it as a user turn, so the wording is
+/// frozen.
+const OUTPUT_LIMIT_CONTINUATION: &str = "Your previous answer stopped at the output limit. \
+                                         Continue from exactly where it stopped, without \
+                                         repeating what you already wrote.";
+
+/// How many times one prompt asks the model to continue a cut-short answer.
+///
+/// The limit is the model's own maximum unless the application lowered it, so
+/// a second request would spend the whole budget to reach the same place.
+const MAX_OUTPUT_LIMIT_CONTINUATIONS: u32 = 1;
+
+/// The `kind` of the warning that reports an answer cut at the output limit.
+const OUTPUT_LIMIT_WARNING: &str = "output_limit";
+
+/// Why a turn whose tool calls were cut at the output limit is not run.
+const OUTPUT_LIMIT_CUT_TOOL_CALL: &str = "the model's output limit cut off its tool calls, \
+                                          so none of them can be trusted to run";
 
 #[derive(Clone)]
 pub(super) struct CodingAgentBridge {
@@ -95,6 +116,9 @@ pub(super) struct ConversationState {
     inference_start: Option<Instant>,
     tool_start: Option<Instant>,
     boundary_error: Option<Error>,
+    /// How many times this prompt has asked the model to continue an answer
+    /// that stopped at the output limit.
+    output_limit_continuations: u32,
 }
 
 impl ConversationState {
@@ -112,6 +136,7 @@ impl ConversationState {
             inference_start: None,
             tool_start: None,
             boundary_error: None,
+            output_limit_continuations: 0,
         }
     }
 }
@@ -171,6 +196,38 @@ impl CodingAgentBridge {
         state.inference_start = None;
         state.tool_start = None;
         state.boundary_error = None;
+        state.output_limit_continuations = 0;
+    }
+
+    /// Asks the model to finish an answer its output limit cut short.
+    ///
+    /// The answer as far as it got is already committed, so the request is one
+    /// more user turn on top of it. Every cut is reported as a warning; only
+    /// the first [`MAX_OUTPUT_LIMIT_CONTINUATIONS`] in a prompt earn a
+    /// continuation, and after that the answer stands as it is.
+    fn continue_after_output_limit(&self) -> Option<agent::UserMessage> {
+        let continued = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let continued = state.output_limit_continuations < MAX_OUTPUT_LIMIT_CONTINUATIONS;
+            if continued {
+                state.output_limit_continuations += 1;
+            }
+            continued
+        };
+        self.emit(CodingEvent::Warning {
+            kind:    OUTPUT_LIMIT_WARNING.to_owned(),
+            message: if continued {
+                "The answer stopped at the model's output limit; asking it to continue".to_owned()
+            } else {
+                "The answer stopped at the model's output limit again; leaving it as it stands"
+                    .to_owned()
+            },
+            details: serde_json::json!({
+                "max_output_tokens": max_output_tokens(&self.config, &self.facts),
+                "continued": continued,
+            }),
+        });
+        continued.then(|| agent::UserMessage::text(OUTPUT_LIMIT_CONTINUATION))
     }
 
     /// The token that ends the prompt in progress.
@@ -585,9 +642,18 @@ impl agent::AgentLifecycle for CodingAgentBridge {
     async fn after_model(
         &self,
         _context: agent::TurnContext<'_>,
-        _response: &Response,
+        response: &Response,
         _cancel: &CancellationToken,
     ) -> StdResult<agent::ConversationUpdate, agent::LifecycleError> {
+        // A tool call the output limit cut short decodes as a call with
+        // whatever arguments survived, or none. Running it would act on a
+        // guess, so the turn fails and the loop answers its calls as
+        // cancelled.
+        if response.finish_reason == FinishReason::Length && !tool_calls_of(response).is_empty() {
+            return Err(self.record_boundary_error(Error::ToolExecution(
+                OUTPUT_LIMIT_CUT_TOOL_CALL.to_owned(),
+            )));
+        }
         // Do not run tools until the response that requested them is durable.
         self.flush_events().await?;
         self.compact_once_if_needed().await;
@@ -635,9 +701,14 @@ impl agent::AgentLifecycle for CodingAgentBridge {
     async fn after_answer(
         &self,
         _context: agent::TurnContext<'_>,
-        _response: &Response,
+        response: &Response,
         cancel: &CancellationToken,
     ) -> StdResult<agent::AfterAnswerAction, agent::LifecycleError> {
+        if response.finish_reason == FinishReason::Length
+            && let Some(continuation) = self.continue_after_output_limit()
+        {
+            return Ok(agent::AfterAnswerAction::ContinueWith(continuation));
+        }
         let Some(supervisor) = self.subagents.as_ref() else {
             return Ok(agent::AfterAnswerAction::Complete);
         };
@@ -790,7 +861,7 @@ impl CodingRuntime {
             .history
             .to_llm_messages();
         let config = agent::AgentConfig {
-            max_output_tokens: self.max_output_tokens(),
+            max_output_tokens: max_output_tokens(&self.config, &self.facts),
             reasoning_effort: self.config.reasoning_effort,
             speed: self.config.speed,
             turn_replay: self.config.turn_replay,
@@ -827,22 +898,6 @@ impl CodingRuntime {
         }
         expand_skill(&self.skills, input).map_err(Error::SkillExpansion)
     }
-
-    /// The most tokens the model may produce in one turn.
-    fn max_output_tokens(&self) -> Option<u32> {
-        let configured = self
-            .config
-            .max_tokens
-            .and_then(|tokens| u32::try_from(tokens).ok());
-        let from_catalog = || {
-            self.facts
-                .max_output_tokens
-                .map(|tokens| u32::try_from(tokens).unwrap_or(u32::MAX))
-        };
-        configured
-            .or_else(from_catalog)
-            .filter(|tokens| *tokens > 0)
-    }
 }
 
 /// Keeps attachments unchanged when a slash command replaces readable text.
@@ -861,6 +916,22 @@ fn content_after_skill_expansion(content: InputContent, expanded: &ExpandedInput
             .filter(|part| !matches!(part, ContentPart::Text { .. })),
     );
     InputContent::new(parts)
+}
+
+/// The most tokens the model may produce in one turn: the configured cap, or
+/// the catalog's maximum for the model.
+fn max_output_tokens(config: &CodingAgentOptions, facts: &ModelFacts) -> Option<u32> {
+    let configured = config
+        .max_tokens
+        .and_then(|tokens| u32::try_from(tokens).ok());
+    let from_catalog = || {
+        facts
+            .max_output_tokens
+            .map(|tokens| u32::try_from(tokens).unwrap_or(u32::MAX))
+    };
+    configured
+        .or_else(from_catalog)
+        .filter(|tokens| *tokens > 0)
 }
 
 fn tool_calls_of(response: &Response) -> Vec<ToolCall> {
