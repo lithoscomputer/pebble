@@ -1165,6 +1165,7 @@ impl fmt::Debug for CodingAgentControlHandle {
 /// This type owns coding profiles, resources, tools, environment access,
 /// compaction policy, and subagents. Use [`pebble_agent::Agent`] directly when
 /// those coding-specific facilities are not needed.
+#[must_use = "call `shutdown` to stop the agent and join what it owns"]
 pub struct CodingAgent {
     inner:   CodingRuntime,
     control: Arc<CodingControl>,
