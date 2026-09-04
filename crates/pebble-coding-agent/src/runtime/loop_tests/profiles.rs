@@ -42,13 +42,6 @@ api_model = "pebble-test-unknown"
 
 [providers.anthropic.models."pebble-test-unknown".metadata.pebble]
 profile = "nonesuch"
-
-[providers.openai.models."pebble-test-gpt6"]
-display_name = "GPT-6 profile fixture"
-api_model = "pebble-test-gpt6"
-
-[providers.openai.models."pebble-test-gpt6".metadata.pebble]
-profile = "gpt6"
 "#;
 
 /// A client over the catalog lithos ships, plus [`OVERLAY`].
@@ -81,7 +74,7 @@ async fn every_profile_the_shipped_catalog_names_is_one_pebble_runs() {
         ("anthropic/claude-sonnet-5", AgentProfileKind::Claude5),
         ("openai/gpt-5.5", AgentProfileKind::OpenAi),
         ("openai/gpt-5.6-sol", AgentProfileKind::Gpt56),
-        ("openai/pebble-test-gpt6", AgentProfileKind::Gpt6),
+        ("openai/gpt-6-astra", AgentProfileKind::Gpt6),
         ("gemini/gemini-3.5-flash", AgentProfileKind::Gemini),
         ("moonshot/kimi-k3", AgentProfileKind::Kimi),
         // The same model through a gateway: a Kimi row names the Kimi harness
@@ -277,7 +270,7 @@ const SHIPPED: [(&str, AgentProfileKind, bool); 7] = [
     ("anthropic/claude-sonnet-5", AgentProfileKind::Claude5, true),
     ("openai/gpt-5.5", AgentProfileKind::OpenAi, true),
     ("openai/gpt-5.6-sol", AgentProfileKind::Gpt56, true),
-    ("openai/pebble-test-gpt6", AgentProfileKind::Gpt6, true),
+    ("openai/gpt-6-astra", AgentProfileKind::Gpt6, true),
     ("gemini/gemini-3.5-flash", AgentProfileKind::Gemini, true),
     ("moonshot/kimi-k3", AgentProfileKind::Kimi, false),
 ];
