@@ -161,7 +161,10 @@ impl PermissionLevelPolicy {
 
 impl ToolPermissionPolicy for PermissionLevelPolicy {
     fn permission(&self, tool: &pebble_agent::ToolDescriptor) -> ToolPermission {
-        if self.level.auto_approves_tool(tool.id().as_str()) {
+        let category = NativeTool::from_canonical_name(tool.id().as_str())
+            .and_then(NativeTool::category)
+            .unwrap_or(ToolCategory::Shell);
+        if self.level.auto_approves(category) {
             ToolPermission::Allow
         } else {
             ToolPermission::RequireApproval
@@ -298,6 +301,21 @@ mod tests {
         async fn call(&self, _request: ToolCallRequest) -> StdResult<ToolOutcome, ToolSystemError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(ToolOutcome::success("ran".into()))
+        }
+    }
+
+    #[test]
+    fn permission_uses_stable_identity_instead_of_visible_alias() {
+        let policy = PermissionLevelPolicy::new(PermissionLevel::ReadOnly);
+        for (identity, name, expected) in [
+            ("read_file", "Read", ToolPermission::Allow),
+            ("Read", "Read", ToolPermission::RequireApproval),
+        ] {
+            let tool = ToolDescriptor::new(
+                ToolId::try_new(identity).expect("valid identity"),
+                ToolDefinition::function(name, "Read", json!({})),
+            );
+            assert_eq!(policy.permission(&tool), expected);
         }
     }
 

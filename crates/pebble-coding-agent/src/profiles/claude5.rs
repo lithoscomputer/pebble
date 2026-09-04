@@ -196,7 +196,9 @@ mod tests {
 
         let mut registry = ToolRegistry::with_vocabulary(ToolVocabulary::Claude5);
         for tool in profile(false).base_tools() {
-            registry.register(tool);
+            registry
+                .register(tool)
+                .expect("tool registration is unique");
         }
         let mut names = registry.names();
         names.sort();

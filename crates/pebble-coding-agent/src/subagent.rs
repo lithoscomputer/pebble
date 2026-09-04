@@ -282,7 +282,13 @@ fn build_child(
     let inherited = deps
         .tools
         .iter()
-        .filter(|tool| tool.is_inheritable())
+        .filter(|tool| {
+            deps.tool_replacements
+                .iter()
+                .find(|(id, _)| *id == tool.definition.name)
+                .map_or(*tool, |(_, replacement)| replacement)
+                .is_inheritable()
+        })
         .cloned();
     let mut builder = CodingRuntime::builder(deps.client.clone())
         .model(deps.model_selector.clone())
@@ -299,6 +305,11 @@ fn build_child(
             open_sessions: Arc::clone(&deps.open_sessions),
             observer: deps.observer.clone(),
         });
+    for (id, tool) in &deps.tool_replacements {
+        if tool.is_inheritable() {
+            builder = builder.replace_tool(id.clone(), tool.clone());
+        }
+    }
     for middleware in &deps.tool_middleware {
         builder = builder.tool_middleware(Arc::clone(middleware));
     }
@@ -324,6 +335,7 @@ pub(crate) struct ChildDeps {
     pub(crate) profile:           Arc<dyn AgentProfile>,
     pub(crate) environment:       Arc<dyn Environment>,
     pub(crate) tools:             Vec<RegisteredTool>,
+    pub(crate) tool_replacements: Vec<(String, RegisteredTool)>,
     pub(crate) tool_middleware:   Vec<Arc<dyn pebble_agent::ToolMiddleware>>,
     pub(crate) options:           CodingAgentOptions,
     pub(crate) tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
@@ -1830,7 +1842,48 @@ mod tests {
         DenyTool, MockEnvironment, ScriptedCall, message_text, scripted_client, text_response,
     };
     use crate::tool::{PermissionMiddleware, ToolContext, ToolDefinitionWithSource};
-    use crate::types::{CodingAgentEvent, PermissionLevel, ToolErrorKind};
+    use crate::types::{CodingAgentEvent, PermissionLevel, ToolErrorKind, ToolSource};
+
+    #[tokio::test]
+    async fn replacement_inheritance_uses_the_last_selected_tool() {
+        for inheritable in [false, true] {
+            let (client, _) = scripted_client(vec![]);
+            let mut replacement = noop_tool("replacement").with_source(ToolSource::Application);
+            replacement.definition.description = "selected replacement".to_owned();
+            if inheritable {
+                replacement = replacement.allow_in_subagents();
+            }
+            let mut parent = testing::builder(client)
+                .tools([noop_tool("inspect").with_source(ToolSource::Application)])
+                .replace_tool("inspect", noop_tool("earlier").allow_in_subagents())
+                .replace_tool("inspect", replacement)
+                .subagents(SubagentOptions::enabled())
+                .build()
+                .expect("parent builds");
+            let supervisor = supervisor_of(&parent);
+            let mut child = build_child(
+                &supervisor.deps,
+                parent.id().to_owned(),
+                parent.root_session_id().to_owned(),
+                1,
+            )
+            .expect("child builds");
+            let tools = child.registered_tools();
+            let inherited = tools.iter().find(|tool| tool.definition.name == "inspect");
+            assert_eq!(inherited.is_some(), inheritable);
+            if let Some(tool) = inherited {
+                assert_eq!(tool.definition.description, "selected replacement");
+            }
+            child
+                .shutdown(ShutdownReason::Completed)
+                .await
+                .expect("child shutdown");
+            parent
+                .shutdown(ShutdownReason::Completed)
+                .await
+                .expect("parent shutdown");
+        }
+    }
 
     /// Reports the moment the task holding it is dropped, which is what an
     /// abort does to a task that never returns on its own.

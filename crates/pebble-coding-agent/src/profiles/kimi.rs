@@ -161,7 +161,9 @@ mod tests {
     fn registry(profile: &KimiProfile) -> ToolRegistry {
         let mut registry = ToolRegistry::with_vocabulary(profile.tool_vocabulary());
         for tool in profile.base_tools() {
-            registry.register(tool);
+            registry
+                .register(tool)
+                .expect("tool registration is unique");
         }
         registry
     }
@@ -231,14 +233,16 @@ mod tests {
         use crate::tools::skill::make_use_skill_tool_for_vocabulary;
 
         let mut registry = registry(&profile(false));
-        registry.register(make_use_skill_tool_for_vocabulary(
-            Arc::from(vec![Skill {
-                name:        "demo".to_owned(),
-                description: "d".to_owned(),
-                template:    "t".to_owned(),
-            }]),
-            ToolVocabulary::KimiCode,
-        ));
+        registry
+            .register(make_use_skill_tool_for_vocabulary(
+                Arc::from(vec![Skill {
+                    name:        "demo".to_owned(),
+                    description: "d".to_owned(),
+                    template:    "t".to_owned(),
+                }]),
+                ToolVocabulary::KimiCode,
+            ))
+            .expect("tool registration is unique");
 
         let names = registry.names();
         assert!(names.contains(&"Skill".to_owned()), "{names:?}");

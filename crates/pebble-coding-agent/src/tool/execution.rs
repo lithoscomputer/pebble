@@ -56,7 +56,7 @@ pub(crate) struct CodingToolService {
     registry:          Arc<ToolRegistry>,
     /// What every turn discovers, described once: the registry is frozen
     /// before the first prompt.
-    descriptors:       StdResult<Vec<agent::ToolDescriptor>, String>,
+    descriptors:       Vec<agent::ToolDescriptor>,
     env:               Arc<dyn Environment>,
     config:            Arc<CodingAgentOptions>,
     emitter:           Emitter,
@@ -362,13 +362,7 @@ impl agent::ToolService for CodingToolService {
         &self,
         _context: agent::TurnContext<'_>,
     ) -> StdResult<agent::ToolCatalog, agent::ToolSystemError> {
-        match &self.descriptors {
-            Ok(tools) => Ok(agent::ToolCatalog::new(tools.iter().cloned())),
-            Err(message) => Err(agent::ToolSystemError::with_source(
-                message.clone(),
-                agent::ToolIdError,
-            )),
-        }
+        Ok(agent::ToolCatalog::new(self.descriptors.iter().cloned()))
     }
 
     async fn call(
@@ -398,19 +392,17 @@ impl agent::ToolMiddleware for CodingToolService {
 /// A tool's stable identity is its canonical name, so policy written against
 /// pebble's names holds whichever vocabulary the model sees. A tool that parks
 /// the prompt on a person runs alone in its round.
-fn describe(registry: &ToolRegistry) -> StdResult<Vec<agent::ToolDescriptor>, String> {
+fn describe(registry: &ToolRegistry) -> Vec<agent::ToolDescriptor> {
     registry
-        .tools()
-        .map(|tool| {
-            let name = &tool.definition.name;
-            let id = agent::ToolId::try_new(canonical_tool_name(name))
-                .map_err(|_| format!("tool `{name}` has no stable identity"))?;
+        .tools_with_ids()
+        .map(|(id, tool)| {
             let scheduling = if tool.needs_human_input() {
                 agent::ToolScheduling::ExclusiveRound
             } else {
                 agent::ToolScheduling::Concurrent
             };
-            Ok(agent::ToolDescriptor::new(id, tool.definition.clone()).with_scheduling(scheduling))
+            agent::ToolDescriptor::new(id.clone(), tool.definition.clone())
+                .with_scheduling(scheduling)
         })
         .collect()
 }
@@ -580,7 +572,9 @@ mod tests {
     ) -> Arc<CodingToolService> {
         let mut registry = ToolRegistry::new();
         for tool in tools {
-            registry.register(tool);
+            registry
+                .register(tool)
+                .expect("tool registration is unique");
         }
         Arc::new(CodingToolService::new(
             Arc::new(registry),

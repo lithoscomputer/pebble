@@ -315,6 +315,13 @@ Pass it to `CodingAgentBuilder::tools`. Pebble records its source as
 `ToolSource::Application`. The call then uses the same middleware, event,
 output, and cancellation path as a built-in tool.
 
+Duplicate tool names or identities are errors. To replace a registered tool,
+use `.replace_tool("read_file", replacement)` on the coding agent builder.
+The replacement keeps the original identity and the name the profile exposes
+to the model. Its schema and executor come from `replacement`.
+`CodingToolSet::with_tool` is also fallible and has a matching `replace_tool`
+method for intentional replacements.
+
 ## Which harness a session runs
 
 Pebble never guesses. The model selector resolves through the client's catalog,

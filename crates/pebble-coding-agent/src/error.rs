@@ -20,6 +20,7 @@ use tokio::task::JoinError;
 
 use crate::event::EventSinkError;
 use crate::skills::SkillExpansionError;
+use crate::tool::ToolRegistrationError;
 
 /// Why a prompt was interrupted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -117,6 +118,10 @@ impl fmt::Display for TaskKind {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// A discovered tool conflicts with an existing registration.
+    #[error("registering coding tools")]
+    ToolRegistration(#[from] ToolRegistrationError),
+
     /// The model layer failed.
     #[error("calling the model")]
     Llm(#[from] LlmError),
@@ -189,7 +194,7 @@ impl Error {
             Self::Llm(_) => ErrorKind::Llm,
             Self::Compaction(_) => ErrorKind::Compaction,
             Self::Agent(_) | Self::AgentBuild(_) => ErrorKind::Agent,
-            Self::SkillExpansion(_) => ErrorKind::InvalidInput,
+            Self::SkillExpansion(_) | Self::ToolRegistration(_) => ErrorKind::InvalidInput,
             Self::SessionClosed => ErrorKind::SessionClosed,
             Self::InvalidState(_) => ErrorKind::InvalidState,
             Self::ToolExecution(_) => ErrorKind::ToolExecution,
@@ -210,6 +215,7 @@ impl Error {
             | Self::Agent(_)
             | Self::AgentBuild(_)
             | Self::SkillExpansion(_)
+            | Self::ToolRegistration(_)
             | Self::SessionClosed
             | Self::InvalidState(_)
             | Self::ToolExecution(_)

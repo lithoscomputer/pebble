@@ -1023,20 +1023,21 @@ mod tests {
     use lithos_llm::types::ReasoningContent;
 
     use super::*;
+    use crate::coding_agent::ShutdownReason;
+    use crate::runtime::testing;
+    use crate::test_support::scripted_client;
 
     #[tokio::test]
     async fn projection_updates_only_the_changed_tail_and_waits_for_acknowledgement() {
         use agent::ConversationProjection as _;
         use lithos_llm::types::Role;
 
-        let (client, _) = crate::test_support::scripted_client(vec![]);
-        let mut runtime = crate::runtime::testing::builder(client)
-            .build()
-            .expect("builds");
+        let (client, _) = scripted_client(vec![]);
+        let mut runtime = testing::builder(client).build().expect("builds");
         let bridge = CodingAgentBridge::from_runtime(&runtime);
         let old = LlmMessage::text(Role::User, "old");
         bridge.commit_user_message(&old, None);
-        bridge.conversation_replaced(std::slice::from_ref(&old));
+        bridge.conversation_replaced(slice::from_ref(&old));
         assert_eq!(
             bridge.conversation_update(false),
             agent::ConversationUpdate::unchanged()
@@ -1081,7 +1082,7 @@ mod tests {
             agent::ConversationUpdate::replace_tail(2, vec![])
         );
         runtime
-            .shutdown(crate::coding_agent::ShutdownReason::Completed)
+            .shutdown(ShutdownReason::Completed)
             .await
             .expect("shutdown");
     }

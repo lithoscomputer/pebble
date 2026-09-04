@@ -18,7 +18,9 @@ use pebble_agent::{ToolMiddleware, ToolOutcome, ToolSystem, TurnContext};
 use tokio_util::sync::CancellationToken;
 
 use super::execution::CodingToolService;
-use super::registry::{RegisteredTool, ToolDefinitionWithSource, ToolEnvProvider, ToolRegistry};
+use super::registry::{
+    RegisteredTool, ToolDefinitionWithSource, ToolEnvProvider, ToolRegistrationError, ToolRegistry,
+};
 use crate::config::{CodingAgentOptions, NativeToolOptions};
 use crate::environment::Environment;
 use crate::event::{EventOptions, EventPump, EventSink, EventSinkError};
@@ -64,35 +66,56 @@ impl CodingToolSet {
     /// The core tools, with the command timeouts `options` names.
     #[must_use]
     pub fn core_with_options(options: &NativeToolOptions) -> Self {
-        Self::empty()
-            .with_tool(make_read_file_tool())
-            .with_tool(make_write_file_tool())
-            .with_tool(make_edit_file_tool())
-            .with_tool(make_shell_tool_with_options(options))
-            .with_tool(make_grep_tool())
-            .with_tool(make_glob_tool())
+        let mut set = Self::empty();
+        for tool in [
+            make_read_file_tool(),
+            make_write_file_tool(),
+            make_edit_file_tool(),
+            make_shell_tool_with_options(options),
+            make_grep_tool(),
+            make_glob_tool(),
+        ] {
+            set.registry
+                .register(tool)
+                .expect("core tools have distinct names and identities");
+        }
+        set
     }
 
     /// Adds `web_fetch`, summarizing fetched pages through `summarizer` when
     /// one is given.
-    #[must_use]
-    pub fn with_web_fetch(self, summarizer: Option<Arc<WebFetchSummarizer>>) -> Self {
+    pub fn with_web_fetch(
+        self,
+        summarizer: Option<Arc<WebFetchSummarizer>>,
+    ) -> StdResult<Self, ToolRegistrationError> {
         self.with_tool(make_web_fetch_tool(summarizer))
     }
 
     /// Adds `web_search`, answering through `provider`.
-    #[must_use]
-    pub fn with_web_search(self, provider: Arc<dyn SearchProvider>) -> Self {
+    pub fn with_web_search(
+        self,
+        provider: Arc<dyn SearchProvider>,
+    ) -> StdResult<Self, ToolRegistrationError> {
         self.with_tool(make_web_search_tool(provider))
     }
 
     /// Adds one tool, built-in or the application's own.
     ///
-    /// A tool with a name already in the set replaces it.
-    #[must_use]
-    pub fn with_tool(mut self, tool: RegisteredTool) -> Self {
-        self.registry.register(tool);
-        self
+    /// Duplicate names and identities are errors; use `replace_tool` for a
+    /// deliberate replacement.
+    pub fn with_tool(mut self, tool: RegisteredTool) -> StdResult<Self, ToolRegistrationError> {
+        self.registry.register(tool)?;
+        Ok(self)
+    }
+
+    /// Replaces a tool by its stable identity, preserving its visible name.
+    pub fn replace_tool(
+        mut self,
+        id: &str,
+        tool: RegisteredTool,
+    ) -> StdResult<Self, ToolRegistrationError> {
+        self.registry.replace(id, tool)?;
+        Ok(self)
     }
 
     /// The tools in the set, described as a session's event stream describes

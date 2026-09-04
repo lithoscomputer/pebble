@@ -125,7 +125,9 @@ mod tests {
     fn shell_description(profile: &Gpt56Profile) -> String {
         let mut registry = ToolRegistry::with_vocabulary(profile.tool_vocabulary());
         for tool in profile.base_tools() {
-            registry.register(tool);
+            registry
+                .register(tool)
+                .expect("tool registration is unique");
         }
         registry
             .get("shell_command")
@@ -157,7 +159,9 @@ mod tests {
     fn the_shell_reaches_the_model_under_codexs_name() {
         let mut registry = ToolRegistry::with_vocabulary(ToolVocabulary::Codex);
         for tool in patching(false).base_tools() {
-            registry.register(tool);
+            registry
+                .register(tool)
+                .expect("tool registration is unique");
         }
         let mut names = registry.names();
         names.sort();

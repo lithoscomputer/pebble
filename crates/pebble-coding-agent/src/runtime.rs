@@ -136,6 +136,7 @@ pub(crate) struct CodingRuntimeBuilder {
     model:                Option<String>,
     environment:          Option<Arc<dyn Environment>>,
     tools:                Vec<RegisteredTool>,
+    tool_replacements:    Vec<(String, RegisteredTool)>,
     tool_middleware:      Vec<Arc<dyn ToolMiddleware>>,
     human_input:          Option<Arc<dyn HumanInputProvider>>,
     tool_env_provider:    Option<Arc<dyn ToolEnvProvider>>,
@@ -161,6 +162,7 @@ impl CodingRuntimeBuilder {
             model: None,
             environment: None,
             tools: Vec::new(),
+            tool_replacements: Vec::new(),
             tool_middleware: Vec::new(),
             human_input: None,
             tool_env_provider: None,
@@ -221,6 +223,21 @@ impl CodingRuntimeBuilder {
     /// the name that model expects.
     pub(crate) fn tools(mut self, tools: impl IntoIterator<Item = RegisteredTool>) -> Self {
         self.tools.extend(tools);
+        self
+    }
+
+    /// Records an explicit replacement of a registered identity.
+    pub(crate) fn replace_tool(mut self, id: impl Into<String>, tool: RegisteredTool) -> Self {
+        let id = id.into();
+        if let Some((_, selected)) = self
+            .tool_replacements
+            .iter_mut()
+            .find(|(key, _)| *key == id)
+        {
+            *selected = tool;
+        } else {
+            self.tool_replacements.push((id, tool));
+        }
         self
     }
 
@@ -460,19 +477,19 @@ impl CodingRuntimeBuilder {
                 .iter()
                 .any(|tool| tool.definition.name == NativeTool::WebSearch.canonical_name())
         {
-            registry.register(make_web_search_tool(Arc::clone(provider)));
+            registry.register(make_web_search_tool(Arc::clone(provider)))?;
         }
         for tool in profile_tools {
-            registry.register(tool);
+            registry.register(tool)?;
         }
         // Root-only, and only where the application named somewhere to ask: a
         // child reports back to its parent rather than interrupting a person,
         // and a spec carries no `HumanInputProvider` for exactly that reason.
         if let Some(tool) = question_tool {
-            registry.register(tool);
+            registry.register(tool)?;
         }
         for tool in &self.tools {
-            registry.register(tool.clone());
+            registry.register(tool.clone())?;
         }
 
         // A child was placed in its tree by whoever spawned it; a root names
@@ -512,6 +529,7 @@ impl CodingRuntimeBuilder {
                 profile: Arc::clone(&profile),
                 environment: Arc::clone(&environment),
                 tools: self.tools,
+                tool_replacements: self.tool_replacements.clone(),
                 tool_middleware: self.tool_middleware.clone(),
                 options: child_options(&self.options),
                 tool_env_provider: self.tool_env_provider.clone(),
@@ -527,7 +545,11 @@ impl CodingRuntimeBuilder {
         // with no tools when subagents are off, and this is the only place a
         // profile's subagent family reaches the registry.
         for tool in profile.subagent_tools(&SubagentSupport::new(depth, supervisor.clone())) {
-            registry.register(tool);
+            registry.register(tool)?;
+        }
+
+        for (identity, tool) in self.tool_replacements {
+            registry.replace(&identity, tool)?;
         }
 
         let state = StateMachine::new(emitter.clone(), id.clone());
@@ -914,7 +936,7 @@ impl CodingRuntime {
                 .register(make_use_skill_tool_for_vocabulary(
                     Arc::from(state.skills.clone()),
                     vocabulary,
-                ));
+                ))?;
         }
         session.skills = state.skills;
         session.memory_summaries = state.memory_summaries;
@@ -1054,7 +1076,7 @@ impl CodingRuntime {
             self.registry.register(make_use_skill_tool_for_vocabulary(
                 Arc::from(self.skills.clone()),
                 vocabulary,
-            ));
+            ))?;
         }
 
         // Measured once: memory and skills never change again, and the context

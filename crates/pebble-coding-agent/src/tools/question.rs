@@ -841,7 +841,9 @@ mod tests {
         let registered = |profile: AgentProfileKind, vocabulary: ToolVocabulary| {
             let mut registry = ToolRegistry::with_vocabulary(vocabulary);
             if let Some(tool) = make_question_tool(profile) {
-                registry.register(tool);
+                registry
+                    .register(tool)
+                    .expect("tool registration is unique");
             }
             registry
         };
@@ -873,7 +875,9 @@ mod tests {
     #[test]
     fn claude5_is_given_the_strict_schema() {
         let mut registry = ToolRegistry::with_vocabulary(ToolVocabulary::Claude5);
-        registry.register(make_question_tool(AgentProfileKind::Claude5).expect("Claude 5 can ask"));
+        registry
+            .register(make_question_tool(AgentProfileKind::Claude5).expect("Claude 5 can ask"))
+            .expect("tool registration is unique");
 
         let tool = registry.get("AskUserQuestion").expect("registered");
         let schema = schema_of(tool);

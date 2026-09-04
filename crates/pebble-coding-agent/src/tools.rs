@@ -54,7 +54,7 @@ pub use crate::tool::{
     ApprovalDecision, CodingEventEmitter, CodingToolSet, PermissionLevelPolicy,
     PermissionMiddleware, RegisteredTool, StaticEnvProvider, ToolApprovalService, ToolContext,
     ToolEnvProvider, ToolError, ToolEventCallback, ToolExecutor, ToolPermission,
-    ToolPermissionPolicy, ToolRunner, canonical_tool_name,
+    ToolPermissionPolicy, ToolRegistrationError, ToolRunner, canonical_tool_name,
 };
 pub use crate::types::{PermissionLevel, ToolCategory, ToolErrorKind, ToolSource, ToolSummary};
 

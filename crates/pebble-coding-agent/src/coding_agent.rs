@@ -31,7 +31,7 @@ use crate::runtime::{
 };
 use crate::search::SearchProvider;
 use crate::subagent::SubagentOptions;
-use crate::tool::{RegisteredTool, ToolEnvProvider};
+use crate::tool::{RegisteredTool, ToolEnvProvider, ToolRegistrationError};
 use crate::types::{
     Actor, AgentProfileKind, CodingAgentEvent, CodingAgentState, ContextWindowSnapshot,
     InputContent, InputSource, MemoryFileSummary, Message, PermissionLevel, SkillSummary,
@@ -70,6 +70,10 @@ pub struct PromptTiming {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CodingAgentBuildError {
+    /// Tool names and identities must be unambiguous.
+    #[error("registering coding tools")]
+    ToolRegistration(#[from] ToolRegistrationError),
+
     /// An option is outside its supported range.
     #[error("invalid coding agent options")]
     InvalidOptions {
@@ -435,8 +439,21 @@ impl CodingAgentBuilder {
     }
 
     /// Adds tools on top of the selected coding profile.
+    /// Duplicate visible names or stable identities are build errors. Use
+    /// [`replace_tool`](Self::replace_tool) for an intentional replacement.
     pub fn tools(mut self, tools: impl IntoIterator<Item = RegisteredTool>) -> Self {
         self.inner = self.inner.tools(tools);
+        self
+    }
+
+    /// Replaces a tool by its stable identity, such as `read_file`.
+    ///
+    /// The replacement keeps the registered model-visible name and identity.
+    /// Its definition, executor, source, and inheritance policy come from
+    /// `tool`. An unknown identity is a build error. Later replacements of
+    /// the same identity take precedence.
+    pub fn replace_tool(mut self, id: impl Into<String>, tool: RegisteredTool) -> Self {
+        self.inner = self.inner.replace_tool(id, tool);
         self
     }
 

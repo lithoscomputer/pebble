@@ -448,7 +448,9 @@ pub(crate) mod tests {
     ) -> ToolRegistry {
         let mut registry = ToolRegistry::with_vocabulary(profile.tool_vocabulary());
         for tool in profile.base_tools().into_iter().chain(extra) {
-            registry.register(tool);
+            registry
+                .register(tool)
+                .expect("tool registration is unique");
         }
         registry
     }

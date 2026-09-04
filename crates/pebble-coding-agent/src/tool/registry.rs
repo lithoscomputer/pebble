@@ -305,6 +305,36 @@ pub type ToolExecutor = Arc<
         + Sync,
 >;
 
+/// A tool registration that would make dispatch ambiguous.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ToolRegistrationError {
+    /// The tool name cannot serve as an identity.
+    #[error("tool `{name}` has an invalid identity")]
+    InvalidIdentity {
+        /// The invalid name.
+        name: String,
+    },
+    /// Two registrations expose the same name to the model.
+    #[error("tool name `{name}` was registered more than once")]
+    DuplicateName {
+        /// The duplicated visible name.
+        name: String,
+    },
+    /// Two registrations claim the same stable identity.
+    #[error("tool identity `{id}` was registered more than once")]
+    DuplicateIdentity {
+        /// The duplicated stable identity.
+        id: String,
+    },
+    /// An explicit replacement names no registered tool.
+    #[error("cannot replace unregistered tool identity `{id}`")]
+    UnknownReplacement {
+        /// The requested stable identity.
+        id: String,
+    },
+}
+
 /// A tool a session can call: what the model is told, and what runs.
 ///
 /// Build one with [`function`](Self::function) or [`new`](Self::new), then say
@@ -474,6 +504,7 @@ impl ToolDefinitionWithSource {
 #[derive(Clone)]
 pub(crate) struct ToolRegistry {
     tools:      HashMap<String, RegisteredTool>,
+    identities: HashMap<pebble_agent::ToolId, String>,
     /// The naming scheme applied to built-in tools as they are registered.
     ///
     /// Held by the registry rather than applied as a pass over a finished set,
@@ -494,6 +525,7 @@ impl ToolRegistry {
     pub(crate) fn with_vocabulary(vocabulary: ToolVocabulary) -> Self {
         Self {
             tools: HashMap::new(),
+            identities: HashMap::new(),
             vocabulary,
         }
     }
@@ -512,9 +544,11 @@ impl ToolRegistry {
     /// extension registered as `Read` keeps that name instead of being
     /// mistaken for pebble's file reader.
     ///
-    /// The tool is keyed by the name it ends up exposed under, and the last
-    /// registration of a name wins.
-    pub(crate) fn register(&mut self, mut tool: RegisteredTool) {
+    /// Both the translated visible name and stable identity must be unique.
+    pub(crate) fn register(
+        &mut self,
+        mut tool: RegisteredTool,
+    ) -> StdResult<(), ToolRegistrationError> {
         let native = match &tool.source {
             ToolSource::Native => NativeTool::from_canonical_name(&tool.definition.name),
             ToolSource::Skill if tool.definition.name == NativeTool::UseSkill.canonical_name() => {
@@ -524,12 +558,61 @@ impl ToolRegistry {
             // the vocabulary applies to it.
             ToolSource::Application | ToolSource::Skill | ToolSource::Mcp { .. } => None,
         };
+        let identity = match native {
+            Some(native) => native.canonical_name(),
+            None => tool.definition.name.as_str(),
+        };
+        let id = pebble_agent::ToolId::try_new(identity).map_err(|_| {
+            ToolRegistrationError::InvalidIdentity {
+                name: identity.to_owned(),
+            }
+        })?;
         if let Some(native) = native {
             native
                 .name(self.vocabulary)
                 .clone_into(&mut tool.definition.name);
         }
-        self.tools.insert(tool.definition.name.clone(), tool);
+        let name = tool.definition.name.clone();
+        if self.tools.contains_key(&name) {
+            return Err(ToolRegistrationError::DuplicateName { name });
+        }
+        if self.identities.contains_key(&id) {
+            return Err(ToolRegistrationError::DuplicateIdentity {
+                id: id.as_str().to_owned(),
+            });
+        }
+        self.identities.insert(id, name.clone());
+        self.tools.insert(name, tool);
+        Ok(())
+    }
+
+    /// Replaces an explicitly selected tool while preserving its name and
+    /// identity.
+    pub(crate) fn replace(
+        &mut self,
+        id: &str,
+        mut tool: RegisteredTool,
+    ) -> StdResult<(), ToolRegistrationError> {
+        let identity = pebble_agent::ToolId::try_new(id).map_err(|_| {
+            ToolRegistrationError::InvalidIdentity {
+                name: id.to_owned(),
+            }
+        })?;
+        let name = self
+            .identities
+            .get(&identity)
+            .ok_or_else(|| ToolRegistrationError::UnknownReplacement { id: id.to_owned() })?;
+        tool.definition.name.clone_from(name);
+        self.tools.insert(name.clone(), tool);
+        Ok(())
+    }
+
+    pub(crate) fn tools_with_ids(
+        &self,
+    ) -> impl Iterator<Item = (&pebble_agent::ToolId, &RegisteredTool)> {
+        self.identities
+            .iter()
+            .map(|(id, name)| (id, &self.tools[name]))
     }
 
     /// The tool exposed under `name`.
@@ -542,20 +625,17 @@ impl ToolRegistry {
     /// The tool with this stable identity, independent of visible vocabulary.
     #[must_use]
     pub(crate) fn get_by_id(&self, id: &pebble_agent::ToolId) -> Option<&RegisteredTool> {
-        NativeTool::from_canonical_name(id.as_str())
-            .and_then(|tool| self.get_native(tool))
-            .or_else(|| self.tools.get(id.as_str()))
+        self.identities
+            .get(id)
+            .and_then(|name| self.tools.get(name))
     }
 
     /// A built-in tool by identity, whatever vocabulary it is exposed under.
     #[must_use]
     pub(crate) fn get_native(&self, tool: NativeTool) -> Option<&RegisteredTool> {
-        self.tools.get(tool.name(self.vocabulary))
-    }
-
-    /// Every registered tool, in no particular order.
-    pub(crate) fn tools(&self) -> impl Iterator<Item = &RegisteredTool> {
-        self.tools.values()
+        let id = pebble_agent::ToolId::try_new(tool.canonical_name())
+            .expect("native identities are valid");
+        self.get_by_id(&id)
     }
 
     /// Every registered tool's definition, in no particular order.
@@ -746,7 +826,9 @@ mod tests {
     #[test]
     fn register_and_get() {
         let mut registry = ToolRegistry::new();
-        registry.register(make_tool("read_file"));
+        registry
+            .register(make_tool("read_file"))
+            .expect("tool registration is unique");
 
         let tool = registry.get("read_file").expect("registered");
         assert_eq!(tool.definition.name, "read_file");
@@ -755,8 +837,13 @@ mod tests {
     #[test]
     fn kimi_registry_renames_canonical_native_tools_only() {
         let mut registry = ToolRegistry::with_vocabulary(ToolVocabulary::KimiCode);
-        registry.register(make_tool("read_file"));
-        registry.register(make_tool("Read"));
+        registry
+            .register(make_tool("read_file"))
+            .expect("tool registration is unique");
+        assert!(matches!(
+            registry.register(make_tool("Read")),
+            Err(ToolRegistrationError::DuplicateName { .. })
+        ));
 
         assert!(registry.get("Read").is_some());
         assert!(registry.get("read_file").is_none());
@@ -771,7 +858,9 @@ mod tests {
             original_name: "read_file".to_owned(),
         };
 
-        registry.register(tool);
+        registry
+            .register(tool)
+            .expect("tool registration is unique");
 
         assert!(registry.get("read_file").is_some());
         assert!(registry.get("Read").is_none());
@@ -785,8 +874,12 @@ mod tests {
         let mut other = make_tool("read_file");
         other.source = ToolSource::Skill;
 
-        registry.register(skill_tool);
-        registry.register(other);
+        registry
+            .register(skill_tool)
+            .expect("tool registration is unique");
+        registry
+            .register(other)
+            .expect("tool registration is unique");
 
         assert!(registry.get("Skill").is_some());
         assert!(registry.get("use_skill").is_none());
@@ -802,7 +895,9 @@ mod tests {
     #[test]
     fn get_native_resolves_the_exposed_vocabulary() {
         let mut registry = ToolRegistry::with_vocabulary(ToolVocabulary::Claude5);
-        registry.register(make_tool("read_file"));
+        registry
+            .register(make_tool("read_file"))
+            .expect("tool registration is unique");
 
         let tool = registry
             .get_native(NativeTool::ReadFile)
@@ -812,32 +907,43 @@ mod tests {
     }
 
     #[test]
-    fn name_collision_overrides() {
+    fn explicit_replacement_preserves_identity() {
         let mut registry = ToolRegistry::new();
-        registry.register(
-            RegisteredTool::new(
-                ToolDefinition::function("tool_a", "version 1", json!({})),
-                Arc::new(|_args, _ctx| Box::pin(async { Ok("v1".to_owned()) })),
+        registry
+            .register(
+                RegisteredTool::new(
+                    ToolDefinition::function("tool_a", "version 1", json!({})),
+                    Arc::new(|_args, _ctx| Box::pin(async { Ok("v1".to_owned()) })),
+                )
+                .with_source(ToolSource::Native),
             )
-            .with_source(ToolSource::Native),
-        );
-        registry.register(
-            RegisteredTool::new(
-                ToolDefinition::function("tool_a", "version 2", json!({})),
-                Arc::new(|_args, _ctx| Box::pin(async { Ok("v2".to_owned()) })),
+            .expect("tool registration is unique");
+        registry
+            .replace(
+                "tool_a",
+                RegisteredTool::new(
+                    ToolDefinition::function("replacement_name", "version 2", json!({})),
+                    Arc::new(|_args, _ctx| Box::pin(async { Ok("v2".to_owned()) })),
+                )
+                .with_source(ToolSource::Native),
             )
-            .with_source(ToolSource::Native),
-        );
+            .expect("tool registration is unique");
 
         let tool = registry.get("tool_a").expect("registered");
         assert_eq!(tool.definition.description, "version 2");
+        assert_eq!(tool.definition.name, "tool_a");
+        assert!(registry.get("replacement_name").is_none());
     }
 
     #[test]
     fn definitions_returns_all() {
         let mut registry = ToolRegistry::new();
-        registry.register(make_tool("tool_a"));
-        registry.register(make_tool("tool_b"));
+        registry
+            .register(make_tool("tool_a"))
+            .expect("tool registration is unique");
+        registry
+            .register(make_tool("tool_b"))
+            .expect("tool registration is unique");
 
         let definitions = registry.definitions();
 
@@ -853,8 +959,12 @@ mod tests {
     #[test]
     fn sources_for_keeps_only_the_definitions_in_the_request() {
         let mut registry = ToolRegistry::new();
-        registry.register(make_tool("visible"));
-        registry.register(make_tool("hidden"));
+        registry
+            .register(make_tool("visible"))
+            .expect("tool registration is unique");
+        registry
+            .register(make_tool("hidden"))
+            .expect("tool registration is unique");
         let advertised = [ToolDefinition::function(
             "visible",
             "Filtered view",
@@ -872,8 +982,12 @@ mod tests {
     #[test]
     fn names_returns_all() {
         let mut registry = ToolRegistry::new();
-        registry.register(make_tool("tool_x"));
-        registry.register(make_tool("tool_y"));
+        registry
+            .register(make_tool("tool_x"))
+            .expect("tool registration is unique");
+        registry
+            .register(make_tool("tool_y"))
+            .expect("tool registration is unique");
 
         let names = registry.names();
 
@@ -885,7 +999,9 @@ mod tests {
     #[tokio::test]
     async fn executor_can_be_called() {
         let mut registry = ToolRegistry::new();
-        registry.register(make_tool("echo"));
+        registry
+            .register(make_tool("echo"))
+            .expect("tool registration is unique");
         let tool = registry.get("echo").expect("registered");
 
         let result = (tool.executor)(json!({}), context()).await;
@@ -896,15 +1012,17 @@ mod tests {
     #[tokio::test]
     async fn an_executor_reports_a_typed_failure() {
         let mut registry = ToolRegistry::new();
-        registry.register(
-            RegisteredTool::new(
-                ToolDefinition::function("boom", "Fails", json!({})),
-                Arc::new(|_args, _ctx| {
-                    Box::pin(async { Err(ToolError::invalid_arguments("path is required")) })
-                }),
+        registry
+            .register(
+                RegisteredTool::new(
+                    ToolDefinition::function("boom", "Fails", json!({})),
+                    Arc::new(|_args, _ctx| {
+                        Box::pin(async { Err(ToolError::invalid_arguments("path is required")) })
+                    }),
+                )
+                .with_source(ToolSource::Native),
             )
-            .with_source(ToolSource::Native),
-        );
+            .expect("tool registration is unique");
         let tool = registry.get("boom").expect("registered");
 
         let error = (tool.executor)(json!({}), context())

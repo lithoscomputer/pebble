@@ -333,7 +333,7 @@ async fn a_runner_bounds_output_like_a_session() {
     )
     .with_source(ToolSource::Application);
     let runner = ToolRunner::new(
-        CodingToolSet::core().with_tool(big),
+        CodingToolSet::core().with_tool(big).expect("distinct tool"),
         mock_environment() as Arc<dyn Environment>,
     )
     .options(CodingAgentOptions::default().with_tool_output_retention_bytes(4_096))
@@ -385,7 +385,9 @@ async fn an_unknown_tool_and_a_cancelled_call_are_both_answered() {
     )
     .with_source(ToolSource::Application);
     let runner = ToolRunner::new(
-        CodingToolSet::empty().with_tool(cancelled_tool),
+        CodingToolSet::empty()
+            .with_tool(cancelled_tool)
+            .expect("distinct tool"),
         mock_environment() as Arc<dyn Environment>,
     );
 
