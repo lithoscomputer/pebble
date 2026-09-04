@@ -198,8 +198,10 @@ impl Application {
 }
 
 struct Store {
-    directory: PathBuf,
-    events:    Arc<EventLog>,
+    directory:        PathBuf,
+    events:           Arc<EventLog>,
+    #[cfg(test)]
+    checkpoint_stage: Option<recovery::CheckpointStage>,
 }
 
 impl Store {
@@ -210,6 +212,8 @@ impl Store {
         Ok(Self {
             directory: directory.to_owned(),
             events,
+            #[cfg(test)]
+            checkpoint_stage: None,
         })
     }
 
@@ -218,12 +222,30 @@ impl Store {
     async fn save(&self, record: &SessionRecord) -> AppResult {
         let temporary = self.directory.join("session.json.tmp");
         let mut file = File::create(&temporary).await?;
-        file.write_all(&serde_json::to_vec_pretty(record)?).await?;
+        let bytes = serde_json::to_vec_pretty(record)?;
+        #[cfg(test)]
+        if self.checkpoint_stage == Some(recovery::CheckpointStage::PartialWrite) {
+            file.write_all(&bytes[..bytes.len() / 2]).await?;
+            file.flush().await?;
+            recovery::park_at_checkpoint(
+                self.checkpoint_stage,
+                recovery::CheckpointStage::PartialWrite,
+            )
+            .await?;
+        }
+        file.write_all(&bytes).await?;
         file.flush().await?;
         file.sync_all().await?;
+        #[cfg(test)]
+        recovery::park_at_checkpoint(self.checkpoint_stage, recovery::CheckpointStage::Synced)
+            .await?;
         drop(file);
         fs::rename(temporary, self.directory.join("session.json")).await?;
-        sync_directory(&self.directory).await
+        sync_directory(&self.directory).await?;
+        #[cfg(test)]
+        recovery::park_at_checkpoint(self.checkpoint_stage, recovery::CheckpointStage::Replaced)
+            .await?;
+        Ok(())
     }
 
     /// Acknowledgment may have been lost after an event was synced. Reconcile
