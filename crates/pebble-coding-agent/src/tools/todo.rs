@@ -43,9 +43,8 @@ fn session_todo_scope(
     kind: TodoListKind,
     tool_name: &str,
 ) -> Result<String, ToolError> {
-    ctx.session_id
-        .as_ref()
-        .map(|session_id| kind.list_id(session_id))
+    ctx.session_id()
+        .map(|session_id| kind.list_id(session_id.as_str()))
         .ok_or_else(|| ToolError::unavailable(format!("{tool_name} requires an active session")))
 }
 
@@ -55,10 +54,8 @@ fn session_todo_scope(
 /// session with no root recorded falls back to its own identity, which is what
 /// a session outside a tree is.
 fn anthropic_task_scope(ctx: &ToolContext) -> Result<String, ToolError> {
-    ctx.root_session_id
-        .as_ref()
-        .or(ctx.session_id.as_ref())
-        .map(|session_id| TodoListKind::AnthropicTasks.list_id(session_id))
+    ctx.root_session_id()
+        .map(|session_id| TodoListKind::AnthropicTasks.list_id(session_id.as_str()))
         .ok_or_else(|| ToolError::unavailable("task tools require an active session"))
 }
 

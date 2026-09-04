@@ -30,6 +30,7 @@ pub mod extensions;
 mod file_tracker;
 mod history;
 mod human_input;
+mod identity;
 mod loop_detection;
 mod memory;
 mod profile;
@@ -74,6 +75,7 @@ pub use self::compaction::{
 };
 pub use self::config::{CodingAgentOptions, CodingAgentOptionsError};
 pub use self::error::{CompactionError, Error, InterruptReason, Result, TaskKind};
+pub use self::identity::{SessionId, SessionIdentity};
 pub use self::runtime::SteeringLease;
 pub use self::skills::SkillExpansionError;
 pub use self::types::{InputContent, InputSource};

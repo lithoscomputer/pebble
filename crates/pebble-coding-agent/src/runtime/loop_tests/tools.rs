@@ -655,7 +655,7 @@ async fn a_child_inherits_its_parents_search_provider() {
         .clone();
 
     supervisor
-        .spawn(parent.id(), parent.root_session_id(), "research".to_owned())
+        .spawn(parent.identity(), "research".to_owned())
         .expect("the spawn succeeds");
 
     assert_eq!(

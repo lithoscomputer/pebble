@@ -15,6 +15,7 @@ use pebble_agent::{
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use crate::SessionIdentity;
 use crate::compaction::{CompactionControl, CompactionOptions, CompactionOutcome};
 use crate::config::{CodingAgentOptions, CodingAgentOptionsError};
 use crate::environment::Environment;
@@ -1468,7 +1469,13 @@ impl CodingAgent {
         self.inner.set_speed(speed);
     }
 
-    /// The stable durable-session and root-stream identifier.
+    /// The stable session identity and the root of its tree.
+    #[must_use]
+    pub const fn identity(&self) -> &SessionIdentity {
+        self.inner.identity()
+    }
+
+    /// The session identifier as text for display and storage.
     #[must_use]
     pub fn id(&self) -> &str {
         self.inner.id()

@@ -20,6 +20,7 @@ use crate::event::{OutputCaptureStats, SessionBoundEmitter};
 use crate::human_input::HumanInputProvider;
 use crate::redact::{NoRedaction, Redactor};
 use crate::types::{CodingEvent, ToolCategory, ToolSource, ToolSummary};
+use crate::{SessionId, SessionIdentity};
 
 /// The narrow handle a running tool publishes events through.
 ///
@@ -93,25 +94,23 @@ impl ToolEnvProvider for StaticEnvProvider {
 /// and read it through its accessors.
 pub struct ToolContext {
     /// Where the tool's work lands.
-    pub(crate) env:                  Arc<dyn Environment>,
+    pub(crate) env: Arc<dyn Environment>,
     /// Fires when this call should stop. Composed from the session's terminal
     /// cancellation and the current model turn's interrupt, so a tool that
     /// watches it observes both.
-    pub(crate) cancel:               CancellationToken,
+    pub(crate) cancel: CancellationToken,
     /// Extra environment variables for a command this call runs.
-    pub(crate) tool_env_provider:    Option<Arc<dyn ToolEnvProvider>>,
+    pub(crate) tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
     /// The session that called the tool.
-    pub(crate) session_id:           Option<String>,
-    /// The root of the session tree this call belongs to.
-    pub(crate) root_session_id:      Option<String>,
+    identity: Option<SessionIdentity>,
     /// The model-native identifier of this call.
-    pub(crate) tool_call_id:         Option<String>,
+    pub(crate) tool_call_id: Option<String>,
     /// Where the tool publishes events.
     pub(crate) coding_event_emitter: Option<Arc<dyn CodingEventEmitter>>,
     /// Where the tool asks the person a question.
-    pub(crate) human_input:          Option<Arc<dyn HumanInputProvider>>,
+    pub(crate) human_input: Option<Arc<dyn HumanInputProvider>>,
     /// What strips secrets out of text the tool publishes.
-    pub(crate) redactor:             Arc<dyn Redactor>,
+    pub(crate) redactor: Arc<dyn Redactor>,
 }
 
 impl ToolContext {
@@ -143,16 +142,16 @@ impl ToolContext {
 
     /// The session that called the tool, when the call runs inside one.
     #[must_use]
-    pub fn session_id(&self) -> Option<&str> {
-        self.session_id.as_deref()
+    pub fn session_id(&self) -> Option<&SessionId> {
+        self.identity.as_ref().map(SessionIdentity::session_id)
     }
 
     /// The root of the session tree this call belongs to. Equal to
     /// [`session_id`](Self::session_id) in a root session; a child inherits
     /// its parent's root.
     #[must_use]
-    pub fn root_session_id(&self) -> Option<&str> {
-        self.root_session_id.as_deref()
+    pub fn root_session_id(&self) -> Option<&SessionId> {
+        self.identity.as_ref().map(SessionIdentity::root_session_id)
     }
 
     /// The model-native identifier of this call.
@@ -187,8 +186,7 @@ impl ToolContext {
             env,
             cancel: CancellationToken::new(),
             tool_env_provider: None,
-            session_id: None,
-            root_session_id: None,
+            identity: None,
             tool_call_id: None,
             coding_event_emitter: None,
             human_input: None,
@@ -205,14 +203,15 @@ impl ToolContext {
 
     /// Sets the calling session and the root of its session tree.
     #[must_use]
-    pub fn with_session(
-        mut self,
-        session_id: impl Into<String>,
-        root_session_id: impl Into<String>,
-    ) -> Self {
-        self.session_id = Some(session_id.into());
-        self.root_session_id = Some(root_session_id.into());
+    pub fn with_session(mut self, identity: SessionIdentity) -> Self {
+        self.identity = Some(identity);
         self
+    }
+
+    /// The calling session and its tree, absent for a call outside a session.
+    #[must_use]
+    pub const fn identity(&self) -> Option<&SessionIdentity> {
+        self.identity.as_ref()
     }
 
     /// Sets the model-native identifier of this call.
@@ -286,10 +285,7 @@ impl ToolContext {
     /// session to be root of.
     #[must_use]
     pub fn is_root_session(&self) -> bool {
-        match (&self.session_id, &self.root_session_id) {
-            (Some(session_id), Some(root_session_id)) => session_id == root_session_id,
-            _ => false,
-        }
+        self.identity.as_ref().is_some_and(SessionIdentity::is_root)
     }
 }
 
@@ -1151,8 +1147,22 @@ mod tests {
     #[test]
     fn a_context_outside_a_session_is_not_a_root_session() {
         assert!(!context().is_root_session());
-        assert!(context().with_session("ses_1", "ses_1").is_root_session());
-        assert!(!context().with_session("ses_2", "ses_1").is_root_session());
+        assert!(
+            context()
+                .with_session(
+                    crate::SessionIdentity::root(crate::SessionId::new("ses_1"))
+                        .child(crate::SessionId::new("ses_1"))
+                )
+                .is_root_session()
+        );
+        assert!(
+            !context()
+                .with_session(
+                    crate::SessionIdentity::root(crate::SessionId::new("ses_1"))
+                        .child(crate::SessionId::new("ses_2"))
+                )
+                .is_root_session()
+        );
     }
 
     #[test]

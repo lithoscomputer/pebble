@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use lithos_llm::types::{ContentPart, ToolCall, ToolDefinition, ToolResult};
 use pebble_agent::{ToolCallNext, ToolCallRequest, ToolMiddleware, ToolOutcome, ToolSystemError};
-use pebble_coding_agent::CodingAgentOptions;
 use pebble_coding_agent::environment::Environment;
 use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent};
 use pebble_coding_agent::test_support::{DenyTool, FixedPermission, MockEnvironment};
@@ -17,6 +16,7 @@ use pebble_coding_agent::tools::{
     ApprovalDecision, CodingToolSet, PermissionMiddleware, RegisteredTool, ToolApprovalService,
     ToolError, ToolErrorKind, ToolPermission, ToolRunner, ToolSource,
 };
+use pebble_coding_agent::{CodingAgentOptions, SessionId, SessionIdentity};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
@@ -123,7 +123,7 @@ fn runner_with(
     let recorder = Arc::clone(&log);
     let runner = ToolRunner::new(CodingToolSet::core(), environment)
         .options(options)
-        .session_id("runner-1")
+        .session_id(SessionId::new("runner-1"))
         .on_event(move |event| {
             recorder
                 .0
@@ -432,4 +432,38 @@ async fn an_event_callback_failure_fails_the_run() {
         .expect_err("a failed callback makes event delivery incomplete");
 
     assert!(error.message().contains("event pipeline"));
+}
+
+#[tokio::test]
+async fn a_runner_delivers_session_identity_separately_from_the_tool_call_id() {
+    let identity = SessionIdentity::root(SessionId::new("runner/session"));
+    let expected = identity.clone();
+    let tool = RegisteredTool::function(
+        "inspect_identity",
+        "Inspect context",
+        json!({"type":"object"}),
+        move |context, _| {
+            let expected = expected.clone();
+            async move {
+                assert_eq!(context.identity(), Some(&expected));
+                assert_eq!(context.session_id(), Some(expected.session_id()));
+                assert_eq!(context.root_session_id(), Some(expected.root_session_id()));
+                assert_eq!(context.tool_call_id(), Some("model-call"));
+                Ok("identified".to_owned())
+            }
+        },
+    );
+    let tools = CodingToolSet::empty()
+        .with_tool(tool)
+        .expect("tool registered");
+    let result = ToolRunner::new(tools, mock_environment())
+        .session_id(identity.session_id().clone())
+        .run(
+            &ToolCall::function("model-call", "inspect_identity", json!({})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("call succeeds");
+    assert!(!result.is_error);
+    assert_eq!(text_of(&result), "identified");
 }

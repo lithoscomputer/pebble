@@ -31,6 +31,7 @@ use crate::tools::{
     make_shell_tool_with_options, make_web_fetch_tool, make_web_search_tool, make_write_file_tool,
 };
 use crate::types::{CodingAgentEvent, ToolSummary};
+use crate::{SessionId, SessionIdentity};
 
 /// The session identifier a runner stamps on its events when the application
 /// names none.
@@ -170,7 +171,7 @@ pub struct ToolRunner {
     redactor:          Option<Arc<dyn Redactor>>,
     tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
     on_event:          Option<ToolEventCallback>,
-    session_id:        String,
+    session_id:        SessionId,
 }
 
 impl ToolRunner {
@@ -185,7 +186,7 @@ impl ToolRunner {
             redactor: None,
             tool_env_provider: None,
             on_event: None,
-            session_id: DEFAULT_SESSION_ID.to_owned(),
+            session_id: SessionId::new(DEFAULT_SESSION_ID),
         }
     }
 
@@ -220,8 +221,8 @@ impl ToolRunner {
 
     /// Names the session the runner's events are stamped with.
     #[must_use]
-    pub fn session_id(mut self, session_id: impl Into<String>) -> Self {
-        self.session_id = session_id.into();
+    pub fn session_id(mut self, session_id: SessionId) -> Self {
+        self.session_id = session_id;
         self
     }
 
@@ -278,8 +279,7 @@ impl ToolRunner {
             Arc::clone(&self.environment),
             Arc::clone(&self.options),
             emitter.clone(),
-            self.session_id.clone(),
-            self.session_id.clone(),
+            SessionIdentity::root(self.session_id.clone()),
             redactor,
         );
         if let Some(provider) = self.tool_env_provider.as_ref() {

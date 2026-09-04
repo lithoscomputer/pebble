@@ -17,6 +17,7 @@ use tokio_util::sync::CancellationToken;
 use super::control::{actor_from_attribution, input_message, input_source_from_attribution};
 use super::retry::RetryEventBridge;
 use super::{CodingRuntime, PromptResources, PromptTotals, SessionModel, StateMachine};
+use crate::SessionId;
 use crate::coding_agent::CodingInput;
 use crate::compaction::{
     CompactionControl, CompactionOutcome, CompactionReason, CompactionRequest, check_context_usage,
@@ -75,7 +76,7 @@ pub(super) struct CodingAgentBridge {
     config:        Arc<CodingAgentOptions>,
     tools:         Arc<CodingToolService>,
     emitter:       Emitter,
-    session_id:    String,
+    session_id:    SessionId,
     /// The session's state, moved to `Executing` for the length of a tool
     /// round and back to `Thinking` after it.
     state_machine: StateMachine,
@@ -295,8 +296,7 @@ impl CodingAgentBridge {
             Arc::clone(&runtime.env),
             Arc::clone(&config),
             runtime.emitter.clone(),
-            runtime.id.clone(),
-            runtime.root_session_id.clone(),
+            runtime.identity.clone(),
             Arc::clone(&runtime.redactor),
         );
         if let Some(provider) = runtime.tool_env_provider.as_ref() {
@@ -312,7 +312,7 @@ impl CodingAgentBridge {
             config,
             tools: Arc::new(tools),
             emitter: runtime.emitter.clone(),
-            session_id: runtime.id.clone(),
+            session_id: runtime.identity.session_id().clone(),
             state_machine: runtime.state.clone(),
             prompt_cancel: Arc::new(Mutex::new(runtime.cancel_token.clone())),
             compaction: runtime.compaction.clone(),
@@ -392,7 +392,7 @@ impl CodingAgentBridge {
     }
 
     fn emit(&self, event: CodingEvent) {
-        self.emitter.emit(self.session_id.clone(), event);
+        self.emitter.emit(self.session_id.to_string(), event);
     }
 
     pub(super) fn finish_inference(&self) {
@@ -411,7 +411,7 @@ impl CodingAgentBridge {
                 self.model_context.facts.context_window_tokens,
                 self.config.compaction_threshold_percent,
                 &self.emitter,
-                &self.session_id,
+                self.session_id.as_str(),
             )
         };
         let Some(estimate) = estimate else {
@@ -442,7 +442,7 @@ impl CodingAgentBridge {
             &file_tracker,
             request,
             &self.emitter,
-            &self.session_id,
+            self.session_id.as_str(),
         )
         .await;
         match result {
@@ -833,7 +833,7 @@ impl agent::ConversationProjection for CodingAgentBridge {
 struct CodingModelService {
     model_context: Arc<SessionModel>,
     emitter:       Emitter,
-    session_id:    String,
+    session_id:    SessionId,
 }
 
 #[async_trait]
@@ -845,7 +845,7 @@ impl agent::ModelService for CodingModelService {
     ) -> StdResult<ResponseStream, LlmError> {
         context.extensions_mut().insert(RetryEventBridge::new(
             self.emitter.clone(),
-            self.session_id.clone(),
+            self.session_id.to_string(),
             self.model_context.provider.clone(),
             self.model_context.model.clone(),
         ));
@@ -942,7 +942,7 @@ impl CodingRuntime {
         let model_service = CodingModelService {
             model_context: self.model_context.clone(),
             emitter:       self.emitter.clone(),
-            session_id:    self.id.clone(),
+            session_id:    self.identity.session_id().clone(),
         };
         let messages = bridge
             .state

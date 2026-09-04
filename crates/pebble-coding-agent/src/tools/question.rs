@@ -362,12 +362,10 @@ fn parse_tool_args<T: for<'de> Deserialize<'de>>(args: Value) -> Result<T, ToolE
 /// nobody to ask.
 async fn ask(ctx: ToolContext, questions: Vec<Question>) -> Result<Vec<Answer>, ToolError> {
     let session_id = ctx
-        .session_id
-        .as_deref()
+        .session_id()
         .ok_or_else(|| ToolError::unavailable(ROOT_SESSION_REQUIRED_ERROR))?;
     let root_session_id = ctx
-        .root_session_id
-        .as_deref()
+        .root_session_id()
         .ok_or_else(|| ToolError::unavailable(ROOT_SESSION_REQUIRED_ERROR))?;
     if session_id != root_session_id {
         return Err(ToolError::denied(
@@ -706,7 +704,10 @@ mod tests {
     /// A root session with `provider` to ask through.
     fn root_context(provider: Arc<dyn HumanInputProvider>) -> ToolContext {
         context(MockEnvironment::default())
-            .with_session("root", "root")
+            .with_session(
+                crate::SessionIdentity::root(crate::SessionId::new("root"))
+                    .child(crate::SessionId::new("root")),
+            )
             .with_tool_call_id("call_1")
             .with_human_input(provider)
     }
@@ -1075,7 +1076,10 @@ mod tests {
     async fn claude5_question_tool_rejects_subagent_sessions() {
         let tool = make_claude5_question_tool();
         let child = context(MockEnvironment::default())
-            .with_session("child", "root")
+            .with_session(
+                crate::SessionIdentity::root(crate::SessionId::new("root"))
+                    .child(crate::SessionId::new("child")),
+            )
             .with_tool_call_id("call")
             .with_human_input(Arc::new(Scripted {
                 answers: Vec::new(),
@@ -1097,7 +1101,10 @@ mod tests {
     async fn a_session_with_nobody_to_ask_says_so() {
         let tool = make_anthropic_question_tool();
         let context = context(MockEnvironment::default())
-            .with_session("root", "root")
+            .with_session(
+                crate::SessionIdentity::root(crate::SessionId::new("root"))
+                    .child(crate::SessionId::new("root")),
+            )
             .with_tool_call_id("call");
 
         let error = (tool.executor)(

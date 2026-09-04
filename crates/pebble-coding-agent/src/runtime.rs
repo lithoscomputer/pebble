@@ -74,6 +74,7 @@ use crate::types::{
     MemoryFileSummary, Message, PermissionLevel, SkillSummary, TokenUsage, ToolSummary,
     rfc3339_millis,
 };
+use crate::{SessionId, SessionIdentity};
 
 /// The catalog metadata namespace pebble reads.
 const METADATA_NAMESPACE: &str = "pebble";
@@ -410,7 +411,7 @@ impl CodingRuntimeBuilder {
 
     fn build_with_id(
         mut self,
-        id: String,
+        id: SessionId,
         created_at: SystemTime,
     ) -> StdResult<CodingRuntime, CodingAgentBuildError> {
         if let Some(level) = self.permission_level {
@@ -497,8 +498,8 @@ impl CodingRuntimeBuilder {
         let (parent_session_id, root_session_id, depth, open_sessions, observer, inherited_emitter) =
             match self.child {
                 Some(child) => (
-                    Some(child.parent_session_id),
-                    child.root_session_id,
+                    Some(child.parent.session_id().clone()),
+                    child.parent.root_session_id().clone(),
                     child.depth,
                     child.open_sessions,
                     child.observer,
@@ -518,7 +519,7 @@ impl CodingRuntimeBuilder {
             (emitter, None)
         } else {
             let (emitter, pump) = EventPump::new(self.events);
-            let emitter = emitter.in_stream(root_session_id.clone());
+            let emitter = emitter.in_stream(root_session_id.to_string());
             (emitter, Some(tokio::spawn(pump.run())))
         };
 
@@ -569,9 +570,8 @@ impl CodingRuntimeBuilder {
                 memory_tokens: 0,
                 skills_tokens: 0,
             }),
-            root_session_id,
+            identity: SessionIdentity::root(root_session_id).child(id),
             parent_session_id,
-            id,
             created_at,
             config: self.options,
             conversation: Arc::new(Mutex::new(ConversationState::new(History::default()))),
@@ -699,8 +699,8 @@ fn profile_kind(
 }
 
 /// A fresh session identifier.
-fn new_session_id() -> String {
-    format!("ses_{}", uuid::Uuid::new_v4())
+fn new_session_id() -> SessionId {
+    SessionId::new(format!("ses_{}", uuid::Uuid::new_v4()))
 }
 
 /// Where an outside task names why it is about to cancel a prompt.
@@ -768,13 +768,9 @@ struct PromptResources {
 pub(crate) struct CodingRuntime {
     model_context:     Arc<SessionModel>,
     resources:         Arc<PromptResources>,
-    id:                String,
-    /// The root of this session's tree. A root session names itself; a child
-    /// inherits its parent's root, which is how root-scoped tools — one shared
-    /// todo list across a tree of agents — know where they belong.
-    root_session_id:   String,
+    identity:          SessionIdentity,
     /// The session that spawned this one, for a child. A root has none.
-    parent_session_id: Option<String>,
+    parent_session_id: Option<SessionId>,
     created_at:        SystemTime,
     config:            CodingAgentOptions,
     /// The conversation and what the current prompt has accumulated, shared
@@ -820,8 +816,8 @@ impl fmt::Debug for CodingRuntime {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("CodingRuntime")
-            .field("id", &self.id)
-            .field("root_session_id", &self.root_session_id)
+            .field("id", &self.identity.session_id())
+            .field("root_session_id", &self.identity.root_session_id())
             .field("provider", &self.model_context.provider)
             .field("model", &self.model_context.model)
             .field("profile", &self.profile.profile_kind())
@@ -891,7 +887,8 @@ impl CodingRuntime {
         let mut deps = deps;
         deps.model = Some(selector);
         deps.events.resume_after_seq = record.last_event_seq;
-        let built = deps.build_with_id(record.session_id.clone(), record.created_at);
+        let built =
+            deps.build_with_id(SessionId::new(record.session_id.clone()), record.created_at);
         let mut session = match (built, &recorded) {
             // An exact route the client cannot reach is its own failure, and
             // never a reason to run the conversation somewhere else.
@@ -921,7 +918,7 @@ impl CodingRuntime {
         // child again says the same thing. The tree itself is not: a resumed
         // child has no supervisor above it, and rebuilding one is the
         // application's to do.
-        session.parent_session_id = record.parent_session_id;
+        session.parent_session_id = record.parent_session_id.map(SessionId::new);
         Ok(session)
     }
 
@@ -1006,8 +1003,8 @@ impl CodingRuntime {
     /// Public callers take records between prompts, after the prompt's event
     /// barrier has committed its complete history.
     pub(crate) fn to_record(&self) -> SessionRecord {
-        let mut record = SessionRecord::new(self.id.clone());
-        record.parent_session_id.clone_from(&self.parent_session_id);
+        let mut record = SessionRecord::new(self.identity.session_id().to_string());
+        record.parent_session_id = self.parent_session_id.as_ref().map(ToString::to_string);
         record.provider = Some(self.model_context.provider.clone());
         record.model = Some(self.model_context.model.clone());
         record.created_at = self.created_at;
@@ -1038,7 +1035,7 @@ impl CodingRuntime {
     #[tracing::instrument(
         name = "coding_session_initialize",
         skip_all,
-        fields(session_id = %self.id, provider = %self.model_context.provider, model = %self.model_context.model)
+        fields(session_id = %self.identity.session_id(), provider = %self.model_context.provider, model = %self.model_context.model)
     )]
     pub(crate) async fn initialize(&mut self) -> Result<()> {
         let cancel = self.cancel_token.clone();
@@ -1234,11 +1231,10 @@ impl CodingRuntime {
 
     /// This session's identifier.
     pub(crate) fn id(&self) -> &str {
-        &self.id
+        self.identity.session_id().as_str()
     }
 
-    /// The root of this session's tree, which a root session answers with its
-    /// own [`id`](Self::id).
+    /// The session and root identities that place this session in its tree.
     ///
     /// Read-only for the same reason [`CodingRuntimeBuilder`]'s `child_of` is
     /// crate-internal: a session's place in its tree is settled when it is
@@ -1246,8 +1242,13 @@ impl CodingRuntime {
     /// stream, and stored records all key on this, so a session that could
     /// be re-rooted afterwards could be detached from the tree that owns
     /// it.
+    pub(crate) const fn identity(&self) -> &SessionIdentity {
+        &self.identity
+    }
+
+    /// The root identity as text for event and snapshot boundaries.
     pub(crate) fn root_session_id(&self) -> &str {
-        &self.root_session_id
+        self.identity.root_session_id().as_str()
     }
 
     /// Which harness this session runs.
@@ -1450,7 +1451,7 @@ impl CodingRuntime {
     /// parent's session identity on that same pipeline.
     pub(crate) fn sub_agent_event_callback(&self) -> SubagentEventCallback {
         let emitter = self.emitter.clone();
-        let parent_session_id = self.id.clone();
+        let parent_session_id = self.identity.session_id().to_string();
         Arc::new(move |event| {
             emitter.emit(parent_session_id.clone(), event);
         })
@@ -1562,7 +1563,7 @@ impl CodingRuntime {
             &file_tracker,
             request,
             &self.emitter,
-            &self.id,
+            self.identity.session_id().as_str(),
         )
         .await;
         drop(operation);
@@ -1605,7 +1606,7 @@ impl CodingRuntime {
         name = "coding_session_prompt",
         skip_all,
         fields(
-            session_id = %self.id,
+            session_id = %self.identity.session_id(),
             provider = %self.model_context.provider,
             model = %self.model_context.model
         )
@@ -1749,7 +1750,7 @@ impl CodingRuntime {
     #[tracing::instrument(
         name = "coding_session_shutdown",
         skip_all,
-        fields(session_id = %self.id, reason = ?reason)
+        fields(session_id = %self.identity.session_id(), reason = ?reason)
     )]
     pub(crate) async fn shutdown(&mut self, reason: ShutdownReason) -> Result<bool> {
         if self.ended {
@@ -1886,7 +1887,8 @@ impl CodingRuntime {
 
     /// Publishes one event on this session's stream.
     fn emit(&self, event: CodingEvent) {
-        self.emitter.emit(self.id.clone(), event);
+        self.emitter
+            .emit(self.identity.session_id().to_string(), event);
     }
 
     /// Publishes a model failure, closing the session when the credential is
@@ -1920,12 +1922,12 @@ impl CodingRuntime {
 pub(crate) struct StateMachine {
     state:      Arc<Mutex<CodingAgentState>>,
     emitter:    Emitter,
-    session_id: String,
+    session_id: SessionId,
 }
 
 impl StateMachine {
     /// A session that starts idle.
-    fn new(emitter: Emitter, session_id: String) -> Self {
+    fn new(emitter: Emitter, session_id: SessionId) -> Self {
         Self {
             state: Arc::new(Mutex::new(CodingAgentState::Idle)),
             emitter,
@@ -1976,7 +1978,7 @@ impl StateMachine {
         ) && to == CodingAgentState::Idle
         {
             self.emitter
-                .emit(self.session_id.clone(), CodingEvent::ProcessingEnd);
+                .emit(self.session_id.to_string(), CodingEvent::ProcessingEnd);
         }
     }
 }

@@ -249,12 +249,11 @@ fn make_agent_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
                     .get("run_in_background")
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
-                let (session_id, root_session_id) = tree_position(&context)?;
+                let parent = tree_position(&context)?;
 
                 if run_in_background {
                     let task_id = supervisor.spawn_with_parent_notification(
-                        session_id,
-                        root_session_id,
+                        parent,
                         prompt.to_owned(),
                         description.to_owned(),
                     )?;
@@ -262,8 +261,7 @@ fn make_agent_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
                         "Agent started in the background.\n\nTask ID: {task_id}"
                     ))
                 } else {
-                    let task_id =
-                        supervisor.spawn(session_id, root_session_id, prompt.to_owned())?;
+                    let task_id = supervisor.spawn(parent, prompt.to_owned())?;
                     let result = supervisor
                         .wait_with_cancel(&task_id, &context.cancel)
                         .await?;
@@ -639,7 +637,7 @@ mod tests {
 
     /// A call made from inside `parent`.
     fn call_in(parent: &CodingRuntime) -> ToolContext {
-        context(MockEnvironment::linux()).with_session(parent.id(), parent.root_session_id())
+        context(MockEnvironment::linux()).with_session(parent.identity().clone())
     }
 
     #[tokio::test]
@@ -758,8 +756,7 @@ mod tests {
         let supervisor = supervisor_of(&parent);
         let task_id = supervisor
             .spawn_with_parent_notification(
-                parent.id(),
-                parent.root_session_id(),
+                parent.identity(),
                 "Inspect".to_owned(),
                 "Inspect explicitly".to_owned(),
             )
@@ -795,7 +792,7 @@ mod tests {
         let parent = parent_answering("defaulted report");
         let supervisor = supervisor_of(&parent);
         let task_id = supervisor
-            .spawn(parent.id(), parent.root_session_id(), "Inspect".to_owned())
+            .spawn(parent.identity(), "Inspect".to_owned())
             .expect("the spawn succeeds");
         supervisor
             .wait_with_cancel(&task_id, &CancellationToken::new())
@@ -854,7 +851,7 @@ mod tests {
         let parent = parent_answering("child report");
         let supervisor = supervisor_of(&parent);
         let task_id = supervisor
-            .spawn(parent.id(), parent.root_session_id(), "Inspect".to_owned())
+            .spawn(parent.identity(), "Inspect".to_owned())
             .expect("the spawn succeeds");
         supervisor
             .wait_with_cancel(&task_id, &CancellationToken::new())

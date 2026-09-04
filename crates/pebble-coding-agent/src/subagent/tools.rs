@@ -15,6 +15,7 @@ use lithos_llm::types::ToolDefinition;
 use serde_json::json;
 
 use super::SubagentSupervisor;
+use crate::SessionIdentity;
 use crate::tool::{NativeTool, RegisteredTool, ToolContext, ToolError, required_str};
 use crate::types::ToolSource;
 
@@ -33,14 +34,10 @@ pub(crate) fn subagent_tools(supervisor: &SubagentSupervisor) -> Vec<RegisteredT
 /// A child inherits the root of its parent's tree, so root-scoped tools — one
 /// shared todo list — cover the whole tree. Both spawn-tool families read
 /// their position through this one function, error string included.
-pub(crate) fn tree_position(context: &ToolContext) -> Result<(&str, &str), ToolError> {
-    let Some(session_id) = context.session_id.as_deref() else {
-        return Err(ToolError::execution(
-            "A subagent can only be spawned from inside a session",
-        ));
-    };
-    let root_session_id = context.root_session_id.as_deref().unwrap_or(session_id);
-    Ok((session_id, root_session_id))
+pub(crate) fn tree_position(context: &ToolContext) -> Result<&SessionIdentity, ToolError> {
+    context
+        .identity()
+        .ok_or_else(|| ToolError::execution("A subagent can only be spawned from inside a session"))
 }
 
 /// Starts a child on a task and answers with its identifier.
@@ -65,8 +62,8 @@ fn spawn_agent_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
             let supervisor = supervisor.clone();
             Box::pin(async move {
                 let task = required_str(&arguments, "task")?;
-                let (session_id, root_session_id) = tree_position(&context)?;
-                supervisor.spawn(session_id, root_session_id, task.to_owned())
+                let parent = tree_position(&context)?;
+                supervisor.spawn(parent, task.to_owned())
             })
         }),
     )

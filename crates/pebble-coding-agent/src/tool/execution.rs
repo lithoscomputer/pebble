@@ -36,6 +36,7 @@ use super::permissions::canonical_tool_name;
 use super::registry::{
     CodingEventEmitter, RegisteredTool, ToolContext, ToolEnvProvider, ToolRegistry,
 };
+use crate::SessionIdentity;
 use crate::config::CodingAgentOptions;
 use crate::environment::Environment;
 use crate::event::{Emitter, OutputCaptureStats, SessionBoundEmitter};
@@ -61,11 +62,7 @@ pub(crate) struct CodingToolService {
     env:               Arc<dyn Environment>,
     config:            Arc<CodingAgentOptions>,
     emitter:           Emitter,
-    session_id:        String,
-    /// Equal to `session_id` in a root session; a child carries the root of
-    /// its tree, which is how a root-only tool knows it is running somewhere
-    /// it should not.
-    root_session_id:   String,
+    identity:          SessionIdentity,
     tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
     /// Absent in a child session and wherever the application installed no
     /// provider, which is what makes a question tool report that it cannot
@@ -84,8 +81,7 @@ impl CodingToolService {
         env: Arc<dyn Environment>,
         config: Arc<CodingAgentOptions>,
         emitter: Emitter,
-        session_id: String,
-        root_session_id: String,
+        identity: SessionIdentity,
         redactor: Arc<dyn Redactor>,
     ) -> Self {
         Self {
@@ -94,8 +90,7 @@ impl CodingToolService {
             env,
             config,
             emitter,
-            session_id,
-            root_session_id,
+            identity,
             tool_env_provider: None,
             human_input: None,
             redactor,
@@ -201,12 +196,12 @@ impl CodingToolService {
 
         let bound = Arc::new(SessionBoundEmitter::new(
             self.emitter.clone(),
-            &self.session_id,
+            self.identity.session_id().as_str(),
             Some(call.id.clone()),
         ));
         let mut context = ToolContext::new(Arc::clone(&self.env))
             .with_cancel(cancel)
-            .with_session(&self.session_id, &self.root_session_id)
+            .with_session(self.identity.clone())
             .with_tool_call_id(call.id.clone())
             .with_coding_event_emitter(Arc::clone(&bound) as Arc<dyn CodingEventEmitter>)
             .with_redactor(Arc::clone(&self.redactor));
@@ -352,8 +347,11 @@ impl CodingToolService {
     /// Publishes an event about one call, stamping the call on the envelope so
     /// a fragment with no identity of its own is still attributable.
     fn emit(&self, tool_call_id: &str, event: CodingEvent) {
-        self.emitter
-            .emit_with_tool_call_id(&self.session_id, event, Some(tool_call_id.to_owned()));
+        self.emitter.emit_with_tool_call_id(
+            self.identity.session_id().as_str(),
+            event,
+            Some(tool_call_id.to_owned()),
+        );
     }
 }
 
@@ -596,8 +594,7 @@ mod tests {
             Arc::new(MockEnvironment::default()),
             Arc::new(CodingAgentOptions::default()),
             events.emitter.clone(),
-            "ses_1".to_owned(),
-            "ses_1".to_owned(),
+            SessionIdentity::root(crate::SessionId::new("ses_1")),
             redactor,
         ))
     }
