@@ -17,13 +17,13 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, process};
 
-use lithos_llm::types::ToolDefinition;
+use lithos_llm::types::{ContentPart, ToolDefinition};
 use pebble_coding_agent::environment::LocalEnvironment;
 use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent, ToolSource};
 use pebble_coding_agent::state::Message;
 use pebble_coding_agent::test_support::{
-    ScriptedCall, ScriptedProvider, client_from, message_text, text_delta_events, text_response,
-    tool_call_response, with_cost,
+    ScriptedCall, ScriptedProvider, client_from, message_text, multi_tool_call_response,
+    text_delta_events, text_response, tool_call_response, with_cost,
 };
 use pebble_coding_agent::tools::RegisteredTool;
 use pebble_coding_agent::{CodingAgent, ShutdownReason};
@@ -320,6 +320,55 @@ async fn a_finished_prompt_reports_what_it_used() {
         2,
         "the input and the answer"
     );
+}
+
+#[tokio::test]
+async fn edits_in_one_round_preserve_both_changes_and_the_following_read() {
+    let workspace = Workspace::new("ordered-edits");
+    fs::write(workspace.join("note.txt"), "alpha\nbeta\n").expect("initial file");
+    let (mut agent, _provider) = coding_agent(&workspace, vec![
+        ScriptedCall::response(multi_tool_call_response(vec![
+            (
+                "edit_file",
+                "edit_a",
+                json!({"file_path":"note.txt", "old_string":"alpha", "new_string":"ALPHA"}),
+            ),
+            (
+                "edit_file",
+                "edit_b",
+                json!({"file_path":"note.txt", "old_string":"beta", "new_string":"BETA"}),
+            ),
+            ("read_file", "read", json!({"file_path":"note.txt"})),
+        ])),
+        ScriptedCall::response(text_response("done")),
+    ])
+    .await;
+    timeout(PATIENCE, agent.prompt("edit both lines"))
+        .await
+        .expect("prompt finishes")
+        .expect("prompt succeeds");
+    assert_eq!(
+        fs::read_to_string(workspace.join("note.txt")).expect("file remains"),
+        "ALPHA\nBETA\n"
+    );
+    let history = agent.history();
+    let results = history
+        .turns()
+        .iter()
+        .find_map(|message| match message {
+            Message::ToolResults { results, .. } => Some(results),
+            _ => None,
+        })
+        .expect("tool results committed");
+    assert_eq!(results.len(), 3);
+    assert!(results.iter().all(|result| !result.is_error));
+    assert!(
+        matches!(results[2].content.as_slice(), [ContentPart::Text { text }] if text == "1 | ALPHA\n2 | BETA\n")
+    );
+    agent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("shutdown");
 }
 
 // --- The harness these tests are assembled from ---
