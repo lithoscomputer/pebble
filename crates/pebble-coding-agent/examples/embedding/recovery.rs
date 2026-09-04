@@ -291,15 +291,12 @@ impl Workspace {
         let exited = timeout(PATIENCE, child.wait()).await;
         let stdout = finish_reader(stdout).await;
         let stderr = finish_reader(stderr).await;
-        let status = exited??;
-        let stdout = stdout?;
-        let stderr = stderr?;
-        if !matches!(reached, Ok(Ok(()))) || killed.is_err() || status.success() {
-            return Err(io::Error::other(format!(
-                "scenario {scenario}: readiness {reached:?}, kill {killed:?}, exit {status}; stdout: {stdout}; stderr: {stderr}"
-            )).into());
+        match (&reached, &killed, &exited, &stdout, &stderr) {
+            (Ok(Ok(())), Ok(()), Ok(Ok(status)), Ok(_), Ok(_)) if !status.success() => Ok(()),
+            _ => Err(io::Error::other(format!(
+                "scenario {scenario}: readiness {reached:?}, kill {killed:?}, exit {exited:?}; stdout: {stdout:?}; stderr: {stderr:?}"
+            )).into()),
         }
-        Ok(())
     }
 
     async fn expected_record(&self) -> AppResult<SessionRecord> {
@@ -430,6 +427,10 @@ async fn recover_checkpoint(scenario: &str, stage: CheckpointStage) -> AppResult
     let temporary = workspace.state().join("session.json.tmp");
     if stage == CheckpointStage::Replaced {
         assert_eq!(authoritative.messages, expected.messages);
+        assert_eq!(
+            recovered.messages, expected.messages,
+            "loading selects the replacement"
+        );
         assert_eq!(authoritative.last_event_seq, expected.last_event_seq);
         assert!(!fs::try_exists(&temporary).await?);
     } else {
