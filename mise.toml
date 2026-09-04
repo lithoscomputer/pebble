@@ -61,6 +61,14 @@ description = "Check all targets with the declared minimum Rust version"
 env = { CARGO_TARGET_DIR = "{{config_root}}/target/msrv" }
 run = "cargo +1.88.0 check --locked --workspace --all-targets --all-features"
 
+[tasks."check:libraries"]
+description = "Check library features without the CLI or dev dependencies"
+run = [
+  "cargo check --locked -p pebble-agent --lib --no-default-features",
+  "cargo check --locked -p pebble-coding-agent --lib --no-default-features",
+  "cargo check --locked -p pebble-coding-agent --lib --no-default-features --features test-util",
+]
+
 [tasks."check:actions"]
 description = "Audit GitHub Actions workflows"
 run = "zizmor .github/workflows"
@@ -78,6 +86,7 @@ depends = [
   "test:doc",
   "doc",
   "check:actions",
+  "check:libraries",
   "check:whitespace",
 ]
 
