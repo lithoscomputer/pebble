@@ -439,6 +439,40 @@ impl Environment for LocalEnvironment {
         })
     }
 
+    async fn rename_file(&self, source: &str, destination: &str) -> EnvResult<()> {
+        let source = self.resolve_path(source);
+        let destination = self.resolve_path(destination);
+        let resolved_source = fs::canonicalize(&source).await.map_err(|error| {
+            EnvironmentError::io(format!("Failed to resolve {}", source.display()), error)
+        })?;
+        match fs::canonicalize(&destination).await {
+            Ok(resolved_destination) if resolved_destination == resolved_source => return Ok(()),
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(EnvironmentError::io(
+                    format!("Failed to resolve {}", destination.display()),
+                    error,
+                ));
+            }
+        }
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent).await.map_err(|error| {
+                EnvironmentError::io(format!("Failed to create {}", parent.display()), error)
+            })?;
+        }
+        fs::rename(&source, &destination).await.map_err(|error| {
+            EnvironmentError::io(
+                format!(
+                    "Failed to move {} to {}",
+                    source.display(),
+                    destination.display()
+                ),
+                error,
+            )
+        })
+    }
+
     async fn delete_file(&self, path: &str) -> EnvResult<()> {
         let full_path = self.resolve_path(path);
         fs::remove_file(&full_path).await.map_err(|error| {
@@ -1147,6 +1181,63 @@ mod tests {
                 "File is not valid UTF-8: {}",
                 directory.join("binary.bin").display()
             )
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn renaming_between_file_or_directory_aliases_preserves_both_paths() {
+        let directory = TempDir::new("rename-aliases");
+        directory.write("file.txt", "content");
+        symlink(directory.join("file.txt"), directory.join("alias.txt")).expect("file alias");
+        symlink(directory.join("."), directory.join("linked")).expect("directory alias");
+        let env = environment(&directory);
+        for (source, destination) in [
+            ("file.txt", "alias.txt"),
+            ("alias.txt", "file.txt"),
+            ("file.txt", "linked/file.txt"),
+        ] {
+            env.rename_file(source, destination)
+                .await
+                .expect("same file move");
+            assert_eq!(
+                env.read_file_text(source).await.expect("source remains"),
+                "content"
+            );
+            assert_eq!(
+                env.read_file_text(destination)
+                    .await
+                    .expect("destination remains"),
+                "content"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn renaming_creates_parents_and_leaves_source_intact_on_failure() {
+        let directory = TempDir::new("rename");
+        directory.write("source.txt", "content");
+        let env = environment(&directory);
+        env.rename_file("source.txt", "nested/destination.txt")
+            .await
+            .expect("moves into new directory");
+        assert!(!env.file_exists("source.txt").await.expect("source check"));
+        assert_eq!(
+            env.read_file_text("nested/destination.txt")
+                .await
+                .expect("destination"),
+            "content"
+        );
+        assert!(
+            env.rename_file("nested/destination.txt", "nested")
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            env.read_file_text("nested/destination.txt")
+                .await
+                .expect("failed move keeps source"),
+            "content"
         );
     }
 

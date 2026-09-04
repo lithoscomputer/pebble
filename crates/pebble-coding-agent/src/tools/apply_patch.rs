@@ -368,14 +368,16 @@ pub(crate) async fn apply_patch_operations(
                 })?;
                 let updated = apply_hunks(path, &original, hunks)?;
                 let dest = new_path.as_deref().unwrap_or(path);
-                env.write_file(dest, &updated)
-                    .await
-                    .map_err(|error| failure(&format!("Failed to write file {dest}"), error))?;
                 if new_path.is_some() {
-                    env.delete_file(path).await.map_err(|error| {
-                        failure(&format!("Failed to remove original {path}"), error)
+                    // Renaming belongs to the environment: only it can tell
+                    // whether two spellings identify the same file.
+                    env.rename_file(path, dest).await.map_err(|error| {
+                        failure(&format!("Failed to move {path} to {dest}"), error)
                     })?;
                 }
+                env.write_existing_file(dest, &updated)
+                    .await
+                    .map_err(|error| failure(&format!("Failed to write file {dest}"), error))?;
                 modified.push(dest.to_owned());
             }
         }

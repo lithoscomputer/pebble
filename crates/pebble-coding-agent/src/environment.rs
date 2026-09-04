@@ -498,6 +498,15 @@ pub trait Environment: Send + Sync {
         self.write_file(path, content).await
     }
 
+    /// Moves an existing file, creating missing destination directories and
+    /// replacing an existing destination file.
+    ///
+    /// If both paths resolve to the same file, this must succeed without
+    /// removing either path. Resolve aliases in this environment, not in the
+    /// host running Pebble. A failed move must leave the source file intact.
+    /// Cross-filesystem moves may return an error.
+    async fn rename_file(&self, source: &str, destination: &str) -> EnvResult<()>;
+
     /// Deletes a file.
     async fn delete_file(&self, path: &str) -> EnvResult<()>;
 

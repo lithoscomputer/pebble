@@ -168,6 +168,14 @@ impl Environment for MockEnvironment {
         self.write_file(path, content).await
     }
 
+    async fn rename_file(&self, source: &str, destination: &str) -> EnvResult<()> {
+        if source == destination {
+            return Ok(());
+        }
+        let content = self.read_file_text(source).await?;
+        self.write_file(destination, &content).await
+    }
+
     async fn delete_file(&self, _path: &str) -> EnvResult<()> {
         Ok(())
     }
@@ -305,6 +313,21 @@ impl Environment for MutableMockEnvironment {
             .lock()
             .expect("files lock is not poisoned")
             .insert(path.to_owned(), content.to_owned());
+        Ok(())
+    }
+
+    async fn rename_file(&self, source: &str, destination: &str) -> EnvResult<()> {
+        let mut files = self.files.lock().expect("files lock is not poisoned");
+        let content = files.get(source).cloned().ok_or_else(|| {
+            EnvironmentError::new(
+                EnvironmentErrorKind::NotFound,
+                format!("File not found: {source}"),
+            )
+        })?;
+        if source != destination {
+            files.remove(source);
+            files.insert(destination.to_owned(), content);
+        }
         Ok(())
     }
 

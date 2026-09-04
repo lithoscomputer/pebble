@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{env, fs, process};
 
-use lithos_llm::types::{ContentPart, ToolDefinition};
+use lithos_llm::types::{ContentPart, ToolCall, ToolDefinition};
 use pebble_coding_agent::environment::LocalEnvironment;
 use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent, ToolSource};
 use pebble_coding_agent::state::Message;
@@ -25,11 +25,14 @@ use pebble_coding_agent::test_support::{
     ScriptedCall, ScriptedProvider, client_from, message_text, multi_tool_call_response,
     text_delta_events, text_response, tool_call_response, with_cost,
 };
-use pebble_coding_agent::tools::RegisteredTool;
+use pebble_coding_agent::tools::{
+    CodingToolSet, RegisteredTool, ToolRunner, make_apply_patch_tool,
+};
 use pebble_coding_agent::{CodingAgent, ShutdownReason};
 use serde_json::json;
 use tokio::sync::{Notify, broadcast};
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 /// How long a test waits for a prompt another task has to unblock.
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -369,6 +372,42 @@ async fn edits_in_one_round_preserve_both_changes_and_the_following_read() {
         .shutdown(ShutdownReason::Completed)
         .await
         .expect("shutdown");
+}
+
+#[tokio::test]
+async fn patching_and_moving_to_the_same_file_keeps_the_updated_file() {
+    let workspace = Workspace::new("self-move");
+    fs::create_dir(workspace.join("sub")).expect("alias parent exists");
+    let absolute = workspace.join("note.txt").to_string_lossy().into_owned();
+    let runner = ToolRunner::new(
+        CodingToolSet::empty()
+            .with_tool(make_apply_patch_tool())
+            .expect("patch tool"),
+        Arc::new(LocalEnvironment::new(workspace.path())),
+    );
+    for destination in [
+        "note.txt",
+        "./note.txt",
+        "sub/../note.txt",
+        absolute.as_str(),
+    ] {
+        fs::write(workspace.join("note.txt"), "old\n").expect("initial file");
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: note.txt\n*** Move to: {destination}\n@@\n-old\n+new\n*** End Patch"
+        );
+        let result = runner
+            .run(
+                &ToolCall::custom("move", "apply_patch", patch),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("tool runs");
+        assert!(!result.is_error, "move to {destination}: {result:?}");
+        assert_eq!(
+            fs::read_to_string(workspace.join("note.txt")).expect("file remains"),
+            "new\n"
+        );
+    }
 }
 
 // --- The harness these tests are assembled from ---
