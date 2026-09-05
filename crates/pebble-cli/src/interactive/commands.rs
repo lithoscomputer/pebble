@@ -31,6 +31,16 @@ use crate::storage;
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "Commands and keyboard shortcuts"),
     ("/new", "Start a new session"),
+    ("/fork", "Branch before an earlier prompt, or at @bookmark"),
+    ("/clone", "Copy the current session into a new branch"),
+    (
+        "/tree",
+        "Navigate branches and saved conversation boundaries",
+    ),
+    (
+        "/bookmark",
+        "Name the current boundary, or choose a bookmark",
+    ),
     ("/resume", "Choose a saved session"),
     ("/name", "Name this session"),
     ("/session", "Session details"),
@@ -214,6 +224,25 @@ impl App {
                     self.operation_cancel.clone(),
                 ))?;
                 self.busy = true;
+            }
+            "/fork" => {
+                self.require_idle()?;
+                self.fork_session(argument).await?;
+            }
+            "/clone" => {
+                self.require_idle()?;
+                if !argument.is_empty() {
+                    bail!("/clone takes no arguments");
+                }
+                self.clone_session().await?;
+            }
+            "/tree" => {
+                self.require_idle()?;
+                self.tree().await?;
+            }
+            "/bookmark" => {
+                self.require_idle()?;
+                self.bookmark(argument).await?;
             }
             "/new" => {
                 self.require_idle()?;
@@ -466,7 +495,7 @@ impl App {
         Ok(())
     }
 
-    fn worker(&self) -> Result<&Worker> {
+    pub(super) fn worker(&self) -> Result<&Worker> {
         self.worker
             .as_ref()
             .context("the coding agent is unavailable")
@@ -510,6 +539,9 @@ impl App {
                             .replace_token(start, &format!("{value}{suffix}"));
                     }
                     Purpose::Command => self.editor.replace_token(0, &format!("{value} ")),
+                    Purpose::Navigate => {
+                        Box::pin(self.command(&value)).await?;
+                    }
                     Purpose::Sessions => {
                         self.command(&format!("/resume {value}")).await?;
                     }
@@ -1006,7 +1038,11 @@ impl App {
         Ok(())
     }
 
-    async fn change_session(&mut self, id: Option<&str>, model: Option<&str>) -> Result<()> {
+    pub(super) async fn change_session(
+        &mut self,
+        id: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<()> {
         let same = id == Some(self.metadata.id.as_str());
         let store = if same {
             self.store.clone()
@@ -1027,6 +1063,7 @@ impl App {
             metadata.id = store.id();
             metadata.name = "New session".into();
             metadata.forked_from = None;
+            metadata.forked_at = None;
             None
         };
         let mut attachments = super::attachments::Attachments::open(store.directory()).await?;

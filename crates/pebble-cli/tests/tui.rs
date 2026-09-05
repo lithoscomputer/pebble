@@ -751,3 +751,128 @@ async fn shell_shortcuts_approve_stream_cancel_and_control_model_context() {
     server.abort();
     let _ = server.await;
 }
+
+fn saved_sessions(root: &Path) -> Vec<(PathBuf, serde_json::Value)> {
+    fs::read_dir(root.join("sessions"))
+        .expect("sessions")
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            let value =
+                serde_json::from_slice(&fs::read(path.join("checkpoint.json")).ok()?).ok()?;
+            Some((path, value))
+        })
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clone_fork_tree_and_bookmarks_preserve_original_history() {
+    let root = tempfile::tempdir().expect("test directory");
+    let (url, server) = provider("tests/cmd/scenarios.json").await;
+    let mut terminal = Terminal::start(&arguments(root.path()), &url, "exec-answers-without-tools");
+    terminal.contains("context ?").await;
+    terminal.send(b"say hello\r").await;
+    terminal.contains("Hello from the twin.").await;
+    terminal
+        .until(|screen| {
+            screen
+                .live_text()
+                .lines()
+                .any(|line| line.trim() == "Ready")
+        })
+        .await;
+    let (original_path, original) = saved_sessions(root.path()).pop().expect("original");
+    terminal.send(b"/bookmark answered\r").await;
+    terminal.contains("as answered").await;
+    terminal.send(b"/clone\r").await;
+    terminal.contains("New session · branch").await;
+    terminal
+        .until(|screen| {
+            screen
+                .live_text()
+                .lines()
+                .any(|line| line.trim() == "Ready")
+        })
+        .await;
+    let sessions = saved_sessions(root.path());
+    assert_eq!(sessions.len(), 2);
+    let (_, clone) = sessions
+        .iter()
+        .find(|(path, _)| path != &original_path)
+        .expect("clone");
+    assert_eq!(clone["record"]["messages"], original["record"]["messages"]);
+    assert_ne!(
+        clone["record"]["session_id"],
+        original["record"]["session_id"]
+    );
+    assert_eq!(clone["metadata"]["forked_from"], original["metadata"]["id"]);
+    terminal.send(b"/tree\r").await;
+    terminal.contains("Branches and history").await;
+    terminal.send(b"answered").await;
+    terminal
+        .until(|screen| screen.live_text().contains("★ answered"))
+        .await;
+    terminal.send(b"\x1b").await;
+    terminal
+        .until(|screen| screen.cursor_line().starts_with("›"))
+        .await;
+    terminal.send(b"/fork\r").await;
+    terminal
+        .until(|screen| {
+            screen.live_text().contains("say hello")
+                && screen.live_text().contains("Branches and history")
+        })
+        .await;
+    terminal.send(b"\r").await;
+    terminal.contains("Forked before input").await;
+    terminal
+        .until(|screen| screen.cursor_line().contains("say hello"))
+        .await;
+    let sessions = saved_sessions(root.path());
+    assert_eq!(sessions.len(), 3);
+    assert!(sessions.iter().any(|(_, value)| {
+        value["metadata"]["forked_from"] == clone["metadata"]["id"]
+            && value["record"]["messages"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+    }));
+    let unchanged: serde_json::Value = serde_json::from_slice(
+        &fs::read(original_path.join("checkpoint.json")).expect("source checkpoint"),
+    )
+    .expect("checkpoint");
+    assert_eq!(
+        unchanged["record"]["messages"],
+        original["record"]["messages"]
+    );
+    terminal.send(b"\x03/quit\r").await;
+    terminal.finish().await;
+    let mut args = arguments(root.path());
+    args.extend([
+        "--resume".into(),
+        original["metadata"]["id"].as_str().expect("id").into(),
+    ]);
+    let mut terminal = Terminal::start(&args, &url, "unused");
+    terminal.contains("Hello from the twin.").await;
+    terminal
+        .until(|screen| {
+            screen
+                .live_text()
+                .lines()
+                .any(|line| line.trim() == "Ready")
+        })
+        .await;
+    terminal.send(b"/fork @answered\r").await;
+    terminal.contains("New session · branch").await;
+    terminal
+        .until(|screen| {
+            screen
+                .live_text()
+                .lines()
+                .any(|line| line.trim() == "Ready")
+        })
+        .await;
+    assert_eq!(saved_sessions(root.path()).len(), 4);
+    terminal.send(b"/quit\r").await;
+    terminal.finish().await;
+    server.abort();
+    let _ = server.await;
+}

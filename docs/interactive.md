@@ -73,6 +73,10 @@ to the editor. Image placeholders preserve their original content and order.
 | `/help` | Show commands and shortcuts. |
 | `/new` | Start a new session with the current model and permissions. |
 | `/resume [id]` | Choose or resume a saved session. |
+| `/fork [input-event or @bookmark]` | Branch before an earlier prompt and restore it for editing. |
+| `/clone` | Copy the current model context into a new session. |
+| `/tree` | Navigate saved sessions, their ancestry, and current conversation boundaries. |
+| `/bookmark [name]` | Name the current boundary, or choose a saved bookmark. |
 | `/name <name>` | Rename the current session. |
 | `/session` | Show the session id and storage directory. |
 | `/model [model]` | Choose or set a configured model. `/model all` shows setup requirements for other models. |
@@ -158,8 +162,23 @@ is saved in an `events.partial-*` file before the journal is repaired. Complete
 malformed records produce an error.
 Pebble also refuses a journal that ends before its saved checkpoint.
 
-Compaction changes model context and leaves the full journal in place. Session
-forks and a conversation tree are not part of this version.
+Compaction changes model context and leaves the full journal in place. New
+checkpoints are also retained in `checkpoints/`. This uses more disk space than
+keeping only the latest context, but permits branching across compaction.
+Older sessions remain readable; prompts from before checkpoint retention cannot
+be selected as fork points.
+
+`/fork` offers earlier prompts. Selecting one creates a new session with the
+context from before that prompt and restores the prompt in the editor. Nothing
+runs until you submit it. `/clone` copies the current context. Both preserve the
+original session and copy attachments, applicable shell results, and bookmarks.
+An existing draft moves with you. A fork appends the restored prompt to that draft.
+
+Use `/bookmark working` to name the current context. `/fork @working` creates
+a branch there. Reusing a bookmark name moves the bookmark. `/tree` shows session
+ancestry and saved boundaries; selecting a history boundary creates a branch.
+Selecting a session resumes that session. Branches record their parent session
+and event number in the checkpoint metadata.
 
 ## Preferences
 

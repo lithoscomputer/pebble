@@ -10,6 +10,7 @@ pub(super) enum Purpose {
     Command,
     Completion(usize),
     Sessions,
+    Navigate,
     Models,
     Login,
     Logout,
@@ -100,6 +101,7 @@ impl Menu {
     pub(super) fn draw(&self, terminal: &mut Terminal, status: &str) -> io::Result<()> {
         let title = match self.purpose {
             Purpose::Models => "Models",
+            Purpose::Navigate => "Branches and history",
             Purpose::Sessions => "Sessions",
             Purpose::Login => "Log in",
             Purpose::Logout => "Log out",

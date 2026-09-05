@@ -26,6 +26,7 @@ use crate::credentials::AuthStore;
 use crate::exec::print_err;
 
 mod attachments;
+mod branch;
 mod commands;
 mod dialog;
 mod editor;
@@ -199,6 +200,7 @@ async fn start(args: InteractiveArgs) -> Result<()> {
             approvals: !args.no_approvals,
             updated_at: store::timestamp(),
             forked_from: None,
+            forked_at: None,
         },
         |checkpoint| checkpoint.metadata.clone(),
     );

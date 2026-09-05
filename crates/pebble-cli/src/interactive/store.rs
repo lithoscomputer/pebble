@@ -38,9 +38,11 @@ pub(super) struct Metadata {
     pub updated_at:   u64,
     #[serde(default)]
     pub forked_from:  Option<String>,
+    #[serde(default)]
+    pub forked_at:    Option<u64>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Checkpoint {
     pub metadata: Metadata,
     pub record:   SessionRecord,
@@ -152,7 +154,15 @@ impl Store {
     ) -> Result<()> {
         let mut metadata = metadata.clone();
         metadata.updated_at = timestamp();
+        let seq = record.last_event_seq;
         let content = serde_json::to_vec_pretty(&Checkpoint { metadata, record })?;
+        atomic_write(
+            self.directory
+                .join("checkpoints")
+                .join(format!("{seq}.json")),
+            content.clone(),
+        )
+        .await?;
         atomic_write(self.directory.join("checkpoint.json"), content).await
     }
 
@@ -321,6 +331,7 @@ mod tests {
             approvals:    true,
             updated_at:   0,
             forked_from:  None,
+            forked_at:    None,
         };
         let mut record = SessionRecord::new("root");
         record.advance_event_cursor(1);

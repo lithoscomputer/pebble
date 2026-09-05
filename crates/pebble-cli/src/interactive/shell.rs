@@ -40,7 +40,7 @@ pub(super) struct Record {
 }
 
 impl Record {
-    fn marker(&self) -> String {
+    pub(super) fn marker(&self) -> String {
         format!("[Shell result {}]", self.id)
     }
 
@@ -58,7 +58,7 @@ impl Record {
         )
     }
 
-    async fn save(&self, store: &Store) -> Result<()> {
+    pub(super) async fn save(&self, store: &Store) -> Result<()> {
         atomic_write(
             store
                 .directory()
