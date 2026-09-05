@@ -43,6 +43,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/agents", "Subagent activity"),
     ("/skills", "Available skills"),
     ("/copy", "Copy the last answer"),
+    (
+        "/shells",
+        "Show shell results; /shells clear drops pending context",
+    ),
     ("/export", "Export the transcript"),
     ("/editor", "Edit the prompt externally"),
     ("/attach", "Attach an image to the prompt"),
@@ -154,6 +158,19 @@ impl App {
 
     async fn dispatch(&mut self, command: &str, argument: &str) -> Result<()> {
         match command {
+            "/shells" => {
+                if argument == "clear" {
+                    self.require_idle()?;
+                    super::shell::clear(&self.store).await?;
+                    self.terminal.message("Pending shell context cleared.")?;
+                } else if argument.is_empty() {
+                    for record in super::shell::records(&self.store).await? {
+                        self.terminal.message(&record.display())?;
+                    }
+                } else {
+                    bail!("usage: /shells [clear]");
+                }
+            }
             "/help" => {
                 self.terminal.message(
                     &COMMANDS
@@ -162,7 +179,7 @@ impl App {
                         .collect::<Vec<_>>()
                         .join("\n"),
                 )?;
-                self.terminal.message("\nEnter: send/steer · Alt+Enter: follow-up · Shift+Enter or Ctrl+J: newline\nEsc: cancel · Ctrl+G: editor · Ctrl+O: live tools · Ctrl+T: reasoning\nTab: completion · Ctrl+L: models · Ctrl+P: next model · Shift+Tab: thinking\nAlt+Up: recover queued input · Ctrl+_: undo\nCtrl+Z: suspend · Ctrl+C: clear; press twice to quit · Ctrl+D: quit with an empty editor")?;
+                self.terminal.message("\n!command: shell result in next prompt · !!command: shell without model context\nEnter: send/steer · Alt+Enter: follow-up · Shift+Enter or Ctrl+J: newline\nEsc: cancel · Ctrl+G: editor · Ctrl+O: live tools · Ctrl+T: reasoning\nTab: completion · Ctrl+L: models · Ctrl+P: next model · Shift+Tab: thinking\nAlt+Up: recover queued input · Ctrl+_: undo\nCtrl+Z: suspend · Ctrl+C: clear; press twice to quit · Ctrl+D: quit with an empty editor")?;
             }
             "/quit" => {
                 if !argument.is_empty() {
@@ -455,7 +472,7 @@ impl App {
             .context("the coding agent is unavailable")
     }
     fn require_idle(&self) -> Result<()> {
-        if self.busy {
+        if self.busy || self.shell.is_some() {
             bail!("Wait for the current work to finish, or press Esc to cancel it.");
         }
         Ok(())
@@ -974,6 +991,13 @@ impl App {
                     }
                 }
             }
+            for record in super::shell::records(&self.store).await? {
+                // Indented code remains literal even when shell output contains fences.
+                markdown.push('\n');
+                for line in text::plain(&record.display()).lines() {
+                    writeln!(markdown, "    {line}")?;
+                }
+            }
             markdown.into_bytes()
         };
         storage::atomic_write(path.clone(), bytes).await?;
@@ -994,6 +1018,7 @@ impl App {
             if same {
                 Some(self.worker()?.record().await?)
             } else {
+                super::shell::reconcile(&store).await?;
                 let checkpoint = store.load().await?;
                 metadata = checkpoint.metadata;
                 Some(checkpoint.record)

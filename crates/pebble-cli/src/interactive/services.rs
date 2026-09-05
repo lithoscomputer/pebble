@@ -27,6 +27,17 @@ pub(super) struct Services {
 }
 
 impl Services {
+    pub(super) async fn approve_shell(&self, command: &str, cancel: &CancellationToken) -> bool {
+        let (reply, answer) = oneshot::channel();
+        let request = Request::Approval {
+            details: format!("Run shell command?\n$ {command}"),
+            reply,
+            cancel: cancel.clone(),
+        };
+        tokio::select! { () = cancel.cancelled() => return false, result = self.sender.send(request) => if result.is_err() { return false; } }
+        tokio::select! { () = cancel.cancelled() => false, result = answer => result.unwrap_or(false) }
+    }
+
     pub(super) fn channel() -> (Self, mpsc::Receiver<Request>) {
         let (sender, receiver) = mpsc::channel(8);
         (Self { sender }, receiver)

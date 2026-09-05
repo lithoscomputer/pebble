@@ -666,3 +666,88 @@ async fn patches_render_colored_diffs_and_export_plain_markdown() {
     server.abort();
     let _ = server.await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shell_shortcuts_approve_stream_cancel_and_control_model_context() {
+    let root = tempfile::tempdir().expect("test directory");
+    let (url, server) = provider("tests/cmd/scenarios.json").await;
+    let mut terminal = Terminal::start(&arguments(root.path()), &url, "exec-answers-without-tools");
+    terminal.contains("context ?").await;
+    terminal.send(b"!printf shell-context-token\r").await;
+    terminal.contains("Run shell command?").await;
+    terminal.send(b"y").await;
+    terminal.contains("Shell: exit 0").await;
+    assert!(
+        !journal(root.path())
+            .1
+            .iter()
+            .any(|event| matches!(event.event, CodingEvent::UserInput { .. }))
+    );
+    terminal.send(b"/quit\r").await;
+    terminal.finish().await;
+    let (session, _) = journal(root.path());
+    let mut args = arguments(root.path());
+    args.extend([
+        "--resume".into(),
+        session
+            .file_name()
+            .expect("id")
+            .to_string_lossy()
+            .into_owned(),
+    ]);
+    let mut terminal = Terminal::start(&args, &url, "exec-answers-without-tools");
+    terminal.contains("context ?").await;
+    terminal.send(b"!!printf excluded-token; sleep 30\r").await;
+    terminal
+        .until(|screen| {
+            screen.live_text().contains("Run shell command?")
+                && screen.live_text().contains("excluded-token")
+        })
+        .await;
+    terminal.send(b"y").await;
+    terminal
+        .until(|screen| screen.live_text().contains("Shell running"))
+        .await;
+    terminal.send(b"\x1b").await;
+    terminal.contains("Shell: cancelled").await;
+    terminal.send(b"say hello\r").await;
+    terminal.contains("Hello from the twin.").await;
+    terminal
+        .until(|screen| {
+            screen
+                .live_text()
+                .lines()
+                .any(|line| line.trim() == "Ready")
+        })
+        .await;
+    let (_, events) = journal(root.path());
+    let text = events
+        .iter()
+        .find_map(|event| {
+            if let CodingEvent::UserInput { text, .. } = &event.event {
+                Some(text)
+            } else {
+                None
+            }
+        })
+        .expect("model input");
+    assert!(text.contains("shell-context-token"));
+    assert!(!text.contains("excluded-token"));
+    terminal.send(b"/quit\r").await;
+    terminal.finish().await;
+    let (session, _) = journal(root.path());
+    let shell: Vec<serde_json::Value> = fs::read_dir(session.join("shell"))
+        .expect("shell records")
+        .map(|entry| {
+            serde_json::from_slice(&fs::read(entry.expect("entry").path()).expect("record"))
+                .expect("json")
+        })
+        .collect();
+    assert!(
+        shell
+            .iter()
+            .any(|record| record["include_context"] == true && record["consumed"] == true)
+    );
+    server.abort();
+    let _ = server.await;
+}

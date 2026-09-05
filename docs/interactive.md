@@ -84,6 +84,7 @@ to the editor. Image placeholders preserve their original content and order.
 | `/agents [id]` | Choose a subagent and print its saved transcript. |
 | `/skills` | List available skills. Invoke one with `/skill:<name> [input]`. |
 | `/attach <image-path>` | Attach a PNG, JPEG, GIF, or WebP image up to 5 MiB. |
+| `/shells [clear]` | Show saved shell results, or drop pending shell context. |
 | `/copy` | Copy the last assistant answer through the system clipboard command. |
 | `/export [path]` | Save Markdown, or the complete event log when the path ends in `.jsonl`. |
 | `/editor` | Open the draft in the external editor. |
@@ -115,6 +116,26 @@ Model cycling uses the configured catalog order and keeps the unsent draft.
 File completion after `@` searches tracked and unignored files in the current
 Git repository. It inserts a reference for the model. It does not automatically
 read the whole file into the prompt. Path completion works outside Git too.
+
+## Shell commands
+
+Enter `!command` to run a command with `/bin/sh` in the session directory.
+The command and its result join the next model prompt. `!!command` runs without
+adding model context. Neither form sends a model request by itself. Commands
+require an idle agent. A draft stays editable while a command runs.
+
+Shell commands ask for approval unless permission is `full`. With
+`--no-approvals`, lower permission levels reject commands. Escape cancels the
+command and its process group. Exit status and cancellation appear below the
+output. Child processes cannot outlive the command.
+
+Pebble retains up to 64 KiB of combined output per command. `/shells` shows
+saved results, including after a restart. `/shells clear` drops pending context
+without deleting those results. Pending context is limited to 512 KiB.
+Markdown exports include shell results; `.jsonl` exports contain agent events
+only. Completed results are saved; a hard crash can lose an active command's
+partial output. Commands use the current process environment, and shell state
+such as `cd` does not carry over to the next command.
 
 ## Storage and recovery
 

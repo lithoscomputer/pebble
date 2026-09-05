@@ -34,6 +34,7 @@ mod input;
 mod menu;
 mod services;
 mod setup;
+mod shell;
 use crate::settings;
 mod store;
 mod terminal;
@@ -118,6 +119,7 @@ struct App {
     dialog:           Option<Dialog>,
     menu:             Option<menu::Menu>,
     completion_files: Option<Vec<String>>,
+    shell:            Option<shell::Job>,
     busy:             bool,
     dirty:            bool,
     quit:             bool,
@@ -216,6 +218,9 @@ async fn start(args: InteractiveArgs) -> Result<()> {
     if args.no_approvals {
         metadata.approvals = false;
     }
+    if checkpoint.is_some() {
+        shell::reconcile(&store).await?;
+    }
     let last_sequence = store.last_sequence().await?;
     let mut recovered = store.repaired_tail;
     let record = checkpoint.map(|checkpoint| {
@@ -291,6 +296,7 @@ async fn start(args: InteractiveArgs) -> Result<()> {
         dialog: None,
         menu: None,
         completion_files: None,
+        shell: None,
         busy: false,
         dirty: true,
         quit: false,
@@ -307,6 +313,11 @@ async fn start(args: InteractiveArgs) -> Result<()> {
         if let Some(prompt) = args.prompt { app.submit(prompt, false).await?; }
         app.run().await
     }.await;
+    let shell_shutdown = if let Some(shell) = app.shell.take() {
+        shell.shutdown().await
+    } else {
+        Ok(())
+    };
     let shutdown = if let Some(worker) = app.worker.take() {
         worker.shutdown().await
     } else {
@@ -323,6 +334,7 @@ async fn start(args: InteractiveArgs) -> Result<()> {
     drop(app);
     drop(temporary);
     shutdown?;
+    shell_shutdown?;
     result
 }
 
@@ -386,9 +398,14 @@ impl App {
                         }
                     }
                 }
+                output = async { self.shell.as_mut().expect("shell branch is enabled only while running").output.recv().await }, if self.shell.is_some() => {
+                    if let Some(output) = output { self.terminal.message(&output)?; self.dirty = true; }
+                    else { self.finish_shell().await?; }
+                }
                 notice = worker.finished.recv() => {
                     let notice = notice.context("the coding agent task stopped")?;
                     self.replay(false).await?;
+                    shell::reconcile(&self.store).await?;
                     self.busy = false;
                     if let Some(error) = notice.error { self.terminal.message(&error)?; }
                     for input in notice.restored { let restored = self.attachments.render_parts(input.content().parts()).await?; self.editor.restore(&restored); }
@@ -458,7 +475,9 @@ impl App {
 
     fn draw(&mut self) -> Result<()> {
         let mut activity = self.transcript.activity(self.busy, self.terminal.width());
-        if !self.busy {
+        if self.shell.is_some() {
+            activity.push("Shell running · Esc cancels".into());
+        } else if !self.busy {
             activity.push("Ready".into());
         }
         if let Some(worker) = &self.worker {
@@ -547,6 +566,9 @@ impl App {
             }
             KeyCode::Esc => {
                 self.operation_cancel.cancel();
+                if let Some(shell) = &self.shell {
+                    shell.cancel.cancel();
+                }
                 if let Some(worker) = &self.worker {
                     if worker.control.is_compacting() {
                         worker.control.cancel_compaction();
@@ -630,7 +652,64 @@ impl App {
         Ok(())
     }
 
+    async fn finish_shell(&mut self) -> Result<()> {
+        if let Some(shell) = self.shell.take() {
+            let record = shell.task.await.context("joining the shell command")??;
+            self.terminal.message(&format!(
+                "Shell: {} · {}",
+                record.status,
+                if record.include_context {
+                    "included in next prompt"
+                } else {
+                    "excluded from model context"
+                }
+            ))?;
+        }
+        self.completion_files = None;
+        self.dirty = true;
+        Ok(())
+    }
+
     async fn submit(&mut self, text: String, follow_up: bool) -> Result<()> {
+        if self.shell.is_some() {
+            self.editor.restore(&text);
+            self.terminal
+                .message("Wait for the shell command or press Esc to cancel it.")?;
+            return Ok(());
+        }
+        if let Some(command) = text.strip_prefix('!') {
+            if self.busy {
+                self.editor.restore(&text);
+                self.terminal
+                    .message("Wait for the agent before running a shell command.")?;
+                return Ok(());
+            }
+            let include_context = !command.starts_with('!');
+            let command = command.strip_prefix('!').unwrap_or(command).trim();
+            if !command.is_empty() {
+                match shell::Job::start(
+                    command,
+                    include_context,
+                    self.metadata.clone(),
+                    self.store.clone(),
+                    self.services.clone(),
+                )
+                .await
+                {
+                    Ok(job) => {
+                        self.terminal.message(&format!("$ {command}"))?;
+                        self.editor.add_history(text);
+                        self.shell = Some(job);
+                    }
+                    Err(error) => {
+                        self.editor.restore(&text);
+                        self.terminal.message(&format!("{error:#}"))?;
+                    }
+                }
+            }
+            self.dirty = true;
+            return Ok(());
+        }
         if !self.busy {
             let checked = async {
                 let route = model_route(&self.client, &self.metadata.model)?;
@@ -644,7 +723,7 @@ impl App {
                 return Ok(());
             }
         }
-        let parts = match self.attachments.expand(&text).await {
+        let mut parts = match self.attachments.expand(&text).await {
             Ok(parts) => parts,
             Err(error) => {
                 self.editor.restore(&text);
@@ -652,6 +731,19 @@ impl App {
                 return Ok(());
             }
         };
+        if !self.busy {
+            match shell::context(&self.store).await {
+                Ok(mut context) => {
+                    context.append(&mut parts);
+                    parts = context;
+                }
+                Err(error) => {
+                    self.editor.restore(&text);
+                    self.terminal.message(&format!("{error:#}"))?;
+                    return Ok(());
+                }
+            }
+        }
         let Some(worker) = &self.worker else {
             self.editor.restore(&text);
             return Ok(());
