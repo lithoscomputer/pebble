@@ -30,6 +30,7 @@ mod commands;
 mod dialog;
 mod editor;
 mod input;
+mod menu;
 mod services;
 mod setup;
 use crate::settings;
@@ -113,7 +114,8 @@ struct App {
     editor:           Editor,
     transcript:       Transcript,
     dialog:           Option<Dialog>,
-    menu:             Option<commands::Menu>,
+    menu:             Option<menu::Menu>,
+    completion_files: Option<Vec<String>>,
     busy:             bool,
     dirty:            bool,
     quit:             bool,
@@ -286,6 +288,7 @@ async fn start(args: InteractiveArgs) -> Result<()> {
         transcript,
         dialog: None,
         menu: None,
+        completion_files: None,
         busy: false,
         dirty: true,
         quit: false,
@@ -354,7 +357,10 @@ impl App {
                         Some(Ok(Event::Paste(value))) => {
                             if let Some(login) = &mut self.login {
                                 if !login.input.paste(&value) { self.terminal.message("API key must be printable ASCII, at most 8192 bytes.")?; }
+                            } else if let Some(menu) = self.menu.as_mut().filter(|menu| !menu.is_completion()) {
+                                menu.paste(&value);
                             } else {
+                                self.menu = None;
                                 let editor = self.dialog.as_mut().map_or(&mut self.editor, |dialog| &mut dialog.editor);
                                 if !editor.insert(&value) { self.terminal.message("Paste is too large; attach a file or use a smaller prompt.")?; }
                             }
@@ -388,6 +394,7 @@ impl App {
                         let (steering, follow_ups) = worker.control.take_pending_input().into_parts();
                         for input in steering.into_iter().chain(follow_ups) { let restored = self.attachments.render_parts(input.content().parts()).await?; self.editor.restore(&restored); }
                     }
+                    self.completion_files = None;
                     self.metadata = notice.metadata;
                     if let Some(worker) = self.worker.as_mut() { worker.snapshot = notice.snapshot; }
                     self.dirty = true;
@@ -488,11 +495,13 @@ impl App {
         } else if let Some(dialog) = &self.dialog {
             self.terminal
                 .draw(&dialog.editor, &status, &[], &dialog.lines())?;
+        } else if let Some(menu) = self.menu.as_ref().filter(|menu| !menu.is_completion()) {
+            menu.draw(&mut self.terminal, &status)?;
         } else {
             let menu = self
                 .menu
                 .as_ref()
-                .map_or_else(Vec::new, commands::Menu::lines);
+                .map_or_else(Vec::new, |menu| menu.lines(5));
             self.terminal
                 .draw(&self.editor, &status, &activity, &menu)?;
         }
@@ -514,6 +523,7 @@ impl App {
             return Ok(());
         }
         let key = self.settings.remap(key);
+        let previous_draft = self.editor.text().to_owned();
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
@@ -564,6 +574,25 @@ impl App {
                     self.terminal.message(&format!("{error:#}"))?;
                 }
             }
+            KeyCode::Char('l') if control => {
+                self.command("/model").await?;
+            }
+            KeyCode::Char('p' | 'P') if control => {
+                if let Err(error) = self
+                    .cycle_model(
+                        key.modifiers.contains(KeyModifiers::SHIFT)
+                            || key.code == KeyCode::Char('P'),
+                    )
+                    .await
+                {
+                    self.terminal.message(&format!("{error:#}"))?;
+                }
+            }
+            KeyCode::BackTab => {
+                if let Err(error) = self.cycle_thinking() {
+                    self.terminal.message(&format!("{error:#}"))?;
+                }
+            }
             KeyCode::Char('o') if control => {
                 self.transcript.expand_tools = !self.transcript.expand_tools;
             }
@@ -591,6 +620,9 @@ impl App {
                 self.last_interrupt = None;
                 self.editor.handle(key);
             }
+        }
+        if self.editor.text() != previous_draft {
+            self.refresh_completion().await;
         }
         Ok(())
     }

@@ -9,7 +9,8 @@ use tokio::signal::ctrl_c;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal};
 
-use super::commands::{MenuAction, Purpose, model_menu, provider_menu};
+use super::commands::{model_menu, provider_menu};
+use super::menu::{MenuAction, Purpose};
 use super::{Editor, Input, Terminal};
 use crate::application::{model_choices, model_route};
 use crate::credentials::{AuthStore, accepts_api_key};
@@ -79,7 +80,7 @@ pub(super) async fn choose(
         .iter()
         .any(|choice| choice.unavailable.is_none())
     {
-        model_menu(client, auth, false).await?
+        model_menu(client, auth, false, requested, settings.model.as_deref()).await?
     } else {
         terminal.message("No configured model is available. Choose a provider to save an API key, or set its environment variable and restart Pebble.")?;
         provider_menu(client, Purpose::Login)
@@ -101,12 +102,7 @@ pub(super) async fn choose(
         if let Some(login) = &login {
             login.draw(terminal, "Provider setup")?;
         } else {
-            terminal.draw(
-                &Editor::default(),
-                "Model setup · Esc cancels",
-                &[],
-                &menu.lines(),
-            )?;
+            menu.draw(terminal, "Model setup · Type to search")?;
         }
         let event = tokio::select! {
             () = &mut shutdown => return Ok(None),
@@ -118,10 +114,12 @@ pub(super) async fn choose(
         match event.context("reading setup input")? {
             Event::Resize(width, height) => terminal.resize(width, height),
             Event::Paste(text) => {
-                if let Some(login) = &mut login
-                    && !login.input.paste(&text)
-                {
-                    terminal.message("API key must be printable ASCII, at most 8192 bytes.")?;
+                if let Some(login) = &mut login {
+                    if !login.input.paste(&text) {
+                        terminal.message("API key must be printable ASCII, at most 8192 bytes.")?;
+                    }
+                } else {
+                    menu.paste(&text);
                 }
             }
             Event::Key(key) if key.kind != KeyEventKind::Release => {
@@ -152,7 +150,14 @@ pub(super) async fn choose(
                                         return Ok(Some(route.handle().to_string()));
                                     }
                                     login = None;
-                                    menu = model_menu(client, auth, false).await?;
+                                    menu = model_menu(
+                                        client,
+                                        auth,
+                                        false,
+                                        requested,
+                                        settings.model.as_deref(),
+                                    )
+                                    .await?;
                                 }
                                 Err(error) => terminal.message(&format!("{error:#}"))?,
                             }
@@ -163,12 +168,19 @@ pub(super) async fn choose(
                 match menu.key(key) {
                     MenuAction::Close => {
                         if matches!(menu.purpose, Purpose::Login) {
-                            menu = model_menu(client, auth, false).await?;
+                            menu = model_menu(
+                                client,
+                                auth,
+                                false,
+                                requested,
+                                settings.model.as_deref(),
+                            )
+                            .await?;
                         } else {
                             return Ok(None);
                         }
                     }
-                    MenuAction::Select(value) => {
+                    MenuAction::Select(value) | MenuAction::SaveDefault(value) => {
                         if matches!(menu.purpose, Purpose::Login) {
                             let provider = client.catalog().provider(&value)?;
                             login =
@@ -177,8 +189,26 @@ pub(super) async fn choose(
                         }
                         match value.as_str() {
                             "@login" => menu = provider_menu(client, Purpose::Login),
-                            "@all" => menu = model_menu(client, auth, true).await?,
-                            "@configured" => menu = model_menu(client, auth, false).await?,
+                            "@all" => {
+                                menu = model_menu(
+                                    client,
+                                    auth,
+                                    true,
+                                    requested,
+                                    settings.model.as_deref(),
+                                )
+                                .await?;
+                            }
+                            "@configured" => {
+                                menu = model_menu(
+                                    client,
+                                    auth,
+                                    false,
+                                    requested,
+                                    settings.model.as_deref(),
+                                )
+                                .await?;
+                            }
                             _ => {
                                 let result = async {
                                     let route = model_route(client, &value)?;

@@ -170,9 +170,9 @@ pub(crate) fn model_route(client: &Client, selector: &str) -> Result<ResolvedRou
 }
 
 pub(crate) struct ModelChoice {
-    pub selector:    String,
-    pub label:       String,
-    pub unavailable: Option<String>,
+    pub display_name: String,
+    pub selector:     String,
+    pub unavailable:  Option<String>,
 }
 
 pub(crate) async fn model_choices(client: &Client, auth: &AuthStore) -> Result<Vec<ModelChoice>> {
@@ -189,13 +189,8 @@ pub(crate) async fn model_choices(client: &Client, auth: &AuthStore) -> Result<V
                 status.as_ref().err().map(ToString::to_string)
             };
             let selector = format!("{}/{}", provider.id(), model.id());
-            let source = unavailable.as_deref().unwrap_or_else(|| {
-                status
-                    .as_ref()
-                    .map_or("configured", |resolved| resolved.source.as_str())
-            });
             choices.push(ModelChoice {
-                label: format!("{} · {selector} · {source}", model.display_name()),
+                display_name: model.display_name().into(),
                 selector,
                 unavailable,
             });

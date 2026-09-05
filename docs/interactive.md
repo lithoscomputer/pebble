@@ -43,7 +43,10 @@ can print a saved tool result again at the current width.
 | Ctrl+U / Ctrl+K | Delete to the start or end of a line. |
 | Ctrl+W | Delete the previous word. |
 | Ctrl+_ | Undo a draft change. |
-| Tab | Complete a command, skill, path, or `@` file reference. |
+| Tab | Insert the selected command, skill, path, or `@` file reference. |
+| Ctrl+L | Open the model picker. |
+| Ctrl+P / Ctrl+Shift+P | Cycle configured models forward / backward. |
+| Shift+Tab | Cycle reasoning effort. |
 | Ctrl+G | Open the draft in an external editor. |
 | Ctrl+O | Toggle details for running tools. |
 | Ctrl+T | Toggle visible reasoning. |
@@ -93,6 +96,17 @@ Session changes, model changes, and compaction require idle work. Stop the
 current turn with Escape first. A model change rebuilds the coding profile
 through the library's resume path. A failed model selection restores the
 previous agent. An unsent draft moves with you when changing sessions.
+
+Typing `/` or `@` opens suggestions automatically. Typing continues to edit the
+prompt. Up and Down select a suggestion; Tab inserts it; Enter submits the
+prompt; Escape dismisses suggestions without changing the draft.
+
+Other pickers have a separate search field with its own cursor. Search words
+can appear in either order. Results rank close matches first and show the
+selection position and result count. Arrow keys wrap; Page Up and Page Down
+move by ten entries. The model picker marks and prioritizes the current model
+and saved default. Ctrl+S selects a model and saves it as the startup default.
+Model cycling uses the configured catalog order and keeps the unsent draft.
 
 File completion after `@` searches tracked and unignored files in the current
 Git repository. It inserts a reference for the model. It does not automatically
@@ -146,7 +160,8 @@ Key names use modifiers in this order: `ctrl+`, `alt+`, `shift+`, then a
 character or a name such as `enter`, `esc`, `up`, or `tab`. Supported actions
 are `submit`, `follow-up`, `newline`, `cancel`, `quit`, `external-editor`,
 `toggle-tools`, `toggle-reasoning`, `recover-input`, `complete`, `history-up`,
-`history-down`, `undo`, and `suspend`. Remapping applies to the main editor;
+`history-down`, `undo`, `suspend`, `model-picker`, `next-model`,
+`previous-model`, and `cycle-thinking`. Remapping applies to the main editor;
 approval and question controls keep their displayed bindings.
 
 Without an editor preference, Pebble uses `VISUAL`, then `EDITOR`, then `vi`.

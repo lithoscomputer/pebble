@@ -263,6 +263,14 @@ impl Screen {
             .join("\n")
     }
 
+    pub(crate) fn cursor_line(&self) -> String {
+        self.rows[self.row]
+            .iter()
+            .collect::<String>()
+            .trim_end()
+            .into()
+    }
+
     fn resize(&mut self, columns: usize, rows: usize) {
         while self.row >= rows {
             self.history.push(self.rows.remove(0).iter().collect());

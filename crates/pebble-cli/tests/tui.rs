@@ -522,3 +522,100 @@ async fn a_signal_cancels_cli_login_and_restores_terminal_modes() {
     terminal.finish_with("login cancelled", false).await;
     assert!(!root.path().join("auth.json").exists());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_picker_focus_default_and_shortcuts_preserve_the_draft() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(
+        root.path().join("settings.json"),
+        r#"{"model":"openai/gpt-5.6-sol"}"#,
+    )
+    .unwrap();
+    let mut terminal = Terminal::start(&arguments(root.path()), "http://127.0.0.1:1/v1", "unused");
+    terminal.contains("Ready").await;
+    terminal.send(b"keep my draft\x0c").await;
+    terminal
+        .until(|screen| screen.cursor_line() == "Search:")
+        .await;
+    assert!(terminal.screen.live_text().contains("current · default"));
+    assert!(terminal.screen.live_text().contains("of "));
+    terminal.send(b"terra\x13").await;
+    terminal
+        .until(|screen| {
+            screen.cursor_line() == "› keep my draft"
+                && screen.live_text().contains("Ready")
+                && screen.live_text().contains("openai/gpt-5.6-terra")
+        })
+        .await;
+    let settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.path().join("settings.json")).unwrap()).unwrap();
+    assert_eq!(settings["model"], "openai/gpt-5.6-terra");
+    terminal.send(b"\x10").await;
+    terminal
+        .until(|screen| {
+            screen.cursor_line() == "› keep my draft"
+                && screen.live_text().contains("openai/gpt-6-astra · 0 in")
+        })
+        .await;
+    terminal.send(b"\x1b[Z").await;
+    terminal
+        .until(|screen| {
+            screen.cursor_line() == "› keep my draft"
+                && screen.live_text().contains("gpt-6-astra · low")
+        })
+        .await;
+    terminal.send(b"\x03/quit\r").await;
+    terminal.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn automatic_completion_keeps_typing_and_cancellation_in_the_editor() {
+    let root = tempfile::tempdir().unwrap();
+    assert!(
+        ProcessCommand::new("git")
+            .args(["init", "--quiet"])
+            .arg(root.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    fs::create_dir(root.path().join("src")).unwrap();
+    fs::write(root.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+    let mut terminal = Terminal::start(&arguments(root.path()), "http://127.0.0.1:1/v1", "unused");
+    terminal.contains("Ready").await;
+    terminal.send(b"/hel").await;
+    terminal
+        .until(|screen| {
+            screen.cursor_line() == "› /hel" && screen.live_text().contains("Tab completes")
+        })
+        .await;
+    terminal.send(b"\t").await;
+    terminal
+        .until(|screen| screen.cursor_line() == "› /help")
+        .await;
+    terminal.send(b"\x03look at @smr").await;
+    terminal
+        .until(|screen| {
+            screen.cursor_line() == "› look at @smr" && screen.live_text().contains("src/main.rs")
+        })
+        .await;
+    terminal.send(b"\x1b").await;
+    terminal
+        .until(|screen| {
+            screen.cursor_line() == "› look at @smr"
+                && !screen.live_text().contains("Tab completes")
+        })
+        .await;
+    terminal.send(b"\t\t").await;
+    terminal
+        .until(|screen| screen.cursor_line() == "› look at @src/main.rs")
+        .await;
+    terminal.send(b"\x03/quit\r").await;
+    terminal.finish().await;
+    let (_, events) = journal(root.path());
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event.event, CodingEvent::UserInput { .. }))
+    );
+}

@@ -1,6 +1,7 @@
 //! A small live area on the normal terminal screen. History is append-only.
 
 use std::io::{self, Write as _};
+use std::ops::Range;
 use std::panic;
 
 use crossterm::cursor::{self, Hide, MoveTo, Show};
@@ -177,6 +178,49 @@ impl Terminal {
             lines.push(text::truncate(status, self.width()));
         }
         lines.truncate(available);
+        self.paint(
+            &lines,
+            first_editor..first_editor + draft.len(),
+            first_editor + cursor_row,
+            cursor_column + 2,
+        )
+    }
+
+    pub(super) fn picker_capacity(&mut self) -> io::Result<usize> {
+        self.refresh_size()?;
+        Ok(usize::from(self.height).saturating_sub(5).clamp(1, 10))
+    }
+
+    pub(super) fn picker(
+        &mut self,
+        search: &Editor,
+        title: &str,
+        status: &str,
+        choices: &[String],
+    ) -> io::Result<()> {
+        self.refresh_size()?;
+        let (draft, _, column) = search.layout(self.width().saturating_sub(8).max(1), 1);
+        let mut lines = vec![
+            text::truncate(title, self.width()),
+            format!("Search: {}", draft.first().map_or("", String::as_str)),
+        ];
+        lines.extend(
+            choices
+                .iter()
+                .map(|line| text::truncate(line, self.width())),
+        );
+        lines.push(text::truncate(status, self.width()));
+        lines.truncate(usize::from(self.height));
+        self.paint(&lines, 1..2, 1, column + 8)
+    }
+
+    fn paint(
+        &mut self,
+        lines: &[String],
+        focus: Range<usize>,
+        cursor_row: usize,
+        cursor_column: usize,
+    ) -> io::Result<()> {
         let height = u16::try_from(lines.len()).unwrap_or(self.height);
         let scroll = self
             .anchor
@@ -198,7 +242,7 @@ impl Terminal {
         for (offset, line) in lines.iter().enumerate() {
             let row = self.anchor + u16::try_from(offset).unwrap_or(0);
             queue!(self.output, MoveTo(0, row))?;
-            if self.color && (offset < first_editor || offset >= first_editor + draft.len()) {
+            if self.color && (!focus.contains(&offset) && !line.starts_with('›')) {
                 queue!(self.output, SetAttribute(Attribute::Dim))?;
             } else if self.color {
                 queue!(self.output, SetForegroundColor(Color::Cyan))?;
@@ -208,9 +252,9 @@ impl Terminal {
         }
         let row = self
             .anchor
-            .saturating_add(u16::try_from(first_editor + cursor_row).unwrap_or(0))
+            .saturating_add(u16::try_from(cursor_row).unwrap_or(0))
             .min(self.height - 1);
-        let column = u16::try_from(cursor_column + 2)
+        let column = u16::try_from(cursor_column)
             .unwrap_or(0)
             .min(self.width.saturating_sub(1));
         self.cursor_row = row;

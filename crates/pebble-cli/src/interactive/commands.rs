@@ -3,9 +3,10 @@
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use lithos_llm::Client;
 use lithos_llm::types::ReasoningEffort;
 #[cfg(unix)]
@@ -13,9 +14,11 @@ use rustix::process::{Signal, getpid, kill_process};
 use tokio::fs;
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command as ProcessCommand;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use super::input::Input;
+use super::menu::{Menu, MenuAction, Purpose, score};
 use super::setup::Login;
 use super::{App, Command, Store, Transcript, Worker, text};
 use crate::application::{model_choices, model_route};
@@ -46,117 +49,49 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/quit", "Save and exit"),
 ];
 
-pub(super) enum Purpose {
-    Command,
-    Completion(usize),
-    Sessions,
-    Models,
-    Login,
-    Logout,
-    Tools,
-    Agents,
-    Thinking,
-    Settings,
-}
-
-pub(super) struct Menu {
-    pub purpose: Purpose,
-    items:       Vec<(String, String)>,
-    query:       String,
-    selected:    usize,
-}
-
-impl Menu {
-    pub(super) fn new(purpose: Purpose, items: Vec<(String, String)>) -> Self {
-        Self {
-            purpose,
-            items,
-            query: String::new(),
-            selected: 0,
-        }
-    }
-
-    fn matches(&self) -> Vec<&(String, String)> {
-        self.items
-            .iter()
-            .filter(|(label, _)| fuzzy(&self.query, label))
-            .collect()
-    }
-
-    pub(super) fn lines(&self) -> Vec<String> {
-        let mut lines = vec![format!("Search: {}", self.query)];
-        let matches = self.matches();
-        let selected = self.selected.min(matches.len().saturating_sub(1));
-        for (index, (label, _)) in matches
-            .iter()
-            .enumerate()
-            .skip(selected.saturating_sub(3))
-            .take(5)
-        {
-            lines.push(format!(
-                "{} {label}",
-                if index == selected { "›" } else { " " }
-            ));
-        }
-        if matches.is_empty() {
-            lines.push("No matches".into());
-        }
-        lines.push("↑/↓ choose · Enter selects · Esc closes".into());
-        lines
-    }
-
-    pub(super) fn key(&mut self, key: KeyEvent) -> MenuAction {
-        match key.code {
-            KeyCode::Esc => MenuAction::Close,
-            KeyCode::Char('c' | 'q' | 'd') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                MenuAction::Close
-            }
-            KeyCode::Up => {
-                self.selected = self.selected.saturating_sub(1);
-                MenuAction::Editing
-            }
-            KeyCode::Down | KeyCode::Tab => {
-                self.selected = (self.selected + 1).min(self.matches().len().saturating_sub(1));
-                MenuAction::Editing
-            }
-            KeyCode::Backspace => {
-                self.query.pop();
-                self.selected = 0;
-                MenuAction::Editing
-            }
-            KeyCode::Char(value)
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                self.query.push(value);
-                self.selected = 0;
-                MenuAction::Editing
-            }
-            KeyCode::Enter => self
-                .matches()
-                .get(self.selected)
-                .map_or(MenuAction::Editing, |(_, value)| {
-                    MenuAction::Select(value.clone())
-                }),
-            _ => MenuAction::Unhandled,
-        }
-    }
-}
-
-pub(super) enum MenuAction {
-    Editing,
-    Unhandled,
-    Close,
-    Select(String),
-}
-
-pub(super) async fn model_menu(client: &Client, auth: &AuthStore, all: bool) -> Result<Menu> {
-    let choices = model_choices(client, auth).await?;
+pub(super) async fn model_menu(
+    client: &Client,
+    auth: &AuthStore,
+    all: bool,
+    current: Option<&str>,
+    default: Option<&str>,
+) -> Result<Menu> {
+    let default = default
+        .and_then(|value| model_route(client, value).ok())
+        .map(|route| route.handle().to_string());
+    let mut choices = model_choices(client, auth).await?;
+    choices.sort_by_key(|choice| {
+        (
+            current != Some(choice.selector.as_str()),
+            default.as_deref() != Some(choice.selector.as_str()),
+        )
+    });
     let mut items: Vec<_> = choices
         .into_iter()
         .filter(|choice| all || choice.unavailable.is_none())
-        .map(|choice| (choice.label, choice.selector))
+        .map(|choice| {
+            let current_mark = if current == Some(choice.selector.as_str()) {
+                " · current"
+            } else {
+                ""
+            };
+            let default_mark = if default.as_deref() == Some(choice.selector.as_str()) {
+                " · default"
+            } else {
+                ""
+            };
+            (
+                format!(
+                    "{}{current_mark}{default_mark} · {}{}",
+                    choice.selector,
+                    choice.display_name,
+                    choice
+                        .unavailable
+                        .map_or_else(String::new, |reason| format!(" · {reason}"))
+                ),
+                choice.selector,
+            )
+        })
         .collect();
     items.push(("Set up a provider API key".into(), "@login".into()));
     items.push(if all {
@@ -225,7 +160,7 @@ impl App {
                         .collect::<Vec<_>>()
                         .join("\n"),
                 )?;
-                self.terminal.message("\nEnter: send/steer · Alt+Enter: follow-up · Shift+Enter or Ctrl+J: newline\nEsc: cancel · Ctrl+G: editor · Ctrl+O: live tools · Ctrl+T: reasoning\nTab: completion · Alt+Up: recover queued input · Ctrl+_: undo\nCtrl+Z: suspend · Ctrl+C: clear; press twice to quit · Ctrl+D: quit with an empty editor")?;
+                self.terminal.message("\nEnter: send/steer · Alt+Enter: follow-up · Shift+Enter or Ctrl+J: newline\nEsc: cancel · Ctrl+G: editor · Ctrl+O: live tools · Ctrl+T: reasoning\nTab: completion · Ctrl+L: models · Ctrl+P: next model · Shift+Tab: thinking\nAlt+Up: recover queued input · Ctrl+_: undo\nCtrl+Z: suspend · Ctrl+C: clear; press twice to quit · Ctrl+D: quit with an empty editor")?;
             }
             "/quit" => {
                 if !argument.is_empty() {
@@ -328,7 +263,16 @@ impl App {
             }
             "/model" if argument == "all" => {
                 self.require_idle()?;
-                self.menu = Some(model_menu(&self.client, &self.auth, true).await?);
+                self.menu = Some(
+                    model_menu(
+                        &self.client,
+                        &self.auth,
+                        true,
+                        Some(&self.metadata.model),
+                        self.settings.model.as_deref(),
+                    )
+                    .await?,
+                );
             }
             "/model" if !argument.is_empty() => {
                 self.require_idle()?;
@@ -339,7 +283,16 @@ impl App {
             }
             "/model" => {
                 self.require_idle()?;
-                self.menu = Some(model_menu(&self.client, &self.auth, false).await?);
+                self.menu = Some(
+                    model_menu(
+                        &self.client,
+                        &self.auth,
+                        false,
+                        Some(&self.metadata.model),
+                        self.settings.model.as_deref(),
+                    )
+                    .await?,
+                );
             }
             "/thinking" if !argument.is_empty() => {
                 self.require_idle()?;
@@ -516,6 +469,15 @@ impl App {
             }
             MenuAction::Editing => {}
             MenuAction::Unhandled => return Ok(false),
+            MenuAction::SaveDefault(value) => {
+                self.menu = None;
+                if !value.starts_with('@') {
+                    self.command(&format!("/model {value}")).await?;
+                    if self.metadata.model == value {
+                        self.command("/settings model").await?;
+                    }
+                }
+            }
             MenuAction::Select(value) => {
                 let purpose = self
                     .menu
@@ -524,9 +486,11 @@ impl App {
                     .purpose;
                 match purpose {
                     Purpose::Completion(start) => {
-                        self.editor.replace_token(start, &format!("{value} "));
+                        let suffix = if value.ends_with('/') { "" } else { " " };
+                        self.editor
+                            .replace_token(start, &format!("{value}{suffix}"));
                     }
-                    Purpose::Command => self.editor.set(format!("{value} ")),
+                    Purpose::Command => self.editor.replace_token(0, &format!("{value} ")),
                     Purpose::Sessions => {
                         self.command(&format!("/resume {value}")).await?;
                     }
@@ -535,10 +499,28 @@ impl App {
                             self.command("/login").await?;
                         }
                         "@all" => {
-                            self.menu = Some(model_menu(&self.client, &self.auth, true).await?);
+                            self.menu = Some(
+                                model_menu(
+                                    &self.client,
+                                    &self.auth,
+                                    true,
+                                    Some(&self.metadata.model),
+                                    self.settings.model.as_deref(),
+                                )
+                                .await?,
+                            );
                         }
                         "@configured" => {
-                            self.menu = Some(model_menu(&self.client, &self.auth, false).await?);
+                            self.menu = Some(
+                                model_menu(
+                                    &self.client,
+                                    &self.auth,
+                                    false,
+                                    Some(&self.metadata.model),
+                                    self.settings.model.as_deref(),
+                                )
+                                .await?,
+                            );
                         }
                         _ => {
                             self.command(&format!("/model {value}")).await?;
@@ -603,48 +585,80 @@ impl App {
         Ok(())
     }
 
+    pub(super) async fn refresh_completion(&mut self) {
+        if self.menu.as_ref().is_some_and(|menu| !menu.is_completion()) {
+            return;
+        }
+        let (start, token) = self.editor.token();
+        if (start == 0 && token.starts_with('/')) || token.starts_with('@') {
+            // Automatic suggestions are optional. Explicit Tab reports failures.
+            if self.complete().await.is_err() {
+                self.menu = None;
+            }
+        } else {
+            self.menu = None;
+        }
+    }
+
     pub(super) async fn complete(&mut self) -> Result<()> {
         let (start, token) = self.editor.token();
         let token = token.to_owned();
-        if start == 0 && token.starts_with('/') {
+        let mut menu = if start == 0 && token.starts_with('/') {
             let mut items: Vec<_> = COMMANDS
                 .iter()
-                .filter(|(name, _)| name.starts_with(&token))
                 .map(|(name, description)| (format!("{name} — {description}"), (*name).into()))
                 .collect();
             for skill in self.worker()?.snapshot.skills() {
                 let command = format!("/skill:{}", skill.name);
-                if command.starts_with(&token) {
-                    items.push((format!("{command} — {}", skill.description), command));
-                }
+                items.push((format!("{command} — {}", skill.description), command));
             }
-            self.menu = Some(Menu::new(Purpose::Command, items));
+            let mut menu = Menu::new(Purpose::Command, items);
+            menu.filter(&token);
+            menu
         } else if let Some(query) = token.strip_prefix('@') {
-            let output = ProcessCommand::new("git")
-                .args([
-                    "ls-files",
-                    "--cached",
-                    "--others",
-                    "--exclude-standard",
-                    "-z",
-                ])
-                .current_dir(&self.metadata.cwd)
-                .kill_on_drop(true)
-                .output()
+            if self.completion_files.is_none() {
+                let output = timeout(
+                    Duration::from_secs(2),
+                    ProcessCommand::new("git")
+                        .args([
+                            "ls-files",
+                            "--cached",
+                            "--others",
+                            "--exclude-standard",
+                            "-z",
+                        ])
+                        .current_dir(&self.metadata.cwd)
+                        .kill_on_drop(true)
+                        .output(),
+                )
                 .await
+                .context("project file listing timed out")?
                 .context("listing project files")?;
-            if !output.status.success() {
-                bail!("File mentions need a Git repository; use path completion here.");
+                if !output.status.success() {
+                    bail!("File mentions need a Git repository; use path completion here.");
+                }
+                let mut files: Vec<_> = String::from_utf8_lossy(&output.stdout)
+                    .split('\0')
+                    .filter(|path| !path.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                files.sort();
+                files.dedup();
+                self.completion_files = Some(files);
             }
-            let mut items: Vec<_> = String::from_utf8_lossy(&output.stdout)
-                .split('\0')
-                .filter(|path| !path.is_empty() && fuzzy(query, path))
-                .take(1000)
-                .map(|path| (path.to_owned(), format!("@{path}")))
+            let mut matches: Vec<_> = self
+                .completion_files
+                .iter()
+                .flatten()
+                .filter_map(|path| score(query, path).map(|rank| (rank, path)))
                 .collect();
-            items.sort();
-            items.dedup();
-            self.menu = Some(Menu::new(Purpose::Completion(start), items));
+            matches.sort_by_key(|(rank, _)| *rank);
+            let items = matches
+                .into_iter()
+                .take(1000)
+                .map(|(_, path)| (path.clone(), format!("@{path}")))
+                .collect();
+            Menu::new(Purpose::Completion(start), items)
         } else {
             let path = PathBuf::from(&token);
             let parent = if token.ends_with('/') {
@@ -678,8 +692,66 @@ impl App {
                 }
             }
             items.sort();
-            self.menu = Some(Menu::new(Purpose::Completion(start), items));
+            Menu::new(Purpose::Completion(start), items)
+        };
+        // Keep ordinary typing in the prompt; Tab inserts the selected item.
+        if matches!(menu.purpose, Purpose::Command) {
+            menu.filter(&token);
         }
+        self.menu = Some(menu);
+        Ok(())
+    }
+
+    pub(super) async fn cycle_model(&mut self, reverse: bool) -> Result<()> {
+        self.require_idle()?;
+        let choices: Vec<_> = model_choices(&self.client, &self.auth)
+            .await?
+            .into_iter()
+            .filter(|choice| choice.unavailable.is_none())
+            .collect();
+        if choices.is_empty() {
+            bail!("No configured models. Use /login to configure a provider.");
+        }
+        let index = choices
+            .iter()
+            .position(|choice| choice.selector == self.metadata.model)
+            .unwrap_or(0);
+        let next = if reverse {
+            (index + choices.len() - 1) % choices.len()
+        } else {
+            (index + 1) % choices.len()
+        };
+        self.command(&format!("/model {}", choices[next].selector))
+            .await?;
+        Ok(())
+    }
+
+    pub(super) fn cycle_thinking(&mut self) -> Result<()> {
+        self.require_idle()?;
+        let route = model_route(&self.client, &self.metadata.model)?;
+        let capabilities = route.model().capabilities();
+        let mut levels = vec![None];
+        for level in [
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh,
+            ReasoningEffort::Max,
+        ] {
+            if !capabilities.reasoning_effort(level).is_unsupported() {
+                levels.push(Some(level));
+            }
+        }
+        if levels.len() == 1 {
+            bail!("This model does not support reasoning effort.");
+        }
+        let index = levels
+            .iter()
+            .position(|level| *level == self.metadata.reasoning)
+            .unwrap_or(0);
+        self.worker()?
+            .send(Command::Reasoning(levels[(index + 1) % levels.len()]))?;
+        self.busy = true;
         Ok(())
     }
 
@@ -963,17 +1035,9 @@ impl App {
         }
         self.worker = Some(worker);
         self.busy = false;
+        self.completion_files = None;
         self.header()?;
         self.replay(!same).await?;
         Ok(())
     }
-}
-
-fn fuzzy(query: &str, candidate: &str) -> bool {
-    let candidate = candidate.to_lowercase();
-    let mut chars = candidate.chars();
-    query
-        .to_lowercase()
-        .chars()
-        .all(|needle| chars.by_ref().any(|character| character == needle))
 }

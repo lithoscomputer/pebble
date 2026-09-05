@@ -66,7 +66,10 @@ impl Editor {
 
     pub(super) fn replace_token(&mut self, start: usize, replacement: &str) {
         self.remember();
-        self.text.replace_range(start..self.cursor, replacement);
+        let end = self.text[self.cursor..]
+            .find(char::is_whitespace)
+            .map_or(self.text.len(), |offset| self.cursor + offset);
+        self.text.replace_range(start..end, replacement);
         self.cursor = start + replacement.len();
     }
 
@@ -342,5 +345,16 @@ mod tests {
             editor.layout(4, 2),
             (vec!["four".into(), String::new()], 1, 0)
         );
+    }
+
+    #[test]
+    fn completion_replaces_the_whole_token_and_preserves_following_text() {
+        let mut editor = Editor::default();
+        editor.insert("/hep keep this draft");
+        editor.handle(KeyCode::Home.into());
+        editor.handle(KeyCode::Right.into());
+        editor.handle(KeyCode::Right.into());
+        editor.replace_token(0, "/help");
+        assert_eq!(editor.text(), "/help keep this draft");
     }
 }
