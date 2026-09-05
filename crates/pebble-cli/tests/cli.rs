@@ -40,7 +40,9 @@ async fn cli_cases() {
         axum::serve(listener, app).await.expect("the twin serves");
     });
 
+    let home = tempfile::tempdir().expect("isolated Pebble configuration");
     let cases = trycmd::TestCases::new();
+    cases.env("PEBBLE_HOME", home.path().display().to_string());
     let base_url = format!("http://{address}/v1");
     for provider in ["OPENAI", "MOONSHOT", "OPENROUTER", "VENICE", "FIREWORKS"] {
         cases.env(format!("PEBBLE_{provider}_BASE_URL"), base_url.clone());

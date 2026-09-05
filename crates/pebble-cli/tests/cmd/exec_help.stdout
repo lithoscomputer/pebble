@@ -8,9 +8,7 @@ Arguments:
 
 Options:
   -m, --model <MODEL>
-          The model selector, as the catalog knows it
-[..]
-          [default: claude-sonnet-5]
+          The model selector (default: saved preference, then claude-sonnet-5)
 
   -C, --cwd <DIR>
           The directory the agent works in. Created when missing

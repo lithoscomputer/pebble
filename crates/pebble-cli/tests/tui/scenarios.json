@@ -1,0 +1,83 @@
+{
+  "scenarios": [
+    {
+      "scenario_id": "tui-cancel/1",
+      "namespace": "tui-cancel",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Starting the slow command.",
+        "tool_calls": [
+          {
+            "id": "call_slow",
+            "name": "shell_command",
+            "arguments": {
+              "command": "echo started > slow-started.txt; sleep 30"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "tui-cancel/2",
+      "namespace": "tui-cancel",
+      "matcher": {
+        "endpoint": "responses",
+        "input_contains": "after cancel"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Ready after cancellation."
+      }
+    },
+    {
+      "scenario_id": "tui-approval/1",
+      "namespace": "tui-approval",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Requesting a command.",
+        "tool_calls": [
+          {
+            "id": "call_approval",
+            "name": "shell_command",
+            "arguments": {
+              "command": "echo ran > approval.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "tui-approval/2",
+      "namespace": "tui-approval",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Permission handled."
+      }
+    }
+  ]
+}

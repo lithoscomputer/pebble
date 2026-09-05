@@ -9,6 +9,17 @@ embeds the coding agent. Most coding-agent work is a change to
 tests in `crates/pebble-coding-agent/tests/`. Generic turn-loop work belongs
 in `crates/pebble-agent/src/`.
 
+The CLI's private `interactive` modules own terminal input and output, prompt
+editing, session files, questions, and approvals. The normal-screen renderer
+uses Crossterm and Termimad. Terminal and storage concerns stay in the CLI.
+Run it with `cargo run --locked -p pebble-cli`.
+
+The private `application`, `settings`, `credentials`, and `storage` modules
+provide common configuration for the TUI, `exec`, and auth commands. Login
+input uses a separate `secret_input` buffer with no history. The CLI layers
+optional `models.toml` over the upstream catalog and supplies an application-owned
+`CredentialProvider`. These concerns stay outside the agent libraries.
+
 ## Setup
 
 Pebble is a library crate. It depends on `lithos-llm` as a git dependency
@@ -110,6 +121,19 @@ with no `agent_id`, which waits for every child, and fixtures elide the id
 with `[..]`. Run
 `TRYCMD=overwrite mise run test` to accept changed output after reviewing it,
 and `TRYCMD=dump` to write actual output to a `dump/` directory instead.
+
+`crates/pebble-cli/tests/tui.rs` drives the actual interactive binary through a
+pseudoterminal on Unix. A small VTE-based terminal emulator checks normal
+scrollback, cursor placement, bracketed paste, resize, and terminal-mode
+restoration. The same deterministic provider covers saved sessions,
+cancellation, and approvals. Run it with
+`cargo nextest run --locked -p pebble-cli --test tui`.
+
+`tests/configuration.rs` checks saved credentials, environment precedence,
+custom catalog entries, and concurrent auth commands through the real binary.
+CLI and terminal tests set an isolated `PEBBLE_HOME`. Terminal tests also check
+masked login, credential setup on resume, and that keys never appear in terminal
+output, the session journal, or exports.
 
 ## Rust policy
 

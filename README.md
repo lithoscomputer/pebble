@@ -135,6 +135,33 @@ the next, and reports what the agent used. Run it with `mise run dev`.
 
 ## The command line
 
+Run `pebble` in a terminal for an interactive coding session:
+
+```sh
+pebble
+pebble --model gpt-5.6 --cwd ../service
+pebble --continue
+pebble --resume <session-id>
+```
+
+The conversation stays in normal terminal scrollback. The prompt accepts
+multiple lines, paste, history, and completion while the agent works. Enter
+queues steering during a turn; Alt+Enter queues a follow-up. Escape cancels
+active work and restores pending input. `/help` lists commands and shortcuts.
+Sessions save locally and can resume after exit. See the
+[interactive guide](docs/interactive.md) for commands, settings, and recovery.
+
+On first use, Pebble offers provider setup and model selection. `/login` saves
+an API key through masked input, and `/model` lists configured models. From the
+shell, use `pebble auth login <provider>` and `pebble auth status`. The TUI and
+`exec` share `~/.pebble/settings.json`, `models.toml`, and `auth.json`, relocated
+by `PEBBLE_HOME`. See [models and credentials](docs/models-and-credentials.md)
+for precedence, custom providers, and credential storage.
+
+Interactive mode asks before each tool call outside the selected permission
+level. Approval starts on **Deny**. `--no-approvals` hides those tools instead.
+The permission level is an application policy, not an operating-system sandbox.
+
 `pebble exec` runs one prompt to completion without a person in the loop: the
 prompt goes in, the tools the model asks for run, and the final answer comes
 out on standard output. Events are rendered to standard error as they happen,
@@ -150,9 +177,11 @@ pebble exec --json "..."   # one JSON event per line on standard error
 
 The permission flag chooses what the agent may do without asking:
 `read-only`, `read-write` (the default), or `full`, which enables commands.
-There is no approval path, so a tool the level does not allow is hidden from
-the model and refused if called anyway. Credentials come from the provider's
-usual environment variable, `ANTHROPIC_API_KEY` for the default model.
+In `pebble exec`, there is no approval path, so a tool the level does not allow is hidden from
+the model and refused if called anyway. Credentials come from explicit sources,
+the provider's usual environment variables, or saved API keys. Environment
+variables override saved keys. `exec` uses `--model`, then the saved default,
+then `claude-sonnet-5`, and never opens a setup prompt.
 `PEBBLE_<PROVIDER>_BASE_URL`, such as `PEBBLE_OPENAI_BASE_URL` or
 `PEBBLE_MOONSHOT_BASE_URL`, points a built-in provider at a compatible
 endpoint instead: a proxy, a self-hosted model, or a test double. `--subagents`
@@ -187,8 +216,9 @@ model types. The Pebble packages do not re-export their dependencies.
 **Credentials.** They belong to the client, and lithos-llm resolves them per
 call — `EnvironmentCredentials::conventional()` reads the usual variables
 (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and the rest), and an application with
-a vault implements lithos-llm's `CredentialProvider` instead. Pebble never sees
-a key.
+a vault implements lithos-llm's `CredentialProvider` instead. The agent libraries
+never see a key. `pebble-cli` supplies its own credential provider for saved keys
+and environment sources.
 
 **An `Environment`.** Every tool acts through this one seam: reading and
 writing files, listing a directory, searching by content or by name, and

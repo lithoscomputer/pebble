@@ -1,5 +1,6 @@
 //! `pebble`: a coding agent at the command line.
 //!
+//! Bare `pebble` opens an interactive session in normal terminal scrollback.
 //! `pebble exec` runs one non-interactive coding-agent session: one prompt in,
 //! the tools the model asks for, the final answer out. Events are rendered to
 //! standard error as they happen, the answer goes to standard output, and the
@@ -7,8 +8,15 @@
 
 use std::process::ExitCode;
 
+mod application;
+mod auth;
+mod credentials;
 mod exec;
+mod interactive;
 mod render;
+mod secret_input;
+mod settings;
+mod storage;
 
 use clap::Parser;
 
@@ -21,19 +29,26 @@ use clap::Parser;
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
+
+    #[command(flatten)]
+    interactive: interactive::InteractiveArgs,
 }
 
 #[derive(Debug, clap::Subcommand)]
 enum Command {
     /// Run one prompt to completion and print the answer.
     Exec(exec::ExecArgs),
+    /// Manage provider credentials.
+    Auth(auth::AuthArgs),
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Exec(args) => exec::run(args).await,
+        Some(Command::Exec(args)) => exec::run(args).await,
+        Some(Command::Auth(args)) => auth::run(args).await,
+        None => interactive::run(cli.interactive).await,
     }
 }

@@ -1,10 +1,56 @@
 Run a coding agent from the command line
 
-Usage: pebble <COMMAND>
+Usage: pebble [OPTIONS] [PROMPT] [COMMAND]
 
 Commands:
   exec  Run one prompt to completion and print the answer
+  auth  Manage provider credentials
+
+Arguments:
+  [PROMPT]
+          An optional first prompt for the interactive session
 
 Options:
-  -h, --help     Print help
-  -V, --version  Print version
+  -m, --model <MODEL>
+          The model selector, as the catalog knows it
+
+  -C, --cwd <DIR>
+          The directory the agent works in
+
+      --permission <PERMISSION>
+          What the agent may do without asking
+
+          Possible values:
+          - read-only:  Reads only
+          - read-write: Reads and writes, but no commands
+          - full:       Everything, including commands
+
+  -r, --resume [<ID>]
+          Resume a session id, or the latest session when no id is given
+
+  -c, --continue
+          Continue the latest session for this directory
+
+      --name <NAME>
+          Display name for this session
+
+      --sessions-dir <DIR>
+          Directory for saved sessions (default: ~/.pebble/sessions)
+
+      --no-session
+          Use temporary session storage, removed on exit
+
+      --no-approvals
+          Hide disallowed tools instead of asking for approval
+
+      --subagents
+          Let the agent spawn subagents for independent work
+
+      --instructions <TEXT>
+          Extra instructions added to the system prompt
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+  -V, --version
+          Print version

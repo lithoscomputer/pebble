@@ -1,0 +1,303 @@
+//! A small live area on the normal terminal screen. History is append-only.
+
+use std::io::{self, Write as _};
+use std::panic;
+
+use crossterm::cursor::{self, Hide, MoveTo, Show};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
+use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
+use crossterm::terminal::{self, BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
+use crossterm::{execute, queue};
+use termimad::MadSkin;
+
+use super::editor::Editor;
+use super::text;
+
+pub(super) struct Terminal {
+    output:        io::Stdout,
+    width:         u16,
+    height:        u16,
+    anchor:        u16,
+    cursor_row:    u16,
+    active:        bool,
+    enhanced_keys: bool,
+    skin:          MadSkin,
+    color:         bool,
+}
+
+impl Terminal {
+    pub(super) fn open(color: bool) -> io::Result<Self> {
+        let (width, height) = terminal::size()?;
+        let mut output = io::stdout();
+        terminal::enable_raw_mode()?;
+        let (column, mut row) = match cursor::position() {
+            Ok(position) => position,
+            Err(error) => {
+                terminal::disable_raw_mode()?;
+                return Err(error);
+            }
+        };
+        if column > 0 {
+            if let Err(error) = write!(output, "\r\n") {
+                let _ = terminal::disable_raw_mode();
+                return Err(error);
+            }
+            row = row.saturating_add(1).min(height.saturating_sub(1));
+        }
+        let enhanced_keys = terminal::supports_keyboard_enhancement().unwrap_or(false);
+        let mut terminal = Self {
+            output,
+            width,
+            height,
+            anchor: row,
+            cursor_row: row,
+            active: true,
+            enhanced_keys,
+            color,
+            skin: if color {
+                MadSkin::default()
+            } else {
+                MadSkin::no_style()
+            },
+        };
+        terminal.enable_input()?;
+        Ok(terminal)
+    }
+
+    pub(super) fn install_panic_hook() {
+        let previous = panic::take_hook();
+        panic::set_hook(Box::new(move |info| {
+            let _ = terminal::disable_raw_mode();
+            let _ = execute!(
+                io::stdout(),
+                EndSynchronizedUpdate,
+                DisableBracketedPaste,
+                PopKeyboardEnhancementFlags,
+                ResetColor,
+                SetAttribute(Attribute::Reset),
+                Show
+            );
+            previous(info);
+        }));
+    }
+
+    pub(super) fn width(&self) -> usize {
+        usize::from(self.width.saturating_sub(2).max(1))
+    }
+
+    pub(super) fn resize(&mut self, width: u16, height: u16) {
+        // Track the live area when the terminal removes rows from the top.
+        let removed = self
+            .cursor_row
+            .saturating_add(1)
+            .saturating_sub(height.max(1));
+        self.anchor = self.anchor.saturating_sub(removed);
+        self.width = width.max(1);
+        self.height = height.max(1);
+        self.anchor = self.anchor.min(self.height - 1);
+        self.cursor_row = self.cursor_row.saturating_sub(removed).min(self.height - 1);
+    }
+
+    pub(super) fn markdown(&mut self, markdown: &str) -> io::Result<()> {
+        self.refresh_size()?;
+        let safe = text::plain(markdown);
+        let width = self.width();
+        let rendered = if width >= 3 {
+            self.skin.text(&safe, Some(width)).to_string()
+        } else {
+            safe
+        };
+        self.append_rows(rendered.lines())
+    }
+
+    pub(super) fn message(&mut self, message: &str) -> io::Result<()> {
+        self.refresh_size()?;
+        let rows = text::wrap(&text::plain(message), self.width());
+        self.append_rows(rows.iter().map(String::as_str))
+    }
+
+    fn append_rows<'a>(&mut self, rows: impl IntoIterator<Item = &'a str>) -> io::Result<()> {
+        queue!(
+            self.output,
+            BeginSynchronizedUpdate,
+            Hide,
+            MoveTo(0, self.anchor),
+            Clear(ClearType::FromCursorDown)
+        )?;
+        for row in rows {
+            write!(self.output, "{row}\r\n")?;
+            self.anchor = self
+                .anchor
+                .saturating_add(1)
+                .min(self.height.saturating_sub(1));
+        }
+        queue!(
+            self.output,
+            ResetColor,
+            SetAttribute(Attribute::Reset),
+            Show,
+            EndSynchronizedUpdate
+        )?;
+        self.cursor_row = self.anchor;
+        self.output.flush()
+    }
+
+    pub(super) fn draw(
+        &mut self,
+        editor: &Editor,
+        status: &str,
+        activity: &[String],
+        menu: &[String],
+    ) -> io::Result<()> {
+        self.refresh_size()?;
+        let available = usize::from(self.height);
+        let max_editor = (available / 3).clamp(1, 8);
+        let editor_width = self.width().saturating_sub(2).max(1);
+        let (draft, cursor_row, cursor_column) = editor.layout(editor_width, max_editor);
+        let mut lines = Vec::new();
+        let extra_budget = available.saturating_sub(draft.len() + 1);
+        let extras = if menu.is_empty() { activity } else { menu };
+        lines.extend(
+            extras
+                .iter()
+                .rev()
+                .take(extra_budget.min(8))
+                .rev()
+                .map(|row| text::truncate(row, self.width())),
+        );
+        let first_editor = lines.len();
+        for (index, row) in draft.iter().enumerate() {
+            let prefix = if index == 0 { "› " } else { "  " };
+            lines.push(format!("{prefix}{row}"));
+        }
+        if lines.len() < available {
+            lines.push(text::truncate(status, self.width()));
+        }
+        lines.truncate(available);
+        let height = u16::try_from(lines.len()).unwrap_or(self.height);
+        let scroll = self
+            .anchor
+            .saturating_add(height)
+            .saturating_sub(self.height);
+        queue!(self.output, BeginSynchronizedUpdate, Hide)?;
+        if scroll > 0 {
+            queue!(self.output, MoveTo(0, self.height - 1))?;
+            for _ in 0..scroll {
+                write!(self.output, "\r\n")?;
+            }
+            self.anchor = self.anchor.saturating_sub(scroll);
+        }
+        queue!(
+            self.output,
+            MoveTo(0, self.anchor),
+            Clear(ClearType::FromCursorDown)
+        )?;
+        for (offset, line) in lines.iter().enumerate() {
+            let row = self.anchor + u16::try_from(offset).unwrap_or(0);
+            queue!(self.output, MoveTo(0, row))?;
+            if self.color && (offset < first_editor || offset >= first_editor + draft.len()) {
+                queue!(self.output, SetAttribute(Attribute::Dim))?;
+            } else if self.color {
+                queue!(self.output, SetForegroundColor(Color::Cyan))?;
+            }
+            write!(self.output, "{line}")?;
+            queue!(self.output, ResetColor, SetAttribute(Attribute::Reset))?;
+        }
+        let row = self
+            .anchor
+            .saturating_add(u16::try_from(first_editor + cursor_row).unwrap_or(0))
+            .min(self.height - 1);
+        let column = u16::try_from(cursor_column + 2)
+            .unwrap_or(0)
+            .min(self.width.saturating_sub(1));
+        self.cursor_row = row;
+        queue!(
+            self.output,
+            MoveTo(column, row),
+            Show,
+            EndSynchronizedUpdate
+        )?;
+        self.output.flush()
+    }
+
+    pub(super) fn pause(&mut self) -> io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        execute!(
+            self.output,
+            MoveTo(0, self.anchor),
+            Clear(ClearType::FromCursorDown),
+            EndSynchronizedUpdate,
+            DisableBracketedPaste,
+            ResetColor,
+            SetAttribute(Attribute::Reset),
+            Show
+        )?;
+        if self.enhanced_keys {
+            execute!(self.output, PopKeyboardEnhancementFlags)?;
+        }
+        terminal::disable_raw_mode()?;
+        self.active = false;
+        Ok(())
+    }
+
+    // A resize signal can arrive during setup or an external-editor handoff.
+    // Read the current dimensions before painting, even if its event is late.
+    fn refresh_size(&mut self) -> io::Result<()> {
+        let (width, height) = terminal::size()?;
+        if width != self.width || height != self.height {
+            self.resize(width, height);
+        }
+        Ok(())
+    }
+
+    /// Call before restarting the input reader, which shares terminal input.
+    pub(super) fn resume(&mut self) -> io::Result<()> {
+        terminal::enable_raw_mode()?;
+        self.active = true;
+        let (width, height) = terminal::size()?;
+        self.width = width.max(1);
+        self.height = height.max(1);
+        let (column, row) = cursor::position()?;
+        self.anchor = row.min(self.height - 1);
+        self.cursor_row = self.anchor;
+        if column > 0 {
+            write!(self.output, "\r\n")?;
+            self.anchor = self.anchor.saturating_add(1).min(self.height - 1);
+        }
+        self.enable_input()
+    }
+
+    fn enable_input(&mut self) -> io::Result<()> {
+        execute!(self.output, EnableBracketedPaste)?;
+        if self.enhanced_keys {
+            execute!(
+                self.output,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+                )
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        if self.pause().is_err() {
+            let _ = terminal::disable_raw_mode();
+            let _ = execute!(
+                self.output,
+                EndSynchronizedUpdate,
+                DisableBracketedPaste,
+                ResetColor,
+                Show
+            );
+        }
+    }
+}
