@@ -212,7 +212,9 @@ mod tests {
         let tool = make_use_skill_tool_for_vocabulary(test_skills(), vocabulary);
         let context = context(MockEnvironment::default())
             .with_coding_event_emitter(Arc::clone(&recorder) as Arc<dyn CodingEventEmitter>);
-        let result = (tool.executor)(args, context).await;
+        let result = (tool.executor)(args, context)
+            .await
+            .map(|output| output.text());
         (result, recorder.events())
     }
 
@@ -233,6 +235,7 @@ mod tests {
             context(MockEnvironment::default()),
         )
         .await
+        .map(|output| output.text())
         .expect("the skill is loaded");
 
         assert_eq!(output, "Review changes and commit.\n\n{{user_input}}");

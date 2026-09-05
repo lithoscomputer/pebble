@@ -192,6 +192,7 @@ mod tests {
 
         let output = (tool.executor)(json!({"pattern": "fn"}), context(environment))
             .await
+            .map(|output| output.text())
             .expect("the search runs");
 
         assert_eq!(output, "src/main.rs:10:fn main()\nsrc/lib.rs:5:pub fn");
@@ -203,6 +204,7 @@ mod tests {
 
         let error = (tool.executor)(json!({}), context(MockEnvironment::default()))
             .await
+            .map(|output| output.text())
             .expect_err("the pattern is required");
 
         assert_eq!(error.kind(), ToolErrorKind::InvalidArguments);
@@ -224,6 +226,7 @@ mod tests {
             context(MockEnvironment::default()),
         )
         .await
+        .map(|output| output.text())
         .expect("the search runs");
 
         // The mock answers with no matches; what matters is that every
@@ -263,6 +266,7 @@ mod tests {
 
         let output = (tool.executor)(json!({"pattern": "src/**/*.rs"}), context(environment))
             .await
+            .map(|output| output.text())
             .expect("the search runs");
 
         assert_eq!(output, "src/main.rs\nsrc/lib.rs");
@@ -274,6 +278,7 @@ mod tests {
 
         let error = (tool.executor)(json!({}), context(MockEnvironment::default()))
             .await
+            .map(|output| output.text())
             .expect_err("the pattern is required");
 
         assert_eq!(error.message(), "Missing required parameter: pattern");
@@ -303,6 +308,7 @@ mod tests {
             context_for(Arc::clone(&environment)),
         )
         .await
+        .map(|output| output.text())
         .expect("the listing runs");
 
         assert_eq!(output, "src/\nREADME.md");
@@ -321,6 +327,7 @@ mod tests {
 
         let error = (tool.executor)(json!({}), context(MockEnvironment::default()))
             .await
+            .map(|output| output.text())
             .expect_err("the path is required");
 
         assert_eq!(error.message(), "Missing required parameter: path");

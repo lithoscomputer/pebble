@@ -9,15 +9,17 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use lithos_llm::types::ToolDefinition;
 use pebble_agent::ToolScheduling;
 use tokio::task;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::config::NativeToolOptions;
 use crate::environment::{ExecOutcome, ExecRequest};
+use crate::output::{CountedWriter, ToolOutputWriter, storage_call};
 use crate::tool::{
     NativeTool, RegisteredTool, ToolContext, ToolError, optional_integer_arg, required_str,
 };
@@ -87,17 +89,60 @@ pub(crate) async fn execute_shell_command(
         env_var_count = tool_env.as_ref().map_or(0, HashMap::len),
         "Injecting environment variables into a tool call"
     );
-    ctx.env
+    let writer = if let Some(store) = &ctx.output_store {
+        let scope = ctx
+            .session_scope()
+            .ok_or_else(|| ToolError::unavailable("Output capture requires a session"))?;
+        let call_id = ctx
+            .tool_call_id()
+            .ok_or_else(|| ToolError::unavailable("Output capture requires a tool call ID"))?;
+        Some(Arc::new(CountedWriter::new(
+            storage_call(&ctx.cancel, store.start(scope, call_id)).await?,
+        )))
+    } else {
+        None
+    };
+    let outcome = ctx
+        .env
         .exec(ExecRequest {
             timeout_ms: Some(timeout_ms),
             working_dir: cwd,
             env_vars: tool_env.as_ref(),
             cancel_token: Some(ctx.cancel.clone()),
             output_bytes_cap: Some(DEFAULT_TOOL_OUTPUT_RETENTION_BYTES),
+            output_writer: writer
+                .clone()
+                .map(|writer| writer as Arc<dyn ToolOutputWriter>),
             ..ExecRequest::new(command)
         })
         .await
-        .map_err(|error| no_process_result(ToolError::from(error)))
+        .map_err(|error| no_process_result(ToolError::from(error)))?;
+    if let Some(writer) = writer {
+        if !writer.matches(&outcome) {
+            emit_shell_process_completed(ctx, outcome).await;
+            return Err(ToolError::execution(
+                "Command finished, but the environment did not capture all observed output",
+            ));
+        }
+        // Finalize partial logs after cancellation as well. This operation has
+        // its own bounded cleanup window instead of the already-cancelled token.
+        let artifacts = match storage_call(&CancellationToken::new(), writer.finish()).await {
+            Ok(artifacts) => artifacts,
+            Err(error) => {
+                emit_shell_process_completed(ctx, outcome).await;
+                let message = format!(
+                    "Command finished, but saving its output failed: {}",
+                    error.message()
+                );
+                return Err(error.with_message(message));
+            }
+        };
+        ctx.output_artifacts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(artifacts);
+    }
+    Ok(outcome)
 }
 
 /// Runs one command, renders it for the model, and publishes what the process
@@ -385,6 +430,7 @@ mod tests {
             context(environment_with(exited("hello", "a warning", 0, 10))),
         )
         .await
+        .map(|output| output.text())
         .expect("exit 0 is a successful tool result");
 
         assert_eq!(
@@ -403,7 +449,8 @@ mod tests {
             json!({"command": "make test"}),
             context_for(Arc::clone(&environment)),
         )
-        .await;
+        .await
+        .map(|output| output.text());
 
         assert_eq!(
             *environment
@@ -423,7 +470,8 @@ mod tests {
             json!({"command": "sleep 1", "timeout_ms": 5000}),
             context_for(Arc::clone(&environment)),
         )
-        .await;
+        .await
+        .map(|output| output.text());
 
         assert_eq!(
             *environment
@@ -446,7 +494,8 @@ mod tests {
             json!({"command": "sleep 1", "timeout_ms": 30000.0}),
             context_for(Arc::clone(&environment)),
         )
-        .await;
+        .await
+        .map(|output| output.text());
 
         assert_eq!(
             *environment
@@ -470,7 +519,8 @@ mod tests {
             json!({"command": "sleep 100", "timeout_ms": 600_000}),
             context_for(Arc::clone(&environment)),
         )
-        .await;
+        .await
+        .map(|output| output.text());
 
         assert_eq!(
             *environment
@@ -490,6 +540,7 @@ mod tests {
             context(environment_with(exited("error", "", 1, 10))),
         )
         .await
+        .map(|output| output.text())
         .expect_err("a nonzero exit is a failed tool result");
 
         assert_eq!(error.kind(), ToolErrorKind::Execution);
@@ -515,6 +566,7 @@ mod tests {
             })),
         )
         .await
+        .map(|output| output.text())
         .expect_err("a timeout is a failed tool result");
 
         assert_eq!(error.kind(), ToolErrorKind::Execution);
@@ -539,6 +591,7 @@ mod tests {
             })),
         )
         .await
+        .map(|output| output.text())
         .expect_err("a cancellation is a failed tool result");
 
         assert_eq!(error.kind(), ToolErrorKind::Cancelled);
@@ -562,6 +615,7 @@ mod tests {
             context(environment).with_coding_event_emitter(events.bound()),
         )
         .await
+        .map(|output| output.text())
         .expect_err("an environment failure is a failed tool result");
 
         let output = error.message();
@@ -598,7 +652,8 @@ mod tests {
                 .with_coding_event_emitter(events.bound())
                 .with_redactor(Arc::new(DropKeys)),
         )
-        .await;
+        .await
+        .map(|output| output.text());
 
         match events.only_event().await {
             CodingEvent::ToolProcessCompleted {
@@ -642,6 +697,7 @@ mod tests {
             context(environment).with_coding_event_emitter(events.bound()),
         )
         .await
+        .map(|output| output.text())
         .expect("exit 0 is a successful tool result");
 
         assert!(
@@ -679,6 +735,7 @@ mod tests {
             ))),
         )
         .await
+        .map(|output| output.text())
         .expect_err("a nonzero exit is a failed tool result");
         let output = error.message();
         let truncated = truncate_tool_output(output, ToolOutputLimits::defaults_for("shell"));
@@ -712,7 +769,8 @@ mod tests {
             json!({"command": "cat big"}),
             context(environment).with_coding_event_emitter(Arc::new(bound.clone())),
         )
-        .await;
+        .await
+        .map(|output| output.text());
 
         let stats = bound
             .take_tool_output_stats()
@@ -752,6 +810,7 @@ mod tests {
             context_for(environment).with_coding_event_emitter(events.bound()),
         )
         .await
+        .map(|output| output.text())
         .expect_err("exit 7 is a failed tool result");
 
         let output = error.message();
@@ -791,7 +850,8 @@ mod tests {
             context_for(Arc::clone(&environment))
                 .with_tool_env_provider(Arc::new(StaticEnvProvider(tool_env.clone()))),
         )
-        .await;
+        .await
+        .map(|output| output.text());
 
         assert_eq!(
             *environment
@@ -834,7 +894,8 @@ mod tests {
                 context_for(Arc::clone(&environment))
                     .with_tool_env_provider(Arc::clone(&provider) as Arc<dyn ToolEnvProvider>),
             )
-            .await;
+            .await
+            .map(|output| output.text());
 
             assert_eq!(
                 *environment
@@ -868,6 +929,7 @@ mod tests {
             context_for(Arc::clone(&environment)).with_tool_env_provider(Arc::new(Failing)),
         )
         .await
+        .map(|output| output.text())
         .expect_err("the provider fails");
 
         assert_eq!(
@@ -893,7 +955,8 @@ mod tests {
             json!({"command": "echo hello"}),
             context_for(Arc::clone(&environment)),
         )
-        .await;
+        .await
+        .map(|output| output.text());
 
         assert_eq!(
             *environment
@@ -910,6 +973,7 @@ mod tests {
 
         let error = (tool.executor)(json!({}), context(MockEnvironment::default()))
             .await
+            .map(|output| output.text())
             .expect_err("the command is required");
 
         assert_eq!(error.kind(), ToolErrorKind::InvalidArguments);

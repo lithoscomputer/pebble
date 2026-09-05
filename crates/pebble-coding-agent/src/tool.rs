@@ -28,7 +28,7 @@ pub(crate) use self::registry::{
     optional_usize_arg, required_str, whole_number,
 };
 pub use self::registry::{
-    CodingEventEmitter, RegisteredTool, StaticEnvProvider, ToolContext, ToolEnvProvider,
-    ToolExecutor, ToolRegistrationError,
+    CodingEventEmitter, RegisteredTool, RichToolExecutor, StaticEnvProvider, ToolContext,
+    ToolEnvProvider, ToolExecutor, ToolRegistrationError,
 };
 pub use self::runner::{CodingToolSet, ToolEventCallback, ToolRunner};

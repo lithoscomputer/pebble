@@ -52,6 +52,8 @@ use crate::file_tracker::FileTracker;
 use crate::history::History;
 use crate::human_input::HumanInputProvider;
 use crate::memory::{MEMORY_BUDGET_BYTES, MemoryDocument, load_memory};
+use crate::output::{ToolOutputStore, read_output_tool};
+use crate::policy::{CompactionPolicy, ContextPolicy};
 use crate::profile::{AgentProfile, EnvContext, ModelFacts, SubagentSupport, builtin_profile};
 use crate::profiles::{FileEditToolKind, ProfileDeps};
 use crate::prompt_transform::{SystemPromptContext, SystemPromptTransform};
@@ -140,6 +142,7 @@ pub(crate) struct CodingRuntimeBuilder {
     tool_replacements:    Vec<(String, RegisteredTool)>,
     tool_middleware:      Vec<Arc<dyn ToolMiddleware>>,
     human_input:          Option<Arc<dyn HumanInputProvider>>,
+    output_store:         Option<Arc<dyn ToolOutputStore>>,
     tool_env_provider:    Option<Arc<dyn ToolEnvProvider>>,
     redactor:             Arc<dyn Redactor>,
     web_fetch_summarizer: Option<String>,
@@ -149,6 +152,8 @@ pub(crate) struct CodingRuntimeBuilder {
     events:               EventOptions,
     profile:              Option<Arc<dyn AgentProfile>>,
     prompt_transform:     Option<Arc<dyn SystemPromptTransform>>,
+    context_policy:       Option<Arc<dyn ContextPolicy>>,
+    compaction_policy:    Option<Arc<dyn CompactionPolicy>>,
     subagents_enabled:    bool,
     child_observer:       Option<ChildObserver>,
     subagent_limits:      SubagentLimits,
@@ -166,6 +171,7 @@ impl CodingRuntimeBuilder {
             tool_replacements: Vec::new(),
             tool_middleware: Vec::new(),
             human_input: None,
+            output_store: None,
             tool_env_provider: None,
             redactor: Arc::new(NoRedaction),
             web_fetch_summarizer: None,
@@ -175,6 +181,8 @@ impl CodingRuntimeBuilder {
             events: EventOptions::default(),
             profile: None,
             prompt_transform: None,
+            context_policy: None,
+            compaction_policy: None,
             subagents_enabled: false,
             child_observer: None,
             subagent_limits: SubagentLimits::default(),
@@ -193,6 +201,16 @@ impl CodingRuntimeBuilder {
         transform: Arc<dyn SystemPromptTransform>,
     ) -> Self {
         self.prompt_transform = Some(transform);
+        self
+    }
+
+    pub(crate) fn context_policy(mut self, policy: Arc<dyn ContextPolicy>) -> Self {
+        self.context_policy = Some(policy);
+        self
+    }
+
+    pub(crate) fn compaction_policy(mut self, policy: Arc<dyn CompactionPolicy>) -> Self {
+        self.compaction_policy = Some(policy);
         self
     }
 
@@ -260,6 +278,12 @@ impl CodingRuntimeBuilder {
     /// prompt waiting for an answer nobody will give.
     pub(crate) fn human_input(mut self, provider: Arc<dyn HumanInputProvider>) -> Self {
         self.human_input = Some(provider);
+        self
+    }
+
+    /// Installs application-owned output storage and retrieval.
+    pub(crate) fn output_store(mut self, store: Arc<dyn ToolOutputStore>) -> Self {
+        self.output_store = Some(store);
         self
     }
 
@@ -468,6 +492,9 @@ impl CodingRuntimeBuilder {
         let profile = self.profile.unwrap_or_else(|| builtin_profile(kind, &deps));
 
         let mut registry = ToolRegistry::with_vocabulary(profile.tool_vocabulary());
+        if let Some(store) = &self.output_store {
+            registry.register(read_output_tool(Arc::clone(store)))?;
+        }
         let profile_tools = profile.base_tools();
         // Built-in profiles contribute the search shape their models expect.
         // An injected profile that contributes no search tool gets the
@@ -532,7 +559,10 @@ impl CodingRuntimeBuilder {
                 tools: self.tools,
                 tool_replacements: self.tool_replacements.clone(),
                 tool_middleware: self.tool_middleware.clone(),
+                context_policy: self.context_policy.clone(),
+                compaction_policy: self.compaction_policy.clone(),
                 options: child_options(&self.options),
+                output_store: self.output_store.clone(),
                 tool_env_provider: self.tool_env_provider.clone(),
                 redactor: Arc::clone(&self.redactor),
                 search_provider: self.search_provider.clone(),
@@ -585,6 +615,7 @@ impl CodingRuntimeBuilder {
             tool_middleware: self.tool_middleware,
             env: environment,
             human_input: self.human_input,
+            output_store: self.output_store,
             tool_env_provider: self.tool_env_provider,
             redactor: self.redactor,
             agent_control: AgentControlHandle::detached(),
@@ -594,6 +625,8 @@ impl CodingRuntimeBuilder {
             memory_summaries: Vec::new(),
             subagents: supervisor,
             prompt_transform: self.prompt_transform,
+            context_policy: self.context_policy,
+            compaction_policy: self.compaction_policy,
             coding_agent: None,
             coding_bridge: None,
         };
@@ -789,6 +822,7 @@ pub(crate) struct CodingRuntime {
     tool_middleware:   Vec<Arc<dyn ToolMiddleware>>,
     env:               Arc<dyn Environment>,
     human_input:       Option<Arc<dyn HumanInputProvider>>,
+    output_store:      Option<Arc<dyn ToolOutputStore>>,
     tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
     /// What strips secrets out of the process output this session publishes.
     redactor:          Arc<dyn Redactor>,
@@ -805,6 +839,8 @@ pub(crate) struct CodingRuntime {
     /// The application's adjustment to the system prompt, applied once when
     /// the session initializes.
     prompt_transform:  Option<Arc<dyn SystemPromptTransform>>,
+    context_policy:    Option<Arc<dyn ContextPolicy>>,
+    compaction_policy: Option<Arc<dyn CompactionPolicy>>,
     /// The provider-neutral conversation loop, created after initialization on
     /// the first prompt and retained for the rest of the session.
     coding_agent:      Option<Agent>,
@@ -1551,6 +1587,7 @@ impl CodingRuntime {
         let operation = self.compaction.begin(&compaction_cancel);
         self.state.transition(CodingAgentState::Compacting);
         let request = CompactionRequest {
+            policy: self.compaction_policy.as_deref(),
             model: &self.model_context.model_selector,
             facts: self.model_context.facts,
             preserve_turns,

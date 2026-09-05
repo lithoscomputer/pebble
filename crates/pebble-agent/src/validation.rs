@@ -1,10 +1,13 @@
 //! Structural validation of model-supplied tool arguments.
 
+use std::collections::HashSet;
 use std::error::Error as StdError;
 use std::fmt;
 
-use lithos_llm::types::ToolDefinitionKind;
+use lithos_llm::types::{ContentPart, Message, Role, ToolDefinitionKind};
 use serde_json::Value;
+
+use crate::LifecycleError;
 
 /// A structural mismatch between tool arguments and their input schema.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -155,6 +158,44 @@ const fn type_name(value: &Value) -> &'static str {
         Value::Array(_) => "array",
         Value::Object(_) => "object",
     }
+}
+
+/// Validates tool-call pairing in an application-prepared request view.
+pub(crate) fn validate_context(messages: &[Message]) -> Result<(), LifecycleError> {
+    let mut pending = HashSet::new();
+    for message in messages {
+        if !pending.is_empty() && message.role() != Role::Tool {
+            return Err(LifecycleError::new(
+                "prepared context separates tool calls from their results",
+            ));
+        }
+        for part in message.content() {
+            match part {
+                ContentPart::ToolCall(call)
+                    if (message.role() != Role::Assistant || !pending.insert(call.id.as_str())) =>
+                {
+                    return Err(LifecycleError::new(
+                        "prepared context contains an invalid or duplicate tool call",
+                    ));
+                }
+                ContentPart::ToolResult(result)
+                    if message.role() != Role::Tool
+                        || !pending.remove(result.tool_call_id.as_str()) =>
+                {
+                    return Err(LifecycleError::new(
+                        "prepared context contains an unmatched tool result",
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    if !pending.is_empty() {
+        return Err(LifecycleError::new(
+            "prepared context contains unanswered tool calls",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

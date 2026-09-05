@@ -1,5 +1,6 @@
 //! Generic tools exposed to an agent.
 
+mod output;
 mod system;
 
 use std::error::Error as StdError;
@@ -14,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
+pub use self::output::{ToolArtifact, ToolOutputMetadata};
 pub(crate) use self::system::CANCELLED;
 pub use self::system::{
     ToolCallNext, ToolCallRequest, ToolCatalog, ToolDescriptor, ToolDiscoveryNext, ToolId,
@@ -294,7 +296,8 @@ where
 /// Content returned from a successful tool execution.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ToolOutput {
-    content: Vec<ContentPart>,
+    content:  Vec<ContentPart>,
+    metadata: Box<ToolOutputMetadata>,
 }
 
 impl ToolOutput {
@@ -302,7 +305,8 @@ impl ToolOutput {
     #[must_use]
     pub fn new(content: impl IntoIterator<Item = ContentPart>) -> Self {
         Self {
-            content: content.into_iter().collect(),
+            content:  content.into_iter().collect(),
+            metadata: Box::default(),
         }
     }
 
@@ -310,6 +314,45 @@ impl ToolOutput {
     #[must_use]
     pub fn content(&self) -> &[ContentPart] {
         &self.content
+    }
+
+    /// Observer-only details and artifact references.
+    #[must_use]
+    pub fn metadata(&self) -> &ToolOutputMetadata {
+        &self.metadata
+    }
+
+    /// Replaces observer-only information without changing model content.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: ToolOutputMetadata) -> Self {
+        *self.metadata = metadata;
+        self
+    }
+
+    /// Attaches structured details for middleware and observers.
+    #[must_use]
+    pub fn with_details(mut self, details: Value) -> Self {
+        self.metadata.details = Some(details);
+        self
+    }
+
+    /// Attaches an application-owned artifact.
+    #[must_use]
+    pub fn with_artifact(mut self, artifact: ToolArtifact) -> Self {
+        self.metadata.artifacts.push(artifact);
+        self
+    }
+
+    /// Concatenates the text parts, omitting images and other non-text parts.
+    #[must_use]
+    pub fn text(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|part| match part {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     pub(crate) fn into_content(self) -> Vec<ContentPart> {

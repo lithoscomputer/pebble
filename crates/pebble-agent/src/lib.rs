@@ -64,10 +64,10 @@ pub use self::error::{AgentBuildError, AgentError, Result};
 pub use self::event::{AgentEvent, EventProjection, FirstOutputKind};
 pub use self::model::ModelService;
 pub use self::tool::{
-    Tool, ToolCallNext, ToolCallRequest, ToolCatalog, ToolContext, ToolDescriptor,
+    Tool, ToolArtifact, ToolCallNext, ToolCallRequest, ToolCatalog, ToolContext, ToolDescriptor,
     ToolDiscoveryNext, ToolError, ToolErrorKind, ToolExecutor, ToolId, ToolIdError, ToolMiddleware,
-    ToolOutcome, ToolOutput, ToolOutputStats, ToolScheduling, ToolService, ToolSystem,
-    ToolSystemError,
+    ToolOutcome, ToolOutput, ToolOutputMetadata, ToolOutputStats, ToolScheduling, ToolService,
+    ToolSystem, ToolSystemError,
 };
 pub use self::turn::{
     AfterAnswerAction, AgentLifecycle, ConversationUpdate, LifecycleError, TurnContext,

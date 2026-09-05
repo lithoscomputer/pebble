@@ -163,7 +163,9 @@ mod tests {
 
     async fn call(provider: Arc<dyn SearchProvider>, args: Value) -> Result<String, ToolError> {
         let tool = make_web_search_tool(provider);
-        (tool.executor)(args, context(MockEnvironment::default())).await
+        (tool.executor)(args, context(MockEnvironment::default()))
+            .await
+            .map(|output| output.text())
     }
 
     #[test]

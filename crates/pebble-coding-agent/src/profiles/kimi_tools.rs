@@ -346,7 +346,7 @@ contents have little continuity with the old contents.
 #[must_use]
 pub(crate) fn make_kimi_edit_tool(description: &str) -> RegisteredTool {
     let shared_executor = make_edit_file_tool().executor;
-    RegisteredTool::new(
+    RegisteredTool::new_rich(
         definition(
             NativeTool::EditFile,
             description,
@@ -602,6 +602,7 @@ mod tests {
             context_for(environment),
         )
         .await
+        .map(|output| output.text())
         .expect("the file is read");
 
         assert!(output.contains("line18"), "{output}");
@@ -622,6 +623,7 @@ mod tests {
             context_for(environment),
         )
         .await
+        .map(|output| output.text())
         .expect("the file is read");
 
         assert!(output.contains("line5"), "{output}");
@@ -640,6 +642,7 @@ mod tests {
             context_for(environment),
         )
         .await
+        .map(|output| output.text())
         .expect("the file is read");
 
         assert!(output.contains("2001 | line2001"), "{output}");
@@ -655,6 +658,7 @@ mod tests {
             context_for(environment),
         )
         .await
+        .map(|output| output.text())
         .expect_err("zero names no line");
 
         assert_eq!(error.kind(), ToolErrorKind::InvalidArguments);
@@ -671,6 +675,7 @@ mod tests {
             context_for(Arc::clone(&environment)),
         )
         .await
+        .map(|output| output.text())
         .expect("the file is appended to");
 
         assert_eq!(
@@ -691,6 +696,7 @@ mod tests {
             context_for(Arc::clone(&environment)),
         )
         .await
+        .map(|output| output.text())
         .expect("the file is written");
 
         assert_eq!(
@@ -711,6 +717,7 @@ mod tests {
             context_for(environment),
         )
         .await
+        .map(|output| output.text())
         .expect_err("there is no prepend");
 
         assert_eq!(error.kind(), ToolErrorKind::InvalidArguments);
@@ -730,6 +737,7 @@ mod tests {
             context_for(environment),
         )
         .await
+        .map(|output| output.text())
         .expect_err("there is nothing to append to");
 
         assert!(
@@ -749,6 +757,7 @@ mod tests {
             context_for(Arc::clone(&environment)),
         )
         .await
+        .map(|output| output.text())
         .expect("the edit lands");
 
         assert_eq!(
@@ -769,7 +778,9 @@ mod tests {
             grep_results: lines,
             ..MockEnvironment::default()
         };
-        (make_kimi_grep_tool().executor)(arguments, context(environment)).await
+        (make_kimi_grep_tool().executor)(arguments, context(environment))
+            .await
+            .map(|output| output.text())
     }
 
     #[tokio::test]
@@ -929,6 +940,7 @@ mod tests {
                 .with_tool_env_provider(Arc::new(StaticEnvProvider(tool_env.clone()))),
         )
         .await
+        .map(|output| output.text())
         .expect_err("a timeout is a failed call");
 
         assert!(
@@ -976,6 +988,7 @@ mod tests {
 
         let error = (tool.executor)(json!({"command": "false"}), context(environment))
             .await
+            .map(|output| output.text())
             .expect_err("a nonzero exit is a failed call");
 
         assert_eq!(error.kind(), ToolErrorKind::Execution);

@@ -4,6 +4,9 @@ pub use crate::human_input::{
     Answer, AnswerStatus, HumanInputError, HumanInputProvider, Question, QuestionKind,
     QuestionOption,
 };
+pub use crate::policy::{
+    CompactionPolicy, CompactionPreparation, CompactionSummary, ContextPolicy, ContextPreparation,
+};
 pub use crate::profile::EnvContext;
 pub use crate::prompt_transform::{
     SystemPromptContext, SystemPromptDecision, SystemPromptTransform,

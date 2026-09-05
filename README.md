@@ -287,6 +287,65 @@ provider, no question tool), an `extensions::SearchProvider` (no provider, no
 call messages, and a
 `subagents::SubagentOptions` for subagents.
 
+## Native embedding extensions
+
+`RegisteredTool::function` and `RegisteredTool::new` keep their string-returning
+API. Use `RegisteredTool::rich_function` or `RegisteredTool::new_rich` when a tool
+returns multiple `ContentPart` values. Its `ToolOutput` can include images and
+other provider-neutral content. `with_details` and `with_artifact` attach
+observer-only data. Middleware and the durable `ToolCallCompleted.metadata`
+field receive that data. Model requests and conversation records contain only
+the model-facing content. Applications keep completion events to restore their
+rich tool views. `ToolError::with_metadata` supports the same data on failures.
+
+The coding layer bounds mixed content as well as text. It omits oversized media
+parts instead of cutting media payloads. Metadata is limited to the smaller of
+64 KiB and one quarter of the serialized output budget. Large details belong in
+an artifact. Existing serialized completion events without metadata still load.
+
+**Recoverable output.** Install a `tools::ToolOutputStore` with
+`CodingAgentBuilder::output_store` or `ToolRunner::output_store`. Pebble then
+registers `read_tool_output` as a read tool. Shell tools capture stdout and stderr
+before preview truncation, including output from failed commands. Other tool
+results are saved when the coding layer would truncate them. Saved references
+appear in completion metadata and in a model-facing retrieval hint.
+
+The store supplies a `ToolOutputWriter` for each call. Pebble awaits writes to
+bound memory use. The application owns storage, access checks, quotas, expiry,
+redaction, and cleanup of abandoned captures. Writers receive raw bytes;
+Pebble's event redactor does not redact storage. References are opaque and need
+not be workspace paths. `read_tool_output` passes the requesting `SessionScope`
+to the store for authorization. It reads at most 16 KiB per call and returns
+byte offsets for paging. Text is decoded with replacement for invalid UTF-8;
+offsets always count original bytes.
+
+Environment adapters must honor `ExecRequest::output_writer`. They must forward
+all bytes before applying capture limits, or return an error if they cannot.
+`LocalEnvironment` provides this behavior and stops the process on storage
+failure. Storage operations have a five-second bound. Cancellation still allows
+a bounded finalization of output collected before the process stopped. Petri
+can implement the store and environment over its own services without shared
+filesystem paths. The CLI does not install an output store by default.
+
+**Context and compaction policy.** Install `extensions::ContextPolicy` with
+`CodingAgentBuilder::context_policy` to prepare the messages for each model
+request. The hook runs after compaction and tool discovery, receives the
+session identity and visible tools, and returns an optional replacement view.
+It does not rewrite committed history or replace the profile's system prompt.
+Pebble rejects unpaired tool calls and results before sending the request.
+
+Install `extensions::CompactionPolicy` with `compaction_policy` to supply summary
+generation for both automatic and manual compaction. The hook receives the
+selected history, recent turns, and the default summary request. It returns
+summary text, usage, and optional cost. Pebble owns the safe cut, summary limits,
+history replacement, and terminal events. Failed, empty, or cancelled summaries
+leave history intact. Existing compaction rules still clear stale usage
+estimates and non-replayable provider data in retained turns.
+
+These hooks and the output store are inherited by subagents. They are runtime
+services, so install them again when resuming a record. They support native
+library embedding; no transport adapter is required.
+
 ## The generic agent API
 
 Use `pebble-agent` directly when the application supplies its own tools and

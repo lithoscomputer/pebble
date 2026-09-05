@@ -57,6 +57,8 @@ use crate::config::CodingAgentOptions;
 use crate::environment::Environment;
 use crate::error::{Error, ErrorData, ErrorKind, InterruptReason, Result, TaskKind};
 use crate::event::Emitter;
+use crate::output::ToolOutputStore;
+use crate::policy::{CompactionPolicy, ContextPolicy};
 use crate::profile::AgentProfile;
 use crate::redact::Redactor;
 use crate::runtime::{CodingAgentBuildError, CodingRuntime, ShutdownReason};
@@ -315,6 +317,15 @@ fn build_child(
     if let Some(provider) = deps.tool_env_provider.as_ref() {
         builder = builder.tool_env_provider(Arc::clone(provider));
     }
+    if let Some(store) = &deps.output_store {
+        builder = builder.output_store(Arc::clone(store));
+    }
+    if let Some(policy) = &deps.context_policy {
+        builder = builder.context_policy(policy.clone());
+    }
+    if let Some(policy) = &deps.compaction_policy {
+        builder = builder.compaction_policy(policy.clone());
+    }
     builder = builder.redactor(Arc::clone(&deps.redactor));
     if let Some(provider) = deps.search_provider.as_ref() {
         builder = builder.search_provider(Arc::clone(provider));
@@ -336,7 +347,10 @@ pub(crate) struct ChildDeps {
     pub(crate) tools:             Vec<RegisteredTool>,
     pub(crate) tool_replacements: Vec<(String, RegisteredTool)>,
     pub(crate) tool_middleware:   Vec<Arc<dyn pebble_agent::ToolMiddleware>>,
+    pub(crate) context_policy:    Option<Arc<dyn ContextPolicy>>,
+    pub(crate) compaction_policy: Option<Arc<dyn CompactionPolicy>>,
     pub(crate) options:           CodingAgentOptions,
+    pub(crate) output_store:      Option<Arc<dyn ToolOutputStore>>,
     pub(crate) tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
     /// What strips secrets out of what a child publishes. Inherited, because
     /// a child's process output reaches the same stream its parent's does.
@@ -3486,22 +3500,26 @@ mod tests {
             context(),
         )
         .await
+        .map(|output| output.text())
         .expect("the spawn succeeds");
         let sent = (tool_named(&tools, "send_input").executor)(
             json!({ "agent_id": agent_id, "message": "and the tests" }),
             context(),
         )
         .await
+        .map(|output| output.text())
         .expect("the message is queued");
         let waited =
             (tool_named(&tools, "wait").executor)(json!({ "agent_id": agent_id }), context())
                 .await
+                .map(|output| output.text())
                 .expect("the child answers");
         let closed = (tool_named(&tools, "close_agent").executor)(
             json!({ "agent_id": agent_id }),
             context(),
         )
         .await
+        .map(|output| output.text())
         .expect("the close succeeds");
 
         assert_eq!(sent, format!("Message sent to agent {agent_id}"));
@@ -3524,6 +3542,7 @@ mod tests {
             context,
         )
         .await
+        .map(|output| output.text())
         .expect_err("the call names no agent");
 
         assert_eq!(error.kind(), ToolErrorKind::InvalidArguments);
@@ -3540,6 +3559,7 @@ mod tests {
 
         let output = (tool_named(&tools, "wait").executor)(json!({}), context)
             .await
+            .map(|output| output.text())
             .expect("both children answer");
 
         let first_at = output
@@ -3567,6 +3587,7 @@ mod tests {
 
         let output = (tool_named(&tools, "wait").executor)(json!({}), context)
             .await
+            .map(|output| output.text())
             .expect("an empty tree is not an error");
 
         assert_eq!(output, "No subagents are running.");

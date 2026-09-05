@@ -702,6 +702,7 @@ mod tests {
             call_in(&parent),
         )
         .await
+        .map(|output| output.text())
         .expect("the spawn succeeds");
 
         let task_id = output
@@ -742,6 +743,7 @@ mod tests {
             call_in(&parent),
         )
         .await
+        .map(|output| output.text())
         .expect("the child answers");
 
         assert_eq!(
@@ -774,6 +776,7 @@ mod tests {
             call_in(&parent),
         )
         .await
+        .map(|output| output.text())
         .expect("a finished agent answers from its cache");
 
         assert!(output.contains("explicit report"), "{output}");
@@ -804,6 +807,7 @@ mod tests {
         let tool = make_task_output_tool(supervisor.clone());
         let output = (tool.executor)(json!({"task_id": task_id}), call_in(&parent))
             .await
+            .map(|output| output.text())
             .expect("the defaults cover the omitted arguments");
 
         assert!(output.contains("defaulted report"), "{output}");
@@ -822,6 +826,7 @@ mod tests {
             call_in(&parent),
         )
         .await
+        .map(|output| output.text())
         .expect_err("a string is not a boolean");
 
         assert_eq!(error.kind(), ToolErrorKind::InvalidArguments);
@@ -838,6 +843,7 @@ mod tests {
 
         let error = (tool.executor)(json!({"task_id": "agent-1"}), call_in(&parent))
             .await
+            .map(|output| output.text())
             .expect_err("there is no such agent");
 
         assert_eq!(
@@ -866,12 +872,14 @@ mod tests {
             call_in(&parent),
         )
         .await
+        .map(|output| output.text())
         .expect("a finished agent takes another turn");
         assert_eq!(sent, format!("Message sent to agent {task_id}."));
 
         let stop = make_task_stop_tool(supervisor.clone());
         let stopped = (stop.executor)(json!({"task_id": task_id}), call_in(&parent))
             .await
+            .map(|output| output.text())
             .expect("the agent stops");
         assert_eq!(stopped, format!("Agent {task_id} stopped."));
 

@@ -32,6 +32,8 @@ pub(crate) mod todo;
 pub(crate) mod web;
 pub(crate) mod web_search;
 
+pub use pebble_agent::{ToolArtifact, ToolOutput, ToolOutputMetadata};
+
 pub use self::apply_patch::make_apply_patch_tool;
 pub use self::files::{
     make_edit_file_tool, make_read_file_tool, make_read_many_files_tool, make_write_file_tool,
@@ -50,10 +52,13 @@ pub use self::web::{WebFetchSummarizer, make_web_fetch_tool};
 pub use self::web_search::make_web_search_tool;
 pub use crate::config::NativeToolOptions;
 pub use crate::event::OutputCaptureStats;
+pub use crate::output::{
+    MAX_OUTPUT_READ_BYTES, OutputPage, OutputStream, ToolOutputStore, ToolOutputWriter,
+};
 pub use crate::tool::{
     ApprovalDecision, CodingEventEmitter, CodingToolSet, PermissionLevelPolicy,
-    PermissionMiddleware, RegisteredTool, StaticEnvProvider, ToolApprovalService, ToolContext,
-    ToolEnvProvider, ToolError, ToolEventCallback, ToolExecutor, ToolPermission,
+    PermissionMiddleware, RegisteredTool, RichToolExecutor, StaticEnvProvider, ToolApprovalService,
+    ToolContext, ToolEnvProvider, ToolError, ToolEventCallback, ToolExecutor, ToolPermission,
     ToolPermissionPolicy, ToolRegistrationError, ToolRunner, canonical_tool_name,
 };
 pub use crate::types::{PermissionLevel, ToolCategory, ToolErrorKind, ToolSource, ToolSummary};

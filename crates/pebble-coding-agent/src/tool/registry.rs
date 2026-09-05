@@ -5,11 +5,11 @@ use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
 use std::result::Result as StdResult;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lithos_llm::types::ToolDefinition;
-use pebble_agent::ToolScheduling;
+use pebble_agent::{ToolOutput, ToolScheduling};
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -19,6 +19,7 @@ use super::permissions::known_tool_category;
 use crate::environment::Environment;
 use crate::event::{OutputCaptureStats, SessionBoundEmitter};
 use crate::human_input::HumanInputProvider;
+use crate::output::ToolOutputStore;
 use crate::redact::{NoRedaction, Redactor};
 use crate::types::{CodingEvent, ToolCategory, ToolSource, ToolSummary};
 use crate::{SessionId, SessionScope};
@@ -100,6 +101,10 @@ pub struct ToolContext {
     /// cancellation and the current model turn's interrupt, so a tool that
     /// watches it observes both.
     pub(crate) cancel:               CancellationToken,
+    /// Application-owned storage for complete output.
+    pub(crate) output_store:         Option<Arc<dyn ToolOutputStore>>,
+    /// References collected before the command's model-facing result is built.
+    pub(crate) output_artifacts:     Arc<Mutex<Vec<pebble_agent::ToolArtifact>>>,
     /// Extra environment variables for a command this call runs.
     pub(crate) tool_env_provider:    Option<Arc<dyn ToolEnvProvider>>,
     /// The calling session and the root shared by its tree.
@@ -188,6 +193,8 @@ impl ToolContext {
         Self {
             env,
             cancel: CancellationToken::new(),
+            output_store: None,
+            output_artifacts: Arc::default(),
             tool_env_provider: None,
             session_scope: None,
             tool_call_id: None,
@@ -221,6 +228,14 @@ impl ToolContext {
     #[must_use]
     pub fn with_tool_call_id(mut self, tool_call_id: impl Into<String>) -> Self {
         self.tool_call_id = Some(tool_call_id.into());
+        self
+    }
+
+    /// Sets storage for complete command output. The store must authorize reads
+    /// using the supplied session identity and clean up abandoned captures.
+    #[must_use]
+    pub fn with_output_store(mut self, store: Arc<dyn ToolOutputStore>) -> Self {
+        self.output_store = Some(store);
         self
     }
 
@@ -306,6 +321,16 @@ pub type ToolExecutor = Arc<
         + Sync,
 >;
 
+/// Executes a tool that returns content parts and observer-only information.
+pub type RichToolExecutor = Arc<
+    dyn Fn(
+            Value,
+            ToolContext,
+        ) -> Pin<Box<dyn Future<Output = Result<ToolOutput, ToolError>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// A tool registration that would make dispatch ambiguous.
 #[derive(Debug, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
@@ -349,7 +374,7 @@ pub struct RegisteredTool {
     /// insert; see [`ToolRegistry::register`].
     pub(crate) definition: ToolDefinition,
     /// What runs when the model calls it.
-    pub(crate) executor:   ToolExecutor,
+    pub(crate) executor:   RichToolExecutor,
     /// Where the tool came from.
     pub(crate) source:     ToolSource,
     /// Whether a child session may be given this tool.
@@ -379,6 +404,18 @@ impl RegisteredTool {
     /// Name another origin with [`with_source`](Self::with_source).
     #[must_use]
     pub fn new(definition: ToolDefinition, executor: ToolExecutor) -> Self {
+        Self::new_rich(
+            definition,
+            Arc::new(move |arguments, context| {
+                let result = executor(arguments, context);
+                Box::pin(async move { result.await.map(ToolOutput::from) })
+            }),
+        )
+    }
+
+    /// Pairs a definition with an executor returning rich content.
+    #[must_use]
+    pub fn new_rich(definition: ToolDefinition, executor: RichToolExecutor) -> Self {
         Self {
             definition,
             executor,
@@ -405,6 +442,27 @@ impl RegisteredTool {
         Fut: Future<Output = Result<String, ToolError>> + Send + 'static,
     {
         Self::new(
+            ToolDefinition::function(name, description, input_schema),
+            Arc::new(move |arguments, context| Box::pin(execute(context, arguments))),
+        )
+    }
+
+    /// Defines an application tool returning content parts, details, and
+    /// artifacts.
+    ///
+    /// Only content parts are sent to the model. Details and artifact metadata
+    /// travel through middleware and the durable completion event.
+    pub fn rich_function<F, Fut>(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        input_schema: Value,
+        execute: F,
+    ) -> Self
+    where
+        F: Fn(ToolContext, Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
+    {
+        Self::new_rich(
             ToolDefinition::function(name, description, input_schema),
             Arc::new(move |arguments, context| Box::pin(execute(context, arguments))),
         )
@@ -841,6 +899,7 @@ mod tests {
 
         let output = (tool.executor)(json!({"name": "parser"}), context())
             .await
+            .map(|output| output.text())
             .expect("the tool succeeds");
 
         assert_eq!(tool.definition.name, "inspect");
@@ -1029,7 +1088,9 @@ mod tests {
             .expect("tool registration is unique");
         let tool = registry.get("echo").expect("registered");
 
-        let result = (tool.executor)(json!({}), context()).await;
+        let result = (tool.executor)(json!({}), context())
+            .await
+            .map(|output| output.text());
 
         assert_eq!(result.expect("the tool succeeds"), "ok");
     }
@@ -1052,6 +1113,7 @@ mod tests {
 
         let error = (tool.executor)(json!({}), context())
             .await
+            .map(|output| output.text())
             .expect_err("the tool fails");
 
         assert_eq!(error.kind(), ToolErrorKind::InvalidArguments);

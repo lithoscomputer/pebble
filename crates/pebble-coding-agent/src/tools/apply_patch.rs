@@ -1130,6 +1130,7 @@ mod tests {
 
         let output = (tool.executor)(json!(patch), context_for(Arc::clone(&env)))
             .await
+            .map(|output| output.text())
             .expect("a raw custom patch applies");
 
         assert_eq!(

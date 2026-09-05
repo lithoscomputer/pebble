@@ -990,6 +990,13 @@ pub enum CodingEvent {
         tool_call_id:          String,
         /// The output handed back to the model.
         output:                serde_json::Value,
+        /// Structured details and artifacts for observers; never sent to the
+        /// model.
+        #[serde(
+            default,
+            skip_serializing_if = "pebble_agent::ToolOutputMetadata::is_empty"
+        )]
+        metadata:              pebble_agent::ToolOutputMetadata,
         /// Whether the call failed.
         is_error:              bool,
         /// Why the call failed, when it did.
@@ -2231,6 +2238,7 @@ mod tests {
             tool_name:             "shell".into(),
             tool_call_id:          "call_1".into(),
             output:                json!("permission denied"),
+            metadata:              pebble_agent::ToolOutputMetadata::default(),
             is_error:              true,
             error_kind:            Some(ToolErrorKind::Denied),
             output_bytes_observed: 17,

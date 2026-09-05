@@ -31,6 +31,7 @@ use crate::error::{CompactionError, Error, ErrorData, InterruptReason, Result};
 use crate::event::Emitter;
 use crate::file_tracker::FileTracker;
 use crate::history::{APPROX_CHARS_PER_TOKEN, History};
+use crate::policy::{CompactionPolicy, CompactionPreparation, CompactionSummary};
 use crate::profile::ModelFacts;
 use crate::tool::result_text;
 use crate::types::{CodingEvent, Message, TokenUsage};
@@ -364,8 +365,9 @@ pub(crate) struct ContextEstimate {
 ///
 /// An argument bundle rather than something an application reads back, so it is
 /// plainly constructible and a member added later is a breaking change.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub(crate) struct CompactionRequest<'a> {
+    pub(crate) policy:         Option<&'a dyn CompactionPolicy>,
     /// The model selector the session runs on. Compaction summarizes with the
     /// same model, so the summary reads the conversation the way its author
     /// did.
@@ -506,6 +508,33 @@ pub(crate) async fn compact_context(
         reason: request.reason,
         finished: false,
     };
+    let generate = async {
+        if let Some(policy) = request.policy {
+            policy
+                .summarize(
+                    CompactionPreparation {
+                        session_id,
+                        reason: request.reason,
+                        messages: &history.turns()[..preserve_start],
+                        retained_messages: &history.turns()[preserve_start..],
+                        default_request: &summary_request,
+                    },
+                    request.cancel,
+                )
+                .await
+                .map_err(CompactionError::Policy)
+        } else {
+            let response = client
+                .complete(summary_request)
+                .await
+                .map_err(CompactionError::Llm)?;
+            Ok(CompactionSummary {
+                text:            response.text(),
+                usage:           TokenUsage::from(response.usage),
+                cost_usd_micros: response.cost.map(|cost| cost.usd_micros),
+            })
+        }
+    };
     let response = tokio::select! {
         biased;
         () = request.cancel.cancelled() => {
@@ -515,8 +544,8 @@ pub(crate) async fn compact_context(
             });
             return Err(Error::Interrupted(InterruptReason::Cancelled));
         }
-        response = client.complete(summary_request) => {
-            match response.map_err(CompactionError::Llm) {
+        response = generate => {
+            match response {
                 Ok(response) => response,
                 Err(source) => {
                     drop_guard.finished = true;
@@ -539,7 +568,7 @@ pub(crate) async fn compact_context(
     // `compact_from` discards the summarized turns for good, so an empty
     // summary is refused before history is touched. Trimming first stops a
     // whitespace-only response from passing as a summary.
-    let response_text = response.text();
+    let response_text = response.text;
     let summary = response_text.trim();
     if summary.is_empty() {
         let error = Error::from(CompactionError::EmptySummary {
@@ -570,8 +599,8 @@ pub(crate) async fn compact_context(
         summary_token_estimate,
         tracked_file_count: file_tracker.file_count(),
         summary_truncated,
-        usage: TokenUsage::from(response.usage),
-        cost_usd_micros: response.cost.map(|cost| cost.usd_micros),
+        usage: response.usage,
+        cost_usd_micros: response.cost_usd_micros,
     };
 
     history.compact_from(preserve_start, &result);
@@ -1015,6 +1044,7 @@ mod tests {
 
     fn compaction_request(estimate_tokens: usize) -> CompactionRequest<'static> {
         CompactionRequest {
+            policy:         None,
             model:          "test/model",
             facts:          facts(),
             preserve_turns: 1,
@@ -1485,6 +1515,7 @@ mod tests {
             &client,
             &FileTracker::default(),
             CompactionRequest {
+                policy: None,
                 preserve_turns: 0,
                 ..compaction_request(1_000)
             },
@@ -1518,6 +1549,7 @@ mod tests {
             &client,
             &FileTracker::default(),
             CompactionRequest {
+                policy: None,
                 preserve_turns: 4,
                 ..compaction_request(1_000)
             },
@@ -1588,6 +1620,7 @@ mod tests {
             &client,
             &FileTracker::default(),
             CompactionRequest {
+                policy: None,
                 facts: ModelFacts {
                     reasons_by_default: true,
                     ..facts()
@@ -1622,6 +1655,7 @@ mod tests {
             &client,
             &FileTracker::default(),
             CompactionRequest {
+                policy: None,
                 model: "   ",
                 ..compaction_request(1_000)
             },

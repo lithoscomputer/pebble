@@ -1060,6 +1060,7 @@ mod tests {
 
         let output = (tool.executor)(claude5_question(), root_context(provider))
             .await
+            .map(|output| output.text())
             .expect("the person answered");
 
         assert_eq!(
@@ -1087,6 +1088,7 @@ mod tests {
 
         let error = (tool.executor)(claude5_question(), child)
             .await
+            .map(|output| output.text())
             .expect_err("a child asks its parent, not a person");
 
         assert!(
@@ -1116,6 +1118,7 @@ mod tests {
             context,
         )
         .await
+        .map(|output| output.text())
         .expect_err("there is nobody to ask");
 
         assert_eq!(error.kind(), ToolErrorKind::Unavailable);
@@ -1135,6 +1138,7 @@ mod tests {
             context(MockEnvironment::default()),
         )
         .await
+        .map(|output| output.text())
         .expect_err("there is no session");
 
         assert_eq!(error.message(), ROOT_SESSION_REQUIRED_ERROR);
@@ -1164,6 +1168,7 @@ mod tests {
             root_context(provider),
         )
         .await
+        .map(|output| output.text())
         .expect_err("nobody answered");
 
         assert_eq!(
@@ -1204,6 +1209,7 @@ mod tests {
             root_context(Arc::new(Broken)),
         )
         .await
+        .map(|output| output.text())
         .expect_err("the channel failed");
 
         assert_eq!(
@@ -1224,6 +1230,7 @@ mod tests {
             })),
         )
         .await
+        .map(|output| output.text())
         .expect_err("the question has no text and no id");
 
         assert!(

@@ -32,6 +32,7 @@ use crate::event::Emitter;
 use crate::file_tracker::FileTracker;
 use crate::history::History;
 use crate::loop_detection::detect_loop;
+use crate::policy::{CompactionPolicy, ContextPolicy, ContextPreparation};
 use crate::profile::ModelFacts;
 use crate::reasoning::ReasoningOutput;
 use crate::skills::{ExpandedInput, SkillExpansion, expand_skill};
@@ -70,22 +71,25 @@ const OUTPUT_LIMIT_WARNING: &str = "output_limit";
 
 #[derive(Clone)]
 pub(super) struct CodingAgentBridge {
-    model_context: Arc<SessionModel>,
-    resources:     Arc<PromptResources>,
-    state:         Arc<Mutex<ConversationState>>,
-    config:        Arc<CodingAgentOptions>,
-    tools:         Arc<CodingToolService>,
-    emitter:       Emitter,
-    session_id:    SessionId,
+    model_context:     Arc<SessionModel>,
+    resources:         Arc<PromptResources>,
+    state:             Arc<Mutex<ConversationState>>,
+    config:            Arc<CodingAgentOptions>,
+    tools:             Arc<CodingToolService>,
+    emitter:           Emitter,
+    session_id:        SessionId,
     /// The session's state, moved to `Executing` for the length of a tool
     /// round and back to `Thinking` after it.
-    state_machine: StateMachine,
+    state_machine:     StateMachine,
     /// The token that ends the prompt in progress. A child of the runtime's
     /// terminal token, so it also fires when the session is shut down, and set
     /// afresh by [`begin_prompt`](Self::begin_prompt) for every prompt.
-    prompt_cancel: Arc<Mutex<CancellationToken>>,
-    compaction:    CompactionControl,
-    subagents:     Option<SubagentSupervisor>,
+    prompt_cancel:     Arc<Mutex<CancellationToken>>,
+    compaction:        CompactionControl,
+    session_scope:     crate::SessionScope,
+    context_policy:    Option<Arc<dyn ContextPolicy>>,
+    compaction_policy: Option<Arc<dyn CompactionPolicy>>,
+    subagents:         Option<SubagentSupervisor>,
 }
 
 /// The conversation and what one prompt accumulates around it.
@@ -299,6 +303,9 @@ impl CodingAgentBridge {
             runtime.session_scope.clone(),
             Arc::clone(&runtime.redactor),
         );
+        if let Some(store) = &runtime.output_store {
+            tools = tools.with_output_store(Arc::clone(store));
+        }
         if let Some(provider) = runtime.tool_env_provider.as_ref() {
             tools = tools.with_tool_env_provider(Arc::clone(provider));
         }
@@ -316,6 +323,9 @@ impl CodingAgentBridge {
             state_machine: runtime.state.clone(),
             prompt_cancel: Arc::new(Mutex::new(runtime.cancel_token.clone())),
             compaction: runtime.compaction.clone(),
+            session_scope: runtime.session_scope.clone(),
+            context_policy: runtime.context_policy.clone(),
+            compaction_policy: runtime.compaction_policy.clone(),
             subagents: runtime.subagents.clone(),
         }
     }
@@ -428,6 +438,7 @@ impl CodingAgentBridge {
         let prompt_cancel = self.prompt_cancel();
         let operation = self.compaction.begin(&prompt_cancel);
         let request = CompactionRequest {
+            policy: self.compaction_policy.as_deref(),
             model: &self.model_context.model_selector,
             facts: self.model_context.facts,
             preserve_turns: self.config.compaction_preserve_turns,
@@ -684,8 +695,10 @@ impl agent::EventProjection for CodingAgentBridge {
                 result,
                 error_kind,
                 output_stats,
+                metadata,
             } => {
-                self.tools.emit_result(result, *output_stats, *error_kind);
+                self.tools
+                    .emit_result(result, *output_stats, *error_kind, metadata);
             }
             agent::AgentEvent::TurnInterrupted { generation } => {
                 self.state
@@ -703,6 +716,29 @@ impl agent::EventProjection for CodingAgentBridge {
 
 #[async_trait]
 impl agent::AgentLifecycle for CodingAgentBridge {
+    async fn prepare_context(
+        &self,
+        turn: agent::TurnContext<'_>,
+        tools: &agent::ToolCatalog,
+        cancel: &CancellationToken,
+    ) -> StdResult<Option<Vec<LlmMessage>>, agent::LifecycleError> {
+        match &self.context_policy {
+            Some(policy) => {
+                policy
+                    .prepare(
+                        ContextPreparation {
+                            session: &self.session_scope,
+                            turn,
+                            tools,
+                        },
+                        cancel,
+                    )
+                    .await
+            }
+            None => Ok(None),
+        }
+    }
+
     async fn before_model(
         &self,
         _context: agent::TurnContext<'_>,

@@ -54,6 +54,9 @@ impl fmt::Display for InterruptReason {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum CompactionError {
+    /// An application-defined summarizer failed.
+    #[error("running the application compaction policy")]
+    Policy(#[source] pebble_agent::LifecycleError),
     /// The summarization request could not be built, which a session with an
     /// unusable model selector runs into before any call is made.
     #[error("building the summary request")]
@@ -210,7 +213,9 @@ impl Error {
         match self {
             Self::Llm(error) | Self::Compaction(CompactionError::Llm(error)) => Some(error),
             Self::Compaction(
-                CompactionError::EmptySummary { .. } | CompactionError::Request(_),
+                CompactionError::EmptySummary { .. }
+                | CompactionError::Request(_)
+                | CompactionError::Policy(_),
             )
             | Self::Agent(_)
             | Self::AgentBuild(_)

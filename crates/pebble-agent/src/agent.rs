@@ -30,6 +30,7 @@ use crate::tool::{
 use crate::turn::{
     AfterAnswerAction, AgentLifecycle, ConversationUpdate, LifecycleError, TurnContext,
 };
+use crate::validation::validate_context;
 
 /// The default number of lifecycle events held for each subscriber.
 const DEFAULT_EVENT_CAPACITY: usize = 256;
@@ -688,8 +689,28 @@ impl Agent {
                     self.apply_conversation_update(update)
                         .map_err(|source| AgentError::Lifecycle { source })?;
                 }
+                let prepared = if let Some(lifecycle) = self.lifecycle.as_ref() {
+                    let context = TurnContext::new(&self.model, turn_count, &self.messages);
+                    tokio::select! {
+                        biased;
+                        () = prompt_cancel.cancelled() => return Err(AgentError::Aborted),
+                        () = round_cancel.cancelled() => continue,
+                        result = lifecycle.prepare_context(context, &tools, &round_cancel) => {
+                            result.map_err(|source| AgentError::Lifecycle { source })?
+                        }
+                    }
+                } else {
+                    None
+                };
+                if let Some(messages) = &prepared {
+                    validate_context(messages)
+                        .map_err(|source| AgentError::Lifecycle { source })?;
+                }
+                let request = self.build_request_with_messages(
+                    &tools,
+                    prepared.as_deref().unwrap_or(&self.messages),
+                )?;
                 self.emit(AgentEvent::TurnStarted { turn: turn_count });
-                let request = self.build_request(&tools)?;
                 self.emit(AgentEvent::ModelRequestStarted {
                     model:   self.model.clone(),
                     request: request.clone(),
@@ -868,12 +889,16 @@ impl Agent {
             .map_err(|source| AgentError::Lifecycle { source })
     }
 
-    fn build_request(&self, tools: &ToolCatalog) -> Result<Request> {
+    fn build_request_with_messages(
+        &self,
+        tools: &ToolCatalog,
+        messages: &[Message],
+    ) -> Result<Request> {
         let mut builder = Request::builder().model(self.model.clone());
         if !self.system_prompt.trim().is_empty() {
             builder = builder.system(self.system_prompt.clone());
         }
-        for message in &self.messages {
+        for message in messages {
             builder = builder.message(message.clone());
         }
         for tool in tools.visible_tools() {
@@ -1140,11 +1165,13 @@ impl Agent {
     ) -> ExecutedCall {
         let error_kind = outcome.error_kind();
         let output_stats = outcome.output_stats();
+        let metadata = outcome.metadata().clone();
         let result = outcome.into_result(call);
         self.emit(AgentEvent::ToolCompleted {
             result: result.clone(),
             error_kind,
             output_stats,
+            metadata,
         });
         ExecutedCall {
             result,

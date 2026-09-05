@@ -261,6 +261,7 @@ mod tests {
             context_for(Arc::clone(&environment)),
         )
         .await
+        .map(|output| output.text())
         .expect("the page is fetched");
 
         assert!(
@@ -292,6 +293,7 @@ mod tests {
             context_for(Arc::clone(&environment)),
         )
         .await
+        .map(|output| output.text())
         .expect_err("only http and https are fetched");
 
         assert_eq!(error.kind(), ToolErrorKind::InvalidArguments);
@@ -314,7 +316,8 @@ mod tests {
             json!({"url": "https://example.com", "timeout_ms": 15_000}),
             context_for(Arc::clone(&environment)),
         )
-        .await;
+        .await
+        .map(|output| output.text());
 
         assert_eq!(
             *environment
@@ -343,7 +346,8 @@ mod tests {
             json!({"url": "https://example.com", "timeout_ms": 120_000}),
             context_for(Arc::clone(&environment)),
         )
-        .await;
+        .await
+        .map(|output| output.text());
 
         assert_eq!(
             *environment
@@ -372,6 +376,7 @@ mod tests {
             context(fetched(&"x".repeat(150 * 1024))),
         )
         .await
+        .map(|output| output.text())
         .expect("the page is fetched");
 
         assert!(output.len() < 110 * 1024, "{}", output.len());
@@ -391,6 +396,7 @@ mod tests {
             context(fetched(&page)),
         )
         .await
+        .map(|output| output.text())
         .expect("the page is fetched");
 
         assert!(output.ends_with("[Output truncated at 100KB]"));
@@ -419,6 +425,7 @@ mod tests {
             context(environment),
         )
         .await
+        .map(|output| output.text())
         .expect_err("curl failed");
 
         assert_eq!(
@@ -438,7 +445,8 @@ mod tests {
             context_for(Arc::clone(&environment))
                 .with_tool_env_provider(Arc::new(StaticEnvProvider(tool_env.clone()))),
         )
-        .await;
+        .await
+        .map(|output| output.text());
 
         assert_eq!(
             *environment
@@ -458,6 +466,7 @@ mod tests {
             context,
         )
         .await
+        .map(|output| output.text())
         .expect("the summarizer answers");
 
         assert_eq!(output, "Rust is a systems programming language.");
@@ -487,6 +496,7 @@ mod tests {
             )),
         )
         .await
+        .map(|output| output.text())
         .expect("the page is fetched");
 
         assert_eq!(
@@ -514,6 +524,7 @@ mod tests {
             context(fetched("<html><body><p>content</p></body></html>")),
         )
         .await
+        .map(|output| output.text())
         .expect_err("the summarizing call failed");
 
         assert_eq!(error.kind(), ToolErrorKind::Execution);
@@ -599,6 +610,7 @@ capabilities = { text = true }
             context(fetched("<html><body><p>Page content</p></body></html>")),
         )
         .await
+        .map(|output| output.text())
         .expect("the named provider answers");
 
         assert_eq!(output, "summarized content");

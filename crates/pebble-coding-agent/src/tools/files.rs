@@ -246,6 +246,7 @@ mod tests {
             file_context("/test.txt", "hello\nworld"),
         )
         .await
+        .map(|output| output.text())
         .expect("the file is read");
 
         assert_eq!(output, "1 | hello\n2 | world\n");
@@ -264,6 +265,7 @@ mod tests {
             file_context("/test.txt", &content),
         )
         .await
+        .map(|output| output.text())
         .expect("the file is read");
 
         assert!(output.contains("2000 | line2000"), "{output}");
@@ -279,6 +281,7 @@ mod tests {
             file_context("/test.txt", "line1\nline2\nline3\nline4"),
         )
         .await
+        .map(|output| output.text())
         .expect("the file is read");
 
         assert_eq!(output, "2 | line2\n3 | line3\n");
@@ -295,6 +298,7 @@ mod tests {
             file_context("/test.txt", "line1\nline2\nline3\nline4\nline5\nline6"),
         )
         .await
+        .map(|output| output.text())
         .expect("the file is read");
 
         assert_eq!(output, "2 | line2\n3 | line3\n4 | line4\n");
@@ -306,6 +310,7 @@ mod tests {
 
         let error = (tool.executor)(json!({}), context(MockEnvironment::default()))
             .await
+            .map(|output| output.text())
             .expect_err("the path is required");
 
         assert_eq!(error.kind(), ToolErrorKind::InvalidArguments);
@@ -321,6 +326,7 @@ mod tests {
             context(MockEnvironment::default()),
         )
         .await
+        .map(|output| output.text())
         .expect_err("the file does not exist");
 
         assert_eq!(error.kind(), ToolErrorKind::Execution);
@@ -348,6 +354,7 @@ mod tests {
             file_context("/test.txt", "hello").with_tool_env_provider(Arc::new(Failing)),
         )
         .await
+        .map(|output| output.text())
         .expect("the file is read");
 
         assert_eq!(output, "1 | hello\n");
@@ -363,6 +370,7 @@ mod tests {
             context_for(Arc::clone(&environment)),
         )
         .await
+        .map(|output| output.text())
         .expect("the file is written");
 
         assert_eq!(output, "Successfully wrote to /out.txt");
@@ -393,6 +401,7 @@ mod tests {
             context_for(Arc::clone(&environment)),
         )
         .await
+        .map(|output| output.text())
         .expect("the file is edited");
 
         assert_eq!(output, "Successfully edited /f.txt");
@@ -418,6 +427,7 @@ mod tests {
             file_context("/f.txt", "hello world"),
         )
         .await
+        .map(|output| output.text())
         .expect_err("the string is not in the file");
 
         assert_eq!(error.kind(), ToolErrorKind::InvalidArguments);
@@ -437,6 +447,7 @@ mod tests {
             file_context("/f.txt", "aa bb aa"),
         )
         .await
+        .map(|output| output.text())
         .expect_err("the string appears twice");
 
         assert_eq!(error.kind(), ToolErrorKind::InvalidArguments);
@@ -465,6 +476,7 @@ mod tests {
             context_for(Arc::clone(&environment)),
         )
         .await
+        .map(|output| output.text())
         .expect("the file is edited");
 
         assert_eq!(output, "Successfully edited /f.txt");
@@ -498,6 +510,7 @@ mod tests {
             context_for(Arc::clone(&environment)),
         )
         .await
+        .map(|output| output.text())
         .expect("the file is edited");
 
         assert_eq!(output, "Successfully edited /f.txt");
@@ -521,6 +534,7 @@ mod tests {
             context_for(Arc::new(environment)),
         )
         .await
+        .map(|output| output.text())
         .expect("the files are read");
 
         assert_eq!(
@@ -538,6 +552,7 @@ mod tests {
             file_context("/a.txt", "alpha"),
         )
         .await
+        .map(|output| output.text())
         .expect("one unreadable file does not fail the call");
 
         assert!(output.contains("=== /a.txt ===\n1 | alpha"), "{output}");
@@ -553,10 +568,12 @@ mod tests {
 
         let missing = (tool.executor)(json!({}), context(MockEnvironment::default()))
             .await
+            .map(|output| output.text())
             .expect_err("paths is required");
         let wrong_element =
             (tool.executor)(json!({"paths": [7]}), context(MockEnvironment::default()))
                 .await
+                .map(|output| output.text())
                 .expect_err("a path must be a string");
 
         assert_eq!(missing.kind(), ToolErrorKind::InvalidArguments);

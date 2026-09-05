@@ -21,6 +21,7 @@ use crate::config::{CodingAgentOptions, CodingAgentOptionsError};
 use crate::environment::Environment;
 use crate::error::{Error, InterruptReason};
 use crate::event::{EventCapacity, EventSink, EventSinkTimeout};
+use crate::extensions::{CompactionPolicy, ContextPolicy};
 use crate::history::History;
 use crate::human_input::HumanInputProvider;
 use crate::prompt_transform::SystemPromptTransform;
@@ -33,6 +34,7 @@ use crate::runtime::{
 use crate::search::SearchProvider;
 use crate::subagent::SubagentOptions;
 use crate::tool::{RegisteredTool, ToolEnvProvider, ToolRegistrationError};
+use crate::tools::ToolOutputStore;
 use crate::types::{
     Actor, AgentProfileKind, CodingAgentEvent, CodingAgentState, ContextWindowSnapshot,
     InputContent, InputSource, MemoryFileSummary, Message, PermissionLevel, SkillSummary,
@@ -538,8 +540,34 @@ impl CodingAgentBuilder {
     }
 
     /// Replaces coding-agent policy.
+    ///
+    /// Runtime service hooks are configured separately from these stored
+    /// options.
     pub fn options(mut self, options: CodingAgentOptions) -> Self {
         self.inner = self.inner.options(options);
+        self
+    }
+
+    /// Captures full tool output in application-owned storage and registers
+    /// `read_tool_output`. Inherited by subagents. Reinstall on resume.
+    pub fn output_store(mut self, store: Arc<dyn ToolOutputStore>) -> Self {
+        self.inner = self.inner.output_store(store);
+        self
+    }
+
+    /// Prepares an ephemeral context view before each model request.
+    /// Inherited by subagents with their session identity; reinstall on resume.
+    pub fn context_policy(mut self, policy: Arc<dyn ContextPolicy>) -> Self {
+        self.inner = self.inner.context_policy(policy);
+        self
+    }
+
+    /// Supplies summary generation for manual and automatic compaction.
+    ///
+    /// Pebble still chooses a safe cut, validates the summary, and records the
+    /// outcome. Inherited by subagents; reinstall the service when resuming.
+    pub fn compaction_policy(mut self, policy: Arc<dyn CompactionPolicy>) -> Self {
+        self.inner = self.inner.compaction_policy(policy);
         self
     }
 

@@ -21,8 +21,9 @@
 //! act on.
 
 use std::borrow::Cow;
+use std::mem::take;
 use std::result::Result as StdResult;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use async_trait::async_trait;
 use lithos_llm::types::{ContentPart, ToolCall, ToolResult};
@@ -40,6 +41,7 @@ use crate::config::CodingAgentOptions;
 use crate::environment::Environment;
 use crate::event::{Emitter, OutputCaptureStats, SessionBoundEmitter};
 use crate::human_input::HumanInputProvider;
+use crate::output::{OutputStream, ToolOutputStore, storage_call};
 use crate::redact::Redactor;
 use crate::truncation::{
     OutputBudgets, ToolOutputLimits, preview_tool_output, serialized_json_bytes,
@@ -62,6 +64,7 @@ pub(crate) struct CodingToolService {
     config:            Arc<CodingAgentOptions>,
     emitter:           Emitter,
     session_scope:     SessionScope,
+    output_store:      Option<Arc<dyn ToolOutputStore>>,
     tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
     /// Absent in a child session and wherever the application installed no
     /// provider, which is what makes a question tool report that it cannot
@@ -90,10 +93,16 @@ impl CodingToolService {
             config,
             emitter,
             session_scope,
+            output_store: None,
             tool_env_provider: None,
             human_input: None,
             redactor,
         }
+    }
+
+    pub(crate) fn with_output_store(mut self, store: Arc<dyn ToolOutputStore>) -> Self {
+        self.output_store = Some(store);
+        self
     }
 
     /// Sets where a call gets its extra environment variables.
@@ -128,8 +137,9 @@ impl CodingToolService {
         };
         let stats = outcome.output_stats();
         let error_kind = outcome.error_kind();
+        let metadata = outcome.metadata().clone();
         let result = outcome.into_result(call);
-        self.emit_result(&result, stats, error_kind);
+        self.emit_result(&result, stats, error_kind, &metadata);
         result
     }
 
@@ -141,6 +151,7 @@ impl CodingToolService {
             .run_tool(&mut call, self.registry.get_by_id(&tool_id), cancellation)
             .await;
         outcome_from_result(executed.result, executed.error_kind, executed.output_stats)
+            .with_metadata(executed.metadata)
     }
 
     /// Applies coding output policy to the final call result.
@@ -150,7 +161,17 @@ impl CodingToolService {
         tool_name: &str,
         outcome: agent::ToolOutcome,
     ) -> agent::ToolOutcome {
+        if !outcome.metadata().is_empty()
+            && serialized_json_bytes(outcome.metadata())
+                > (self.config.tool_output_serialized_bytes / 4).min(64 * 1024)
+        {
+            return self.finish_terminal(call_id, tool_name, agent::ToolOutcome::failure(
+                ToolErrorKind::Execution,
+                "Tool output metadata exceeds the event budget; store large details as an artifact",
+            ));
+        }
         let previous = outcome.output_stats();
+        let metadata = outcome.metadata().clone();
         let (result, error_kind) = match outcome {
             agent::ToolOutcome::Success { output, .. } => (
                 ToolResult {
@@ -174,9 +195,35 @@ impl CodingToolService {
                 Some(ToolErrorKind::Execution),
             ),
         };
-        let retained = self.retain(result, previous);
-        let result = self.truncate_for_history(retained.result, tool_name);
-        outcome_from_result(result, error_kind, Some(retained.output_stats))
+        let retained = self.retain_with_metadata(result, previous, &metadata);
+        let mut result = self.truncate_for_history(retained.result, tool_name);
+        // Per-tool notices can expand a short preview. Keep the final payload
+        // inside the envelope too, without changing the capture accounting.
+        let serialized_limit =
+            self.config
+                .tool_output_serialized_bytes
+                .saturating_sub(if metadata.is_empty() {
+                    0
+                } else {
+                    serialized_json_bytes(&metadata)
+                });
+        let exceeds_budget = match result.content.as_slice() {
+            [ContentPart::Text { text }] => {
+                text.len() > self.config.tool_output_retention_bytes
+                    || serialized_json_bytes(text) > serialized_limit
+            }
+            content => {
+                serialized_json_bytes(content)
+                    > self
+                        .config
+                        .tool_output_retention_bytes
+                        .min(serialized_limit)
+            }
+        };
+        if exceeds_budget {
+            result = self.retain_with_metadata(result, None, &metadata).result;
+        }
+        outcome_from_result(result, error_kind, Some(retained.output_stats)).with_metadata(metadata)
     }
 
     /// Runs one resolved tool.
@@ -199,11 +246,15 @@ impl CodingToolService {
             Some(call.id.clone()),
         ));
         let mut context = ToolContext::new(Arc::clone(&self.env))
-            .with_cancel(cancel)
+            .with_cancel(cancel.clone())
             .with_session(self.session_scope.clone())
             .with_tool_call_id(call.id.clone())
             .with_coding_event_emitter(Arc::clone(&bound) as Arc<dyn CodingEventEmitter>)
             .with_redactor(Arc::clone(&self.redactor));
+        if let Some(store) = &self.output_store {
+            context = context.with_output_store(Arc::clone(store));
+        }
+        let artifacts = Arc::clone(&context.output_artifacts);
         if let Some(provider) = &self.tool_env_provider {
             context = context.with_tool_env_provider(Arc::clone(provider));
         }
@@ -217,18 +268,66 @@ impl CodingToolService {
                 return self.failed(call, &ToolError::invalid_arguments(error.to_string()));
             }
         };
-        let (result, error_kind) = match (tool.executor)(arguments, context).await {
-            Ok(output) => (text_result(call, output, false), None),
+        let (mut result, error_kind, mut metadata) = match (tool.executor)(arguments, context).await
+        {
+            Ok(output) => {
+                let metadata = output.metadata().clone();
+                (
+                    agent::ToolOutcome::success(output).into_result(call),
+                    None,
+                    metadata,
+                )
+            }
             Err(error) => (
                 self.error_result_for(&call.id, &call.name, &error),
                 Some(error.kind()),
+                error.metadata().clone(),
             ),
         };
 
+        let mut stored_artifacts =
+            take(&mut *artifacts.lock().unwrap_or_else(PoisonError::into_inner));
+        // A process was captured before its environment truncated the streams.
+        // Other tools can be saved here before the coding layer cuts their result.
+        if stored_artifacts.is_empty()
+            && canonical_tool_name(&call.name) != "read_tool_output"
+            && let Some(store) = &self.output_store
+            && self.truncate_for_history(self.retain(result.clone(), None).result, &call.name)
+                != result
+        {
+            let save = async {
+                let writer = store.start(&self.session_scope, &call.id).await?;
+                writer
+                    .append(OutputStream::Result, result_text(&result).as_bytes())
+                    .await?;
+                writer.finish().await
+            };
+            match storage_call(&cancel, save).await {
+                Ok(artifacts) => stored_artifacts = artifacts,
+                Err(error) => return self.failed(call, &error),
+            }
+        }
+        if !stored_artifacts.is_empty() {
+            let hint = format!(
+                "\nSaved output: use read_tool_output with reference {}.\n",
+                stored_artifacts
+                    .iter()
+                    .map(|artifact| serde_json::to_string(&artifact.reference)
+                        .expect("strings serialize"))
+                    .collect::<Vec<_>>()
+                    .join(" or ")
+            );
+            match result.content.as_mut_slice() {
+                [ContentPart::Text { text }] => text.push_str(&hint),
+                _ => result.content.insert(0, ContentPart::Text { text: hint }),
+            }
+        }
+        metadata.artifacts.extend(stored_artifacts);
         ExecutedTool {
             result,
             error_kind,
             output_stats: bound.take_tool_output_stats(),
+            metadata,
         }
     }
 
@@ -238,6 +337,7 @@ impl CodingToolService {
             result:       self.error_result_for(&call.id, &call.name, error),
             error_kind:   Some(error.kind()),
             output_stats: None,
+            metadata:     agent::ToolOutputMetadata::default(),
         }
     }
 
@@ -258,10 +358,26 @@ impl CodingToolService {
     /// environment already dropped while draining the process are carried in
     /// through `previous`, so the counters describe everything the tool
     /// produced rather than everything that reached this point.
-    fn retain(&self, mut result: ToolResult, previous: Option<OutputCaptureStats>) -> Retained {
+    fn retain(&self, result: ToolResult, previous: Option<OutputCaptureStats>) -> Retained {
+        self.retain_with_metadata(result, previous, &agent::ToolOutputMetadata::default())
+    }
+
+    fn retain_with_metadata(
+        &self,
+        mut result: ToolResult,
+        previous: Option<OutputCaptureStats>,
+        metadata: &agent::ToolOutputMetadata,
+    ) -> Retained {
+        let metadata_bytes = if metadata.is_empty() {
+            0
+        } else {
+            serialized_json_bytes(metadata)
+        };
         let budgets = OutputBudgets::new(
             self.config.tool_output_retention_bytes,
-            self.config.tool_output_serialized_bytes,
+            self.config
+                .tool_output_serialized_bytes
+                .saturating_sub(metadata_bytes),
         );
         let output_stats = match text_part_mut(&mut result) {
             Some(text) => {
@@ -273,8 +389,7 @@ impl CodingToolService {
                 }
                 stats
             }
-            // Structured output is left alone; only its size is reported.
-            None => OutputCaptureStats::complete(serialized_json_bytes(&result.content)),
+            None => retain_content_parts(&mut result.content, budgets),
         };
 
         Retained {
@@ -285,7 +400,10 @@ impl CodingToolService {
 
     /// Cuts the copy history keeps to the limits this tool deserves.
     fn truncate_for_history(&self, mut result: ToolResult, tool_name: &str) -> ToolResult {
-        if let Some(text) = text_part_mut(&mut result) {
+        for part in &mut result.content {
+            let ContentPart::Text { text } = part else {
+                continue;
+            };
             let limits = ToolOutputLimits::resolve(
                 tool_name,
                 canonical_tool_name(tool_name),
@@ -319,6 +437,7 @@ impl CodingToolService {
         result: &ToolResult,
         output_stats: Option<OutputCaptureStats>,
         error_kind: Option<ToolErrorKind>,
+        metadata: &agent::ToolOutputMetadata,
     ) {
         let output = output_value(result);
         let text = result_text(result);
@@ -335,6 +454,7 @@ impl CodingToolService {
             tool_name: result.name.clone().unwrap_or_default(),
             tool_call_id: result.tool_call_id.clone(),
             output,
+            metadata: metadata.clone(),
             is_error: result.is_error,
             error_kind,
             output_bytes_observed: stats.observed_bytes,
@@ -351,6 +471,61 @@ impl CodingToolService {
             event,
             Some(tool_call_id.to_owned()),
         );
+    }
+}
+
+/// Preserves content types while keeping their combined serialized size
+/// bounded. Oversized binary parts are omitted, never cut into invalid media
+/// payloads.
+fn retain_content_parts(
+    content: &mut Vec<ContentPart>,
+    budgets: OutputBudgets,
+) -> OutputCaptureStats {
+    let observed_bytes = serialized_json_bytes(content);
+    let limit = budgets.retained_bytes.min(budgets.serialized_bytes);
+    if observed_bytes <= limit {
+        return OutputCaptureStats::complete(observed_bytes);
+    }
+    let mut kept = Vec::new();
+    // Leave room for the array delimiters, content wrapper, and omission notice.
+    let mut remaining = limit.saturating_sub(128);
+    for part in take(content) {
+        let size = serialized_json_bytes(&part).saturating_add(1);
+        if size <= remaining {
+            remaining -= size;
+            kept.push(part);
+        } else if let ContentPart::Text { text } = part {
+            let preview = preview_tool_output(
+                &text,
+                OutputBudgets::new(remaining.saturating_sub(32), remaining.saturating_sub(32)),
+                0,
+            );
+            let bounded = ContentPart::Text {
+                text: preview.output.into_owned(),
+            };
+            let size = serialized_json_bytes(&bounded).saturating_add(1);
+            if size <= remaining {
+                remaining -= size;
+                kept.push(bounded);
+            }
+        }
+    }
+    let retained_bytes = serialized_json_bytes(&kept).min(observed_bytes);
+    let notice = ContentPart::Text {
+        text: "Some tool output parts were omitted to fit the output budget.".to_owned(),
+    };
+    if serialized_json_bytes(&kept)
+        .saturating_add(serialized_json_bytes(&notice))
+        .saturating_add(1)
+        <= limit
+    {
+        kept.push(notice);
+    }
+    *content = kept;
+    OutputCaptureStats {
+        observed_bytes,
+        retained_bytes,
+        omitted_bytes: observed_bytes.saturating_sub(retained_bytes),
     }
 }
 
@@ -406,6 +581,7 @@ struct ExecutedTool {
     error_kind:   Option<ToolErrorKind>,
     /// What the tool reported about its own output, when it reported anything.
     output_stats: Option<OutputCaptureStats>,
+    metadata:     agent::ToolOutputMetadata,
 }
 
 /// One call's result inside the session's output budgets.
@@ -432,12 +608,6 @@ fn outcome_from_result(
         Some(stats) => outcome.with_output_stats(stats),
         None => outcome,
     }
-}
-
-/// A result carrying one block of text, which is what every pebble tool
-/// produces.
-fn text_result(call: &ToolCall, text: String, is_error: bool) -> ToolResult {
-    text_result_for(&call.id, &call.name, text, is_error)
 }
 
 fn text_result_for(
@@ -834,7 +1004,7 @@ mod tests {
             let counter = Arc::clone(&counter);
             Box::pin(async move {
                 *counter.lock().unwrap_or_else(PoisonError::into_inner) += 1;
-                Ok("ran".to_owned())
+                Ok("ran".into())
             })
         });
         let events = Events::new();

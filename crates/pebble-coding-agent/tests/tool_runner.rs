@@ -467,3 +467,91 @@ async fn a_runner_delivers_session_scope_separately_from_the_tool_call_id() {
     assert!(!result.is_error);
     assert_eq!(text_of(&result), "identified");
 }
+
+#[tokio::test]
+async fn application_failures_keep_observer_details_out_of_model_text() {
+    use pebble_coding_agent::tools::ToolOutputMetadata;
+    let tool = RegisteredTool::function("fail", "Fail", json!({"type":"object"}), |_, _| async {
+        Err(
+            ToolError::execution("Something failed").with_metadata(ToolOutputMetadata {
+                details:   Some(json!({"diagnostic":"observer-only"})),
+                artifacts: Vec::new(),
+            }),
+        )
+    });
+    let events = Arc::new(EventLog::default());
+    let record = Arc::clone(&events);
+    let runner = ToolRunner::new(
+        CodingToolSet::empty().with_tool(tool).expect("tool"),
+        mock_environment(),
+    )
+    .on_event(move |event| record.0.lock().expect("events").push(event));
+    let result = runner
+        .run(
+            &ToolCall::function("failure", "fail", json!({})),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("answers");
+    assert!(result.is_error);
+    assert!(!text_of(&result).contains("observer-only"));
+    let CodingEvent::ToolCallCompleted { metadata, .. } = events.completion() else {
+        unreachable!()
+    };
+    assert_eq!(
+        metadata.details,
+        Some(json!({"diagnostic":"observer-only"}))
+    );
+}
+
+#[tokio::test]
+async fn mixed_content_and_metadata_cannot_bypass_output_budgets() {
+    use lithos_llm::types::{ImageContent, MediaSource};
+    use pebble_coding_agent::tools::ToolOutput;
+    for oversized_details in [false, true] {
+        let tool = RegisteredTool::rich_function(
+            "rich",
+            "Rich",
+            json!({"type":"object"}),
+            move |_, _| async move {
+                Ok(ToolOutput::new(vec![
+                ContentPart::Text { text:"a\"\n".repeat(5000) },
+                ContentPart::Image(ImageContent::new(MediaSource::url("https://example.test/image.png"))),
+            ]).with_details(json!({"value":if oversized_details { "x".repeat(100_000) } else { "small".into() }})))
+            },
+        );
+        let events = Arc::new(EventLog::default());
+        let record = Arc::clone(&events);
+        let runner = ToolRunner::new(
+            CodingToolSet::empty().with_tool(tool).expect("tool"),
+            mock_environment(),
+        )
+        .options(
+            CodingAgentOptions::default()
+                .with_tool_output_retention_bytes(512)
+                .with_tool_output_serialized_bytes(768),
+        )
+        .on_event(move |event| record.0.lock().expect("events").push(event));
+        let result = runner
+            .run(
+                &ToolCall::function("rich-1", "rich", json!({})),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("answers");
+        assert_eq!(result.is_error, oversized_details);
+        assert!(serde_json::to_vec(&result.content).expect("content").len() <= 512);
+        let CodingEvent::ToolCallCompleted {
+            metadata, output, ..
+        } = events.completion()
+        else {
+            unreachable!()
+        };
+        assert!(
+            serde_json::to_vec(&(output, metadata))
+                .expect("event data")
+                .len()
+                <= 768
+        );
+    }
+}

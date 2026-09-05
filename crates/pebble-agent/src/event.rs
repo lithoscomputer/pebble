@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::broadcast;
 
-use crate::tool::{ToolErrorKind, ToolOutputStats};
+use crate::tool::{ToolErrorKind, ToolOutputMetadata, ToolOutputStats};
 
 /// The first model output observed in one stream attempt.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -107,6 +107,9 @@ pub enum AgentEvent {
         error_kind:   Option<ToolErrorKind>,
         /// Output byte counts supplied by the execution layer.
         output_stats: Option<ToolOutputStats>,
+        /// Observer-only details and artifacts, excluded from conversation
+        /// content.
+        metadata:     ToolOutputMetadata,
     },
     /// A round was interrupted so queued steering can be applied.
     TurnInterrupted {

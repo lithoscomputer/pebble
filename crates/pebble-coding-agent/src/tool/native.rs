@@ -56,6 +56,8 @@ impl ToolVocabulary {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub(crate) enum NativeTool {
+    /// Retrieves an application-owned output object.
+    ReadToolOutput,
     /// Reads one file.
     ReadFile,
     /// Reads several files in one call.
@@ -120,6 +122,7 @@ impl NativeTool {
     /// A slice rather than an array, so a tool added later does not change
     /// this constant's type.
     pub(crate) const ALL: &'static [Self] = &[
+        Self::ReadToolOutput,
         Self::ReadFile,
         Self::ReadManyFiles,
         Self::WriteFile,
@@ -154,6 +157,7 @@ impl NativeTool {
     #[must_use]
     pub(crate) const fn canonical_name(self) -> &'static str {
         match self {
+            Self::ReadToolOutput => "read_tool_output",
             Self::ReadFile => "read_file",
             Self::ReadManyFiles => "read_many_files",
             Self::WriteFile => "write_file",
@@ -326,7 +330,8 @@ impl NativeTool {
             Self::SpawnAgent => limits(Some(20_000), None, TruncationMode::HeadTail),
             Self::EditFile | Self::ApplyPatch => limits(Some(10_000), None, TruncationMode::Tail),
             Self::WriteFile => limits(Some(1_000), None, TruncationMode::Tail),
-            Self::ReadManyFiles
+            Self::ReadToolOutput
+            | Self::ReadManyFiles
             | Self::ListDir
             | Self::WebSearch
             | Self::WebFetch
@@ -360,9 +365,12 @@ impl NativeTool {
     #[must_use]
     pub(crate) const fn category(self) -> Option<ToolCategory> {
         match self {
-            Self::ReadFile | Self::ReadManyFiles | Self::Grep | Self::Glob | Self::ListDir => {
-                Some(ToolCategory::Read)
-            }
+            Self::ReadToolOutput
+            | Self::ReadFile
+            | Self::ReadManyFiles
+            | Self::Grep
+            | Self::Glob
+            | Self::ListDir => Some(ToolCategory::Read),
             Self::WriteFile | Self::EditFile | Self::ApplyPatch => Some(ToolCategory::Write),
             Self::Shell => Some(ToolCategory::Shell),
             Self::SpawnAgent

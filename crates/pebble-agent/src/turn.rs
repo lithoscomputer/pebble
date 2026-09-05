@@ -129,6 +129,22 @@ impl ConversationUpdate {
 /// continues the same prompt with that message.
 #[async_trait]
 pub trait AgentLifecycle: Send + Sync {
+    /// Prepares an ephemeral view for the next model request after tool
+    /// discovery.
+    ///
+    /// `None` uses committed history. A replacement changes this request only;
+    /// it does not change history or the system prompt. Tool calls and results
+    /// must remain paired. The future may be dropped on cancellation and must
+    /// not leave cleanup-sensitive work behind.
+    async fn prepare_context(
+        &self,
+        _context: TurnContext<'_>,
+        _tools: &ToolCatalog,
+        _cancel: &CancellationToken,
+    ) -> StdResult<Option<Vec<Message>>, LifecycleError> {
+        Ok(None)
+    }
+
     /// Runs after steering is committed and before tools are resolved.
     async fn before_model(
         &self,

@@ -11,7 +11,7 @@ use lithos_llm::types::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{ToolContext, ToolErrorKind, ToolOutput, ToolOutputStats};
+use super::{ToolContext, ToolErrorKind, ToolOutput, ToolOutputMetadata, ToolOutputStats};
 use crate::event::EventHub;
 use crate::turn::TurnContext;
 use crate::validation::validate_tool_arguments;
@@ -338,6 +338,8 @@ pub enum ToolOutcome {
         message:      String,
         /// Output byte counts supplied by an execution layer.
         output_stats: Option<ToolOutputStats>,
+        /// Observer-only information retained even when the call fails.
+        metadata:     Box<ToolOutputMetadata>,
     },
 }
 
@@ -358,6 +360,7 @@ impl ToolOutcome {
             kind,
             message: message.into(),
             output_stats: None,
+            metadata: Box::default(),
         }
     }
 
@@ -389,6 +392,25 @@ impl ToolOutcome {
             Self::Success { .. } => None,
             Self::Failure { kind, .. } => Some(*kind),
         }
+    }
+
+    /// Observer-only information, excluded by `into_result`.
+    #[must_use]
+    pub fn metadata(&self) -> &ToolOutputMetadata {
+        match self {
+            Self::Success { output, .. } => output.metadata(),
+            Self::Failure { metadata, .. } => metadata,
+        }
+    }
+
+    /// Replaces observer-only information on either a success or a failure.
+    #[must_use]
+    pub fn with_metadata(mut self, value: ToolOutputMetadata) -> Self {
+        match &mut self {
+            Self::Success { output, .. } => *output.metadata = value,
+            Self::Failure { metadata, .. } => **metadata = value,
+        }
+        self
     }
 
     /// Converts the logical outcome to the provider-neutral call result.
@@ -836,6 +858,7 @@ mod tests {
         assert_eq!(outcome, ToolOutcome::Failure {
             kind:         ToolErrorKind::Denied,
             message:      "not allowed".to_owned(),
+            metadata:     Box::default(),
             output_stats: None,
         });
         assert!(

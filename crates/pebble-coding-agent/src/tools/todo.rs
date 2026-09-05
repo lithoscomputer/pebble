@@ -672,7 +672,9 @@ mod kimi_tests {
     use crate::types::ToolErrorKind;
 
     async fn call(tool: &RegisteredTool, args: Value) -> Result<String, ToolError> {
-        (tool.executor)(args, context_for("ses_kimi", "ses_kimi")).await
+        (tool.executor)(args, context_for("ses_kimi", "ses_kimi"))
+            .await
+            .map(|output| output.text())
     }
 
     #[tokio::test]
@@ -795,7 +797,9 @@ mod tests {
     }
 
     async fn call(tool: &RegisteredTool, args: Value) -> Result<String, ToolError> {
-        (tool.executor)(args, context_for("ses_a", "ses_a")).await
+        (tool.executor)(args, context_for("ses_a", "ses_a"))
+            .await
+            .map(|output| output.text())
     }
 
     // --- update_plan ---
@@ -935,12 +939,14 @@ mod tests {
             context_for("ses_parent", "ses_parent"),
         )
         .await
+        .map(|output| output.text())
         .expect("the plan is accepted");
         (tool.executor)(
             json!({"plan": [{"step": "child_step", "status": "pending"}]}),
             context_for("ses_child", "ses_parent"),
         )
         .await
+        .map(|output| output.text())
         .expect("the plan is accepted");
 
         let parent = runtime
@@ -1265,12 +1271,14 @@ Blocks: #4"
             context_for("ses_parent", "ses_parent"),
         )
         .await
+        .map(|output| output.text())
         .expect("the task is created");
         (create.executor)(
             json!({"subject": "c", "description": "d"}),
             context_for("ses_child", "ses_parent"),
         )
         .await
+        .map(|output| output.text())
         .expect("the task is created");
 
         assert!(runtime.snapshot(&anthropic_list("ses_child")).is_none());
@@ -1293,12 +1301,14 @@ Blocks: #4"
 
         let error = (plan.executor)(json!({"plan": []}), bare())
             .await
+            .map(|output| output.text())
             .expect_err("there is no session to scope the plan to");
         assert_eq!(error.message(), "update_plan requires an active session");
         assert_eq!(error.kind(), ToolErrorKind::Unavailable);
 
         let error = (tasks.executor)(json!({}), bare())
             .await
+            .map(|output| output.text())
             .expect_err("there is no session to scope the list to");
         assert_eq!(error.message(), "task tools require an active session");
     }

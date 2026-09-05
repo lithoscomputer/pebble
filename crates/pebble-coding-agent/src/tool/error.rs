@@ -27,6 +27,7 @@ use crate::types::ToolErrorKind;
 #[error("{message}")]
 #[non_exhaustive]
 pub struct ToolError {
+    metadata:          Box<pebble_agent::ToolOutputMetadata>,
     kind:              ToolErrorKind,
     message:           String,
     causes_in_message: bool,
@@ -39,6 +40,7 @@ impl ToolError {
     #[must_use]
     pub fn new(kind: ToolErrorKind, message: impl Into<String>) -> Self {
         Self {
+            metadata: Box::default(),
             kind,
             message: message.into(),
             causes_in_message: false,
@@ -54,6 +56,7 @@ impl ToolError {
         source: impl StdError + Send + Sync + 'static,
     ) -> Self {
         Self {
+            metadata: Box::default(),
             kind,
             message: message.into(),
             causes_in_message: false,
@@ -70,6 +73,7 @@ impl ToolError {
     ) -> Self {
         let message = format!("{}: {}", context.into(), render_error(&source));
         Self {
+            metadata: Box::default(),
             kind,
             message,
             causes_in_message: true,
@@ -90,6 +94,7 @@ impl ToolError {
         source: Box<dyn StdError + Send + Sync + 'static>,
     ) -> Self {
         Self {
+            metadata: Box::default(),
             kind,
             message: message.into(),
             causes_in_message: false,
@@ -105,6 +110,7 @@ impl ToolError {
         source: Box<dyn StdError + Send + Sync + 'static>,
     ) -> Self {
         Self {
+            metadata: Box::default(),
             kind,
             message: message.into(),
             causes_in_message: true,
@@ -150,6 +156,19 @@ impl ToolError {
     pub(crate) fn with_message(mut self, message: impl Into<String>) -> Self {
         self.message = message.into();
         self
+    }
+
+    /// Attaches observer-only details and artifact references to this failure.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: pebble_agent::ToolOutputMetadata) -> Self {
+        *self.metadata = metadata;
+        self
+    }
+
+    /// Data preserved by middleware and the durable completion event.
+    #[must_use]
+    pub fn metadata(&self) -> &pebble_agent::ToolOutputMetadata {
+        &self.metadata
     }
 
     /// The category of this failure.
