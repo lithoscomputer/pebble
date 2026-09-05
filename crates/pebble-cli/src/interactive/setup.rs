@@ -227,7 +227,8 @@ pub(super) async fn choose(
                             }
                         }
                     }
-                    MenuAction::Editing | MenuAction::Unhandled => {}
+                    MenuAction::Editing | MenuAction::Unhandled | MenuAction::ToggleFavorite(_) => {
+                    }
                 }
             }
             _ => {}

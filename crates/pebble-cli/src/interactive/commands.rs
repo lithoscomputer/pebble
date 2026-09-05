@@ -45,6 +45,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/resume", "Choose a saved session"),
     ("/name", "Name this session"),
     ("/session", "Session details"),
+    (
+        "/favorites",
+        "Choose models for Ctrl+P; /favorites <model> toggles, clear resets",
+    ),
     ("/model", "Choose a model"),
     ("/login", "Save a provider API key"),
     ("/logout", "Remove saved provider credentials"),
@@ -111,6 +115,12 @@ pub(super) async fn model_menu(
             )
         })
         .collect();
+    if current.is_some() {
+        items.push((
+            "Choose favorite models for Ctrl+P".into(),
+            "@favorites".into(),
+        ));
+    }
     items.push(("Set up a provider API key".into(), "@login".into()));
     items.push(if all {
         ("Show configured models".into(), "@configured".into())
@@ -311,6 +321,7 @@ impl App {
                     }
                 }
             }
+            "/favorites" => self.favorites(argument).await?,
             "/model" if argument == "all" => {
                 self.require_idle()?;
                 self.menu = Some(
@@ -515,6 +526,15 @@ impl App {
             }
             MenuAction::Editing => {}
             MenuAction::Unhandled => return Ok(false),
+            MenuAction::ToggleFavorite(value) => match self.toggle_favorite(&value).await {
+                Ok(()) => {
+                    let items = self.favorite_items().await?;
+                    if let Some(menu) = &mut self.menu {
+                        menu.replace_items(items);
+                    }
+                }
+                Err(error) => self.terminal.message(&format!("{error:#}"))?,
+            },
             MenuAction::SaveDefault(value) => {
                 self.menu = None;
                 if !value.starts_with('@') {
@@ -543,7 +563,11 @@ impl App {
                     Purpose::Sessions => {
                         self.command(&format!("/resume {value}")).await?;
                     }
+                    Purpose::Favorites => {}
                     Purpose::Models => match value.as_str() {
+                        "@favorites" => {
+                            self.command("/favorites").await?;
+                        }
                         "@login" => {
                             self.command("/login").await?;
                         }
@@ -753,23 +777,30 @@ impl App {
 
     pub(super) async fn cycle_model(&mut self, reverse: bool) -> Result<()> {
         self.require_idle()?;
-        let choices: Vec<_> = model_choices(&self.client, &self.auth)
-            .await?
-            .into_iter()
-            .filter(|choice| choice.unavailable.is_none())
-            .collect();
+        let choices = super::favorites::cycling_choices(
+            &self.client,
+            &self.settings.favorite_models,
+            model_choices(&self.client, &self.auth).await?,
+        );
         if choices.is_empty() {
-            bail!("No configured models. Use /login to configure a provider.");
+            bail!(if self.settings.favorite_models.is_empty() {
+                "No configured models. Use /login to configure a provider."
+            } else {
+                "No favorite models are available. Use /favorites to change the shortlist or /login to configure a provider."
+            });
         }
         let index = choices
             .iter()
-            .position(|choice| choice.selector == self.metadata.model)
-            .unwrap_or(0);
-        let next = if reverse {
-            (index + choices.len() - 1) % choices.len()
-        } else {
-            (index + 1) % choices.len()
+            .position(|choice| choice.selector == self.metadata.model);
+        let next = match (index, reverse) {
+            (Some(index), true) => (index + choices.len() - 1) % choices.len(),
+            (Some(index), false) => (index + 1) % choices.len(),
+            (None, true) => choices.len() - 1,
+            (None, false) => 0,
         };
+        if choices[next].selector == self.metadata.model {
+            return Ok(());
+        }
         self.command(&format!("/model {}", choices[next].selector))
             .await?;
         Ok(())

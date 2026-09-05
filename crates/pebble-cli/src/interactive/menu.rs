@@ -12,6 +12,7 @@ pub(super) enum Purpose {
     Sessions,
     Navigate,
     Models,
+    Favorites,
     Login,
     Logout,
     Tools,
@@ -33,6 +34,7 @@ pub(super) enum MenuAction {
     Close,
     Select(String),
     SaveDefault(String),
+    ToggleFavorite(String),
 }
 
 impl Menu {
@@ -52,6 +54,11 @@ impl Menu {
     pub(super) fn filter(&mut self, query: &str) {
         self.search.set(query.into());
         self.selected = 0;
+    }
+
+    pub(super) fn replace_items(&mut self, items: Vec<(String, String)>) {
+        self.items = items;
+        self.selected = self.selected.min(self.matches().len().saturating_sub(1));
     }
 
     fn matches(&self) -> Vec<&(String, String)> {
@@ -88,6 +95,8 @@ impl Menu {
             matches.len(),
             if self.is_completion() {
                 "Tab completes"
+            } else if matches!(self.purpose, Purpose::Favorites) {
+                "Enter toggles and saves"
             } else {
                 "Enter selects"
             }
@@ -101,6 +110,7 @@ impl Menu {
     pub(super) fn draw(&self, terminal: &mut Terminal, status: &str) -> io::Result<()> {
         let title = match self.purpose {
             Purpose::Models => "Models",
+            Purpose::Favorites => "Favorite models",
             Purpose::Navigate => "Branches and history",
             Purpose::Sessions => "Sessions",
             Purpose::Login => "Log in",
@@ -154,12 +164,17 @@ impl Menu {
                 self.selected = (self.selected + 10).min(count.saturating_sub(1));
                 MenuAction::Editing
             }
-            KeyCode::Enter | KeyCode::Tab => self
-                .matches()
-                .get(self.selected)
-                .map_or(MenuAction::Editing, |(_, value)| {
-                    MenuAction::Select(value.clone())
-                }),
+            KeyCode::Enter | KeyCode::Tab => {
+                self.matches()
+                    .get(self.selected)
+                    .map_or(MenuAction::Editing, |(_, value)| {
+                        if matches!(self.purpose, Purpose::Favorites) {
+                            MenuAction::ToggleFavorite(value.clone())
+                        } else {
+                            MenuAction::Select(value.clone())
+                        }
+                    })
+            }
             KeyCode::Char('s') if control && matches!(self.purpose, Purpose::Models) => self
                 .matches()
                 .get(self.selected)

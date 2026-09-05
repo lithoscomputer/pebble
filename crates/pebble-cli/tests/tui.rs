@@ -1035,3 +1035,105 @@ async fn clipboard_errors_and_unsupported_graphics_keep_the_draft_usable() {
     terminal.send(b"\x03/quit\r").await;
     terminal.finish().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn favorites_keep_the_full_picker_and_cycle_in_saved_order_across_restart() {
+    let root = tempfile::tempdir().expect("test directory");
+    fs::write(root.path().join("settings.json"), r#"{"favorite_models":["gone/model","gpt-5.6-terra","openai/gpt-6-astra","openai/gpt-5.6-terra"],"future_setting":{"keep":true}}"#).expect("favorites");
+    let args = arguments(root.path());
+    let mut terminal = Terminal::start(&args, "http://127.0.0.1:1/v1", "unused");
+    terminal.contains("Ready").await;
+    terminal.send(b"keep draft\x1b[112;6u").await;
+    terminal
+        .until(|screen| {
+            screen.cursor_line() == "› keep draft"
+                && screen.live_text().contains("openai/gpt-6-astra · 0 in")
+        })
+        .await;
+    terminal.send(b"\x10").await;
+    terminal
+        .until(|screen| {
+            screen.cursor_line() == "› keep draft"
+                && screen.live_text().contains("openai/gpt-5.6-terra · 0 in")
+        })
+        .await;
+    terminal.send(b"\x0csol\r").await;
+    terminal
+        .until(|screen| {
+            screen.cursor_line() == "› keep draft"
+                && screen.live_text().contains("openai/gpt-5.6-sol · 0 in")
+        })
+        .await;
+    terminal.send(b"\x0cfavorite\r").await;
+    terminal
+        .until(|screen| {
+            screen.live_text().contains("Favorite models") && screen.cursor_line() == "Search:"
+        })
+        .await;
+    terminal.send(b"terra\r").await;
+    terminal
+        .until(|screen| {
+            screen.cursor_line() == "Search: terra"
+                && screen.live_text().contains("[ ] openai/gpt-5.6-terra")
+        })
+        .await;
+    let settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.path().join("settings.json")).expect("settings"))
+            .expect("json");
+    assert_eq!(
+        settings["favorite_models"],
+        serde_json::json!(["gone/model", "openai/gpt-6-astra"])
+    );
+    assert_eq!(settings["future_setting"], serde_json::json!({"keep":true}));
+    terminal.send(b"\x1b").await;
+    terminal
+        .until(|screen| screen.cursor_line() == "› keep draft")
+        .await;
+    terminal.send(b"\x03/quit\r").await;
+    terminal.finish().await;
+    let mut terminal = Terminal::start(&args, "http://127.0.0.1:1/v1", "unused");
+    terminal.contains("Ready").await;
+    terminal.send(b"\x10").await;
+    terminal
+        .until(|screen| screen.live_text().contains("openai/gpt-6-astra · 0 in"))
+        .await;
+    terminal.send(b"/favorites clear\r").await;
+    terminal.contains("Saved 0 favorite models.").await;
+    terminal.send(b"/quit\r").await;
+    terminal.finish().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unavailable_favorites_can_be_removed_without_losing_the_draft() {
+    let root = tempfile::tempdir().expect("test directory");
+    fs::write(
+        root.path().join("settings.json"),
+        r#"{"favorite_models":["gone/model"]}"#,
+    )
+    .expect("favorites");
+    let mut terminal = Terminal::start(&arguments(root.path()), "http://127.0.0.1:1/v1", "unused");
+    terminal.contains("Ready").await;
+    terminal.send(b"keep\x10").await;
+    terminal.contains("No favorite models are available.").await;
+    terminal
+        .until(|screen| screen.cursor_line() == "› keep")
+        .await;
+    terminal.send(b"\x0cfavorite\r").await;
+    terminal
+        .until(|screen| screen.cursor_line() == "Search:")
+        .await;
+    terminal.send(b"gone/model\r").await;
+    terminal
+        .until(|screen| screen.live_text().contains("No matches"))
+        .await;
+    let settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.path().join("settings.json")).expect("settings"))
+            .expect("json");
+    assert_eq!(settings["favorite_models"], serde_json::json!([]));
+    terminal.send(b"\x1b").await;
+    terminal
+        .until(|screen| screen.cursor_line() == "› keep")
+        .await;
+    terminal.send(b"\x03/quit\r").await;
+    terminal.finish().await;
+}

@@ -80,6 +80,7 @@ to the editor. Image placeholders preserve their original content and order.
 | `/bookmark [name]` | Name the current boundary, or choose a saved bookmark. |
 | `/name <name>` | Rename the current session. |
 | `/session` | Show the session id and storage directory. |
+| `/favorites [model or clear]` | Choose a saved shortlist for Ctrl+P. A model argument toggles it; `clear` restores cycling through all configured models. |
 | `/model [model]` | Choose or set a configured model. `/model all` shows setup requirements for other models. |
 | `/login [provider]` | Save an API key through a dedicated masked input. |
 | `/logout [provider]` | Remove a saved credential or explicit credential source. |
@@ -117,7 +118,16 @@ can appear in either order. Results rank close matches first and show the
 selection position and result count. Arrow keys wrap; Page Up and Page Down
 move by ten entries. The model picker marks and prioritizes the current model
 and saved default. Ctrl+S selects a model and saves it as the startup default.
-Model cycling uses the configured catalog order and keeps the unsent draft.
+Model cycling keeps the unsent draft. `/favorites` opens a searchable picker;
+Enter toggles a model and saves immediately. The picker keeps its search and
+selection so you can choose several models. The model picker also links to it.
+
+Ctrl+P and Ctrl+Shift+P cycle favorites in the order you added them. Unavailable
+favorites are skipped. When the current model is outside the shortlist, forward
+cycling starts at the first favorite and backward cycling at the last. An empty
+shortlist uses all configured models in catalog order. `/model` continues to show
+all configured models; `/model all` includes setup requirements for the rest.
+Favorites are saved globally as `favorite_models` in `settings.json`.
 
 File completion after `@` searches tracked and unignored files in the current
 Git repository. It inserts a reference for the model. It does not automatically

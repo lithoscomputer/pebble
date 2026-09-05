@@ -16,11 +16,14 @@ use crate::storage;
 #[serde(default)]
 pub(crate) struct Settings {
     pub model:           Option<String>,
+    pub favorite_models: Vec<String>,
     pub reasoning:       Option<ReasoningEffort>,
     pub show_reasoning:  bool,
     pub expand_tools:    bool,
     pub external_editor: Option<String>,
     pub keybindings:     BTreeMap<String, String>,
+    #[serde(flatten)]
+    extra:               BTreeMap<String, serde_json::Value>,
 }
 
 impl Settings {
@@ -34,6 +37,15 @@ impl Settings {
         };
         let settings: Self = serde_json::from_slice(&bytes)
             .with_context(|| format!("parsing {}", path.display()))?;
+        if settings.favorite_models.len() > 256
+            || settings.favorite_models.iter().any(|model| {
+                model.trim().is_empty() || model.len() > 512 || model.chars().any(char::is_control)
+            })
+        {
+            bail!(
+                "favorite_models must contain at most 256 nonempty model selectors, each at most 512 bytes"
+            );
+        }
         for (key, action) in &settings.keybindings {
             if action_key(action).is_none() {
                 bail!("unknown keybinding action {action:?} for {key:?}");

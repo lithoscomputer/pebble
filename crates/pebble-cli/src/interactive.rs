@@ -30,6 +30,7 @@ mod branch;
 mod commands;
 mod dialog;
 mod editor;
+mod favorites;
 mod highlight;
 mod images;
 mod input;
