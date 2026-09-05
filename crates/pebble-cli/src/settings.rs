@@ -90,6 +90,7 @@ fn action_key(action: &str) -> Option<KeyEvent> {
         "newline" => (KeyCode::Enter, KeyModifiers::SHIFT),
         "cancel" => (KeyCode::Esc, KeyModifiers::NONE),
         "quit" => (KeyCode::Char('q'), KeyModifiers::CONTROL),
+        "paste-image" => (KeyCode::Char('v'), KeyModifiers::CONTROL),
         "external-editor" => (KeyCode::Char('g'), KeyModifiers::CONTROL),
         "toggle-tools" => (KeyCode::Char('o'), KeyModifiers::CONTROL),
         "toggle-reasoning" => (KeyCode::Char('t'), KeyModifiers::CONTROL),

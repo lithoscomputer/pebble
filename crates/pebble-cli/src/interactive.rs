@@ -12,7 +12,7 @@ use clap::Args;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use lithos_llm::Client;
 use lithos_llm::middleware::RetryPolicy;
-use pebble_coding_agent::events::CodingEvent;
+use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent};
 use pebble_coding_agent::{CodingInput, SteeringMessage, SteeringOutcome};
 use tokio::fs;
 #[cfg(unix)]
@@ -31,6 +31,7 @@ mod commands;
 mod dialog;
 mod editor;
 mod highlight;
+mod images;
 mod input;
 mod menu;
 mod services;
@@ -121,6 +122,7 @@ struct App {
     menu:             Option<menu::Menu>,
     completion_files: Option<Vec<String>>,
     shell:            Option<shell::Job>,
+    image_job:        Option<images::Job>,
     busy:             bool,
     dirty:            bool,
     quit:             bool,
@@ -299,6 +301,7 @@ async fn start(args: InteractiveArgs) -> Result<()> {
         menu: None,
         completion_files: None,
         shell: None,
+        image_job: None,
         busy: false,
         dirty: true,
         quit: false,
@@ -315,6 +318,11 @@ async fn start(args: InteractiveArgs) -> Result<()> {
         if let Some(prompt) = args.prompt { app.submit(prompt, false).await?; }
         app.run().await
     }.await;
+    let image_shutdown = if let Some(job) = app.image_job.take() {
+        job.shutdown().await
+    } else {
+        Ok(())
+    };
     let shell_shutdown = if let Some(shell) = app.shell.take() {
         shell.shutdown().await
     } else {
@@ -337,6 +345,7 @@ async fn start(args: InteractiveArgs) -> Result<()> {
     drop(temporary);
     shutdown?;
     shell_shutdown?;
+    image_shutdown?;
     result
 }
 
@@ -390,7 +399,7 @@ impl App {
                 }
                 event = worker.events.recv(), if !worker.events_closed => {
                     match event {
-                        Ok(event) => { let output = self.transcript.apply(&event, false); self.output(output)?; }
+                        Ok(event) => self.apply_event(&event, false).await?,
                         Err(broadcast::error::RecvError::Lagged(_)) => self.replay(false).await?,
                         Err(broadcast::error::RecvError::Closed) => {
                             if self.busy { self.terminal.message("The agent closed. Use /resume or /new to continue.")?; }
@@ -399,6 +408,21 @@ impl App {
                             self.dirty = true;
                         }
                     }
+                }
+                result = async { (&mut self.image_job.as_mut().expect("image branch is enabled only while loading").task).await }, if self.image_job.is_some() => {
+                    self.image_job.take();
+                    match result.context("joining image input")? {
+                        Ok(prepared) => {
+                            let marker = self.attachments.attach_image(&prepared.original).await?;
+                            if let Some(preview) = &prepared.preview { self.attachments.save_preview(&marker, preview).await?; }
+                            if self.editor.insert(&marker) {
+                                self.terminal.message("Image attached. Add a prompt, or delete the placeholder to remove it.")?;
+                                self.terminal.image(prepared.preview.as_ref().unwrap_or(&prepared.original))?;
+                            } else { self.terminal.message("The draft is full. Make room and attach the image again.")?; }
+                        }
+                        Err(error) => self.terminal.message(&format!("{error:#}"))?,
+                    }
+                    self.dirty = true;
                 }
                 output = async { self.shell.as_mut().expect("shell branch is enabled only while running").output.recv().await }, if self.shell.is_some() => {
                     if let Some(output) = output { self.terminal.message(&output)?; self.dirty = true; }
@@ -449,6 +473,45 @@ impl App {
         Ok(())
     }
 
+    async fn apply_event(&mut self, event: &CodingAgentEvent, historical: bool) -> Result<()> {
+        let fresh = event.seq > self.transcript.cursor;
+        let output = self.transcript.apply(event, historical);
+        self.output(output)?;
+        if fresh
+            && event.session_id == self.transcript.root
+            && let CodingEvent::UserInput {
+                content: Some(content),
+                ..
+            }
+            | CodingEvent::SteeringInjected {
+                content: Some(content),
+                ..
+            } = &event.event
+        {
+            for part in content.parts() {
+                match self.attachments.preview(part).await {
+                    Ok(Some(image)) => self.terminal.image(&image)?,
+                    Ok(None) => {}
+                    Err(error) => self
+                        .terminal
+                        .message(&format!("Image preview unavailable: {error:#}"))?,
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn start_image(&mut self, source: images::Source) -> Result<()> {
+        if self.image_job.is_some() {
+            self.terminal
+                .message("An image is already loading. Esc cancels it.")?;
+        } else {
+            self.image_job = Some(images::Job::start(source));
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
     async fn replay(&mut self, historical: bool) -> Result<()> {
         let mut reader = self.store.reader().await?;
         while let Some(event) = reader.next().await? {
@@ -469,17 +532,19 @@ impl App {
                     _ => {}
                 }
             }
-            let output = self.transcript.apply(&event, historical);
-            self.output(output)?;
+            self.apply_event(&event, historical).await?;
         }
         Ok(())
     }
 
     fn draw(&mut self) -> Result<()> {
         let mut activity = self.transcript.activity(self.busy, self.terminal.width());
+        if self.image_job.is_some() {
+            activity.push("Loading image · Esc cancels".into());
+        }
         if self.shell.is_some() {
             activity.push("Shell running · Esc cancels".into());
-        } else if !self.busy {
+        } else if !self.busy && self.image_job.is_none() {
             activity.push("Ready".into());
         }
         if let Some(worker) = &self.worker {
@@ -568,6 +633,9 @@ impl App {
             }
             KeyCode::Esc => {
                 self.operation_cancel.cancel();
+                if let Some(job) = &self.image_job {
+                    job.cancel.cancel();
+                }
                 if let Some(shell) = &self.shell {
                     shell.cancel.cancel();
                 }
@@ -601,6 +669,7 @@ impl App {
                     self.terminal.message(&format!("{error:#}"))?;
                 }
             }
+            KeyCode::Char('v') if control => self.start_image(images::Source::Clipboard)?,
             KeyCode::Char('l') if control => {
                 self.command("/model").await?;
             }
@@ -673,6 +742,12 @@ impl App {
     }
 
     async fn submit(&mut self, text: String, follow_up: bool) -> Result<()> {
+        if self.image_job.is_some() {
+            self.editor.restore(&text);
+            self.terminal
+                .message("Wait for the image to load or press Esc to cancel it.")?;
+            return Ok(());
+        }
         if self.shell.is_some() {
             self.editor.restore(&text);
             self.terminal

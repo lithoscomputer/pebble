@@ -9,6 +9,9 @@ use std::process::Command as ProcessCommand;
 use std::time::Duration;
 use std::{env, fs};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
+use lithos_llm::types::{ContentPart, MediaSource};
 use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent};
 use rustix::process::{Signal, setsid};
 use tokio::net::TcpListener;
@@ -875,4 +878,160 @@ async fn clone_fork_tree_and_bookmarks_preserve_original_history() {
     terminal.finish().await;
     server.abort();
     let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clipboard_images_preview_send_export_and_resume_with_original_bytes() {
+    let root = tempfile::tempdir().expect("test directory");
+    let image_path = root.path().join("clipboard.png");
+    fs::write(&image_path, include_bytes!("fixtures/tiny.png")).expect("clipboard fixture");
+    let (url, server) = provider("tests/cmd/scenarios.json").await;
+    let mut terminal = Terminal::start_with_env(
+        &arguments(root.path()),
+        &url,
+        Some("exec-answers-without-tools"),
+        root.path(),
+        &[
+            ("PEBBLE_CLIPBOARD_COMMAND", "cat \"$PEBBLE_PTY_IMAGE\""),
+            (
+                "PEBBLE_PTY_IMAGE",
+                image_path.to_str().expect("fixture path"),
+            ),
+            ("PEBBLE_IMAGE_PROTOCOL", "kitty"),
+        ],
+    );
+    terminal.contains("context ?").await;
+    terminal.send(b"say hello \x16").await;
+    terminal.contains("Image attached.").await;
+    terminal
+        .until(|screen| screen.cursor_line().contains("[image 1]"))
+        .await;
+    assert!(String::from_utf8_lossy(&terminal.output).contains("\x1b_Ga=T,f=100,q=2,C=1,"));
+    terminal.send(b"\r").await;
+    terminal.contains("Hello from the twin.").await;
+    terminal
+        .until(|screen| {
+            screen
+                .live_text()
+                .lines()
+                .any(|line| line.trim() == "Ready")
+        })
+        .await;
+    terminal.send(b"/export images.md\r").await;
+    terminal.contains("Exported").await;
+    let markdown = fs::read_to_string(root.path().join("images.md")).expect("export");
+    assert!(markdown.contains("![Attached image (3 × 2)](data:image/png;base64,"));
+    assert!(!markdown.contains('\x1b'));
+    terminal.send(b"/quit\r").await;
+    terminal.finish().await;
+    let (session, events) = journal(root.path());
+    let content = events
+        .iter()
+        .find_map(|event| {
+            if let CodingEvent::UserInput { content, .. } = &event.event {
+                content.as_ref()
+            } else {
+                None
+            }
+        })
+        .expect("image input");
+    assert!(
+        content
+            .parts()
+            .iter()
+            .any(|part| matches!(part, ContentPart::Image(_)))
+    );
+    let image = content
+        .parts()
+        .iter()
+        .find_map(|part| {
+            if let ContentPart::Image(image) = part {
+                Some(image)
+            } else {
+                None
+            }
+        })
+        .expect("image");
+    let MediaSource::Base64 { data, .. } = &image.source else {
+        panic!("inline image expected")
+    };
+    assert_eq!(
+        STANDARD.decode(data).expect("base64"),
+        include_bytes!("fixtures/tiny.png")
+    );
+    let mut args = arguments(root.path());
+    args.extend([
+        "--resume".into(),
+        session
+            .file_name()
+            .expect("id")
+            .to_string_lossy()
+            .into_owned(),
+    ]);
+    let mut terminal = Terminal::start_with_env(&args, &url, Some("unused"), root.path(), &[(
+        "PEBBLE_IMAGE_PROTOCOL",
+        "iterm2",
+    )]);
+    terminal.contains("Hello from the twin.").await;
+    terminal
+        .until(|screen| {
+            screen
+                .live_text()
+                .lines()
+                .any(|line| line.trim() == "Ready")
+        })
+        .await;
+    assert!(String::from_utf8_lossy(&terminal.output).contains("\x1b]1337;File=inline=1;"));
+    terminal.send(b"/fork\r").await;
+    terminal.contains("Branches and history").await;
+    terminal.send(b"\r").await;
+    terminal.contains("Forked before input").await;
+    terminal
+        .until(|screen| screen.cursor_line().contains("[image 1]"))
+        .await;
+    terminal.send(b"\x03/quit\r").await;
+    terminal.finish().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn clipboard_errors_and_unsupported_graphics_keep_the_draft_usable() {
+    let root = tempfile::tempdir().expect("test directory");
+    fs::write(
+        root.path().join("image.png"),
+        include_bytes!("fixtures/tiny.png"),
+    )
+    .expect("image");
+    fs::write(root.path().join("bad.png"), b"not an image").expect("invalid image");
+    let mut terminal = Terminal::start_with_env(
+        &arguments(root.path()),
+        "http://127.0.0.1:1/v1",
+        Some("unused"),
+        root.path(),
+        &[
+            ("PEBBLE_CLIPBOARD_COMMAND", "exit 1"),
+            ("PEBBLE_IMAGE_PROTOCOL", "none"),
+        ],
+    );
+    terminal.contains("context ?").await;
+    terminal.send(b"keep draft\x16").await;
+    terminal
+        .contains("Image helper found no supported image.")
+        .await;
+    terminal
+        .until(|screen| screen.cursor_line().contains("keep draft"))
+        .await;
+    terminal.send(b"\x03/attach bad.png\r").await;
+    terminal.contains("Invalid image header.").await;
+    terminal.send(b"/attach image.png\r").await;
+    terminal
+        .contains("preview unavailable in this terminal")
+        .await;
+    terminal
+        .until(|screen| screen.cursor_line().contains("[image 1]"))
+        .await;
+    assert!(!String::from_utf8_lossy(&terminal.output).contains("\x1b_Ga=T"));
+    terminal.send(b"\x03/quit\r").await;
+    terminal.finish().await;
 }

@@ -39,36 +39,45 @@ impl Attachments {
         Ok(Self { directory, entries })
     }
 
-    pub(super) async fn attach_image(&mut self, path: &Path) -> Result<String> {
-        let media_type = match path
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str()
-        {
-            "png" => "image/png",
-            "jpg" | "jpeg" => "image/jpeg",
-            "gif" => "image/gif",
-            "webp" => "image/webp",
-            _ => bail!(
-                "Attach a PNG, JPEG, GIF, or WebP image. Reference text files with @ or a path."
-            ),
-        };
-        if fs::metadata(path).await?.len() > 5 * 1024 * 1024 {
-            bail!("Images must be at most 5 MiB.");
-        }
-        let bytes = fs::read(path)
-            .await
-            .with_context(|| format!("reading {}", path.display()))?;
-        if bytes.len() > 5 * 1024 * 1024 {
-            bail!("The image grew past 5 MiB while being read.");
-        }
-        let data = STANDARD.encode(bytes);
+    pub(super) async fn attach_image(&mut self, image: &super::images::Image) -> Result<String> {
         self.register(&ContentPart::Image(ImageContent::new(MediaSource::base64(
-            data, media_type,
+            STANDARD.encode(&image.bytes),
+            image.mime,
         ))))
         .await
+    }
+
+    pub(super) async fn save_preview(
+        &self,
+        marker: &str,
+        image: &super::images::Image,
+    ) -> Result<()> {
+        let file = self
+            .entries
+            .get(marker)
+            .context("unknown attachment marker")?;
+        storage::atomic_write(
+            self.directory.join(format!("{file}.preview.png")),
+            image.bytes.clone(),
+        )
+        .await
+    }
+
+    pub(super) async fn preview(
+        &mut self,
+        part: &ContentPart,
+    ) -> Result<Option<super::images::Image>> {
+        let ContentPart::Image(image) = part else {
+            return Ok(None);
+        };
+        let marker = self.register(part).await?;
+        if let Some(file) = self.entries.get(&marker)
+            && let Ok(bytes) =
+                super::images::read_file(&self.directory.join(format!("{file}.preview.png"))).await
+        {
+            return super::images::Image::parse(bytes).map(Some);
+        }
+        super::images::from_content(image)
     }
 
     /// Restores the exact order of text and media using editable placeholders.

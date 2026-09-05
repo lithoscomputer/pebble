@@ -51,6 +51,7 @@ can print a saved tool result again at the current width.
 | Ctrl+L | Open the model picker. |
 | Ctrl+P / Ctrl+Shift+P | Cycle configured models forward / backward. |
 | Shift+Tab | Cycle reasoning effort. |
+| Ctrl+V | Paste an image from the clipboard. |
 | Ctrl+G | Open the draft in an external editor. |
 | Ctrl+O | Toggle details for running tools. |
 | Ctrl+T | Toggle visible reasoning. |
@@ -88,6 +89,7 @@ to the editor. Image placeholders preserve their original content and order.
 | `/agents [id]` | Choose a subagent and print its saved transcript. |
 | `/skills` | List available skills. Invoke one with `/skill:<name> [input]`. |
 | `/attach <image-path>` | Attach a PNG, JPEG, GIF, or WebP image up to 5 MiB. |
+| `/paste` | Paste a clipboard image. |
 | `/shells [clear]` | Show saved shell results, or drop pending shell context. |
 | `/copy` | Copy the last assistant answer through the system clipboard command. |
 | `/export [path]` | Save Markdown, or the complete event log when the path ends in `.jsonl`. |
@@ -120,6 +122,39 @@ Model cycling uses the configured catalog order and keeps the unsent draft.
 File completion after `@` searches tracked and unignored files in the current
 Git repository. It inserts a reference for the model. It does not automatically
 read the whole file into the prompt. Path completion works outside Git too.
+
+## Images
+
+Copy an image, then press Ctrl+V or enter `/paste`. macOS uses the system
+clipboard through AppleScript. Linux uses `wl-paste` or `xclip`. You can set
+`PEBBLE_CLIPBOARD_COMMAND` to a command that writes image bytes to stdout.
+For example, this supports a custom clipboard bridge over SSH. Ordinary text
+paste still uses your terminal's paste shortcut.
+
+`/attach <path>` reads an image file. Pebble checks its format header, size,
+and dimensions. Images must be no larger than 5 MiB and 64 million pixels.
+Image loading runs while you edit. Escape cancels it. The placeholder enters
+the draft only after loading succeeds. Delete the placeholder to omit the image.
+
+Previews use the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/)
+in Kitty and Ghostty, and the [iTerm2 image protocol](https://iterm2.com/documentation-images.html)
+in iTerm2 and WezTerm. Other terminals show dimensions and a text label.
+Previews are disabled by default inside tmux and screen. Set
+`PEBBLE_IMAGE_PROTOCOL=kitty`, `iterm2`, or `none` to override detection.
+Graphics stay in normal scrollback above the editor. The terminal controls how
+long it retains them. Very small terminal windows use text labels.
+
+PNG previews need no converter. For other formats, macOS uses its `sips` tool;
+Linux can use an installed ImageMagick `magick` command. A conversion failure
+keeps the original attachment usable. iTerm2 can display the original format;
+Kitty needs a PNG preview. Preview conversion may resize to 1024 pixels; the
+original bytes sent to the model stay unchanged.
+
+Submitted images and cached previews survive resume and branching. Markdown
+exports embed the original image as a data URL; JSONL exports retain the original
+content parts. Remote image URLs are not fetched for previews. Clipboard and
+conversion helpers have a three-second timeout per invocation and bounded output.
+Tests use fixture clipboard commands and never read your clipboard.
 
 ## Shell commands
 
@@ -205,7 +240,7 @@ character or a name such as `enter`, `esc`, `up`, or `tab`. Supported actions
 are `submit`, `follow-up`, `newline`, `cancel`, `quit`, `external-editor`,
 `toggle-tools`, `toggle-reasoning`, `recover-input`, `complete`, `history-up`,
 `history-down`, `undo`, `suspend`, `model-picker`, `next-model`,
-`previous-model`, and `cycle-thinking`. Remapping applies to the main editor;
+`previous-model`, `cycle-thinking`, and `paste-image`. Remapping applies to the main editor;
 approval and question controls keep their displayed bindings.
 
 Without an editor preference, Pebble uses `VISUAL`, then `EDITOR`, then `vi`.

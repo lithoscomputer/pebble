@@ -9,7 +9,8 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail};
 use crossterm::event::KeyEvent;
 use lithos_llm::Client;
-use lithos_llm::types::ReasoningEffort;
+use lithos_llm::types::{ContentPart, ReasoningEffort};
+use pebble_coding_agent::events::CodingEvent;
 #[cfg(unix)]
 use rustix::process::{Signal, getpid, kill_process};
 use tokio::fs;
@@ -59,6 +60,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     ("/export", "Export the transcript"),
     ("/editor", "Edit the prompt externally"),
+    ("/paste", "Paste a clipboard image (Ctrl+V)"),
     ("/attach", "Attach an image to the prompt"),
     ("/settings", "Saved preferences and keybindings"),
     ("/suspend", "Suspend and return to the shell"),
@@ -189,7 +191,7 @@ impl App {
                         .collect::<Vec<_>>()
                         .join("\n"),
                 )?;
-                self.terminal.message("\n!command: shell result in next prompt · !!command: shell without model context\nEnter: send/steer · Alt+Enter: follow-up · Shift+Enter or Ctrl+J: newline\nEsc: cancel · Ctrl+G: editor · Ctrl+O: live tools · Ctrl+T: reasoning\nTab: completion · Ctrl+L: models · Ctrl+P: next model · Shift+Tab: thinking\nAlt+Up: recover queued input · Ctrl+_: undo\nCtrl+Z: suspend · Ctrl+C: clear; press twice to quit · Ctrl+D: quit with an empty editor")?;
+                self.terminal.message("\n!command: shell result in next prompt · !!command: shell without model context\nEnter: send/steer · Alt+Enter: follow-up · Shift+Enter or Ctrl+J: newline\nEsc: cancel · Ctrl+G: editor · Ctrl+V: paste image · Ctrl+O: live tools · Ctrl+T: reasoning\nTab: completion · Ctrl+L: models · Ctrl+P: next model · Shift+Tab: thinking\nAlt+Up: recover queued input · Ctrl+_: undo\nCtrl+Z: suspend · Ctrl+C: clear; press twice to quit · Ctrl+D: quit with an empty editor")?;
             }
             "/quit" => {
                 if !argument.is_empty() {
@@ -424,15 +426,11 @@ impl App {
                 if argument.is_empty() {
                     bail!("usage: /attach <image path>");
                 }
-                let marker = self
-                    .attachments
-                    .attach_image(&self.metadata.cwd.join(argument))
-                    .await?;
-                self.editor.insert(&marker);
-                self.terminal.message(
-                    "Image attached. Add a prompt, or delete the placeholder to remove it.",
-                )?;
+                self.start_image(super::images::Source::File(
+                    self.metadata.cwd.join(argument),
+                ))?;
             }
+            "/paste" => self.start_image(super::images::Source::Clipboard)?,
             "/copy" => self.copy_answer().await?,
             "/editor" => self.external_editor().await?,
             "/suspend" => self.suspend().await?,
@@ -501,7 +499,7 @@ impl App {
             .context("the coding agent is unavailable")
     }
     fn require_idle(&self) -> Result<()> {
-        if self.busy || self.shell.is_some() {
+        if self.busy || self.shell.is_some() || self.image_job.is_some() {
             bail!("Wait for the current work to finish, or press Esc to cancel it.");
         }
         Ok(())
@@ -900,7 +898,6 @@ impl App {
     }
 
     async fn tool_details(&mut self, selected: &str) -> Result<()> {
-        use pebble_coding_agent::events::CodingEvent;
         let mut reader = self.store.reader().await?;
         let mut found = false;
         let mut call = None;
@@ -1019,6 +1016,23 @@ impl App {
                         super::Output::Text(text) | super::Output::Markdown(text) => {
                             markdown.push_str(&text::plain(&text));
                             markdown.push_str("\n\n");
+                        }
+                    }
+                }
+                if let CodingEvent::UserInput {
+                    content: Some(content),
+                    ..
+                }
+                | CodingEvent::SteeringInjected {
+                    content: Some(content),
+                    ..
+                } = &event.event
+                {
+                    for part in content.parts() {
+                        if let ContentPart::Image(image) = part
+                            && let Some(image) = super::images::markdown(image)?
+                        {
+                            markdown.push_str(&image);
                         }
                     }
                 }

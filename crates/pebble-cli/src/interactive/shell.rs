@@ -136,9 +136,9 @@ impl Job {
 
 // The process group is owned by this invocation. Background descendants must
 // not outlive it, including when a pipe read fails or this future is dropped.
-struct ProcessGroup(Option<u32>);
+pub(super) struct ProcessGroup(pub(super) Option<u32>);
 impl ProcessGroup {
-    fn terminate(&self) {
+    pub(super) fn terminate(&self) {
         #[cfg(unix)]
         if let Some(pid) = self
             .0
@@ -211,6 +211,8 @@ async fn execute(
             result = child.wait(), if status.is_none() => {
                 let exit = result?;
                 status = Some(exit.code().map_or_else(|| "terminated by signal".into(), |code| format!("exit {code}")));
+                if let Some(group) = &group { group.terminate(); }
+                sleep(Duration::from_millis(100)).await;
                 drop(group.take()); continue;
             }
             result = stdout.read(&mut out), if out_open => { let count = result?; out_open = count != 0; &out[..count] }

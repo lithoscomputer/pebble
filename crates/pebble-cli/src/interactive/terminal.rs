@@ -15,6 +15,7 @@ use crossterm::{execute, queue};
 use termimad::MadSkin;
 
 use super::editor::Editor;
+use super::images::{Image, Protocol};
 use super::{highlight, text};
 
 pub(super) struct Terminal {
@@ -171,6 +172,48 @@ impl Terminal {
         .map(|line| format!("  {line}"))
         .collect::<Vec<_>>();
         self.append_rows(rows.iter().map(String::as_str))
+    }
+
+    pub(super) fn image(&mut self, image: &Image) -> io::Result<()> {
+        self.refresh_size()?;
+        let (columns, rows) =
+            image.cells(self.width.saturating_sub(2), self.height.saturating_sub(4));
+        let encoded = if self.width >= 4 && self.height >= 6 {
+            Protocol::detect().and_then(|protocol| image.encode(protocol, columns, rows))
+        } else {
+            None
+        };
+        self.message(&format!(
+            "Image · {} × {} · {}{}",
+            image.width,
+            image.height,
+            image.mime,
+            if encoded.is_none() {
+                " · preview unavailable in this terminal"
+            } else {
+                ""
+            }
+        ))?;
+        if let Some(encoded) = encoded {
+            // Reserve real scrollback rows before placing graphics. Subsequent
+            // prompt redraws start below these rows and do not erase the image.
+            self.append_rows((0..rows).map(|_| ""))?;
+            queue!(
+                self.output,
+                BeginSynchronizedUpdate,
+                Hide,
+                MoveTo(0, self.anchor.saturating_sub(rows))
+            )?;
+            self.output.write_all(encoded.as_bytes())?;
+            queue!(
+                self.output,
+                MoveTo(0, self.anchor),
+                Show,
+                EndSynchronizedUpdate
+            )?;
+            self.output.flush()?;
+        }
+        Ok(())
     }
 
     pub(super) fn message(&mut self, message: &str) -> io::Result<()> {
