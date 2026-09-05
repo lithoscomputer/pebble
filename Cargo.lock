@@ -1390,6 +1390,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "similar 2.7.0",
  "tempfile",
  "termimad",
  "tokio",

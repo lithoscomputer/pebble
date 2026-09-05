@@ -6,7 +6,7 @@ use std::mem;
 use lithos_llm::types::ContentPart;
 use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent};
 
-use super::text;
+use super::{text, tool_render};
 
 const OUTPUT_PREVIEW_BYTES: usize = 32 * 1024;
 const MAX_TOOL_RECORDS: usize = 200;
@@ -14,6 +14,7 @@ const MAX_TOOL_RECORDS: usize = 200;
 pub(super) enum Output {
     Text(String),
     Markdown(String),
+    Code { source: String, language: String },
 }
 
 #[derive(Clone)]
@@ -185,8 +186,8 @@ impl Transcript {
                 if root {
                     self.phase = format!("Running {tool_name}");
                     output.push(Output::Text(format!(
-                        "  {tool_name} {}",
-                        text::truncate(&arguments, 140)
+                        "  {}",
+                        tool_render::heading(tool_name, &arguments)
                     )));
                 }
             }
@@ -211,16 +212,11 @@ impl Transcript {
                     tool.output.clear();
                     append_tail(&mut tool.output, &result);
                     if root {
-                        let state = if *is_error { "failed" } else { "done" };
-                        output.push(Output::Text(format!("  {} · {state}", tool.name)));
-                        let safe = text::plain(&tool.output);
-                        let preview = if *is_error { 8 } else { 3 };
-                        for line in safe.lines().take(preview) {
-                            output.push(Output::Text(format!("    {}", text::truncate(line, 180))));
-                        }
-                        if safe.lines().count() > preview || *output_bytes_omitted > 0 {
-                            output.push(Output::Text("    … /tools shows retained details".into()));
-                        }
+                        output.extend(tool_render::result(
+                            tool,
+                            Some(if *is_error { 12 } else { 10 }),
+                            *output_bytes_omitted,
+                        ));
                     }
                 }
             }

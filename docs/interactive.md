@@ -24,8 +24,12 @@ capture the mouse or clear terminal scrollback.
 
 Markdown paragraphs, code blocks, and tables receive terminal styling. The
 unfinished response stays near the editor until it can be printed. Very long
-unfinished blocks use plain text. Code blocks do not yet have language-specific
-syntax colors. Old output keeps its printed layout after a resize. `/tools`
+unfinished blocks use plain text. Code blocks use basic lexical colors for Rust, JavaScript/TypeScript, Python,
+shell, JSON, TOML, YAML, Go, C/C++, and Java. Unknown languages stay plain.
+Edit previews show removed and added lines; failed edits show the error.
+Tool headings show the file or command, with ten retained output lines by default.
+`/tools` prints the retained result and any saved output chunks with the same styling.
+`NO_COLOR` disables syntax and diff colors. Old output keeps its printed layout after a resize. `/tools`
 can print a saved tool result again at the current width.
 
 ## Input

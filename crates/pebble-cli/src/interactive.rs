@@ -29,6 +29,7 @@ mod attachments;
 mod commands;
 mod dialog;
 mod editor;
+mod highlight;
 mod input;
 mod menu;
 mod services;
@@ -37,6 +38,7 @@ use crate::settings;
 mod store;
 mod terminal;
 mod text;
+mod tool_render;
 mod transcript;
 mod worker;
 
@@ -421,6 +423,7 @@ impl App {
             match item {
                 Output::Text(text) => self.terminal.message(&text)?,
                 Output::Markdown(text) => self.terminal.markdown(&text)?,
+                Output::Code { source, language } => self.terminal.code(&source, &language)?,
             }
         }
         self.dirty = true;

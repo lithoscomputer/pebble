@@ -619,3 +619,50 @@ async fn automatic_completion_keeps_typing_and_cancellation_in_the_editor() {
             .any(|event| matches!(event.event, CodingEvent::UserInput { .. }))
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn patches_render_colored_diffs_and_export_plain_markdown() {
+    let root = tempfile::tempdir().unwrap();
+    fs::create_dir(root.path().join("src")).unwrap();
+    fs::write(
+        root.path().join("src/lib.rs"),
+        "fn hello() {\n    println!(\"old\");\n}\n",
+    )
+    .unwrap();
+    let (url, server) = provider("tests/cmd/scenarios.json").await;
+    let mut terminal = Terminal::start_with_env(
+        &arguments(root.path()),
+        &url,
+        Some("exec_patches_a_file_as_gpt56"),
+        root.path(),
+        &[("PEBBLE_PTY_COLOR", "1")],
+    );
+    terminal.contains("Ready").await;
+    terminal.send(b"patch lib.rs\r").await;
+    terminal.contains("Patched lib.rs.").await;
+    terminal
+        .until(|screen| {
+            screen
+                .live_text()
+                .lines()
+                .any(|line| line.trim() == "Ready")
+        })
+        .await;
+    let screen = terminal.screen.text();
+    assert!(screen.contains("-    println!(\"old\");"));
+    assert!(screen.contains("+    println!(\"new\");"));
+    assert!(String::from_utf8_lossy(&terminal.output).contains("\x1b[31m"));
+    assert!(String::from_utf8_lossy(&terminal.output).contains("\x1b[32m"));
+    terminal.send(b"/tools call_patch\r").await;
+    terminal.contains("Tool call call_patch").await;
+    terminal.send(b"/export diff.md\r").await;
+    terminal.contains("Exported").await;
+    terminal.send(b"/quit\r").await;
+    terminal.finish().await;
+    let markdown = fs::read_to_string(root.path().join("diff.md")).unwrap();
+    assert!(markdown.contains("```diff"));
+    assert!(markdown.contains("+    println!(\"new\");"));
+    assert!(!markdown.contains('\x1b'));
+    server.abort();
+    let _ = server.await;
+}

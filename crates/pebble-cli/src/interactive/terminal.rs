@@ -15,7 +15,7 @@ use crossterm::{execute, queue};
 use termimad::MadSkin;
 
 use super::editor::Editor;
-use super::text;
+use super::{highlight, text};
 
 pub(super) struct Terminal {
     output:        io::Stdout,
@@ -103,15 +103,74 @@ impl Terminal {
     }
 
     pub(super) fn markdown(&mut self, markdown: &str) -> io::Result<()> {
-        self.refresh_size()?;
         let safe = text::plain(markdown);
+        let mut prose = String::new();
+        let mut fence: Option<(char, usize, String, String)> = None;
+        for line in safe.split_inclusive('\n') {
+            let trimmed = line.trim_start();
+            let marker = trimmed.chars().next().filter(|c| matches!(c, '`' | '~'));
+            let count = marker.map_or(0, |marker| {
+                trimmed.chars().take_while(|c| *c == marker).count()
+            });
+            if let Some((opening, length, language, source)) = &mut fence {
+                if marker == Some(*opening)
+                    && count >= *length
+                    && trimmed[count..].trim().is_empty()
+                {
+                    self.code(source.trim_end_matches('\n'), language)?;
+                    fence = None;
+                } else {
+                    source.push_str(line);
+                }
+            } else if count >= 3 && line.len() - trimmed.len() <= 3 {
+                self.prose(&prose)?;
+                prose.clear();
+                fence = Some((
+                    marker.expect("a fence has a marker"),
+                    count,
+                    trimmed[count..]
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .into(),
+                    String::new(),
+                ));
+            } else {
+                prose.push_str(line);
+            }
+        }
+        if let Some((_, _, language, source)) = fence {
+            self.code(&source, &language)?;
+        }
+        self.prose(&prose)
+    }
+
+    fn prose(&mut self, safe: &str) -> io::Result<()> {
+        if safe.is_empty() {
+            return Ok(());
+        }
+        self.refresh_size()?;
         let width = self.width();
         let rendered = if width >= 3 {
-            self.skin.text(&safe, Some(width)).to_string()
+            self.skin.text(safe, Some(width)).to_string()
         } else {
-            safe
+            safe.into()
         };
         self.append_rows(rendered.lines())
+    }
+
+    pub(super) fn code(&mut self, source: &str, language: &str) -> io::Result<()> {
+        self.refresh_size()?;
+        let rows = highlight::code(
+            source,
+            language,
+            self.width().saturating_sub(2).max(1),
+            self.color,
+        )
+        .into_iter()
+        .map(|line| format!("  {line}"))
+        .collect::<Vec<_>>();
+        self.append_rows(rows.iter().map(String::as_str))
     }
 
     pub(super) fn message(&mut self, message: &str) -> io::Result<()> {

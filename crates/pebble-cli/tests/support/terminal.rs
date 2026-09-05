@@ -97,6 +97,9 @@ impl Terminal {
             command.env("OPENAI_API_KEY", namespace);
         }
         command.envs(extra.iter().copied());
+        if extra.contains(&("PEBBLE_PTY_COLOR", "1")) {
+            command.env_remove("NO_COLOR");
+        }
         if let Some(profile) = env::var_os("LLVM_PROFILE_FILE") {
             command.env("LLVM_PROFILE_FILE", profile);
         }

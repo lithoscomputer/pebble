@@ -1,6 +1,7 @@
 //! Slash commands and small searchable pickers inside the live area.
 
 use std::env;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -20,7 +21,8 @@ use tokio_util::sync::CancellationToken;
 use super::input::Input;
 use super::menu::{Menu, MenuAction, Purpose, score};
 use super::setup::Login;
-use super::{App, Command, Store, Transcript, Worker, text};
+use super::transcript::ToolRecord;
+use super::{App, Command, Store, Transcript, Worker, text, tool_render};
 use crate::application::{model_choices, model_route};
 use crate::credentials::{AuthStore, accepts_api_key};
 use crate::secret_input::Action;
@@ -852,6 +854,7 @@ impl App {
         use pebble_coding_agent::events::CodingEvent;
         let mut reader = self.store.reader().await?;
         let mut found = false;
+        let mut call = None;
         while let Some(event) = reader.next().await? {
             let id = match &event.event {
                 CodingEvent::ToolCallStarted { tool_call_id, .. }
@@ -872,28 +875,43 @@ impl App {
                     arguments,
                     ..
                 } => {
-                    self.terminal.message(&format!(
-                        "\n{tool_name} · {id}\n{}",
-                        serde_json::to_string_pretty(&arguments)?
-                    ))?;
+                    self.terminal.message(&format!("\nTool call {id}"))?;
+                    call = Some(ToolRecord {
+                        id:        id.into(),
+                        session:   event.session_id.clone(),
+                        name:      tool_name.clone(),
+                        arguments: arguments
+                            .as_str()
+                            .map_or_else(|| arguments.to_string(), str::to_owned),
+                        output:    String::new(),
+                        complete:  false,
+                        failed:    false,
+                    });
                     found = true;
                 }
                 CodingEvent::ToolCallCompleted {
                     output,
                     output_bytes_omitted,
+                    is_error,
                     ..
                 } => {
-                    self.terminal
-                        .message(output.as_str().unwrap_or(&output.to_string()))?;
-                    if *output_bytes_omitted > 0 {
-                        self.terminal.message(&format!(
-                            "[{output_bytes_omitted} bytes were not retained by the tool]"
-                        ))?;
+                    if let Some(mut tool) = call.take() {
+                        tool.complete = true;
+                        tool.failed = *is_error;
+                        tool.output = output
+                            .as_str()
+                            .map_or_else(|| output.to_string(), str::to_owned);
+                        self.output(tool_render::result(&tool, None, *output_bytes_omitted))?;
                     }
                 }
+                // Delta chunks are retained independently of the final tool result.
                 CodingEvent::ToolCallOutputDelta { delta } => self.terminal.message(delta)?,
                 _ => {}
             }
+        }
+        if let Some(tool) = call {
+            self.terminal
+                .message(&tool_render::heading(&tool.name, &tool.arguments))?;
         }
         if !found {
             bail!("No saved tool call matches {selected}.");
@@ -930,6 +948,25 @@ impl App {
             while let Some(event) = reader.next().await? {
                 for output in projection.apply(&event, true) {
                     match output {
+                        super::Output::Code { source, language } => {
+                            let longest = source
+                                .lines()
+                                .map(|line| {
+                                    line.trim_start().chars().take_while(|c| *c == '`').count()
+                                })
+                                .max()
+                                .unwrap_or(0);
+                            let fence = "`".repeat((longest + 1).max(3));
+                            let language: String = language
+                                .chars()
+                                .filter(char::is_ascii_alphanumeric)
+                                .collect();
+                            write!(
+                                markdown,
+                                "{fence}{language}\n{}\n{fence}\n\n",
+                                text::plain(&source)
+                            )?;
+                        }
                         super::Output::Text(text) | super::Output::Markdown(text) => {
                             markdown.push_str(&text::plain(&text));
                             markdown.push_str("\n\n");
