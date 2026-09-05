@@ -27,6 +27,7 @@ use super::{App, Command, Store, Transcript, Worker, text, tool_render};
 use crate::application::{model_choices, model_route};
 use crate::credentials::{AuthStore, accepts_api_key};
 use crate::secret_input::Action;
+use crate::settings::project;
 use crate::storage;
 
 const COMMANDS: &[(&str, &str)] = &[
@@ -66,7 +67,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/editor", "Edit the prompt externally"),
     ("/paste", "Paste a clipboard image (Ctrl+V)"),
     ("/attach", "Attach an image to the prompt"),
-    ("/settings", "Saved preferences and keybindings"),
+    (
+        "/settings",
+        "Saved preferences; /settings project saves repo defaults",
+    ),
     ("/suspend", "Suspend and return to the shell"),
     ("/quit", "Save and exit"),
 ];
@@ -446,15 +450,22 @@ impl App {
             "/editor" => self.external_editor().await?,
             "/suspend" => self.suspend().await?,
             "/settings" if argument.is_empty() => {
-                self.terminal
-                    .message(&format!("Preferences: {}", self.settings_path.display()))?;
+                self.terminal.message(&format!(
+                    "Global preferences: {}\nProject defaults: {}",
+                    self.settings_path.display(),
+                    project::path(&self.metadata.cwd).await?.display()
+                ))?;
                 self.menu = Some(Menu::new(Purpose::Settings, vec![
                     (
-                        format!("Use {} at startup", self.metadata.model),
+                        "Save this model and reasoning level for this project".into(),
+                        "project".into(),
+                    ),
+                    (
+                        format!("Use {} as the global default", self.metadata.model),
                         "model".into(),
                     ),
                     (
-                        "Use the current reasoning level at startup".into(),
+                        "Use the current reasoning level as the global default".into(),
                         "reasoning".into(),
                     ),
                     (
@@ -480,6 +491,16 @@ impl App {
                         "tools".into(),
                     ),
                 ]));
+            }
+            "/settings" if argument == "project" => {
+                let path = project::save(
+                    &self.metadata.cwd,
+                    &self.metadata.model,
+                    self.metadata.reasoning,
+                )
+                .await?;
+                self.terminal
+                    .message(&format!("Saved project defaults: {}", path.display()))?;
             }
             "/settings" => {
                 match argument {

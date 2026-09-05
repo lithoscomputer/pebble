@@ -185,19 +185,26 @@ async fn start(args: InteractiveArgs) -> Result<()> {
     } else {
         None
     };
+    let defaults = settings::project::load(
+        checkpoint
+            .as_ref()
+            .map_or(cwd.as_path(), |saved| saved.metadata.cwd.as_path()),
+        &settings,
+    )
+    .await?;
     let needs_model_choice =
-        checkpoint.is_none() && args.model.is_none() && settings.model.is_none();
+        checkpoint.is_none() && args.model.is_none() && defaults.model.is_none();
     let mut metadata = checkpoint.as_ref().map_or_else(
         || Metadata {
             id: store.id(),
             name: args.name.clone().unwrap_or_else(|| "New session".into()),
             cwd,
-            model: settings
+            model: defaults
                 .model
                 .clone()
                 .unwrap_or_else(|| DEFAULT_MODEL.into()),
             permission: PermissionArg::ReadWrite,
-            reasoning: settings.reasoning,
+            reasoning: defaults.reasoning,
             subagents: args.subagents,
             instructions: args.instructions.clone(),
             approvals: !args.no_approvals,

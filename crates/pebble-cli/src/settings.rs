@@ -12,6 +12,8 @@ use tokio::fs;
 
 use crate::storage;
 
+pub(crate) mod project;
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Settings {

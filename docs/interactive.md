@@ -95,7 +95,7 @@ to the editor. Image placeholders preserve their original content and order.
 | `/copy` | Copy the last assistant answer through the system clipboard command. |
 | `/export [path]` | Save Markdown, or the complete event log when the path ends in `.jsonl`. |
 | `/editor` | Open the draft in the external editor. |
-| `/settings` | Save the current model, reasoning effort, and display preferences. |
+| `/settings` | Save global preferences. `/settings project` saves the current model and reasoning for this repo. |
 | `/suspend` | Suspend on Unix. |
 | `/quit` | Save and exit. |
 
@@ -227,7 +227,7 @@ and event number in the checkpoint metadata.
 
 ## Preferences
 
-Preferences live in `~/.pebble/settings.json`, or `PEBBLE_HOME/settings.json`.
+Global preferences live in `~/.pebble/settings.json`, or `PEBBLE_HOME/settings.json`.
 `--sessions-dir` does not move them. `/settings` saves common choices. Edit
 this file to set an external editor or remap keys:
 
@@ -244,6 +244,19 @@ this file to set an external editor or remap keys:
   }
 }
 ```
+
+Use `/settings project` to save the active model and reasoning level in
+`.pebble/settings.json`. Pebble finds this file from subdirectories within the
+same Git repository, including worktrees. The nearest file wins. When there is
+no project file, the command creates one at the Git root. Outside Git, it uses
+the working directory. Saving preserves unrelated keys in the file.
+
+Project `model` and `reasoning` override global startup defaults in interactive
+mode and `pebble exec`. An explicit `--model` wins over these defaults and a
+resumed session keeps its saved model and reasoning. Missing project fields
+inherit global defaults; `"reasoning": null` selects the model's default effort.
+Only model and reasoning are read from the project file. Credentials,
+keybindings, and external editor commands remain global preferences.
 
 Key names use modifiers in this order: `ctrl+`, `alt+`, `shift+`, then a
 character or a name such as `enter`, `esc`, `up`, or `tab`. Supported actions

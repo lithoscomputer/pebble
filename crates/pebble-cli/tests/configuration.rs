@@ -13,6 +13,53 @@ use twin_openai::config::Config;
 
 const KEY: &str = "exec-answers-without-tools";
 
+#[tokio::test]
+async fn exec_applies_project_defaults_and_explicit_model_precedence() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = home.path().join("repo");
+    let nested = repo.join("src");
+    fs::create_dir_all(&nested).unwrap();
+    fs::create_dir(repo.join(".git")).unwrap();
+    fs::create_dir(repo.join(".pebble")).unwrap();
+    fs::write(
+        home.path().join("settings.json"),
+        r#"{"model":"invalid-global"}"#,
+    )
+    .unwrap();
+    let path = repo.join(".pebble/settings.json");
+    fs::write(&path, r#"{"model":"gpt-5.6","reasoning":"high"}"#).unwrap();
+    let (url, server) = provider().await;
+    let output = command(home.path(), &url)
+        .env("OPENAI_API_KEY", KEY)
+        .args(["exec", "say hello", "--quiet", "--cwd"])
+        .arg(&nested)
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(success(output), "Hello from the twin.\n");
+    server.abort();
+    let _ = server.await;
+    let (url, server) = provider().await;
+    fs::write(&path, r#"{"model":"invalid-project","reasoning":null}"#).unwrap();
+    let output = command(home.path(), &url)
+        .env("OPENAI_API_KEY", KEY)
+        .args([
+            "exec",
+            "say hello",
+            "--quiet",
+            "--model",
+            "gpt-5.6",
+            "--cwd",
+        ])
+        .arg(&nested)
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(success(output), "Hello from the twin.\n");
+    server.abort();
+    let _ = server.await;
+}
+
 fn command(home: &Path, url: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_pebble"));
     command

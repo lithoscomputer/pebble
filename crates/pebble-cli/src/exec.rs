@@ -20,6 +20,7 @@ use tokio::signal::ctrl_c;
 
 use crate::application::{Application, DEFAULT_MODEL, PermissionArg, model_route};
 use crate::render::{Renderer, Style};
+use crate::settings::project;
 
 /// The exit status when the prompt was interrupted or timed out.
 const INTERRUPTED: u8 = 130;
@@ -94,9 +95,10 @@ async fn exec(args: ExecArgs, style: Style) -> Result<Ending> {
 
     let replay = RetryPolicy::exponential().max_attempts(4);
     let application = Application::load(replay).await?;
+    let defaults = project::load(&args.cwd, &application.settings).await?;
     let model = args
         .model
-        .or(application.settings.model)
+        .or(defaults.model)
         .unwrap_or_else(|| DEFAULT_MODEL.into());
     let route = model_route(&application.client, &model)?;
     application.auth.resolve(route.provider()).await?;
@@ -110,7 +112,7 @@ async fn exec(args: ExecArgs, style: Style) -> Result<Ending> {
 
     let mut options = CodingAgentOptions::default()
         .with_turn_replay(replay)
-        .with_reasoning_effort(application.settings.reasoning);
+        .with_reasoning_effort(defaults.reasoning);
     if let Some(timeout) = args.timeout {
         options = options.with_wall_clock_timeout(timeout);
     }

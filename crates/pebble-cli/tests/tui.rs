@@ -68,6 +68,75 @@ fn arguments(root: &Path) -> Vec<String> {
     ]
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn project_defaults_save_separately_and_do_not_replace_resumed_session_choices() {
+    let root = tempfile::tempdir().unwrap();
+    let nested = root.path().join("src");
+    fs::create_dir(&nested).unwrap();
+    fs::create_dir(root.path().join(".git")).unwrap();
+    fs::create_dir(root.path().join(".pebble")).unwrap();
+    let global_path = root.path().join("settings.json");
+    let global = r#"{"model":"openai/gpt-5.6-sol","reasoning":"low","keep":true}"#;
+    fs::write(&global_path, global).unwrap();
+    let project_path = root.path().join(".pebble/settings.json");
+    fs::write(
+        &project_path,
+        r#"{"model":"openai/gpt-5.6-terra","reasoning":"high","keep":42}"#,
+    )
+    .unwrap();
+    let args = without_model(arguments(&nested));
+    let url = "http://127.0.0.1:1/v1";
+    let mut terminal = Terminal::start_with_env(&args, url, Some("fixture-key"), root.path(), &[]);
+    terminal.contains("gpt-5.6-terra · high").await;
+    terminal.send(b"/thinking default\r").await;
+    terminal
+        .until(|screen| {
+            screen.live_text().contains("gpt-5.6-terra · 0 in")
+                && screen.live_text().contains("Ready")
+        })
+        .await;
+    terminal.send(b"/settings project\r").await;
+    terminal.contains("Saved project defaults:").await;
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(&project_path).unwrap()).unwrap();
+    assert_eq!(saved["model"], "openai/gpt-5.6-terra");
+    assert_eq!(saved["reasoning"], serde_json::Value::Null);
+    assert_eq!(saved["keep"], 42);
+    assert_eq!(fs::read_to_string(&global_path).unwrap(), global);
+    // Saving a global display preference must not copy project defaults into it.
+    terminal.send(b"/settings show-reasoning\r").await;
+    terminal.contains("Saved preferences.").await;
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(&global_path).unwrap()).unwrap();
+    assert_eq!(saved["model"], "openai/gpt-5.6-sol");
+    assert_eq!(saved["reasoning"], "low");
+    assert_eq!(saved["keep"], true);
+    terminal.send(b"/quit\r").await;
+    terminal.finish().await;
+    let (session, _) = journal(&nested);
+    fs::write(
+        &project_path,
+        r#"{"model":"openai/gpt-6-astra","reasoning":"low"}"#,
+    )
+    .unwrap();
+    let mut resume = args;
+    resume.extend([
+        "--resume".into(),
+        session.file_name().unwrap().to_string_lossy().into_owned(),
+    ]);
+    let mut terminal =
+        Terminal::start_with_env(&resume, url, Some("fixture-key"), root.path(), &[]);
+    terminal.contains("gpt-5.6-terra · 0 in").await;
+    terminal.send(b"/quit\r").await;
+    terminal.finish().await;
+    resume.extend(["--model".into(), "gpt-5.6-sol".into()]);
+    let mut terminal =
+        Terminal::start_with_env(&resume, url, Some("fixture-key"), root.path(), &[]);
+    terminal.contains("gpt-5.6-sol · 0 in").await;
+    terminal.send(b"/quit\r").await;
+    terminal.finish().await;
+}
+
 fn journal(root: &Path) -> (PathBuf, Vec<CodingAgentEvent>) {
     let session = fs::read_dir(root.join("sessions"))
         .expect("session directory")
