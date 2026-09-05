@@ -35,6 +35,7 @@ mod highlight;
 mod images;
 mod input;
 mod menu;
+mod reload;
 mod services;
 mod setup;
 mod shell;
@@ -324,7 +325,7 @@ async fn start(args: InteractiveArgs) -> Result<()> {
         app.replay(true).await?;
         if recovered { let output = app.transcript.interrupted(); app.output(output)?; app.terminal.message("Recovered the last saved checkpoint. Later work is shown in the transcript but will not be rerun.")?; }
         if let Some(prompt) = args.prompt { app.submit(prompt, false).await?; }
-        app.run().await
+        Box::pin(app.run()).await
     }.await;
     let image_shutdown = if let Some(job) = app.image_job.take() {
         job.shutdown().await
@@ -680,6 +681,9 @@ impl App {
             KeyCode::Char('v') if control => self.start_image(images::Source::Clipboard)?,
             KeyCode::Char('l') if control => {
                 self.command("/model").await?;
+            }
+            KeyCode::Char('r') if control => {
+                self.command("/reload").await?;
             }
             KeyCode::Char('p' | 'P') if control => {
                 if let Err(error) = self

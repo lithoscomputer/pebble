@@ -3,12 +3,17 @@
 #![cfg(unix)]
 
 use std::io::{self, Write as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::{env, fs};
+use std::{env, fs, iter};
 
+use axum::body::{Body, to_bytes};
+use axum::extract::Request as HttpRequest;
+use axum::middleware::{Next, from_fn};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use lithos_llm::types::{ContentPart, MediaSource};
@@ -55,6 +60,255 @@ async fn provider(scenarios: &str) -> (String, JoinHandle<()>) {
         axum::serve(listener, app).await.expect("serve provider");
     });
     (url, task)
+}
+
+async fn recording_provider(
+    requests: Arc<Mutex<Vec<serde_json::Value>>>,
+) -> (String, JoinHandle<()>) {
+    let mut config = Config::from_lookup(&|_| None).expect("fixture configuration");
+    config.scenarios_path =
+        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/tui/reload.json"));
+    let app = twin_openai::build_app_with_config(config)
+        .expect("fixture app")
+        .layer(from_fn(move |request: HttpRequest, next: Next| {
+            let requests = requests.clone();
+            async move {
+                let (parts, body) = request.into_parts();
+                let bytes = to_bytes(body, 4 * 1024 * 1024).await.expect("request body");
+                requests
+                    .lock()
+                    .expect("request lock")
+                    .push(serde_json::from_slice(&bytes).expect("JSON request"));
+                next.run(HttpRequest::from_parts(parts, Body::from(bytes)))
+                    .await
+            }
+        }));
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind fixture");
+    let url = format!(
+        "http://{}/v1",
+        listener.local_addr().expect("fixture address")
+    );
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve fixture");
+    });
+    (url, task)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_reload_keeps_preferences_and_restores_the_old_agent_resources() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let cwd = root.path().join("repo");
+    let bin = root.path().join("bin");
+    for path in [&home, &cwd, &bin] {
+        fs::create_dir(path).unwrap();
+    }
+    fs::create_dir(cwd.join(".pebble")).unwrap();
+    let bash = bin.join("bash");
+    let working_bash = "#!/bin/sh\nexec /bin/bash \"$@\"\n";
+    fs::write(&bash, working_bash).unwrap();
+    fs::set_permissions(&bash, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = env::join_paths(
+        iter::once(bin).chain(env::split_paths(&env::var_os("PATH").unwrap_or_default())),
+    )
+    .unwrap();
+    let settings = home.join("settings.json");
+    fs::write(&settings, r#"{"keybindings":{"ctrl+e":"reload"}}"#).unwrap();
+    fs::write(cwd.join("AGENTS.md"), "OLD_WORKING_INSTRUCTIONS").unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let (url, server) = recording_provider(requests.clone()).await;
+    let mut terminal =
+        Terminal::start_with_env(&arguments(&cwd), &url, Some("tui-reload"), &home, &[(
+            "PATH",
+            path.to_str().unwrap(),
+        )]);
+    terminal.contains("context ?").await;
+    let (_, original_events) = journal(&cwd);
+    fs::write(&settings, "{").unwrap();
+    terminal.send(b"keep this draft\x05").await;
+    terminal.contains("parsing").await;
+    terminal
+        .until(|screen| screen.cursor_line().contains("keep this draft"))
+        .await;
+    let (_, events) = journal(&cwd);
+    assert_eq!(events.len(), original_events.len());
+    fs::write(&settings, r#"{"keybindings":{"ctrl+e":"next-model"}}"#).unwrap();
+    fs::write(cwd.join(".pebble/settings.json"), r#"{"reasoning":"bad"}"#).unwrap();
+    terminal.send(b"\x05").await;
+    terminal.contains("reading reasoning in").await;
+    fs::write(cwd.join(".pebble/settings.json"), "{}").unwrap();
+    fs::write(cwd.join("AGENTS.md"), "NEW_WORKING_INSTRUCTIONS").unwrap();
+    // A fresh environment must reject this interpreter. The restored agent
+    // keeps its already prepared environment and its old in-memory prompt.
+    fs::write(&bash, "#!/bin/sh\nexit 1\n").unwrap();
+    terminal.send(b"\x05").await;
+    terminal
+        .contains("previous settings and resources restored")
+        .await;
+    terminal
+        .until(|screen| screen.cursor_line().contains("keep this draft"))
+        .await;
+    fs::write(&bash, working_bash).unwrap();
+    terminal.send(b"\x03before reload\r").await;
+    terminal.contains("Answer before reload.").await;
+    terminal
+        .until(|screen| screen.live_text().contains("Ready"))
+        .await;
+    terminal.send(b"/reload\r").await;
+    terminal
+        .contains("Reloaded settings, keybindings, 0 skills, and 1 instruction files.")
+        .await;
+    terminal.send(b"after reload\r").await;
+    terminal.contains("Answer after reload.").await;
+    terminal
+        .until(|screen| screen.live_text().contains("Ready"))
+        .await;
+    terminal.send(b"/quit\r").await;
+    terminal.finish().await;
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].to_string().contains("OLD_WORKING_INSTRUCTIONS"));
+    assert!(!requests[0].to_string().contains("NEW_WORKING_INSTRUCTIONS"));
+    assert!(requests[1].to_string().contains("NEW_WORKING_INSTRUCTIONS"));
+    let (_, events) = journal(&cwd);
+    assert!(events.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+    assert!(
+        events
+            .iter()
+            .all(|event| event.stream_id() == events[0].stream_id())
+    );
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reload_refreshes_instructions_skills_and_keys_while_preserving_session_and_image_draft() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let repo = root.path().join("repo");
+    let cwd = repo.join("src");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&cwd).unwrap();
+    fs::create_dir(repo.join(".git")).unwrap();
+    fs::write(home.join("AGENTS.md"), "GLOBAL_INSTRUCTIONS").unwrap();
+    fs::write(repo.join("AGENTS.md"), "OLD_REPO_INSTRUCTIONS").unwrap();
+    fs::write(cwd.join("AGENTS.md"), "LOCAL_INSTRUCTIONS").unwrap();
+    let skills = repo.join(".pebble/skills");
+    fs::create_dir_all(skills.join("demo")).unwrap();
+    fs::create_dir_all(skills.join("removed")).unwrap();
+    fs::write(
+        skills.join("demo/SKILL.md"),
+        "---\nname: demo\ndescription: OLD_SKILL_DESCRIPTION\n---\nOLD_SKILL_BODY",
+    )
+    .unwrap();
+    fs::write(
+        skills.join("removed/SKILL.md"),
+        "---\nname: removed\n---\nRemoved body",
+    )
+    .unwrap();
+    let settings = home.join("settings.json");
+    fs::write(&settings, r#"{"reasoning":"low"}"#).unwrap();
+    fs::write(cwd.join("image.png"), include_bytes!("fixtures/tiny.png")).unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let (url, server) = recording_provider(requests.clone()).await;
+    let mut terminal =
+        Terminal::start_with_env(&arguments(&cwd), &url, Some("tui-reload"), &home, &[(
+            "PEBBLE_IMAGE_PROTOCOL",
+            "none",
+        )]);
+    terminal.contains("context ?").await;
+    terminal.send(b"before reload\r").await;
+    terminal.contains("Answer before reload.").await;
+    terminal
+        .until(|screen| screen.live_text().contains("Ready"))
+        .await;
+    let (session, _) = journal(&cwd);
+    let before: serde_json::Value =
+        serde_json::from_slice(&fs::read(session.join("checkpoint.json")).unwrap()).unwrap();
+    terminal.send(b"/attach image.png\r").await;
+    terminal
+        .until(|screen| screen.cursor_line().contains("[image 1]"))
+        .await;
+    fs::write(repo.join("AGENTS.md"), "NEW_REPO_INSTRUCTIONS").unwrap();
+    fs::write(
+        skills.join("demo/SKILL.md"),
+        "---\nname: demo\ndescription: NEW_SKILL_DESCRIPTION\n---\nNEW_SKILL_BODY {{user_input}}",
+    )
+    .unwrap();
+    fs::remove_dir_all(skills.join("removed")).unwrap();
+    fs::create_dir_all(skills.join("added")).unwrap();
+    fs::write(
+        skills.join("added/SKILL.md"),
+        "---\nname: added\ndescription: ADDED_SKILL_DESCRIPTION\n---\nAdded body",
+    )
+    .unwrap();
+    fs::write(&settings, r#"{"model":"openai/gpt-6-astra","reasoning":"high","favorite_models":["openai/gpt-5.6-terra"],"show_reasoning":true,"keybindings":{"ctrl+e":"next-model","alt+r":"reload"}}"#).unwrap();
+    fs::write(
+        repo.join(".pebble/settings.json"),
+        r#"{"model":"openai/gpt-6-astra","reasoning":"high"}"#,
+    )
+    .unwrap();
+    terminal.send(b" after reload\x12").await;
+    terminal
+        .contains("Reloaded settings, keybindings, 2 skills, and 3 instruction files.")
+        .await;
+    terminal
+        .until(|screen| {
+            screen.cursor_line().contains("[image 1] after reload")
+                && screen.live_text().contains("gpt-5.6-sol · low")
+        })
+        .await;
+    let after: serde_json::Value =
+        serde_json::from_slice(&fs::read(session.join("checkpoint.json")).unwrap()).unwrap();
+    assert_eq!(before["record"]["messages"], after["record"]["messages"]);
+    assert_eq!(before["metadata"]["id"], after["metadata"]["id"]);
+    terminal.send(b"\r").await;
+    terminal.contains("Answer after reload.").await;
+    terminal
+        .until(|screen| screen.live_text().contains("Ready"))
+        .await;
+    terminal.send(b"/skill:demo example\r").await;
+    terminal.contains("Answer from refreshed skill.").await;
+    terminal
+        .until(|screen| screen.live_text().contains("Ready"))
+        .await;
+    terminal.send(b"keep draft\x05").await;
+    terminal
+        .until(|screen| {
+            screen.cursor_line().contains("keep draft")
+                && screen.live_text().contains("gpt-5.6-terra · low")
+        })
+        .await;
+    terminal.send(b"\x03/quit\r").await;
+    let screen = terminal.finish().await;
+    assert_eq!(screen.text().matches("Answer before reload.").count(), 1);
+    let requests = requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 3);
+    let first = requests[0].to_string();
+    let second = requests[1].to_string();
+    let third = requests[2].to_string();
+    for expected in [
+        "OLD_REPO_INSTRUCTIONS",
+        "GLOBAL_INSTRUCTIONS",
+        "LOCAL_INSTRUCTIONS",
+        "OLD_SKILL_DESCRIPTION",
+    ] {
+        assert!(first.contains(expected), "missing {expected}: {first}");
+    }
+    assert!(second.contains("NEW_REPO_INSTRUCTIONS"));
+    assert!(!second.contains("OLD_REPO_INSTRUCTIONS"));
+    assert!(second.contains("NEW_SKILL_DESCRIPTION"));
+    assert!(second.contains("ADDED_SKILL_DESCRIPTION"));
+    assert!(!second.contains("Removed body"));
+    assert!(second.contains("Answer before reload."));
+    assert!(second.contains("data:image/png;base64,"));
+    assert!(third.contains("NEW_SKILL_BODY example"));
+    let (_, events) = journal(&cwd);
+    assert!(events.windows(2).all(|pair| pair[0].seq < pair[1].seq));
+    server.abort();
+    let _ = server.await;
 }
 
 fn arguments(root: &Path) -> Vec<String> {
@@ -241,6 +495,10 @@ async fn cancellation_preserves_the_draft_and_queued_input() {
     terminal.contains("context ?").await;
     terminal.send(b"\x0fslow command\r").await;
     terminal.contains("Running shell_command").await;
+    terminal.send(b"\x12").await;
+    terminal
+        .contains("Wait for the current work to finish")
+        .await;
     timeout(Duration::from_secs(3), async {
         while !root.path().join("slow-started.txt").exists() {
             sleep(Duration::from_millis(10)).await;
@@ -257,7 +515,7 @@ async fn cancellation_preserves_the_draft_and_queued_input() {
             live.contains("unsent draft")
                 && live.contains("queued steer")
                 && !live.contains("Queued:")
-                && !live.contains("Esc to cancel")
+                && live.lines().any(|line| line.trim() == "Ready")
         })
         .await;
     terminal.send(b"\x03after cancel\r").await;

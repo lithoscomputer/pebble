@@ -12,8 +12,9 @@ use pebble_coding_agent::state::SessionRecord;
 use pebble_coding_agent::subagents::SubagentOptions;
 use pebble_coding_agent::tools::{PermissionLevelPolicy, PermissionMiddleware};
 use pebble_coding_agent::{
-    CodingAgent, CodingAgentControlHandle, CodingAgentOptions, CodingAgentSnapshot, CodingInput,
-    CompactionOptions, ResumeMode, ShutdownReason, SteeringMessage,
+    CodingAgent, CodingAgentControlHandle, CodingAgentExport, CodingAgentOptions,
+    CodingAgentSnapshot, CodingInput, CompactionOptions, ResumeMode, ShutdownReason,
+    SteeringMessage,
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -21,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::services::Services;
 use super::store::{Metadata, Store};
+use crate::resources;
 
 pub(super) enum Command {
     Prompt(CodingInput, CancellationToken),
@@ -28,6 +30,7 @@ pub(super) enum Command {
     Reasoning(Option<ReasoningEffort>),
     Name(String),
     Checkpoint(oneshot::Sender<SessionRecord>),
+    Export(oneshot::Sender<CodingAgentExport>),
     Shutdown,
 }
 
@@ -48,12 +51,19 @@ pub(super) struct Worker {
     pub events_closed: bool,
     sender:            mpsc::Sender<Command>,
     task:              JoinHandle<Result<()>>,
+    pub environment:   Arc<LocalEnvironment>,
+}
+
+enum Source {
+    New,
+    Record(SessionRecord),
+    Export(Box<CodingAgentExport>),
 }
 
 impl Worker {
     pub(super) async fn start(
         client: Client,
-        mut metadata: Metadata,
+        metadata: Metadata,
         store: Arc<Store>,
         record: Option<SessionRecord>,
         services: Arc<Services>,
@@ -63,6 +73,44 @@ impl Worker {
             .prepare()
             .await
             .context("preparing the working directory")?;
+        Self::build(
+            client,
+            metadata,
+            store,
+            record.map_or(Source::New, Source::Record),
+            environment,
+            services,
+        )
+        .await
+    }
+
+    pub(super) async fn restore(
+        client: Client,
+        metadata: Metadata,
+        store: Arc<Store>,
+        export: CodingAgentExport,
+        environment: Arc<LocalEnvironment>,
+        services: Arc<Services>,
+    ) -> Result<Self> {
+        Self::build(
+            client,
+            metadata,
+            store,
+            Source::Export(Box::new(export)),
+            environment,
+            services,
+        )
+        .await
+    }
+
+    async fn build(
+        client: Client,
+        mut metadata: Metadata,
+        store: Arc<Store>,
+        source: Source,
+        environment: Arc<LocalEnvironment>,
+        services: Arc<Services>,
+    ) -> Result<Self> {
         let options = CodingAgentOptions::default()
             .with_turn_replay(RetryPolicy::exponential().max_attempts(4))
             .with_reasoning_effort(metadata.reasoning)
@@ -72,15 +120,22 @@ impl Worker {
         } else {
             options
         };
-        let mut builder = if let Some(record) = record {
-            CodingAgent::resume(
+        let options = if matches!(source, Source::Export(_)) {
+            options
+        } else {
+            resources::options(&metadata.cwd, options).await?
+        };
+        let mut builder = match source {
+            Source::Record(record) => CodingAgent::resume(
                 client,
-                environment,
+                environment.clone(),
                 record,
                 ResumeMode::UseModel(metadata.model.clone()),
-            )
-        } else {
-            CodingAgent::builder(client, environment).model(&metadata.model)
+            ),
+            Source::New => CodingAgent::builder(client, environment.clone()).model(&metadata.model),
+            Source::Export(export) => {
+                CodingAgent::resume_from_export(client, environment.clone(), *export)
+            }
         };
         builder = builder
             .options(options)
@@ -104,8 +159,19 @@ impl Worker {
             .await
             .context("building the interactive coding agent")?;
         metadata.model = format!("{}/{}", agent.provider(), agent.model());
-        let (snapshot, events) = agent.observe().await?.into_parts();
-        store.checkpoint(&metadata, agent.to_record()).await?;
+        let observed = async {
+            let observation = agent.observe().await?;
+            store.checkpoint(&metadata, agent.to_record()).await?;
+            Ok::<_, anyhow::Error>(observation.into_parts())
+        }
+        .await;
+        let (snapshot, events) = match observed {
+            Ok(observed) => observed,
+            Err(error) => {
+                let _ = agent.shutdown(ShutdownReason::Error).await;
+                return Err(error);
+            }
+        };
         let control = agent.control_handle();
         let (sender, commands) = mpsc::channel(8);
         let (finished_tx, finished) = mpsc::channel(8);
@@ -118,6 +184,7 @@ impl Worker {
             sender,
             task,
             events_closed: false,
+            environment,
         })
     }
 
@@ -131,6 +198,12 @@ impl Worker {
         let (sender, receiver) = oneshot::channel();
         self.send(Command::Checkpoint(sender))?;
         receiver.await.context("receiving the session checkpoint")
+    }
+
+    pub(super) async fn export(&self) -> Result<CodingAgentExport> {
+        let (sender, receiver) = oneshot::channel();
+        self.send(Command::Export(sender))?;
+        receiver.await.context("receiving the session export")
     }
 
     pub(super) async fn shutdown(self) -> Result<()> {
@@ -178,6 +251,10 @@ async fn run(
                 }
                 Command::Checkpoint(reply) => {
                     let _ = reply.send(agent.to_record());
+                    continue;
+                }
+                Command::Export(reply) => {
+                    let _ = reply.send(agent.export());
                     continue;
                 }
                 Command::Shutdown => break,

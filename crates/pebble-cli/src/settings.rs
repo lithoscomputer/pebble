@@ -110,6 +110,7 @@ fn action_key(action: &str) -> Option<KeyEvent> {
         "toggle-reasoning" => (KeyCode::Char('t'), KeyModifiers::CONTROL),
         "recover-input" => (KeyCode::Up, KeyModifiers::ALT),
         "model-picker" => (KeyCode::Char('l'), KeyModifiers::CONTROL),
+        "reload" => (KeyCode::Char('r'), KeyModifiers::CONTROL),
         "next-model" => (KeyCode::Char('p'), KeyModifiers::CONTROL),
         "previous-model" => (
             KeyCode::Char('p'),

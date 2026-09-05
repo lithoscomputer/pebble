@@ -20,6 +20,7 @@ use tokio::signal::ctrl_c;
 
 use crate::application::{Application, DEFAULT_MODEL, PermissionArg, model_route};
 use crate::render::{Renderer, Style};
+use crate::resources;
 use crate::settings::project;
 
 /// The exit status when the prompt was interrupted or timed out.
@@ -119,6 +120,7 @@ async fn exec(args: ExecArgs, style: Style) -> Result<Ending> {
     if let Some(instructions) = args.instructions {
         options = options.with_user_instructions(instructions);
     }
+    let options = resources::options(&args.cwd, options).await?;
 
     let mut builder = CodingAgent::builder(client, Arc::new(environment))
         .model(&model)

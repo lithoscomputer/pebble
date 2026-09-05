@@ -1,0 +1,22 @@
+{
+  "scenarios": [
+    {
+      "scenario_id": "tui-reload/1",
+      "namespace": "tui-reload",
+      "matcher": { "endpoint": "responses", "input_contains": "before reload" },
+      "script": { "kind": "success", "response_text": "Answer before reload.", "usage": { "input_tokens": 10, "output_tokens": 5 } }
+    },
+    {
+      "scenario_id": "tui-reload/2",
+      "namespace": "tui-reload",
+      "matcher": { "endpoint": "responses", "input_contains": "after reload" },
+      "script": { "kind": "success", "response_text": "Answer after reload.", "usage": { "input_tokens": 10, "output_tokens": 5 } }
+    },
+    {
+      "scenario_id": "tui-reload/3",
+      "namespace": "tui-reload",
+      "matcher": { "endpoint": "responses", "input_contains": "NEW_SKILL_BODY example" },
+      "script": { "kind": "success", "response_text": "Answer from refreshed skill.", "usage": { "input_tokens": 10, "output_tokens": 5 } }
+    }
+  ]
+}

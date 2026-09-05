@@ -14,6 +14,7 @@ mod credentials;
 mod exec;
 mod interactive;
 mod render;
+mod resources;
 mod secret_input;
 mod settings;
 mod storage;

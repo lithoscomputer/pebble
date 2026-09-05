@@ -32,6 +32,10 @@ use crate::storage;
 
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "Commands and keyboard shortcuts"),
+    (
+        "/reload",
+        "Reload settings, keybindings, skills, and AGENTS.md (Ctrl+R)",
+    ),
     ("/new", "Start a new session"),
     ("/fork", "Branch before an earlier prompt, or at @bookmark"),
     ("/clone", "Copy the current session into a new branch"),
@@ -325,6 +329,10 @@ impl App {
                     }
                 }
             }
+            "/reload" => {
+                anyhow::ensure!(argument.is_empty(), "Use /reload without arguments.");
+                self.reload().await?;
+            }
             "/favorites" => self.favorites(argument).await?,
             "/model" if argument == "all" => {
                 self.require_idle()?;
@@ -530,7 +538,7 @@ impl App {
             .as_ref()
             .context("the coding agent is unavailable")
     }
-    fn require_idle(&self) -> Result<()> {
+    pub(super) fn require_idle(&self) -> Result<()> {
         if self.busy || self.shell.is_some() || self.image_job.is_some() {
             bail!("Wait for the current work to finish, or press Esc to cancel it.");
         }

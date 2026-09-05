@@ -497,13 +497,18 @@ async fn an_export_continues_in_memory_without_initializing_again() {
         .prompt("first")
         .await
         .expect("the first prompt succeeds");
-    let export = first.export();
+    let mut export = first.export();
     let history = first.history().turns().to_vec();
     let id = first.id().to_owned();
     first
         .shutdown(ShutdownReason::Completed)
         .await
         .expect("the first agent shuts down");
+    let closed_seq = first.committed_event_seq();
+    assert!(closed_seq > export.record().last_event_seq);
+    export.advance_event_cursor(closed_seq);
+    export.advance_event_cursor(closed_seq - 1);
+    assert_eq!(export.record().last_event_seq, closed_seq);
 
     let log = Arc::new(SequenceLog::default());
     let (client, second_provider) =

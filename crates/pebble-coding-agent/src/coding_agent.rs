@@ -238,6 +238,16 @@ impl CodingAgentExport {
     pub const fn record(&self) -> &SessionRecord {
         &self.inner.record
     }
+
+    /// Advances the successor past events committed after this export was
+    /// taken.
+    ///
+    /// Use the durable log's last sequence after closing the predecessor, or
+    /// after a failed replacement wrote events. This preserves the exported
+    /// conversation and derived state. A smaller cursor never moves it back.
+    pub fn advance_event_cursor(&mut self, committed_seq: u64) {
+        self.inner.record.advance_event_cursor(committed_seq);
+    }
 }
 
 /// The completed result of one coding-agent prompt.

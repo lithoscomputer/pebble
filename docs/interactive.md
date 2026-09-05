@@ -55,6 +55,7 @@ can print a saved tool result again at the current width.
 | Ctrl+G | Open the draft in an external editor. |
 | Ctrl+O | Toggle details for running tools. |
 | Ctrl+T | Toggle visible reasoning. |
+| Ctrl+R | Reload settings, keybindings, skills, and instructions; keep the draft. |
 | Ctrl+Z | Suspend Pebble; return with `fg`. |
 | Ctrl+C | Clear the draft. Press twice within one second to exit. |
 | Ctrl+D | Exit when the draft is empty. |
@@ -96,6 +97,7 @@ to the editor. Image placeholders preserve their original content and order.
 | `/export [path]` | Save Markdown, or the complete event log when the path ends in `.jsonl`. |
 | `/editor` | Open the draft in the external editor. |
 | `/settings` | Save global preferences. `/settings project` saves the current model and reasoning for this repo. |
+| `/reload` | Reload settings, keybindings, skills, and `AGENTS.md` while idle. Keep the conversation and draft. |
 | `/suspend` | Suspend on Unix. |
 | `/quit` | Save and exit. |
 
@@ -263,9 +265,32 @@ character or a name such as `enter`, `esc`, `up`, or `tab`. Supported actions
 are `submit`, `follow-up`, `newline`, `cancel`, `quit`, `external-editor`,
 `toggle-tools`, `toggle-reasoning`, `recover-input`, `complete`, `history-up`,
 `history-down`, `undo`, `suspend`, `model-picker`, `next-model`,
-`previous-model`, `cycle-thinking`, and `paste-image`. Remapping applies to the main editor;
+`previous-model`, `cycle-thinking`, `reload`, and `paste-image`. Remapping applies to the main editor;
 approval and question controls keep their displayed bindings.
 
 Without an editor preference, Pebble uses `VISUAL`, then `EDITOR`, then `vi`.
 The editor setting accepts a shell command with arguments. Pebble restores
 terminal modes during the handoff. Set `NO_COLOR` to disable styling.
+
+## Reloading instructions and skills
+
+At startup, both interactive mode and `pebble exec` load `AGENTS.md` from
+`PEBBLE_HOME` (normally `~/.pebble`), then from the Git root through the working
+directory. Outside Git, only the working directory is searched for project
+instructions. The agent applies its existing 32 KiB instruction budget.
+
+Skills load from `~/.agents/skills`, `PEBBLE_HOME/skills`, then `.agents/skills`
+and `.pebble/skills` in each directory from the Git root through the working
+directory. Each location contains `<name>/SKILL.md`. Later locations override
+earlier skills with the same name. The existing loader skips unreadable
+instructions and invalid or unreadable skills.
+
+Run `/reload`, or press Ctrl+R with a draft, after editing these files or your
+preferences. Pebble refreshes skills, completions, display preferences, and
+keybindings. Added and removed skills take effect too. The conversation,
+session identity, active model and reasoning, and draft attachments stay in
+place. Edited model and reasoning defaults apply on the next startup.
+
+Reload requires an idle session. Invalid settings leave the active settings
+and agent unchanged. If rebuilding the agent fails, Pebble restores its
+previous instructions and skills from memory.
