@@ -224,14 +224,14 @@ where
                 visible_output = true;
                 observer.reasoning_delta(&text);
             }
-            StreamEvent::Completed { response }
+            StreamEvent::Ended { response }
                 if response.finish_reason == FinishReason::Incomplete =>
             {
                 call_cancel.cancel();
                 return StreamAttempt::Truncated { visible_output };
             }
-            StreamEvent::Completed { response } => {
-                return StreamAttempt::Completed(Box::new(response));
+            StreamEvent::Ended { response } => {
+                return StreamAttempt::Completed(response);
             }
             _ => {}
         }
@@ -354,8 +354,8 @@ mod tests {
                     Err(LlmError::new(ErrorKind::Network, "reset")
                         .with_retry(RetryClassification::Safe)),
                 ],
-                vec![Ok(StreamEvent::Completed {
-                    response: response("done"),
+                vec![Ok(StreamEvent::Ended {
+                    response: Box::new(response("done")),
                 })],
             ])),
         };

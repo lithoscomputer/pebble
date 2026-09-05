@@ -192,7 +192,8 @@ impl ScriptedFailure {
 
     /// Builds the error this failure stands for.
     pub fn to_error(&self) -> LlmError {
-        let mut error = LlmError::new(self.kind, self.message.clone()).with_retry(self.retry);
+        let mut error =
+            LlmError::new(self.kind.clone(), self.message.clone()).with_retry(self.retry);
         if let Some(status) = self.status {
             error = error.with_status(status);
         }
@@ -534,8 +535,8 @@ pub fn events_for(response: &Response) -> Vec<ScriptedItem> {
             events.extend(tool_call_events(call));
         }
     }
-    events.push(Ok(StreamEvent::Completed {
-        response: response.clone(),
+    events.push(Ok(StreamEvent::Ended {
+        response: Box::new(response.clone()),
     }));
     events
 }

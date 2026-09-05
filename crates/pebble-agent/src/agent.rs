@@ -1381,7 +1381,9 @@ mod tests {
                 .pop_front()
                 .expect("the script has another response");
             Ok(ResponseStream::new(stream::iter([Ok(
-                StreamEvent::Completed { response },
+                StreamEvent::Ended {
+                    response: Box::new(response),
+                },
             )])))
         }
     }

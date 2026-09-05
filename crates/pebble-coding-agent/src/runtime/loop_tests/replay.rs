@@ -348,7 +348,10 @@ async fn a_failure_worth_no_repeat_ends_the_prompt_on_the_first_attempt() {
         let (mut session, provider) = TestSession::answering(vec![
             ScriptedCall::fails_after(
                 "partial",
-                ScriptedFailure::terminal(kind, format!("deterministic provider error: {kind:?}")),
+                ScriptedFailure::terminal(
+                    kind.clone(),
+                    format!("deterministic provider error: {kind:?}"),
+                ),
             ),
             ScriptedCall::response(text_response("should not replay")),
         ]);
@@ -923,8 +926,8 @@ async fn one_bracket_wraps_a_text_first_turn() {
 async fn reasoning_that_arrives_first_is_what_the_bracket_reports() {
     let mut events = reasoning_delta_events("weighing options");
     events.extend(text_delta_events("Hello"));
-    events.push(Ok(StreamEvent::Completed {
-        response: text_response("Hello"),
+    events.push(Ok(StreamEvent::Ended {
+        response: Box::new(text_response("Hello")),
     }));
     let (mut session, _provider) = TestSession::answering(vec![ScriptedCall::Events(events)]);
     let mut subscriber = session.subscribe();

@@ -1,5 +1,5 @@
 [ask] gpt-5.4
-[retry] attempt 0 in 0.0s: the stream ended without completing the response
+[retry] attempt 0 in 0.1s: the provider ended without a complete response
 Hello after a replay.
 [turn] 15 tokens, 0 tool call(s)
 

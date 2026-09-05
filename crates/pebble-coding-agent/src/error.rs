@@ -403,7 +403,7 @@ impl From<&LlmErrorData> for ErrorData {
         Self {
             kind: ErrorKind::Llm,
             message: error.message.clone(),
-            llm_kind: Some(error.kind),
+            llm_kind: Some(error.kind.clone()),
             retry: Some(error.retry),
             provider: error
                 .provider

@@ -1,6 +1,6 @@
 [ask] gpt-5.4
 Writing the notes
-[warning] truncated_tool_call: the output limit cut off a call to write_file before its arguments were complete
+[warning] truncated_tool_call: the turn was unfinished (length); the call to write_file was withheld from execution
 [turn] 15 tokens, 0 tool call(s)
 [warning] output_limit: The answer stopped at the model's output limit; asking it to continue
 [ask] gpt-5.4
