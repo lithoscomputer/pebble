@@ -2489,7 +2489,7 @@ dependencies = [
 [[package]]
 name = "twin-openai"
 version = "0.1.5"
-source = "git+https://github.com/lithoscomputer/twins?rev=8de27b346a73ccd3d4901490650b2257845fc6ed#8de27b346a73ccd3d4901490650b2257845fc6ed"
+source = "git+https://github.com/lithoscomputer/twins?rev=fedab8e6b9b8e2577bee7d93812a318d6adb4aa4#fedab8e6b9b8e2577bee7d93812a318d6adb4aa4"
 dependencies = [
  "anyhow",
  "async-stream",

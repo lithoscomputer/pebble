@@ -57,7 +57,7 @@ vte = "=0.14.1"
 axum = "0.8"
 tokio = { version = "1.49.0", features = ["net"] }
 trycmd = "1.2.1"
-twin-openai = { git = "https://github.com/lithoscomputer/twins", rev = "8de27b346a73ccd3d4901490650b2257845fc6ed" }
+twin-openai = { git = "https://github.com/lithoscomputer/twins", rev = "fedab8e6b9b8e2577bee7d93812a318d6adb4aa4" }
 
 [lints]
 workspace = true
