@@ -5,7 +5,7 @@ use std::future::Future;
 use std::ops::Range;
 use std::pin::Pin;
 use std::result::Result as StdResult;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use lithos_llm::types::ToolDefinition;
@@ -20,7 +20,6 @@ use crate::SessionScope;
 use crate::environment::Environment;
 use crate::event::{OutputCaptureStats, SessionBoundEmitter};
 use crate::human_input::HumanInputProvider;
-use crate::output::ToolOutputStore;
 use crate::redact::{NoRedaction, Redactor};
 use crate::types::{CodingEvent, ToolCategory, ToolSource, ToolSummary};
 
@@ -101,10 +100,6 @@ pub struct ToolContext {
     /// cancellation and the current model turn's interrupt, so a tool that
     /// watches it observes both.
     pub(crate) cancel:               CancellationToken,
-    /// Application-owned storage for complete output.
-    pub(crate) output_store:         Option<Arc<dyn ToolOutputStore>>,
-    /// References collected before the command's model-facing result is built.
-    pub(crate) output_artifacts:     Arc<Mutex<Vec<pebble_agent::ToolArtifact>>>,
     /// Extra environment variables for a command this call runs.
     pub(crate) tool_env_provider:    Option<Arc<dyn ToolEnvProvider>>,
     /// The calling session and the root shared by its tree.
@@ -177,8 +172,6 @@ impl ToolContext {
         Self {
             env,
             cancel: CancellationToken::new(),
-            output_store: None,
-            output_artifacts: Arc::default(),
             tool_env_provider: None,
             session_scope: SessionScope::default(),
             tool_call_id: None,
@@ -212,14 +205,6 @@ impl ToolContext {
     #[must_use]
     pub fn with_tool_call_id(mut self, tool_call_id: impl Into<String>) -> Self {
         self.tool_call_id = Some(tool_call_id.into());
-        self
-    }
-
-    /// Sets storage for complete command output. The store must authorize reads
-    /// using the supplied session identity and clean up abandoned captures.
-    #[must_use]
-    pub fn with_output_store(mut self, store: Arc<dyn ToolOutputStore>) -> Self {
-        self.output_store = Some(store);
         self
     }
 

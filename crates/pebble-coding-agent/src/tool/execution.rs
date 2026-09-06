@@ -23,7 +23,7 @@
 use std::borrow::Cow;
 use std::mem::take;
 use std::result::Result as StdResult;
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use lithos_llm::types::{ContentPart, ToolCall, ToolResult};
@@ -41,7 +41,6 @@ use crate::config::CodingAgentOptions;
 use crate::environment::Environment;
 use crate::event::{Emitter, OutputCaptureStats, SessionBoundEmitter};
 use crate::human_input::HumanInputProvider;
-use crate::output::{OutputStream, ToolOutputStore, storage_call};
 use crate::redact::Redactor;
 use crate::truncation::{
     OutputBudgets, ToolOutputLimits, preview_tool_output, serialized_json_bytes,
@@ -64,7 +63,6 @@ pub(crate) struct CodingToolService {
     config:            Arc<CodingAgentOptions>,
     emitter:           Emitter,
     session_scope:     SessionScope,
-    output_store:      Option<Arc<dyn ToolOutputStore>>,
     tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
     /// Absent in a child session and wherever the application installed no
     /// provider, which is what makes a question tool report that it cannot
@@ -93,16 +91,10 @@ impl CodingToolService {
             config,
             emitter,
             session_scope,
-            output_store: None,
             tool_env_provider: None,
             human_input: None,
             redactor,
         }
-    }
-
-    pub(crate) fn with_output_store(mut self, store: Arc<dyn ToolOutputStore>) -> Self {
-        self.output_store = Some(store);
-        self
     }
 
     /// Sets where a call gets its extra environment variables.
@@ -251,10 +243,6 @@ impl CodingToolService {
             .with_tool_call_id(call.id.clone())
             .with_coding_event_emitter(Arc::clone(&bound) as Arc<dyn CodingEventEmitter>)
             .with_redactor(Arc::clone(&self.redactor));
-        if let Some(store) = &self.output_store {
-            context = context.with_output_store(Arc::clone(store));
-        }
-        let artifacts = Arc::clone(&context.output_artifacts);
         if let Some(provider) = &self.tool_env_provider {
             context = context.with_tool_env_provider(Arc::clone(provider));
         }
@@ -268,8 +256,7 @@ impl CodingToolService {
                 return self.failed(call, &ToolError::invalid_arguments(error.to_string()));
             }
         };
-        let (mut result, error_kind, mut metadata) = match (tool.executor)(arguments, context).await
-        {
+        let (result, error_kind, metadata) = match (tool.executor)(arguments, context).await {
             Ok(output) => {
                 let metadata = output.metadata().clone();
                 (
@@ -285,44 +272,6 @@ impl CodingToolService {
             ),
         };
 
-        let mut stored_artifacts =
-            take(&mut *artifacts.lock().unwrap_or_else(PoisonError::into_inner));
-        // A process was captured before its environment truncated the streams.
-        // Other tools can be saved here before the coding layer cuts their result.
-        if stored_artifacts.is_empty()
-            && canonical_tool_name(&call.name) != "read_tool_output"
-            && let Some(store) = &self.output_store
-            && self.truncate_for_history(self.retain(result.clone(), None).result, &call.name)
-                != result
-        {
-            let save = async {
-                let writer = store.start(&self.session_scope, &call.id).await?;
-                writer
-                    .append(OutputStream::Result, result_text(&result).as_bytes())
-                    .await?;
-                writer.finish().await
-            };
-            match storage_call(&cancel, save).await {
-                Ok(artifacts) => stored_artifacts = artifacts,
-                Err(error) => return self.failed(call, &error),
-            }
-        }
-        if !stored_artifacts.is_empty() {
-            let hint = format!(
-                "\nSaved output: use read_tool_output with reference {}.\n",
-                stored_artifacts
-                    .iter()
-                    .map(|artifact| serde_json::to_string(&artifact.reference)
-                        .expect("strings serialize"))
-                    .collect::<Vec<_>>()
-                    .join(" or ")
-            );
-            match result.content.as_mut_slice() {
-                [ContentPart::Text { text }] => text.push_str(&hint),
-                _ => result.content.insert(0, ContentPart::Text { text: hint }),
-            }
-        }
-        metadata.artifacts.extend(stored_artifacts);
         ExecutedTool {
             result,
             error_kind,
@@ -358,10 +307,6 @@ impl CodingToolService {
     /// environment already dropped while draining the process are carried in
     /// through `previous`, so the counters describe everything the tool
     /// produced rather than everything that reached this point.
-    fn retain(&self, result: ToolResult, previous: Option<OutputCaptureStats>) -> Retained {
-        self.retain_with_metadata(result, previous, &agent::ToolOutputMetadata::default())
-    }
-
     fn retain_with_metadata(
         &self,
         mut result: ToolResult,

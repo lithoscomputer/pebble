@@ -9,17 +9,15 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 
 use lithos_llm::types::ToolDefinition;
 use pebble_agent::ToolScheduling;
 use tokio::task;
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::config::NativeToolOptions;
 use crate::environment::{ExecOutcome, ExecRequest};
-use crate::output::{CountedWriter, ToolOutputWriter, storage_call};
 use crate::tool::{
     NativeTool, RegisteredTool, ToolContext, ToolError, optional_integer_arg, required_str,
 };
@@ -89,58 +87,17 @@ pub(crate) async fn execute_shell_command(
         env_var_count = tool_env.as_ref().map_or(0, HashMap::len),
         "Injecting environment variables into a tool call"
     );
-    let writer = if let Some(store) = &ctx.output_store {
-        let scope = ctx.session();
-        let call_id = ctx
-            .tool_call_id()
-            .ok_or_else(|| ToolError::unavailable("Output capture requires a tool call ID"))?;
-        Some(Arc::new(CountedWriter::new(
-            storage_call(&ctx.cancel, store.start(scope, call_id)).await?,
-        )))
-    } else {
-        None
-    };
-    let outcome = ctx
-        .env
+    ctx.env
         .exec(ExecRequest {
             timeout_ms: Some(timeout_ms),
             working_dir: cwd,
             env_vars: tool_env.as_ref(),
             cancel_token: Some(ctx.cancel.clone()),
             output_bytes_cap: Some(DEFAULT_TOOL_OUTPUT_RETENTION_BYTES),
-            output_writer: writer
-                .clone()
-                .map(|writer| writer as Arc<dyn ToolOutputWriter>),
             ..ExecRequest::new(command)
         })
         .await
-        .map_err(|error| no_process_result(ToolError::from(error)))?;
-    if let Some(writer) = writer {
-        if !writer.matches(&outcome) {
-            emit_shell_process_completed(ctx, outcome).await;
-            return Err(ToolError::execution(
-                "Command finished, but the environment did not capture all observed output",
-            ));
-        }
-        // Finalize partial logs after cancellation as well. This operation has
-        // its own bounded cleanup window instead of the already-cancelled token.
-        let artifacts = match storage_call(&CancellationToken::new(), writer.finish()).await {
-            Ok(artifacts) => artifacts,
-            Err(error) => {
-                emit_shell_process_completed(ctx, outcome).await;
-                let message = format!(
-                    "Command finished, but saving its output failed: {}",
-                    error.message()
-                );
-                return Err(error.with_message(message));
-            }
-        };
-        ctx.output_artifacts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .extend(artifacts);
-    }
-    Ok(outcome)
+        .map_err(|error| no_process_result(ToolError::from(error)))
 }
 
 /// Runs one command, renders it for the model, and publishes what the process

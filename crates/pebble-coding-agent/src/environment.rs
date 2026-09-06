@@ -26,7 +26,6 @@ use std::error::Error as StdError;
 use std::fmt::Write as _;
 use std::io::{self, ErrorKind};
 use std::result::Result as StdResult;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -34,7 +33,6 @@ use tokio_util::sync::CancellationToken;
 pub use self::local::{CallerEnvPolicy, LocalEnvironment};
 use crate::char_boundary::floor_char_boundary;
 use crate::event::OutputCaptureStats;
-use crate::output::ToolOutputWriter;
 use crate::redact::Redactor;
 use crate::types::{CommandTermination, ExecOutputTail};
 
@@ -332,13 +330,6 @@ pub struct ExecRequest<'a> {
     /// Draining always continues past the cap, so a noisy command never
     /// deadlocks against a full pipe. `None` retains everything.
     pub output_bytes_cap: Option<usize>,
-    /// Optional full-output writer. Stream every byte to it before applying the
-    /// retention cap, preserving order per stream. Await writes for
-    /// backpressure. An adapter that cannot capture before truncation must
-    /// return an error. The caller owns `finish`; environments must never
-    /// call it. Writes must honor cancellation and failures must stop the
-    /// command with cleanup.
-    pub output_writer:    Option<Arc<dyn ToolOutputWriter>>,
 }
 
 impl<'a> ExecRequest<'a> {
@@ -353,7 +344,6 @@ impl<'a> ExecRequest<'a> {
             env_vars: None,
             cancel_token: None,
             output_bytes_cap: None,
-            output_writer: None,
         }
     }
 }

@@ -32,7 +32,6 @@ mod history;
 mod human_input;
 mod loop_detection;
 mod memory;
-mod output;
 mod policy;
 mod profile;
 mod profiles;

@@ -312,9 +312,6 @@ impl CodingAgentBridge {
             runtime.session_scope.clone(),
             Arc::clone(&runtime.redactor),
         );
-        if let Some(store) = &runtime.output_store {
-            tools = tools.with_output_store(Arc::clone(store));
-        }
         if let Some(provider) = runtime.tool_env_provider.as_ref() {
             tools = tools.with_tool_env_provider(Arc::clone(provider));
         }

@@ -34,7 +34,6 @@ use crate::runtime::{
 use crate::search::SearchProvider;
 use crate::subagent::SubagentOptions;
 use crate::tool::{RegisteredTool, ToolEnvProvider, ToolRegistrationError};
-use crate::tools::ToolOutputStore;
 use crate::types::{
     Actor, AgentProfileKind, CodingAgentEvent, CodingAgentState, ContextWindowSnapshot,
     InputContent, InputSource, MemoryFileSummary, Message, PermissionLevel, SkillSummary,
@@ -538,13 +537,6 @@ impl CodingAgentBuilder {
     /// options.
     pub fn options(mut self, options: CodingAgentOptions) -> Self {
         self.inner = self.inner.options(options);
-        self
-    }
-
-    /// Captures full tool output in application-owned storage and registers
-    /// `read_tool_output`. Inherited by subagents. Reinstall on resume.
-    pub fn output_store(mut self, store: Arc<dyn ToolOutputStore>) -> Self {
-        self.inner = self.inner.output_store(store);
         self
     }
 

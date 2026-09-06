@@ -52,7 +52,6 @@ use crate::file_tracker::FileTracker;
 use crate::history::History;
 use crate::human_input::HumanInputProvider;
 use crate::memory::{MEMORY_BUDGET_BYTES, MemoryDocument, load_memory};
-use crate::output::{ToolOutputStore, read_output_tool};
 use crate::policy::{CompactionPolicy, ContextPolicy};
 use crate::profile::{AgentProfile, EnvContext, ModelFacts, SubagentSupport, builtin_profile};
 use crate::profiles::{FileEditToolKind, ProfileDeps};
@@ -142,7 +141,6 @@ pub(crate) struct CodingRuntimeBuilder {
     tool_replacements:    Vec<(String, RegisteredTool)>,
     tool_middleware:      Vec<Arc<dyn ToolMiddleware>>,
     human_input:          Option<Arc<dyn HumanInputProvider>>,
-    output_store:         Option<Arc<dyn ToolOutputStore>>,
     tool_env_provider:    Option<Arc<dyn ToolEnvProvider>>,
     redactor:             Arc<dyn Redactor>,
     web_fetch_summarizer: Option<String>,
@@ -171,7 +169,6 @@ impl CodingRuntimeBuilder {
             tool_replacements: Vec::new(),
             tool_middleware: Vec::new(),
             human_input: None,
-            output_store: None,
             tool_env_provider: None,
             redactor: Arc::new(NoRedaction),
             web_fetch_summarizer: None,
@@ -278,12 +275,6 @@ impl CodingRuntimeBuilder {
     /// prompt waiting for an answer nobody will give.
     pub(crate) fn human_input(mut self, provider: Arc<dyn HumanInputProvider>) -> Self {
         self.human_input = Some(provider);
-        self
-    }
-
-    /// Installs application-owned output storage and retrieval.
-    pub(crate) fn output_store(mut self, store: Arc<dyn ToolOutputStore>) -> Self {
-        self.output_store = Some(store);
         self
     }
 
@@ -503,9 +494,6 @@ impl CodingRuntimeBuilder {
         let profile = self.profile.unwrap_or_else(|| builtin_profile(kind, &deps));
 
         let mut registry = ToolRegistry::with_vocabulary(profile.tool_vocabulary());
-        if let Some(store) = &self.output_store {
-            registry.register(read_output_tool(Arc::clone(store)))?;
-        }
         let profile_tools = profile.base_tools();
         // Built-in profiles contribute the search shape their models expect.
         // An injected profile that contributes no search tool gets the
@@ -570,7 +558,6 @@ impl CodingRuntimeBuilder {
                 context_policy: self.context_policy.clone(),
                 compaction_policy: self.compaction_policy.clone(),
                 options: child_options(&self.options),
-                output_store: self.output_store.clone(),
                 tool_env_provider: self.tool_env_provider.clone(),
                 redactor: Arc::clone(&self.redactor),
                 search_provider: self.search_provider.clone(),
@@ -621,7 +608,6 @@ impl CodingRuntimeBuilder {
             tool_middleware: self.tool_middleware,
             env: environment,
             human_input: self.human_input,
-            output_store: self.output_store,
             tool_env_provider: self.tool_env_provider,
             redactor: self.redactor,
             agent_control: AgentControlHandle::detached(),
@@ -821,7 +807,6 @@ pub(crate) struct CodingRuntime {
     tool_middleware:   Vec<Arc<dyn ToolMiddleware>>,
     env:               Arc<dyn Environment>,
     human_input:       Option<Arc<dyn HumanInputProvider>>,
-    output_store:      Option<Arc<dyn ToolOutputStore>>,
     tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
     /// What strips secrets out of the process output this session publishes.
     redactor:          Arc<dyn Redactor>,

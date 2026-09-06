@@ -25,7 +25,6 @@ use crate::SessionScope;
 use crate::config::{CodingAgentOptions, NativeToolOptions};
 use crate::environment::Environment;
 use crate::event::{EventOptions, EventPump, EventSink, EventSinkError};
-use crate::output::{ToolOutputStore, read_output_tool};
 use crate::redact::{NoRedaction, Redactor};
 use crate::search::SearchProvider;
 use crate::tools::{
@@ -166,7 +165,6 @@ pub struct ToolRunner {
     options:           Arc<CodingAgentOptions>,
     tool_middleware:   Vec<Arc<dyn ToolMiddleware>>,
     redactor:          Option<Arc<dyn Redactor>>,
-    output_store:      Option<Arc<dyn ToolOutputStore>>,
     tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
     on_event:          Option<ToolEventCallback>,
     session:           SessionScope,
@@ -182,22 +180,10 @@ impl ToolRunner {
             options: Arc::new(CodingAgentOptions::default()),
             tool_middleware: Vec::new(),
             redactor: None,
-            output_store: None,
             tool_env_provider: None,
             on_event: None,
             session: SessionScope::default(),
         }
-    }
-
-    /// Installs storage and adds `read_tool_output` to the tool set.
-    /// Duplicate tool names are reported before any execution.
-    pub fn output_store(
-        mut self,
-        store: Arc<dyn ToolOutputStore>,
-    ) -> StdResult<Self, ToolRegistrationError> {
-        Arc::make_mut(&mut self.registry).register(read_output_tool(Arc::clone(&store)))?;
-        self.output_store = Some(store);
-        Ok(self)
     }
 
     /// Sets the output and execution options calls run under.
@@ -296,9 +282,6 @@ impl ToolRunner {
             self.session.clone(),
             redactor,
         );
-        if let Some(store) = &self.output_store {
-            service = service.with_output_store(Arc::clone(store));
-        }
         if let Some(provider) = self.tool_env_provider.as_ref() {
             service = service.with_tool_env_provider(Arc::clone(provider));
         }

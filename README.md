@@ -320,29 +320,12 @@ parts instead of cutting media payloads. Metadata is limited to the smaller of
 64 KiB and one quarter of the serialized output budget. Large details belong in
 an artifact. Existing serialized completion events without metadata still load.
 
-**Recoverable output.** Install a `tools::ToolOutputStore` with
-`CodingAgentBuilder::output_store` or `ToolRunner::output_store`. Pebble then
-registers `read_tool_output` as a read tool. Shell tools capture stdout and stderr
-before preview truncation, including output from failed commands. Other tool
-results are saved when the coding layer would truncate them. Saved references
-appear in completion metadata and in a model-facing retrieval hint.
-
-The store supplies a `ToolOutputWriter` for each call. Pebble awaits writes to
-bound memory use. The application owns storage, access checks, quotas, expiry,
-redaction, and cleanup of abandoned captures. Writers receive raw bytes;
-Pebble's event redactor does not redact storage. References are opaque and need
-not be workspace paths. `read_tool_output` passes the requesting `SessionScope`
-to the store for authorization. It reads at most 16 KiB per call and returns
-byte offsets for paging. Text is decoded with replacement for invalid UTF-8;
-offsets always count original bytes.
-
-Environment adapters must honor `ExecRequest::output_writer`. They must forward
-all bytes before applying capture limits, or return an error if they cannot.
-`LocalEnvironment` provides this behavior and stops the process on storage
-failure. Storage operations have a five-second bound. Cancellation still allows
-a bounded finalization of output collected before the process stopped. Petri
-can implement the store and environment over its own services without shared
-filesystem paths. The CLI does not install an output store by default.
+**Bounded output.** Pebble retains bounded head-and-tail previews and discards
+the omitted bytes. Truncation does not make a successful tool call fail.
+Retaining complete tool output is an explicit anti-goal: Pebble does not store
+full output or provide a retrieval tool for discarded bytes. Environment
+adapters must continue draining process output after the capture limit is
+reached, while retaining only the bounded preview and byte counts.
 
 **Context and compaction policy.** Install `extensions::ContextPolicy` with
 `CodingAgentBuilder::context_policy` to prepare the messages for each model

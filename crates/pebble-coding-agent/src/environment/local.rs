@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::{self, ErrorKind};
 use std::path::{MAIN_SEPARATOR, Path, PathBuf};
 use std::process::Stdio;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use std::{env, fs as sync_fs, future, process};
 
@@ -23,8 +23,6 @@ use super::{
     DirEntry, EnvResult, Environment, EnvironmentError, EnvironmentErrorKind, ExecOutcome,
     ExecRequest, ExecResult, GrepOptions,
 };
-use crate::output::{OutputStream, ToolOutputWriter, storage_call};
-use crate::tool::ToolError;
 use crate::types::CommandTermination;
 
 /// Shown when the machine has no usable Bash.
@@ -576,7 +574,6 @@ impl Environment for LocalEnvironment {
             env_vars,
             cancel_token,
             output_bytes_cap,
-            output_writer,
         } = request;
         let started = Instant::now();
 
@@ -618,16 +615,13 @@ impl Environment for LocalEnvironment {
         let stdout_pipe = child.stdout.take();
         let stderr_pipe = child.stderr.take();
         let drain_stop = CancellationToken::new();
-        let capture = PipeCapture::new(output_writer);
         let stdout_task = tokio::spawn(drain_pipe(
             stdout_pipe,
-            Some((capture.clone(), OutputStream::Stdout)),
             output_bytes_cap,
             drain_stop.clone(),
         ));
         let stderr_task = tokio::spawn(drain_pipe(
             stderr_pipe,
-            Some((capture.clone(), OutputStream::Stderr)),
             output_bytes_cap,
             drain_stop.clone(),
         ));
@@ -649,10 +643,6 @@ impl Environment for LocalEnvironment {
                 terminate(&mut child).await;
                 (CommandTermination::TimedOut, None)
             }
-            () = capture.failed.cancelled() => {
-                terminate(&mut child).await;
-                (CommandTermination::Cancelled, None)
-            }
             () = cancelled.cancelled() => {
                 terminate(&mut child).await;
                 (CommandTermination::Cancelled, None)
@@ -668,18 +658,6 @@ impl Environment for LocalEnvironment {
             (!matches!(termination, CommandTermination::Exited)).then_some(OUTPUT_DRAIN_GRACE);
         let (stdout_buffer, stderr_buffer) =
             join_drains(stdout_task, stderr_task, &drain_stop, drain_grace).await?;
-        if let Some(error) = capture
-            .error
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take()
-        {
-            return Err(EnvironmentError::with_source(
-                EnvironmentErrorKind::Io,
-                "Failed to capture command output",
-                error,
-            ));
-        }
         let (stdout_bytes, stdout_capture) = stdout_buffer.into_parts();
         let (stderr_bytes, stderr_capture) = stderr_buffer.into_parts();
 
@@ -870,33 +848,6 @@ fn walk_root(base: &Path, relative_start: &str) -> EnvResult<Option<(PathBuf, sy
     Ok(metadata.map(|metadata| (root, metadata)))
 }
 
-/// Shared capture failure state lets either pipe stop the process. The process
-/// owner still reaps it and joins both drains before returning the error.
-#[derive(Clone)]
-struct PipeCapture {
-    writer: Option<Arc<dyn ToolOutputWriter>>,
-    error:  Arc<Mutex<Option<ToolError>>>,
-    failed: CancellationToken,
-}
-
-impl PipeCapture {
-    fn new(writer: Option<Arc<dyn ToolOutputWriter>>) -> Self {
-        Self {
-            writer,
-            error: Arc::default(),
-            failed: CancellationToken::new(),
-        }
-    }
-
-    fn fail(&self, error: ToolError) {
-        let mut first = self.error.lock().unwrap_or_else(PoisonError::into_inner);
-        if first.is_none() {
-            *first = Some(error);
-        }
-        self.failed.cancel();
-    }
-}
-
 /// Reads one pipe to end of file, keeping what the cap allows.
 ///
 /// A read failure ends the capture and keeps what was read: the command itself
@@ -910,7 +861,6 @@ impl PipeCapture {
 /// is dropped by stopping between reads.
 async fn drain_pipe<R>(
     pipe: Option<R>,
-    capture: Option<(PipeCapture, OutputStream)>,
     output_bytes_cap: Option<usize>,
     stop: CancellationToken,
 ) -> OutputCaptureBuffer
@@ -922,35 +872,19 @@ where
         return captured;
     };
 
-    let (capture, stream) =
-        capture.unwrap_or_else(|| (PipeCapture::new(None), OutputStream::Stdout));
     let mut chunk = [0_u8; PIPE_CHUNK_BYTES];
     loop {
         let read = tokio::select! {
             biased;
             read = reader.read(&mut chunk) => read,
-            () = capture.failed.cancelled() => return captured,
-            () = stop.cancelled() => {
-                if capture.writer.is_some() { capture.fail(ToolError::execution("Output capture ended before EOF")); }
-                return captured;
-            },
+            () = stop.cancelled() => return captured,
         };
         match read {
             Ok(0) => return captured,
             Ok(read) => {
                 captured.push(&chunk[..read]);
-                if let Some(writer) = &capture.writer
-                    && let Err(error) =
-                        storage_call(&stop, writer.append(stream, &chunk[..read])).await
-                {
-                    capture.fail(error);
-                    return captured;
-                }
             }
             Err(error) => {
-                if capture.writer.is_some() {
-                    capture.fail(ToolError::execution("Failed to read command output"));
-                }
                 tracing::warn!(%error, "Failed to read command output");
                 return captured;
             }
@@ -1526,7 +1460,6 @@ mod tests {
 
         let captured = drain_pipe(
             Some(FailingReader { wrote: false }),
-            None,
             None,
             CancellationToken::new(),
         )

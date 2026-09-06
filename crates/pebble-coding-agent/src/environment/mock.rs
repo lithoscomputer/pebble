@@ -12,7 +12,6 @@ use super::{
     ExecRequest, ExecResult, GrepOptions,
 };
 use crate::event::OutputCaptureStats;
-use crate::output::OutputStream;
 use crate::types::CommandTermination;
 
 /// An [`Environment`] whose answers are fixtures and whose calls are recorded.
@@ -214,7 +213,6 @@ impl Environment for MockEnvironment {
             env_vars,
             cancel_token: _,
             output_bytes_cap,
-            output_writer,
         } = request;
 
         *self
@@ -250,20 +248,6 @@ impl Environment for MockEnvironment {
         }
 
         let mut result = self.exec_result.clone();
-        if let Some(writer) = output_writer {
-            for (stream, bytes) in [
-                (OutputStream::Stdout, result.stdout.as_bytes()),
-                (OutputStream::Stderr, result.stderr.as_bytes()),
-            ] {
-                writer.append(stream, bytes).await.map_err(|error| {
-                    EnvironmentError::with_source(
-                        EnvironmentErrorKind::Io,
-                        "Output storage failed",
-                        error,
-                    )
-                })?;
-            }
-        }
         let stdout_capture = capture_collected_stream(&mut result.stdout, output_bytes_cap);
         let stderr_capture = capture_collected_stream(&mut result.stderr, output_bytes_cap);
 

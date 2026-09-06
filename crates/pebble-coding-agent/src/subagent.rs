@@ -57,7 +57,6 @@ use crate::config::CodingAgentOptions;
 use crate::environment::Environment;
 use crate::error::{Error, ErrorData, ErrorKind, InterruptReason, Result, TaskKind};
 use crate::event::Emitter;
-use crate::output::ToolOutputStore;
 use crate::policy::{CompactionPolicy, ContextPolicy};
 use crate::profile::AgentProfile;
 use crate::redact::Redactor;
@@ -315,9 +314,6 @@ fn build_child(
     if let Some(provider) = deps.tool_env_provider.as_ref() {
         builder = builder.tool_env_provider(Arc::clone(provider));
     }
-    if let Some(store) = &deps.output_store {
-        builder = builder.output_store(Arc::clone(store));
-    }
     if let Some(policy) = &deps.context_policy {
         builder = builder.context_policy(policy.clone());
     }
@@ -348,7 +344,6 @@ pub(crate) struct ChildDeps {
     pub(crate) context_policy:    Option<Arc<dyn ContextPolicy>>,
     pub(crate) compaction_policy: Option<Arc<dyn CompactionPolicy>>,
     pub(crate) options:           CodingAgentOptions,
-    pub(crate) output_store:      Option<Arc<dyn ToolOutputStore>>,
     pub(crate) tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
     /// What strips secrets out of what a child publishes. Inherited, because
     /// a child's process output reaches the same stream its parent's does.
