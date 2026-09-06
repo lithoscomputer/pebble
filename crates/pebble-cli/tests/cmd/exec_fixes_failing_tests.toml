@@ -1,0 +1,12 @@
+# Each twin response requires the preceding tool's result. The source snapshot
+# verifies the fix, and the test script must stay unchanged.
+bin.name = "pebble"
+args = ["exec", "--model", "openai/gpt-5.6-sol", "--permission", "full", "Run bash test_clamp.sh, fix clamp.sh, and rerun the tests. Do not change the tests."]
+fs.sandbox = true
+status = "success"
+
+[env]
+inherit = false
+
+[env.add]
+OPENAI_API_KEY = "exec_fixes_failing_tests"

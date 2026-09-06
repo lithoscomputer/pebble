@@ -1826,6 +1826,121 @@
       }
     },
     {
+      "scenario_id": "exec_fixes_failing_tests/1",
+      "namespace": "exec_fixes_failing_tests",
+      "matcher": {
+        "input_contains": "Run bash test_clamp.sh",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Running the tests.",
+        "tool_calls": [
+          {
+            "id": "call_test_before",
+            "name": "shell_command",
+            "arguments": {
+              "command": "bash test_clamp.sh"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_fixes_failing_tests/2",
+      "namespace": "exec_fixes_failing_tests",
+      "matcher": {
+        "input_contains": "FAIL: below lower bound (expected 0, got -2)",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Reading the implementation.",
+        "tool_calls": [
+          {
+            "id": "call_read",
+            "name": "shell_command",
+            "arguments": {
+              "command": "cat clamp.sh"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_fixes_failing_tests/3",
+      "namespace": "exec_fixes_failing_tests",
+      "matcher": {
+        "input_contains": "local value=$1 lower=$2 upper=$3",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Clamping values to the bounds.",
+        "tool_calls": [
+          {
+            "id": "call_fix",
+            "name": "apply_patch",
+            "kind": "custom",
+            "arguments": "*** Begin Patch\n*** Update File: clamp.sh\n@@\n     local value=$1 lower=$2 upper=$3\n+    if (( value < lower )); then\n+        value=$lower\n+    elif (( value > upper )); then\n+        value=$upper\n+    fi\n     echo \"$value\"\n*** End Patch"
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_fixes_failing_tests/4",
+      "namespace": "exec_fixes_failing_tests",
+      "matcher": {
+        "input_contains": "Success. Updated the following files",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Rerunning the unchanged tests.",
+        "tool_calls": [
+          {
+            "id": "call_test_after",
+            "name": "shell_command",
+            "arguments": {
+              "command": "bash test_clamp.sh"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_fixes_failing_tests/5",
+      "namespace": "exec_fixes_failing_tests",
+      "matcher": {
+        "input_contains": "PASS: all 4 clamp cases",
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Fixed clamp.sh. All 4 tests pass; test_clamp.sh is unchanged."
+      }
+    },
+    {
       "scenario_id": "exec_patches_a_file_as_gpt56/1",
       "namespace": "exec_patches_a_file_as_gpt56",
       "matcher": {

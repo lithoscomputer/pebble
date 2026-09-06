@@ -1,0 +1,1 @@
+Fixed clamp.sh. All 4 tests pass; test_clamp.sh is unchanged.
