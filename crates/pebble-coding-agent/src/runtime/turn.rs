@@ -226,6 +226,11 @@ impl ConversationState {
             stored.staleness = ContextWindowStaleness::Stored;
             self.context_window = Some(stored);
         }
+        self.accumulate_usage(usage, cost);
+        context_window
+    }
+
+    fn accumulate_usage(&mut self, usage: TokenUsage, cost: Option<u64>) {
         self.totals.usage = self.totals.usage.saturating_add(usage);
         if let Some(cost) = cost {
             self.totals.cost_usd_micros = Some(
@@ -235,7 +240,6 @@ impl ConversationState {
                     .saturating_add(cost),
             );
         }
-        context_window
     }
 
     fn push_assistant(&mut self, message: Message) {
@@ -463,11 +467,12 @@ impl CodingAgentBridge {
         )
         .await;
         match result {
-            Ok(CompactionOutcome::Compacted(_)) => {
-                self.state
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .replace_history(history);
+            Ok(CompactionOutcome::Compacted(result)) => {
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                // Summarization is part of this prompt's bill, but its usage
+                // does not describe the coding request's context window.
+                state.accumulate_usage(result.usage(), result.cost_usd_micros());
+                state.replace_history(history);
             }
             Ok(CompactionOutcome::Unchanged) => {}
             Err(error) => {

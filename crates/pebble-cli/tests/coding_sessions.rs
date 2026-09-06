@@ -20,6 +20,7 @@ use pebble_coding_agent::environment::LocalEnvironment;
 use pebble_coding_agent::events::{
     CodingAgentEvent, CodingEvent, EventSink, EventSinkError, LlmRetryPhase,
 };
+use pebble_coding_agent::state::Message;
 use pebble_coding_agent::{CodingAgent, CodingAgentOptions, ShutdownReason};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -399,6 +400,192 @@ async fn a_broken_stream_after_an_edit_does_not_execute_the_edit_twice() {
         1
     );
     twin.stop().await;
+}
+
+#[tokio::test]
+async fn a_coding_task_survives_compaction_between_failing_and_passing_tests() {
+    const PROMPT: &str = "Fix clamp.sh and rerun bash test_clamp.sh. Do not change the tests.";
+    const TESTS: &str = include_str!("cmd/exec_fixes_failing_tests.in/test_clamp.sh");
+    const SUMMARY: &str = "COMPACTED_TASK: Fix clamp.sh without changing test_clamp.sh. The test below lower bound failed: expected 0, got -2. Read clamp.sh, clamp values to both bounds, then rerun bash test_clamp.sh.";
+    let workspace = tempfile::tempdir().unwrap();
+    fs::write(
+        workspace.path().join("clamp.sh"),
+        include_str!("cmd/exec_fixes_failing_tests.in/clamp.sh"),
+    )
+    .unwrap();
+    fs::write(workspace.path().join("test_clamp.sh"), TESTS).unwrap();
+
+    let mut read = shell("read", "cat clamp.sh");
+    // Cross the pinned model's 80% threshold after the failed test. Pebble
+    // must compact while this new tool call still awaits its result.
+    read["usage"]["input_tokens"] = json!(900_000);
+    let mut summary = scenario(3, "FAIL: below lower bound", answer(SUMMARY));
+    summary["matcher"]["stream"] = json!(false);
+    let mut patch = answer("Applying the fix.");
+    patch["tool_calls"] = json!([{
+        "id": "patch",
+        "name": "apply_patch",
+        "kind": "custom",
+        "arguments": "*** Begin Patch\n*** Update File: clamp.sh\n@@\n     local value=$1 lower=$2 upper=$3\n+    if (( value < lower )); then\n+        value=$lower\n+    elif (( value > upper )); then\n+        value=$upper\n+    fi\n     echo \"$value\"\n*** End Patch"
+    }]);
+    let mut twin = Twin::start(vec![
+        scenario(1, PROMPT, shell("test-before", "bash test_clamp.sh")),
+        scenario(2, "FAIL: below lower bound", read),
+        summary,
+        scenario(4, "local value=$1 lower=$2 upper=$3", patch),
+        scenario(
+            5,
+            "Success. Updated the following files",
+            shell("test-after", "bash test_clamp.sh"),
+        ),
+        scenario(
+            6,
+            "PASS: all 4 clamp cases",
+            answer("Fixed clamp.sh; all four tests pass."),
+        ),
+    ])
+    .await;
+    let events = Arc::new(EventLog::default());
+    let mut agent = twin
+        .agent(
+            workspace.path(),
+            CodingAgentOptions::default()
+                .with_context_compaction(true)
+                .with_compaction_preserve_turns(1),
+            &events,
+        )
+        .await;
+    let report = timeout(PATIENCE, agent.prompt(PROMPT)).await.unwrap();
+    assert_eq!(
+        report.result.unwrap().text.as_deref(),
+        Some("Fixed clamp.sh; all four tests pass.")
+    );
+    assert_eq!(report.usage.input, 900_050, "summary usage is included");
+    assert_eq!(report.usage.output, 30);
+    agent.shutdown(ShutdownReason::Completed).await.unwrap();
+    let summary_cost: u64 = agent
+        .history()
+        .turns()
+        .iter()
+        .filter_map(|message| match message {
+            Message::Compaction {
+                cost_usd_micros, ..
+            } => *cost_usd_micros,
+            _ => None,
+        })
+        .sum();
+    assert!(summary_cost > 0);
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("clamp.sh")).unwrap(),
+        include_str!("cmd/exec_fixes_failing_tests.out/clamp.sh")
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("test_clamp.sh")).unwrap(),
+        TESTS
+    );
+
+    let requests = twin.requests();
+    assert_eq!(requests.len(), 6);
+    assert_eq!(
+        requests[2]["stream"], false,
+        "compaction uses a separate completion request"
+    );
+    let summary_input = serde_json::to_string(&requests[2]["input"]).unwrap();
+    assert!(summary_input.contains(PROMPT));
+    assert!(summary_input.contains("FAIL: below lower bound (expected 0, got -2)"));
+    let resumed_input = serde_json::to_string(&requests[3]["input"]).unwrap();
+    assert!(
+        resumed_input.contains(SUMMARY),
+        "the next model call sees the summary"
+    );
+    assert!(
+        resumed_input.contains(PROMPT),
+        "the original task and constraint survive"
+    );
+    assert!(tool_output(&requests[3], "read").contains("local value=$1 lower=$2 upper=$3"));
+    assert!(
+        !requests[3]["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["call_id"] == "test-before"),
+        "older tool turns were actually compacted"
+    );
+    assert!(tool_output(&requests[5], "test-after").contains("PASS: all 4 clamp cases"));
+    for request in &requests {
+        assert_tool_pairs(request);
+    }
+
+    let published = events.take();
+    let coding_cost: u64 = published
+        .iter()
+        .filter_map(|event| match &event.event {
+            CodingEvent::AssistantMessage {
+                cost_usd_micros, ..
+            } => *cost_usd_micros,
+            _ => None,
+        })
+        .sum();
+    assert_eq!(report.cost_usd_micros, Some(coding_cost + summary_cost));
+    let progress: Vec<_> = published
+        .iter()
+        .filter_map(|event| match &event.event {
+            CodingEvent::ToolCallCompleted {
+                tool_call_id,
+                is_error,
+                ..
+            } => {
+                assert_eq!(*is_error, tool_call_id == "test-before");
+                Some(tool_call_id.as_str())
+            }
+            CodingEvent::CompactionStarted { .. } => Some("compaction-start"),
+            CodingEvent::CompactionCompleted {
+                original_turn_count,
+                preserved_turn_count,
+                ..
+            } => {
+                assert!(preserved_turn_count < original_turn_count);
+                Some("compaction-end")
+            }
+            CodingEvent::CompactionFailed { .. } => panic!("compaction must succeed"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(progress, [
+        "test-before",
+        "compaction-start",
+        "compaction-end",
+        "read",
+        "patch",
+        "test-after"
+    ]);
+    twin.stop().await;
+}
+
+/// Every call in a model request has exactly one corresponding result, in
+/// model order, including the custom apply_patch protocol.
+fn assert_tool_pairs(request: &Value) {
+    let input = request["input"].as_array().expect("Responses input array");
+    let ids = |kinds: &[&str]| -> Vec<&str> {
+        input
+            .iter()
+            .filter(|item| {
+                item["type"]
+                    .as_str()
+                    .is_some_and(|kind| kinds.contains(&kind))
+            })
+            .map(|item| item["call_id"].as_str().expect("tool call id"))
+            .collect()
+    };
+    let calls = ids(&["function_call", "custom_tool_call"]);
+    let results = ids(&["function_call_output", "custom_tool_call_output"]);
+    assert_eq!(
+        calls, results,
+        "tool protocol remains paired across compaction"
+    );
+    for (index, id) in calls.iter().enumerate() {
+        assert!(!calls[..index].contains(id), "tool call {id} occurs once");
+    }
 }
 
 #[cfg(unix)]
