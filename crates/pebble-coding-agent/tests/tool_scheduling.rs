@@ -116,6 +116,7 @@ async fn run_round(tools: Vec<RegisteredTool>, names: &[&str]) {
     timeout(Duration::from_secs(5), agent.prompt("work"))
         .await
         .expect("round completes")
+        .result
         .expect("prompt succeeds");
     agent
         .shutdown(ShutdownReason::Completed)

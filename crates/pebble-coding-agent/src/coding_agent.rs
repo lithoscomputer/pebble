@@ -252,46 +252,35 @@ impl CodingAgentExport {
     }
 }
 
-/// The completed result of one coding-agent prompt.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PromptOutcome {
-    text:            Option<String>,
-    final_message:   Option<Message>,
-    usage:           TokenUsage,
-    cost_usd_micros: Option<u64>,
-    timing:          PromptTiming,
+/// The outcome and observed accounting of one prompt, including failed prompts.
+///
+/// Usage covers this session's accepted main-model responses and queued
+/// follow-ups. It excludes descendants, compaction, and model calls inside
+/// tools. An unfinished response may provide no usage. Cost sums known costs;
+/// `Some` does not certify that every charge was observed.
+///
+/// Accounting remains available if the event sink fails. It does not prove
+/// those events were saved. Dropping a prompt future cannot return a report.
+#[derive(Debug)]
+#[must_use = "inspect the prompt result even when only recording accounting"]
+pub struct PromptReport {
+    /// The final output or the original typed failure.
+    pub result:          Result<PromptOutput, Error>,
+    /// Observed tokens used by this invocation.
+    pub usage:           TokenUsage,
+    /// Known cost in USD micros, or `None` if no cost was reported.
+    pub cost_usd_micros: Option<u64>,
+    /// Time spent in inference and tool execution, including failed work.
+    pub timing:          PromptTiming,
 }
 
-impl PromptOutcome {
-    /// The final readable assistant text, when the response carried any.
-    #[must_use]
-    pub fn text(&self) -> Option<&str> {
-        self.text.as_deref()
-    }
-
+/// The final output of a successful prompt.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PromptOutput {
+    /// The final readable assistant text, when present.
+    pub text:          Option<String>,
     /// The final committed assistant message.
-    #[must_use]
-    pub const fn final_message(&self) -> Option<&Message> {
-        self.final_message.as_ref()
-    }
-
-    /// Token usage summed across all model turns in this prompt.
-    #[must_use]
-    pub const fn usage(&self) -> TokenUsage {
-        self.usage
-    }
-
-    /// Provider-reported cost summed across all model turns, in USD micros.
-    #[must_use]
-    pub const fn cost_usd_micros(&self) -> Option<u64> {
-        self.cost_usd_micros
-    }
-
-    /// Time spent in inference and tool execution.
-    #[must_use]
-    pub const fn timing(&self) -> PromptTiming {
-        self.timing
-    }
+    pub final_message: Option<Message>,
 }
 
 /// An owned view of a coding agent at one committed event boundary.
@@ -1298,10 +1287,10 @@ impl CodingAgent {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::SessionClosed`] after shutdown,
+    /// The report contains [`Error::SessionClosed`] after shutdown,
     /// [`Error::Interrupted`] after cancellation or timeout, and the
     /// applicable model, tool, compaction, or event failure otherwise.
-    pub async fn prompt(&mut self, input: impl Into<CodingInput>) -> Result<PromptOutcome, Error> {
+    pub async fn prompt(&mut self, input: impl Into<CodingInput>) -> PromptReport {
         self.prompt_inner(input, None).await
     }
 
@@ -1325,7 +1314,7 @@ impl CodingAgent {
         &mut self,
         input: impl Into<CodingInput>,
         cancel: &CancellationToken,
-    ) -> Result<PromptOutcome, Error> {
+    ) -> PromptReport {
         self.prompt_inner(input, Some(cancel)).await
     }
 
@@ -1370,16 +1359,17 @@ impl CodingAgent {
         &mut self,
         input: impl Into<CodingInput>,
         cancel: Option<&CancellationToken>,
-    ) -> Result<PromptOutcome, Error> {
-        let text = self.inner.prompt_with_cancellation(input, cancel).await?;
-        let final_message = self.inner.final_assistant_message();
-        Ok(PromptOutcome {
-            text,
-            final_message,
-            usage: self.inner.last_prompt_usage(),
+    ) -> PromptReport {
+        let result = self.inner.prompt_with_cancellation(input, cancel).await;
+        PromptReport {
+            result:          result.map(|text| PromptOutput {
+                text,
+                final_message: self.inner.final_assistant_message(),
+            }),
+            usage:           self.inner.last_prompt_usage(),
             cost_usd_micros: self.inner.last_prompt_cost_usd_micros(),
-            timing: self.inner.last_prompt_timing(),
-        })
+            timing:          self.inner.last_prompt_timing(),
+        }
     }
 
     /// Watches events published after this call.
@@ -1669,7 +1659,11 @@ mod tests {
                 .await
                 .expect("builds");
             assert_eq!(agent.inner.permission_level(), Some(level));
-            agent.prompt("write the file").await.expect("answers");
+            agent
+                .prompt("write the file")
+                .await
+                .result
+                .expect("answers");
             let allowed = level == PermissionLevel::ReadWrite;
             assert_eq!(
                 provider.requests()[0]
@@ -1707,11 +1701,12 @@ mod tests {
             .await
             .expect("the coding agent builds and initializes");
 
-        let outcome = session.prompt("work").await.expect("the prompt succeeds");
+        let report = session.prompt("work").await;
+        assert_eq!(report.usage, session.inner.last_prompt_usage());
+        let outcome = report.result.expect("the prompt succeeds");
 
-        assert_eq!(outcome.text(), Some("done"));
-        assert!(outcome.final_message().is_some());
-        assert_eq!(outcome.usage(), session.inner.last_prompt_usage());
+        assert_eq!(outcome.text.as_deref(), Some("done"));
+        assert!(outcome.final_message.is_some());
         session
             .shutdown(ShutdownReason::Completed)
             .await
@@ -1742,6 +1737,7 @@ mod tests {
         agent
             .prompt(CodingInput::new(parts.clone()).with_source(InputSource::External))
             .await
+            .result
             .expect("the rich prompt succeeds");
 
         let requests = provider.requests();
@@ -1797,7 +1793,11 @@ mod tests {
         assert!(!snapshot.tools().is_empty());
         assert_eq!(snapshot.committed_event_seq(), agent.committed_event_seq());
 
-        agent.prompt("work").await.expect("the prompt succeeds");
+        agent
+            .prompt("work")
+            .await
+            .result
+            .expect("the prompt succeeds");
         let first_later = timeout(PATIENCE, events.recv())
             .await
             .expect("a later event arrives")
@@ -1860,7 +1860,7 @@ mod tests {
         let (result, ()) = tokio::join!(prompting, controlling);
 
         assert!(matches!(
-            result,
+            result.result,
             Err(Error::Interrupted(InterruptReason::Cancelled))
         ));
         assert_eq!(session.state(), CodingAgentState::Idle);
@@ -1868,8 +1868,10 @@ mod tests {
             session
                 .prompt("try again")
                 .await
+                .result
                 .expect("the agent remains reusable")
-                .text(),
+                .text
+                .as_deref(),
             Some("done")
         );
         session
@@ -1891,6 +1893,7 @@ mod tests {
         agent
             .prompt("start")
             .await
+            .result
             .expect("the first prompt succeeds");
         let record = agent.to_record();
         let original_id = agent.id().to_owned();
@@ -1914,8 +1917,10 @@ mod tests {
             resumed
                 .prompt("continue")
                 .await
+                .result
                 .expect("the resumed prompt succeeds")
-                .text(),
+                .text
+                .as_deref(),
             Some("second")
         );
         resumed
@@ -1959,10 +1964,11 @@ mod tests {
         let outcome = timeout(PATIENCE, agent.prompt("start"))
             .await
             .expect("the prompt finishes")
+            .result
             .expect("the prompt succeeds");
         steering.await.expect("the steering task finishes");
 
-        assert_eq!(outcome.text(), Some("done"));
+        assert_eq!(outcome.text.as_deref(), Some("done"));
         let mut texts = steering_texts(&agent);
         texts.sort_unstable();
         assert_eq!(texts, ["from the first handle", "from the second handle"]);
@@ -2096,10 +2102,11 @@ mod tests {
         let outcome = timeout(PATIENCE, agent.prompt("describe everything"))
             .await
             .expect("the interrupt unblocks the hanging stream")
+            .result
             .expect("the prompt succeeds");
         controller.await.expect("the controller finishes");
 
-        assert_eq!(outcome.text(), Some("DONE"));
+        assert_eq!(outcome.text.as_deref(), Some("DONE"));
         let published = drained(&mut recorded).await;
         assert_eq!(
             published
@@ -2151,10 +2158,11 @@ mod tests {
         let outcome = timeout(PATIENCE, agent.prompt("start"))
             .await
             .expect("the queued steer resumes the prompt without a second gesture")
+            .result
             .expect("the prompt succeeds");
         controller.await.expect("the controller finishes");
 
-        assert_eq!(outcome.text(), Some("steered"));
+        assert_eq!(outcome.text.as_deref(), Some("steered"));
         assert_eq!(steering_texts(&agent), ["change course"]);
         let published = drained(&mut recorded).await;
         assert_eq!(
@@ -2190,9 +2198,13 @@ mod tests {
         );
         assert_eq!(control.snapshot().pending_follow_ups(), 1);
 
-        let outcome = agent.prompt("start").await.expect("the prompt succeeds");
+        let outcome = agent
+            .prompt("start")
+            .await
+            .result
+            .expect("the prompt succeeds");
 
-        assert_eq!(outcome.text(), Some("second"));
+        assert_eq!(outcome.text.as_deref(), Some("second"));
         assert_eq!(control.snapshot().pending_follow_ups(), 0);
         assert!(matches!(
             agent.history().turns(),
@@ -2238,10 +2250,12 @@ mod tests {
         agent
             .prompt("first task")
             .await
+            .result
             .expect("first prompt succeeds");
         agent
             .prompt("second task")
             .await
+            .result
             .expect("second prompt succeeds");
         let history_before_cancel = agent.history();
         let cancelled = CancellationToken::new();
@@ -2325,10 +2339,12 @@ mod tests {
         agent
             .prompt("first task")
             .await
+            .result
             .expect("first prompt succeeds");
         agent
             .prompt("second task")
             .await
+            .result
             .expect("second prompt succeeds");
         let history_before = agent.history();
         let control = agent.control_handle();
@@ -2365,8 +2381,10 @@ mod tests {
             agent
                 .prompt("try again")
                 .await
+                .result
                 .expect("the agent remains reusable")
-                .text(),
+                .text
+                .as_deref(),
             Some("second answer")
         );
         agent
@@ -2403,6 +2421,7 @@ mod tests {
         let error = timeout(PATIENCE, agent.prompt_with_cancellation("start", &cancel))
             .await
             .expect("cancellation unblocks the tool")
+            .result
             .expect_err("the prompt was cancelled");
         controller.await.expect("the controller finishes");
 
@@ -2429,8 +2448,9 @@ mod tests {
         let outcome = timeout(PATIENCE, agent.prompt("again"))
             .await
             .expect("the next prompt runs")
+            .result
             .expect("the next prompt succeeds");
-        assert_eq!(outcome.text(), Some("second prompt done"));
+        assert_eq!(outcome.text.as_deref(), Some("second prompt done"));
         agent
             .shutdown(ShutdownReason::Completed)
             .await
@@ -2466,7 +2486,7 @@ mod tests {
         assert!(control.is_closed());
         assert_eq!(agent.state(), CodingAgentState::Closed);
         assert!(matches!(
-            agent.prompt("late").await,
+            agent.prompt("late").await.result,
             Err(Error::SessionClosed)
         ));
         assert!(

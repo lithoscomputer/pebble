@@ -86,9 +86,13 @@ async fn a_prompt_writes_edits_reads_and_runs_a_command_in_its_workspace() {
     let outcome = timeout(PATIENCE, session.prompt("set up greeting.txt"))
         .await
         .expect("the prompt finishes")
+        .result
         .expect("the prompt succeeds");
 
-    assert_eq!(outcome.text(), Some("greeting.txt has three lines"));
+    assert_eq!(
+        outcome.text.as_deref(),
+        Some("greeting.txt has three lines")
+    );
     assert_eq!(
         fs::read_to_string(workspace.join("greeting.txt")).expect("the file was written"),
         EDITED,
@@ -153,6 +157,7 @@ async fn every_tool_call_is_answered_before_the_next_round() {
     timeout(PATIENCE, session.prompt("write and read it back"))
         .await
         .expect("the prompt finishes")
+        .result
         .expect("the prompt succeeds");
 
     let mut asked = 0;
@@ -198,10 +203,11 @@ async fn a_steer_sent_while_a_tool_runs_arrives_as_the_next_turn() {
     let outcome = timeout(PATIENCE, session.prompt("start the job"))
         .await
         .expect("the prompt finishes")
+        .result
         .expect("the prompt succeeds");
     steering.await.expect("the steering task finishes");
 
-    assert_eq!(outcome.text(), Some("noted, and done"));
+    assert_eq!(outcome.text.as_deref(), Some("noted, and done"));
     assert!(
         session.history().turns().iter().any(|turn| matches!(
             turn,
@@ -260,10 +266,11 @@ async fn an_interrupt_abandons_the_round_and_a_steer_resumes_it() {
     let outcome = timeout(PATIENCE, session.prompt("describe every file"))
         .await
         .expect("the interrupt unblocks the hanging stream")
+        .result
         .expect("the prompt succeeds");
     controller.await.expect("the controller finishes");
 
-    assert_eq!(outcome.text(), Some("DONE"));
+    assert_eq!(outcome.text.as_deref(), Some("DONE"));
     assert_eq!(provider.call_count(), 2, "the round was asked again");
     assert!(
         matches!(
@@ -310,14 +317,14 @@ async fn a_finished_prompt_reports_what_it_used() {
 
     let outcome = timeout(PATIENCE, session.prompt("say something"))
         .await
-        .expect("the prompt finishes")
-        .expect("the prompt succeeds");
+        .expect("the prompt finishes");
+    outcome.result.expect("the prompt succeeds");
 
-    let usage = outcome.usage();
+    let usage = outcome.usage;
     assert_eq!(usage.input, 10);
     assert_eq!(usage.output, 5);
     assert_eq!(usage.total(), 15);
-    assert_eq!(outcome.cost_usd_micros(), Some(12_500));
+    assert_eq!(outcome.cost_usd_micros, Some(12_500));
     assert_eq!(
         session.history().turns().len(),
         2,
@@ -349,6 +356,7 @@ async fn edits_in_one_round_preserve_both_changes_and_the_following_read() {
     timeout(PATIENCE, agent.prompt("edit both lines"))
         .await
         .expect("prompt finishes")
+        .result
         .expect("prompt succeeds");
     assert_eq!(
         fs::read_to_string(workspace.join("note.txt")).expect("file remains"),

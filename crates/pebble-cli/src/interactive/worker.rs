@@ -228,6 +228,7 @@ async fn run(
                 Command::Prompt(input, cancel) => agent
                     .prompt_with_cancellation(input, &cancel)
                     .await
+                    .result
                     .map(|_| ()),
                 Command::Compact(instructions, cancel) => {
                     let options = if instructions.is_empty() {

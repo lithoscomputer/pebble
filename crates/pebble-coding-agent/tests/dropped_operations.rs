@@ -94,7 +94,7 @@ async fn dropping_a_coding_prompt_closes_it_and_allows_shutdown() {
         .await
         .expect("idle");
     assert!(matches!(
-        agent.prompt("again").await,
+        agent.prompt("again").await.result,
         Err(Error::SessionClosed)
     ));
     timeout(PATIENCE, agent.shutdown(ShutdownReason::Cancelled))
@@ -153,8 +153,8 @@ async fn dropping_manual_compaction_closes_the_agent_and_pairs_its_events() {
         .build()
         .await
         .expect("builds");
-    agent.prompt("first").await.expect("answers");
-    agent.prompt("second").await.expect("answers");
+    agent.prompt("first").await.result.expect("answers");
+    agent.prompt("second").await.result.expect("answers");
     let control = agent.control_handle();
     let mut events = agent.subscribe();
     tokio::select! {

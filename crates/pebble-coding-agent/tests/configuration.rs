@@ -49,7 +49,7 @@ async fn valid_limits_reach_the_request_and_none_uses_the_catalog() {
             .build()
             .await
             .expect("valid options");
-        agent.prompt("work").await.expect("answers");
+        agent.prompt("work").await.result.expect("answers");
         assert_eq!(provider.requests()[0].max_output_tokens(), Some(expected));
         agent
             .shutdown(ShutdownReason::Completed)

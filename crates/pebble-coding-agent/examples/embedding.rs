@@ -184,7 +184,7 @@ impl Application {
             ready = timeout(Duration::from_secs(5), self.tool_started.notified()) => { ready?; }
         }
         cancel.cancel();
-        match timeout(Duration::from_secs(5), prompt).await? {
+        match timeout(Duration::from_secs(5), prompt).await?.result {
             Err(Error::Interrupted(_)) => Ok(()),
             Err(error) => Err(error.into()),
             Ok(_) => Err(io::Error::other("cancelled prompt unexpectedly completed").into()),
@@ -368,7 +368,10 @@ async fn run(root: &Path) -> AppResult {
     ]);
     let mut agent = application.start(client).await?;
     let work = async {
-        agent.prompt("save a note, then try to delete it").await?;
+        agent
+            .prompt("save a note, then try to delete it")
+            .await
+            .result?;
         application.cancel_active_tool(&mut agent).await?;
         application.checkpoint(&mut agent).await
     }
@@ -389,7 +392,7 @@ async fn run(root: &Path) -> AppResult {
     ]);
     let mut agent = application.resume(client).await?;
     let work = async {
-        agent.prompt("read the saved note").await?;
+        agent.prompt("read the saved note").await.result?;
         application.checkpoint(&mut agent).await
     }
     .await;

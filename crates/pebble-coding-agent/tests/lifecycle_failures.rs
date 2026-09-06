@@ -42,6 +42,7 @@ impl Boundary {
             Self::Model | Self::Tool => agent
                 .prompt_with_cancellation("work", cancel)
                 .await
+                .result
                 .map(|_| ()),
             Self::Compaction => agent
                 .compact_with_cancellation(CompactionOptions::new().preserve_turns(1), cancel)
@@ -135,8 +136,8 @@ async fn check_case(boundary: Boundary, failure: Failure) {
         .await
         .expect("builds");
     if boundary == Boundary::Compaction {
-        agent.prompt("first").await.expect("seed history");
-        agent.prompt("second").await.expect("seed history");
+        agent.prompt("first").await.result.expect("seed history");
+        agent.prompt("second").await.result.expect("seed history");
     }
     let original_history = agent.history();
     let control = agent.control_handle();
@@ -222,10 +223,11 @@ async fn check_case(boundary: Boundary, failure: Failure) {
         timeout(PATIENCE, agent.prompt("recover"))
             .await
             .expect("recovery completes")
+            .result
             .expect("agent reusable");
     } else {
         assert!(matches!(
-            agent.prompt("again").await,
+            agent.prompt("again").await.result,
             Err(Error::SessionClosed)
         ));
     }

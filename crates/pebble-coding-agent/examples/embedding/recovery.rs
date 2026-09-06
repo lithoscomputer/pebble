@@ -35,7 +35,7 @@ impl Workspace {
             scripted_client(vec![ScriptedCall::response(text_response("old answer"))]);
         let mut agent = application.start(client).await?;
         let saved = async {
-            agent.prompt(OLD_INPUT).await?;
+            agent.prompt(OLD_INPUT).await.result?;
             application.checkpoint(&mut agent).await?;
             Ok::<_, Box<dyn StdError + Send + Sync>>(())
         }
@@ -234,7 +234,7 @@ async fn crash_worker() -> AppResult {
             )))
             .build()
             .await?;
-        agent.prompt(NEW_INPUT).await?;
+        agent.prompt(NEW_INPUT).await.result?;
         return Err(io::Error::other("the event acknowledgment was not withheld").into());
     }
 
@@ -244,7 +244,7 @@ async fn crash_worker() -> AppResult {
     } else {
         application.resume(client).await?
     };
-    agent.prompt(NEW_INPUT).await?;
+    agent.prompt(NEW_INPUT).await.result?;
     fs::write(
         application.store.directory.join("expected.json"),
         serde_json::to_vec(&agent.to_record())?,
@@ -367,7 +367,10 @@ async fn a_committed_event_with_lost_acknowledgment_advances_resume_without_repl
     let (client, provider) =
         scripted_client(vec![ScriptedCall::response(text_response("resumed"))]);
     let mut agent = application.resume(client).await?;
-    let result = agent.prompt("continue from the saved checkpoint").await;
+    let result = agent
+        .prompt("continue from the saved checkpoint")
+        .await
+        .result;
     let shutdown = agent.shutdown(ShutdownReason::Completed).await;
     result?;
     shutdown?;

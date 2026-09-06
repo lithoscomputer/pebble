@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use pebble_coding_agent::PromptOutcome;
+use pebble_coding_agent::PromptReport;
 use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent};
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -212,7 +212,7 @@ impl Summary {
     }
 
     /// Prints what the prompt used, after the answer.
-    pub(crate) fn report(&self, outcome: &PromptOutcome, style: Style) {
+    pub(crate) fn report(&self, outcome: &PromptReport, style: Style) {
         if style != Style::Text {
             return;
         }
@@ -223,7 +223,7 @@ impl Summary {
             .map(|(name, count)| format!("{name} x{count}"))
             .collect::<Vec<_>>()
             .join(", ");
-        let usage = outcome.usage();
+        let usage = outcome.usage;
         print_err("");
         print_err(&format!("turns:  {}", self.turns));
         print_err(&format!(
@@ -241,7 +241,7 @@ impl Summary {
             usage.cache_read + usage.cache_write,
             usage.total()
         ));
-        match outcome.cost_usd_micros() {
+        match outcome.cost_usd_micros {
             Some(cost) => print_err(&format!("cost:   {}", dollars(cost))),
             None => print_err("cost:   not reported for this model"),
         }

@@ -83,7 +83,7 @@ async fn rich_content_reaches_the_model_and_details_reach_middleware_and_durable
         .await
         .expect("builds");
     let mut events = agent.subscribe();
-    agent.prompt("draw it").await.expect("answers");
+    agent.prompt("draw it").await.result.expect("answers");
     agent
         .shutdown(ShutdownReason::Completed)
         .await
@@ -170,8 +170,8 @@ async fn context_is_prepared_for_every_request_without_accumulating_in_history()
         .build()
         .await
         .expect("builds");
-    agent.prompt("first").await.expect("first answer");
-    agent.prompt("second").await.expect("second answer");
+    agent.prompt("first").await.result.expect("first answer");
+    agent.prompt("second").await.result.expect("second answer");
     assert_eq!(policy.0.load(Ordering::SeqCst), 3);
     for request in provider.requests() {
         assert_eq!(
@@ -232,7 +232,7 @@ async fn a_context_policy_cannot_send_orphaned_tool_results() {
         .build()
         .await
         .expect("builds");
-    assert!(agent.prompt("read").await.is_err());
+    assert!(agent.prompt("read").await.result.is_err());
     assert_eq!(provider.requests().len(), 1);
     assert_eq!(
         agent.history().turns().len(),
@@ -278,9 +278,13 @@ async fn cancelling_a_context_hook_leaves_the_agent_reusable() {
         policy.0.notified().await;
         cancel.cancel();
     });
-    assert!(result.is_err());
+    assert!(result.result.is_err());
     assert!(provider.requests().is_empty());
-    agent.prompt("second").await.expect("can prompt again");
+    agent
+        .prompt("second")
+        .await
+        .result
+        .expect("can prompt again");
     agent
         .shutdown(ShutdownReason::Completed)
         .await
@@ -321,8 +325,8 @@ async fn application_compaction_keeps_recent_turns_and_records_usage() {
         .build()
         .await
         .expect("builds");
-    agent.prompt("first").await.expect("first");
-    agent.prompt("second").await.expect("second");
+    agent.prompt("first").await.result.expect("first");
+    agent.prompt("second").await.result.expect("second");
     let before = agent.history();
     let result = agent
         .compact(CompactionOptions::new().preserve_turns(1))
@@ -378,8 +382,8 @@ async fn failed_or_empty_application_summaries_leave_history_intact() {
             .build()
             .await
             .expect("builds");
-        agent.prompt("first").await.expect("first");
-        agent.prompt("second").await.expect("second");
+        agent.prompt("first").await.result.expect("first");
+        agent.prompt("second").await.result.expect("second");
         let before = agent.to_record().messages;
         let mut events = agent.subscribe();
         assert!(
@@ -429,8 +433,8 @@ async fn cancelling_application_compaction_leaves_history_intact() {
         .build()
         .await
         .expect("builds");
-    agent.prompt("first").await.expect("first");
-    agent.prompt("second").await.expect("second");
+    agent.prompt("first").await.result.expect("first");
+    agent.prompt("second").await.result.expect("second");
     let before = agent.to_record().messages;
     let cancel = CancellationToken::new();
     let mut events = agent.subscribe();
@@ -443,7 +447,7 @@ async fn cancelling_application_compaction_leaves_history_intact() {
     );
     assert!(result.is_err());
     assert_eq!(agent.to_record().messages, before);
-    agent.prompt("still usable").await.expect("answers");
+    agent.prompt("still usable").await.result.expect("answers");
     agent
         .shutdown(ShutdownReason::Completed)
         .await
@@ -477,8 +481,8 @@ async fn automatic_compaction_uses_the_application_summarizer() {
         .build()
         .await
         .expect("builds");
-    agent.prompt("first").await.expect("first");
-    agent.prompt("second").await.expect("second");
+    agent.prompt("first").await.result.expect("first");
+    agent.prompt("second").await.result.expect("second");
     assert!(!policy.0.lock().expect("lock").is_empty());
     assert!(provider.completion_requests().is_empty());
     agent

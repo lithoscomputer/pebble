@@ -13,7 +13,7 @@ use pebble_coding_agent::environment::LocalEnvironment;
 use pebble_coding_agent::subagents::SubagentOptions;
 use pebble_coding_agent::tools::PermissionLevel;
 use pebble_coding_agent::{
-    CodingAgent, CodingAgentOptions, Error as AgentError, InterruptReason, PromptOutcome,
+    CodingAgent, CodingAgentOptions, Error as AgentError, InterruptReason, PromptOutput,
     ShutdownReason,
 };
 use tokio::signal::ctrl_c;
@@ -139,9 +139,9 @@ async fn exec(args: ExecArgs, style: Style) -> Result<Ending> {
         }
     });
 
-    let result = agent.prompt(prompt).await;
+    let report = agent.prompt(prompt).await;
     interrupt.abort();
-    let reason = match &result {
+    let reason = match &report.result {
         Ok(_) => ShutdownReason::Completed,
         Err(AgentError::Interrupted(_)) => ShutdownReason::Cancelled,
         Err(_) => ShutdownReason::Error,
@@ -151,10 +151,12 @@ async fn exec(args: ExecArgs, style: Style) -> Result<Ending> {
     let shutdown = agent.shutdown(reason).await;
     let summary = renderer.await.context("joining the event renderer")?;
 
-    match result {
-        Ok(outcome) => {
-            write_answer(&outcome)?;
-            summary.report(&outcome, style);
+    if let Ok(outcome) = &report.result {
+        write_answer(outcome)?;
+    }
+    summary.report(&report, style);
+    match report.result {
+        Ok(_) => {
             shutdown.context("shutting the agent down")?;
             Ok(Ending::Answered)
         }
@@ -189,8 +191,8 @@ fn read_prompt(argument: Option<&str>) -> Result<String> {
 }
 
 /// Writes the final answer to standard output, ending it with one newline.
-fn write_answer(outcome: &PromptOutcome) -> Result<()> {
-    let Some(text) = outcome.text() else {
+fn write_answer(outcome: &PromptOutput) -> Result<()> {
+    let Some(text) = outcome.text.as_deref() else {
         return Ok(());
     };
     let mut stdout = io::stdout().lock();

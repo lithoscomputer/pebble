@@ -73,18 +73,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .await?;
 
     let mut events = agent.subscribe();
-    let outcome = agent.prompt("fix the failing test").await?;
+    let report = agent.prompt("fix the failing test").await;
+    let outcome = report.result?;
     agent.shutdown(ShutdownReason::Completed).await?;
 
-    println!("{:?} — first event: {:?}", outcome.text(), events.try_recv());
+    println!("{:?} — first event: {:?}", outcome.text, events.try_recv());
     Ok(())
 }
 ```
 
 `CodingAgentBuilder::build().await` returns a ready coding agent. Resource loading
 and system-prompt construction happen inside the build. There is no separate
-initialization step to remember. `prompt` returns a `PromptOutcome` with the final
-message, text, token usage, cost, and timing.
+initialization step to remember. `prompt` returns a `PromptReport` with token usage, known cost, and timing
+on success and failure. Its `result` contains either a `PromptOutput` with the
+final message and text, or the prompt error. Accounting covers accepted main-model
+responses in this session, including queued follow-ups. It excludes subagents,
+compaction, and model calls made inside tools. Known cost is a subtotal when some
+responses have no price. A dropped prompt future cannot return a report.
 
 The crate root contains the normal coding-agent path and the environment
 contract. The environment a session acts through is in

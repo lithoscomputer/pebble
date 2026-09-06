@@ -471,6 +471,7 @@ async fn check_case(topology: Topology, boundary: RootBoundary, failure: Failure
             let error = timeout(PATIENCE, operation)
                 .await
                 .expect("root stops on descendant sink failure")
+                .result
                 .expect_err("sink refused output");
             assert_original_failure(&error);
         }
@@ -482,7 +483,7 @@ async fn check_case(topology: Topology, boundary: RootBoundary, failure: Failure
     assert!(control.is_closed());
     assert!(!control.is_running());
     assert!(matches!(
-        agent.prompt("again").await,
+        agent.prompt("again").await.result,
         Err(Error::SessionClosed)
     ));
     // Explicit shutdown must join tasks. It must not be what first delivers

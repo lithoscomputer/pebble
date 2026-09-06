@@ -1675,6 +1675,7 @@ impl CodingRuntime {
         let result = self
             .process_input(input, SkillExpansion::Apply, &prompt_cancel)
             .await;
+        self.conversation().finish_prompt_timing();
 
         if let Some(link) = caller_link {
             link.stop().await;

@@ -69,8 +69,8 @@ mod readme {}
 pub use self::coding_agent::{
     CodingAgent, CodingAgentBuildError, CodingAgentBuilder, CodingAgentControlHandle,
     CodingAgentExport, CodingAgentObservation, CodingAgentSnapshot, CodingInput, ControlSnapshot,
-    PendingInput, PromptOutcome, PromptTiming, ResumeMode, ShutdownReason, SteeringMessage,
-    SteeringOutcome,
+    PendingInput, PromptOutput, PromptReport, PromptTiming, ResumeMode, ShutdownReason,
+    SteeringMessage, SteeringOutcome,
 };
 pub use self::compaction::{
     CompactionOptions, CompactionOutcome, CompactionReason, CompactionResult,

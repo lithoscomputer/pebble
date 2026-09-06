@@ -145,6 +145,7 @@ async fn stored_session(client: Client, selector: &str) -> (SessionRecord, Vec<M
     agent
         .prompt("first")
         .await
+        .result
         .expect("the first prompt succeeds");
     let record = agent.to_record();
     let history = agent.history().turns().to_vec();
@@ -197,8 +198,9 @@ async fn a_session_resumes_on_its_recorded_route_exactly() {
     let outcome = resumed
         .prompt("second")
         .await
+        .result
         .expect("the resumed prompt succeeds");
-    assert_eq!(outcome.text(), Some("two"));
+    assert_eq!(outcome.text.as_deref(), Some("two"));
     resumed
         .shutdown(ShutdownReason::Completed)
         .await
@@ -306,8 +308,9 @@ async fn failover_keeps_the_conversation_and_changes_the_route_visibly() {
     let outcome = resumed
         .prompt("second")
         .await
+        .result
         .expect("the resumed prompt succeeds");
-    assert_eq!(outcome.text(), Some("two"));
+    assert_eq!(outcome.text.as_deref(), Some("two"));
     // The new route is what the next record stores.
     let stored_again = resumed.to_record();
     assert_eq!(stored_again.provider.as_deref(), Some("bare"));
@@ -388,6 +391,7 @@ async fn a_restored_conversation_replays_its_tool_results_paired() {
     resumed
         .prompt("carry on")
         .await
+        .result
         .expect("the resumed prompt succeeds");
 
     // The restored conversation reaches the model as a valid exchange: the
@@ -455,6 +459,7 @@ async fn event_numbering_continues_where_the_record_left_off() {
     resumed
         .prompt("second")
         .await
+        .result
         .expect("the resumed prompt succeeds");
     resumed
         .shutdown(ShutdownReason::Completed)
@@ -496,6 +501,7 @@ async fn an_export_continues_in_memory_without_initializing_again() {
     first
         .prompt("first")
         .await
+        .result
         .expect("the first prompt succeeds");
     let mut export = first.export();
     let history = first.history().turns().to_vec();
@@ -528,8 +534,9 @@ async fn an_export_continues_in_memory_without_initializing_again() {
     let outcome = second
         .prompt("second")
         .await
+        .result
         .expect("the successor's prompt succeeds");
-    assert_eq!(outcome.text(), Some("two"));
+    assert_eq!(outcome.text.as_deref(), Some("two"));
 
     let first_requests = first_provider.requests();
     let second_requests = second_provider.requests();

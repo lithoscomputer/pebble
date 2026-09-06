@@ -119,7 +119,11 @@ async fn round_with(
         builder = builder.system_prompt_transform(transform);
     }
     let mut agent = builder.build().await.expect("the agent builds");
-    agent.prompt("hello").await.expect("the prompt succeeds");
+    agent
+        .prompt("hello")
+        .await
+        .result
+        .expect("the prompt succeeds");
     agent
         .shutdown(ShutdownReason::Completed)
         .await

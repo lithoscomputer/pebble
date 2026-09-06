@@ -176,10 +176,19 @@ impl ConversationState {
         self.tool_start.get_or_insert_with(Instant::now);
     }
 
-    fn finish_tools(&mut self, calls: &[ToolCall], results: &[ToolResult]) {
+    pub(super) fn finish_prompt_timing(&mut self) {
+        self.finish_inference();
+        self.finish_tool_timing();
+    }
+
+    fn finish_tool_timing(&mut self) {
         if let Some(started) = self.tool_start.take() {
             self.totals.timing.tool = self.totals.timing.tool.saturating_add(started.elapsed());
         }
+    }
+
+    fn finish_tools(&mut self, calls: &[ToolCall], results: &[ToolResult]) {
+        self.finish_tool_timing();
         if activated_a_skill(calls, results) {
             self.activated_skill_context_observed = true;
         }

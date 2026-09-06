@@ -295,7 +295,7 @@ async fn retrieval_is_only_advertised_with_a_store() {
             builder = builder.output_store(Arc::new(MemoryStore::default()));
         }
         let mut agent = builder.build().await.expect("builds");
-        agent.prompt("hello").await.expect("answers");
+        agent.prompt("hello").await.result.expect("answers");
         assert_eq!(
             provider.requests()[0]
                 .tools()

@@ -59,7 +59,8 @@ async fn cancelling_a_summary_pairs_the_tool_result_and_keeps_the_agent_reusable
         assert!(matches!(
             timeout(PATIENCE, &mut prompt)
                 .await
-                .expect("summary cancellation finishes"),
+                .expect("summary cancellation finishes")
+                .result,
             Err(Error::Interrupted(_))
         ));
         drop(prompt);
@@ -91,8 +92,10 @@ async fn cancelling_a_summary_pairs_the_tool_result_and_keeps_the_agent_reusable
             agent
                 .prompt("continue")
                 .await
+                .result
                 .expect("agent reusable")
-                .text(),
+                .text
+                .as_deref(),
             Some("next answer")
         );
         agent

@@ -39,7 +39,7 @@ use lithos_llm::middleware::{RetryMiddleware, RetryPolicy};
 use pebble_coding_agent::environment::LocalEnvironment;
 use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent, RetryEventObserver, TokenUsage};
 use pebble_coding_agent::{
-    CodingAgent, CodingAgentControlHandle, CodingAgentOptions, PromptOutcome, ShutdownReason,
+    CodingAgent, CodingAgentControlHandle, CodingAgentOptions, PromptReport, ShutdownReason,
 };
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
@@ -144,19 +144,25 @@ async fn run() -> Result<(), Box<dyn StdError>> {
     let steering = steer_once(session.subscribe(), session.control_handle());
 
     eprintln!("\n--- prompt 1: write, edit, run a command ---");
-    let answer = session.prompt(FIRST_PROMPT).await?;
+    let answer = session.prompt(FIRST_PROMPT).await;
     steering.await?;
     totals.add(&answer);
-    eprintln!("\nanswer: {}", answer.text().unwrap_or("(no text)"));
+    eprintln!(
+        "\nanswer: {}",
+        answer.result?.text.as_deref().unwrap_or("(no text)")
+    );
 
     // --- One prompt, interrupted while it works ---
     let interrupting = interrupt_once(session.subscribe(), session.control_handle());
 
     eprintln!("\n--- prompt 2: interrupted mid-answer ---");
-    let answer = session.prompt(SECOND_PROMPT).await?;
+    let answer = session.prompt(SECOND_PROMPT).await;
     interrupting.await?;
     totals.add(&answer);
-    eprintln!("\nanswer: {}", answer.text().unwrap_or("(no text)"));
+    eprintln!(
+        "\nanswer: {}",
+        answer.result?.text.as_deref().unwrap_or("(no text)")
+    );
 
     // Closing publishes what is queued and joins everything the session owns.
     // Joining the event pump is what ends the renderer: the stream closes when
@@ -314,7 +320,7 @@ async fn wait_until(
 
 /// What one session accumulated across its prompts.
 ///
-/// A [`PromptOutcome`] describes one completed prompt, so an application that
+/// A [`PromptReport`] describes one completed prompt, so an application that
 /// wants a session total keeps its own.
 #[derive(Debug, Default)]
 struct Totals {
@@ -326,9 +332,9 @@ struct Totals {
 
 impl Totals {
     /// Adds what the prompt that just finished reported.
-    fn add(&mut self, outcome: &PromptOutcome) {
-        self.usage = self.usage.saturating_add(outcome.usage());
-        if let Some(cost) = outcome.cost_usd_micros() {
+    fn add(&mut self, outcome: &PromptReport) {
+        self.usage = self.usage.saturating_add(outcome.usage);
+        if let Some(cost) = outcome.cost_usd_micros {
             self.cost_usd_micros += cost;
             self.priced = true;
         }

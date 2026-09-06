@@ -115,6 +115,7 @@ async fn replacement_keeps_the_profile_name_and_executes_the_new_tool() {
         agent
             .prompt("read a value")
             .await
+            .result
             .expect("prompt completes");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let requests = provider.requests();
