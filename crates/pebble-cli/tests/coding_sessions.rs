@@ -400,3 +400,176 @@ async fn a_broken_stream_after_an_edit_does_not_execute_the_edit_twice() {
     );
     twin.stop().await;
 }
+
+#[cfg(unix)]
+mod cancellation {
+    use std::io::ErrorKind;
+
+    use pebble_coding_agent::events::CommandTermination;
+    use pebble_coding_agent::{Error, InterruptReason};
+    use rustix::io::Errno;
+    use rustix::process::{Pid, Signal, kill_process_group, test_kill_process};
+    use tokio::fs::read_to_string;
+    use tokio::time::sleep;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+
+    /// Clean up the fixture if an assertion fails while its processes run.
+    struct ProcessGroup(Option<Pid>);
+
+    impl Drop for ProcessGroup {
+        fn drop(&mut self) {
+            if let Some(pid) = self.0 {
+                let _ = kill_process_group(pid, Signal::KILL);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_prompt_reaps_its_shell_and_child_and_allows_another_prompt() {
+        let workspace = tempfile::tempdir().unwrap();
+        // The parent reaps its child on TERM. Signalling only the parent
+        // would leave it waiting for the child and fail the cleanup checks.
+        fs::write(
+            workspace.path().join("worker.sh"),
+            r#"
+trap 'wait "$worker"; exit 0' TERM
+sleep 60 &
+worker=$!
+echo "$$ $worker" > processes.tmp
+mv processes.tmp processes
+wait "$worker"
+"#,
+        )
+        .unwrap();
+        let mut twin = Twin::start(vec![
+            scenario(1, "Run the worker", shell("worker", "bash worker.sh")),
+            scenario(
+                2,
+                "Continue after cancellation",
+                answer("Ready for more work."),
+            ),
+        ])
+        .await;
+        let events = Arc::new(EventLog::default());
+        let mut agent = twin
+            .agent(
+                workspace.path(),
+                CodingAgentOptions::default().with_context_compaction(false),
+                &events,
+            )
+            .await;
+        let cancel = CancellationToken::new();
+        let cancel_when_running = async {
+            let text = loop {
+                match read_to_string(workspace.path().join("processes")).await {
+                    Ok(text) => break text,
+                    Err(error) if error.kind() == ErrorKind::NotFound => {
+                        sleep(Duration::from_millis(10)).await;
+                    }
+                    Err(error) => panic!("reading process readiness: {error}"),
+                }
+            };
+            let pids: Vec<_> = text
+                .split_whitespace()
+                .map(|pid| Pid::from_raw(pid.parse().unwrap()).unwrap())
+                .collect();
+            assert_eq!(pids.len(), 2);
+            let group = ProcessGroup(Some(pids[0]));
+            for pid in &pids {
+                assert!(
+                    test_kill_process(*pid).is_ok(),
+                    "process {pid:?} is running before cancellation"
+                );
+            }
+            cancel.cancel();
+            (group, pids)
+        };
+        let (report, (mut group, pids)) = timeout(PATIENCE, async {
+            tokio::join!(
+                agent.prompt_with_cancellation("Run the worker", &cancel),
+                cancel_when_running
+            )
+        })
+        .await
+        .expect("cancellation finishes within the deadline");
+        assert!(matches!(
+            report.result,
+            Err(Error::Interrupted(InterruptReason::Cancelled))
+        ));
+        assert_eq!(report.usage.input, 10);
+        assert_eq!(report.usage.output, 5);
+        assert!(report.cost_usd_micros.is_some_and(|cost| cost > 0));
+        // Check before shutdown: prompt cancellation must own this cleanup.
+        for pid in pids {
+            assert_eq!(
+                test_kill_process(pid),
+                Err(Errno::SRCH),
+                "process {pid:?} was reaped"
+            );
+        }
+        group.0 = None;
+        agent.flush_events().await.unwrap();
+        let published = events.take();
+        let terminal: Vec<_> = published
+            .iter()
+            .filter_map(|event| match &event.event {
+                CodingEvent::ToolProcessCompleted { termination, .. } => {
+                    assert_eq!(*termination, CommandTermination::Cancelled);
+                    Some("process")
+                }
+                CodingEvent::ToolCallCompleted {
+                    tool_call_id,
+                    is_error,
+                    ..
+                } => {
+                    assert_eq!(tool_call_id, "worker");
+                    assert!(*is_error);
+                    Some("tool")
+                }
+                CodingEvent::ProcessingEnd => Some("prompt"),
+                CodingEvent::SessionEnded => {
+                    panic!("caller cancellation must leave the session reusable")
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terminal, ["process", "tool", "prompt"]);
+
+        let next = timeout(PATIENCE, agent.prompt("Continue after cancellation"))
+            .await
+            .unwrap();
+        assert_eq!(
+            next.result.unwrap().text.as_deref(),
+            Some("Ready for more work.")
+        );
+        assert_eq!(next.usage.input, 10, "usage belongs to this invocation");
+        assert_eq!(next.usage.output, 5);
+        agent.shutdown(ShutdownReason::Completed).await.unwrap();
+        let requests = twin.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "the cancelled prompt makes no further model call"
+        );
+        assert_eq!(tool_output(&requests[1], "worker"), "Cancelled");
+        let end = events.take();
+        assert_eq!(
+            end.iter()
+                .filter(|event| matches!(event.event, CodingEvent::SessionEnded))
+                .count(),
+            1
+        );
+        assert!(
+            published
+                .iter()
+                .chain(&end)
+                .map(|event| event.seq)
+                .collect::<Vec<_>>()
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+        );
+        twin.stop().await;
+    }
+}
