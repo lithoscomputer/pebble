@@ -36,10 +36,6 @@ const OPTION_DESCRIPTION_MAX_CHARS: usize = 2_000;
 /// How much of an option's preview a person is shown.
 const OPTION_PREVIEW_MAX_CHARS: usize = 4_000;
 
-/// What a call outside a root session is told.
-const ROOT_SESSION_REQUIRED_ERROR: &str =
-    "human-question tools are available only during a root agent session";
-
 /// The tool that asks a person a question in `profile`'s vocabulary, or `None`
 /// where the harness has none.
 ///
@@ -356,18 +352,10 @@ fn parse_tool_args<T: for<'de> Deserialize<'de>>(args: Value) -> Result<T, ToolE
 
 /// Puts the questions to the person and waits.
 ///
-/// The four refusals ahead of the call are the ones that make this tool
-/// root-only and application-provided: a call outside a session, a call from a
-/// child, a call the provider could not be correlated with, and a session with
-/// nobody to ask.
+/// Refuses children, calls without a provider call ID, and sessions with nobody
+/// to ask.
 async fn ask(ctx: ToolContext, questions: Vec<Question>) -> Result<Vec<Answer>, ToolError> {
-    let session_id = ctx
-        .session_id()
-        .ok_or_else(|| ToolError::unavailable(ROOT_SESSION_REQUIRED_ERROR))?;
-    let root_session_id = ctx
-        .root_session_id()
-        .ok_or_else(|| ToolError::unavailable(ROOT_SESSION_REQUIRED_ERROR))?;
-    if session_id != root_session_id {
+    if !ctx.session().is_root() {
         return Err(ToolError::denied(
             "human-question tools are only available to the root agent; subagents must report \
              back to their parent",
@@ -659,6 +647,7 @@ mod tests {
     use crate::test_support::MockEnvironment;
     use crate::tool::{ToolRegistry, ToolVocabulary};
     use crate::tools::testing::{context, schema_of};
+    use crate::{SessionId, SessionScope};
 
     /// A provider that answers every question with what it was given.
     struct Scripted {
@@ -704,10 +693,7 @@ mod tests {
     /// A root session with `provider` to ask through.
     fn root_context(provider: Arc<dyn HumanInputProvider>) -> ToolContext {
         context(MockEnvironment::default())
-            .with_session(
-                crate::SessionScope::root(crate::SessionId::new("root"))
-                    .child(crate::SessionId::new("root")),
-            )
+            .with_session(SessionScope::root(SessionId::new("root")))
             .with_tool_call_id("call_1")
             .with_human_input(provider)
     }
@@ -1077,10 +1063,7 @@ mod tests {
     async fn claude5_question_tool_rejects_subagent_sessions() {
         let tool = make_claude5_question_tool();
         let child = context(MockEnvironment::default())
-            .with_session(
-                crate::SessionScope::root(crate::SessionId::new("root"))
-                    .child(crate::SessionId::new("child")),
-            )
+            .with_session(SessionScope::root(SessionId::new("root")).child(SessionId::new("child")))
             .with_tool_call_id("call")
             .with_human_input(Arc::new(Scripted {
                 answers: Vec::new(),
@@ -1103,10 +1086,7 @@ mod tests {
     async fn a_session_with_nobody_to_ask_says_so() {
         let tool = make_anthropic_question_tool();
         let context = context(MockEnvironment::default())
-            .with_session(
-                crate::SessionScope::root(crate::SessionId::new("root"))
-                    .child(crate::SessionId::new("root")),
-            )
+            .with_session(SessionScope::root(SessionId::new("root")))
             .with_tool_call_id("call");
 
         let error = (tool.executor)(
@@ -1126,7 +1106,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_question_asked_outside_a_session_is_unavailable() {
+    async fn a_question_requires_a_provider_call_id() {
         let tool = make_anthropic_question_tool();
 
         let error = (tool.executor)(
@@ -1139,10 +1119,10 @@ mod tests {
         )
         .await
         .map(|output| output.text())
-        .expect_err("there is no session");
+        .expect_err("there is no call ID");
 
-        assert_eq!(error.message(), ROOT_SESSION_REQUIRED_ERROR);
-        assert_eq!(error.kind(), ToolErrorKind::Unavailable);
+        assert!(error.message().contains("missing a provider tool_call_id"));
+        assert_eq!(error.kind(), ToolErrorKind::Execution);
     }
 
     /// The model asked because it could not proceed, so a question that came

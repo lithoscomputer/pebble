@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use lithos_llm::types::{Message, Response};
 use tokio_util::sync::CancellationToken;
 
+use crate::SessionScope;
 use crate::agent::UserMessage;
 use crate::tool::ToolCatalog;
 
@@ -29,6 +30,7 @@ pub enum AfterAnswerAction {
 /// Lifecycle stages and tool discovery both receive one.
 #[derive(Clone, Copy, Debug)]
 pub struct TurnContext<'a> {
+    session:  &'a SessionScope,
     model:    &'a str,
     turn:     usize,
     messages: &'a [Message],
@@ -37,12 +39,24 @@ pub struct TurnContext<'a> {
 impl<'a> TurnContext<'a> {
     /// Creates a context for one model turn.
     #[must_use]
-    pub const fn new(model: &'a str, turn: usize, messages: &'a [Message]) -> Self {
+    pub const fn new(
+        session: &'a SessionScope,
+        model: &'a str,
+        turn: usize,
+        messages: &'a [Message],
+    ) -> Self {
         Self {
+            session,
             model,
             turn,
             messages,
         }
+    }
+
+    /// The acting session and its ancestry.
+    #[must_use]
+    pub const fn session(&self) -> &'a SessionScope {
+        self.session
     }
 
     /// The model selector for this turn.

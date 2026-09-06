@@ -50,7 +50,7 @@ use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-pub(crate) use self::tools::{require_session_scope, subagent_tools};
+pub(crate) use self::tools::subagent_tools;
 use crate::SessionScope;
 use crate::coding_agent::CodingInput;
 use crate::config::CodingAgentOptions;
@@ -276,7 +276,6 @@ pub(crate) type ChildObserver = Arc<dyn Fn(&CodingRuntime) + Send + Sync>;
 fn build_child(
     deps: &Arc<ChildDeps>,
     parent: SessionScope,
-    depth: usize,
 ) -> StdResult<CodingRuntime, CodingAgentBuildError> {
     // A child is given a task, not the application's integrations: an
     // application tool reaches it only when marked inheritable, and a tool
@@ -302,7 +301,6 @@ fn build_child(
         .child_of(ChildIdentity {
             event_emitter: deps.event_emitter.for_child(parent.session_id().as_str()),
             parent,
-            depth,
             open_sessions: Arc::clone(&deps.open_sessions),
             observer: deps.observer.clone(),
         });
@@ -363,9 +361,6 @@ pub(crate) struct ChildDeps {
     /// What sees each child as it is built, for the crate's own tests.
     pub(crate) observer:          Option<ChildObserver>,
     pub(crate) open_sessions:     Arc<OpenSessions>,
-    /// The depth of the session these deps belong to. Its children sit one
-    /// deeper.
-    pub(crate) depth:             usize,
 }
 
 /// Where a child sits in its tree, and which budget it spends.
@@ -373,7 +368,6 @@ pub(crate) struct ChildIdentity {
     /// This child's view of the tree's shared event pipeline.
     pub(crate) event_emitter: Emitter,
     pub(crate) parent:        SessionScope,
-    pub(crate) depth:         usize,
     pub(crate) open_sessions: Arc<OpenSessions>,
     /// What sees this child's own children as they are built, inherited
     /// from the root for the crate's own tests.
@@ -1025,7 +1019,6 @@ impl fmt::Debug for SubagentSupervisor {
         formatter
             .debug_struct("SubagentSupervisor")
             .field("agents", &agents)
-            .field("depth", &self.deps.depth)
             .finish_non_exhaustive()
     }
 }
@@ -1112,8 +1105,8 @@ impl SubagentSupervisor {
             .try_acquire()
             .ok_or_else(|| limit_reached(self.deps.open_sessions.max()))?;
 
-        let child_depth = self.deps.depth.saturating_add(1);
-        let child = build_child(&self.deps, parent.clone(), child_depth).map_err(|error| {
+        let child_depth = parent.depth().saturating_add(1);
+        let child = build_child(&self.deps, parent.clone()).map_err(|error| {
             ToolError::with_rendered_source(
                 ToolErrorKind::Execution,
                 "Could not start a subagent session",
@@ -1832,6 +1825,7 @@ mod tests {
     use tokio::time;
 
     use super::*;
+    use crate::SessionId;
     use crate::error::ErrorKind;
     use crate::record::SessionRecord;
     use crate::runtime::testing::{TestSession, noop_tool};
@@ -1859,8 +1853,8 @@ mod tests {
                 .build()
                 .expect("parent builds");
             let supervisor = supervisor_of(&parent);
-            let mut child = build_child(&supervisor.deps, parent.session_scope().clone(), 1)
-                .expect("child builds");
+            let mut child =
+                build_child(&supervisor.deps, parent.session().clone()).expect("child builds");
             let tools = child.registered_tools();
             let inherited = tools.iter().find(|tool| tool.definition.name == "inspect");
             assert_eq!(inherited.is_some(), inheritable);
@@ -1936,7 +1930,7 @@ mod tests {
 
     fn spawn(supervisor: &SubagentSupervisor, parent: &CodingRuntime, task: &str) -> String {
         supervisor
-            .spawn(parent.session_scope(), task.to_owned())
+            .spawn(parent.session(), task.to_owned())
             .expect("the spawn succeeds")
     }
 
@@ -1948,7 +1942,7 @@ mod tests {
     ) -> String {
         supervisor
             .spawn_with_parent_notification(
-                parent.session_scope(),
+                parent.session(),
                 task.to_owned(),
                 description.to_owned(),
             )
@@ -2966,9 +2960,7 @@ mod tests {
         let grandchild = child
             .supervisor
             .spawn(
-                &parent
-                    .session_scope()
-                    .child(crate::SessionId::new(child.id.clone())),
+                &parent.session().child(SessionId::new(child.id.clone())),
                 "the leaf task".to_owned(),
             )
             .expect("a child may spawn a child of its own");
@@ -3060,7 +3052,7 @@ mod tests {
             .map(|index| spawn(&supervisor, &session, &format!("task {index}")))
             .collect();
         let refused = supervisor
-            .spawn(session.session_scope(), "one too many".to_owned())
+            .spawn(session.session(), "one too many".to_owned())
             .expect_err("the tree is full");
 
         assert_eq!(refused.kind(), ToolErrorKind::Denied);
@@ -3096,7 +3088,7 @@ mod tests {
         supervisor.wait(&agent_id).await.expect("the child answers");
 
         let refused = supervisor
-            .spawn(session.session_scope(), "another".to_owned())
+            .spawn(session.session(), "another".to_owned())
             .expect_err("a finished child still holds its session");
         assert_eq!(refused.kind(), ToolErrorKind::Denied);
 
@@ -3138,8 +3130,12 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(Built {
                     model:  format!("{}/{}", child.provider(), child.model()),
-                    root:   child.root_session_id().to_owned(),
-                    parent: child.to_record().parent_session_id.unwrap_or_default(),
+                    root:   child.session().root_session_id().as_str().to_owned(),
+                    parent: child
+                        .session()
+                        .parent_session_id()
+                        .map(ToString::to_string)
+                        .unwrap_or_default(),
                 });
             recorded_ask.store(child.has_human_input(), Ordering::SeqCst);
         });
@@ -3170,7 +3166,7 @@ mod tests {
         assert_eq!(parent, session.id());
         assert_eq!(
             root,
-            session.root_session_id(),
+            session.session().root_session_id().as_str(),
             "a child belongs to its parent's tree, which root-scoped tools key on"
         );
         assert!(
@@ -3271,8 +3267,11 @@ mod tests {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
             .expect("the child was built");
-        assert_eq!(record.parent_session_id.as_deref(), Some(session.id()));
-        assert!(session.to_record().parent_session_id.is_none());
+        assert_eq!(
+            record.scope.parent_session_id().map(SessionId::as_str),
+            Some(session.id())
+        );
+        assert!(session.session().parent_session_id().is_none());
 
         // A resumed child says the same thing when it is stored again, even
         // though the tree above it is the application's to rebuild.
@@ -3285,7 +3284,7 @@ mod tests {
         )
         .expect("the child's record resumes");
         assert_eq!(
-            resumed.to_record().parent_session_id.as_deref(),
+            resumed.session().parent_session_id().map(SessionId::as_str),
             Some(session.id())
         );
         assert!(resumed.subagent_supervisor().is_none());
@@ -3492,7 +3491,7 @@ mod tests {
         let tools = subagent_tools(&supervisor);
         let context = || {
             ToolContext::new(Arc::new(MockEnvironment::linux()))
-                .with_session(parent.session_scope().clone())
+                .with_session(parent.session().clone())
         };
 
         let agent_id = (tool_named(&tools, "spawn_agent").executor)(

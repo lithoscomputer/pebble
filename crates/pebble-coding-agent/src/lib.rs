@@ -42,7 +42,6 @@ mod record;
 mod redact;
 mod runtime;
 mod search;
-mod session;
 mod skills;
 pub mod state;
 mod subagent;
@@ -66,6 +65,8 @@ pub mod test_support;
 #[doc = include_str!("../../../README.md")]
 mod readme {}
 
+pub use pebble_agent::{SessionId, SessionScope};
+
 pub use self::coding_agent::{
     CodingAgent, CodingAgentBuildError, CodingAgentBuilder, CodingAgentControlHandle,
     CodingAgentExport, CodingAgentObservation, CodingAgentSnapshot, CodingInput, ControlSnapshot,
@@ -78,6 +79,5 @@ pub use self::compaction::{
 pub use self::config::{CodingAgentOptions, CodingAgentOptionsError};
 pub use self::error::{CompactionError, Error, InterruptReason, Result, TaskKind};
 pub use self::runtime::SteeringLease;
-pub use self::session::{SessionId, SessionScope};
 pub use self::skills::SkillExpansionError;
 pub use self::types::{InputContent, InputSource};

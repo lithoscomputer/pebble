@@ -12,6 +12,7 @@ use lithos_llm::types::{
 use tokio_util::sync::CancellationToken;
 
 use super::{ToolContext, ToolErrorKind, ToolOutput, ToolOutputMetadata, ToolOutputStats};
+use crate::SessionScope;
 use crate::event::EventHub;
 use crate::turn::TurnContext;
 use crate::validation::validate_tool_arguments;
@@ -183,7 +184,7 @@ impl ToolCatalog {
     /// descriptor that policy and terminal dispatch use.
     pub fn resolve(
         &self,
-        turn: usize,
+        context: TurnContext<'_>,
         call: ToolCall,
         cancellation: CancellationToken,
     ) -> StdResult<ToolCallRequest, ToolOutcome> {
@@ -214,7 +215,8 @@ impl ToolCatalog {
             ));
         }
         Ok(ToolCallRequest::new(
-            turn,
+            context.session().clone(),
+            context.turn(),
             call,
             descriptor.clone(),
             arguments,
@@ -226,6 +228,7 @@ impl ToolCatalog {
 /// One resolved tool invocation passed through middleware.
 #[derive(Clone)]
 pub struct ToolCallRequest {
+    session:      SessionScope,
     arguments:    serde_json::Value,
     turn:         usize,
     call:         ToolCall,
@@ -236,6 +239,7 @@ pub struct ToolCallRequest {
 
 impl ToolCallRequest {
     const fn new(
+        session: SessionScope,
         turn: usize,
         call: ToolCall,
         descriptor: ToolDescriptor,
@@ -243,6 +247,7 @@ impl ToolCallRequest {
         cancellation: CancellationToken,
     ) -> Self {
         Self {
+            session,
             turn,
             call,
             descriptor,
@@ -250,6 +255,12 @@ impl ToolCallRequest {
             cancellation,
             events: None,
         }
+    }
+
+    /// The acting session and its ancestry.
+    #[must_use]
+    pub const fn session(&self) -> &SessionScope {
+        &self.session
     }
 
     /// The zero-based model turn that requested this call.
@@ -296,13 +307,14 @@ impl ToolCallRequest {
 
     pub(crate) fn into_context_and_arguments(self) -> (ToolContext, serde_json::Value) {
         let Self {
+            session,
             call,
             arguments,
             cancellation,
             events,
             ..
         } = self;
-        let context = ToolContext::new(call.id, call.name, cancellation, events);
+        let context = ToolContext::new(session, call.id, call.name, cancellation, events);
         (context, arguments)
     }
 }
@@ -311,6 +323,7 @@ impl fmt::Debug for ToolCallRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ToolCallRequest")
+            .field("session", &self.session)
             .field("turn", &self.turn)
             .field("call", &self.call)
             .field("descriptor", &self.descriptor)
@@ -649,11 +662,11 @@ impl ToolSystem {
     pub async fn execute(
         &self,
         catalog: &ToolCatalog,
-        turn: usize,
+        context: TurnContext<'_>,
         call: ToolCall,
         cancellation: CancellationToken,
     ) -> StdResult<ToolOutcome, ToolSystemError> {
-        self.execute_with(catalog, turn, call, cancellation, None)
+        self.execute_with(catalog, context, call, cancellation, None)
             .await
     }
 
@@ -662,12 +675,12 @@ impl ToolSystem {
     pub(crate) async fn execute_with(
         &self,
         catalog: &ToolCatalog,
-        turn: usize,
+        context: TurnContext<'_>,
         call: ToolCall,
         cancellation: CancellationToken,
         events: Option<EventHub>,
     ) -> StdResult<ToolOutcome, ToolSystemError> {
-        let request = match catalog.resolve(turn, call, cancellation.clone()) {
+        let request = match catalog.resolve(context, call, cancellation.clone()) {
             Ok(request) => request.with_events(events),
             Err(outcome) => return Ok(outcome),
         };
@@ -798,6 +811,7 @@ mod tests {
 
     fn request() -> ToolCallRequest {
         ToolCallRequest::new(
+            SessionScope::default(),
             0,
             ToolCall {
                 id:                "call_1".to_owned(),
@@ -827,7 +841,8 @@ mod tests {
         }));
 
         let messages = [];
-        let context = TurnContext::new("test/model", 0, &messages);
+        let session = SessionScope::default();
+        let context = TurnContext::new(&session, "test/model", 0, &messages);
         let _ = system.discover(context).await.expect("discovery succeeds");
         let _ = system.call(request()).await.expect("the call succeeds");
 
@@ -874,7 +889,7 @@ mod tests {
         let catalog = ToolCatalog::new([descriptor("inspect")]);
         let outcome = catalog
             .resolve(
-                0,
+                TurnContext::new(&SessionScope::default(), "test/model", 0, &[]),
                 ToolCall::custom("call_1", "inspect", "free form"),
                 CancellationToken::new(),
             )
@@ -892,7 +907,11 @@ mod tests {
         let mut call = ToolCall::function("call_1", "inspect", json!({}));
         call.input = ToolInput::Function(ToolArguments::from_raw("{broken".to_owned()));
         let outcome = catalog
-            .resolve(0, call, CancellationToken::new())
+            .resolve(
+                TurnContext::new(&SessionScope::default(), "test/model", 0, &[]),
+                call,
+                CancellationToken::new(),
+            )
             .expect_err("malformed JSON cannot reach the tool");
         assert!(matches!(outcome, ToolOutcome::Failure {
             kind: ToolErrorKind::InvalidArguments,

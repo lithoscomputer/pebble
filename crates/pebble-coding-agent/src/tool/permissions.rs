@@ -11,6 +11,7 @@ use pebble_agent::{
 };
 
 use super::native::NativeTool;
+use crate::SessionScope;
 use crate::types::{PermissionLevel, ToolCategory};
 
 /// What one permission policy requires for a tool.
@@ -31,7 +32,11 @@ pub enum ToolPermission {
 /// Classifies tools for one permission middleware layer.
 pub trait ToolPermissionPolicy: Send + Sync {
     /// Returns the permission for one stable tool identity.
-    fn permission(&self, tool: &pebble_agent::ToolDescriptor) -> ToolPermission;
+    fn permission(
+        &self,
+        session: &SessionScope,
+        tool: &pebble_agent::ToolDescriptor,
+    ) -> ToolPermission;
 }
 
 /// What an approval service decided for one call and its actual arguments.
@@ -80,12 +85,16 @@ impl PermissionMiddleware {
         self
     }
 
-    fn permission(&self, tool: &pebble_agent::ToolDescriptor) -> ToolPermission {
-        self.policy.permission(tool)
+    fn permission(
+        &self,
+        session: &SessionScope,
+        tool: &pebble_agent::ToolDescriptor,
+    ) -> ToolPermission {
+        self.policy.permission(session, tool)
     }
 
-    fn is_visible(&self, tool: &pebble_agent::ToolDescriptor) -> bool {
-        match self.permission(tool) {
+    fn is_visible(&self, session: &SessionScope, tool: &pebble_agent::ToolDescriptor) -> bool {
+        match self.permission(session, tool) {
             ToolPermission::Allow => true,
             ToolPermission::RequireApproval => self.approval.is_some(),
             ToolPermission::Deny { .. } => false,
@@ -101,7 +110,7 @@ impl ToolMiddleware for PermissionMiddleware {
         next: ToolDiscoveryNext<'_>,
     ) -> StdResult<ToolCatalog, ToolSystemError> {
         let mut catalog = next.run(context).await?;
-        catalog.retain(|tool| self.is_visible(tool));
+        catalog.retain(|tool| self.is_visible(context.session(), tool));
         Ok(catalog)
     }
 
@@ -110,7 +119,7 @@ impl ToolMiddleware for PermissionMiddleware {
         request: ToolCallRequest,
         next: ToolCallNext<'_>,
     ) -> StdResult<ToolOutcome, ToolSystemError> {
-        match self.permission(request.descriptor()) {
+        match self.permission(request.session(), request.descriptor()) {
             ToolPermission::Allow => next.run(request).await,
             ToolPermission::Deny { reason } => {
                 Ok(ToolOutcome::failure(ToolErrorKind::Denied, reason))
@@ -160,7 +169,11 @@ impl PermissionLevelPolicy {
 }
 
 impl ToolPermissionPolicy for PermissionLevelPolicy {
-    fn permission(&self, tool: &pebble_agent::ToolDescriptor) -> ToolPermission {
+    fn permission(
+        &self,
+        _session: &SessionScope,
+        tool: &pebble_agent::ToolDescriptor,
+    ) -> ToolPermission {
         let category = NativeTool::from_canonical_name(tool.id().as_str())
             .and_then(NativeTool::category)
             .unwrap_or(ToolCategory::Shell);
@@ -315,7 +328,7 @@ mod tests {
                 ToolId::try_new(identity).expect("valid identity"),
                 ToolDefinition::function(name, "Read", json!({})),
             );
-            assert_eq!(policy.permission(&tool), expected);
+            assert_eq!(policy.permission(&SessionScope::default(), &tool), expected);
         }
     }
 
@@ -329,7 +342,7 @@ mod tests {
     fn request(descriptor: ToolDescriptor) -> ToolCallRequest {
         ToolCatalog::new([descriptor])
             .resolve(
-                0,
+                TurnContext::new(&SessionScope::default(), "test/model", 0, &[]),
                 ToolCall {
                     id:                "call_1".to_owned(),
                     name:              "shell".to_owned(),
@@ -354,7 +367,12 @@ mod tests {
         ))));
         let messages = [];
         let catalog = system
-            .discover(TurnContext::new("test/model", 0, &messages))
+            .discover(TurnContext::new(
+                &SessionScope::default(),
+                "test/model",
+                0,
+                &messages,
+            ))
             .await
             .expect("discovery succeeds");
 
@@ -390,7 +408,12 @@ mod tests {
         ));
         let messages = [];
         let catalog = system
-            .discover(TurnContext::new("test/model", 0, &messages))
+            .discover(TurnContext::new(
+                &SessionScope::default(),
+                "test/model",
+                0,
+                &messages,
+            ))
             .await
             .expect("discovery succeeds");
         let descriptor = catalog

@@ -22,6 +22,7 @@ pub use self::system::{
     ToolIdError, ToolMiddleware, ToolOutcome, ToolScheduling, ToolService, ToolSystem,
     ToolSystemError,
 };
+use crate::SessionScope;
 use crate::event::{AgentEvent, EventHub};
 use crate::turn::TurnContext;
 
@@ -78,6 +79,7 @@ impl ToolOutputStats {
 /// The context supplied to one tool call.
 #[derive(Clone)]
 pub struct ToolContext {
+    session:      SessionScope,
     tool_call_id: String,
     tool_name:    String,
     cancellation: CancellationToken,
@@ -86,17 +88,25 @@ pub struct ToolContext {
 
 impl ToolContext {
     const fn new(
+        session: SessionScope,
         tool_call_id: String,
         tool_name: String,
         cancellation: CancellationToken,
         events: Option<EventHub>,
     ) -> Self {
         Self {
+            session,
             tool_call_id,
             tool_name,
             cancellation,
             events,
         }
+    }
+
+    /// The acting session and its ancestry.
+    #[must_use]
+    pub const fn session(&self) -> &SessionScope {
+        &self.session
     }
 
     /// The provider's identifier for this call.
@@ -139,6 +149,7 @@ impl fmt::Debug for ToolContext {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ToolContext")
+            .field("session", &self.session)
             .field("tool_call_id", &self.tool_call_id())
             .field("tool_name", &self.tool_name())
             .field("cancelled", &self.cancellation().is_cancelled())

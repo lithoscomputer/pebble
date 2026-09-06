@@ -159,7 +159,7 @@ fn runner(
     let events = Arc::new(Mutex::new(Vec::new()));
     let capture = Arc::clone(&events);
     let runner = ToolRunner::new(CodingToolSet::core(), env)
-        .session_id(SessionId::new("root"))
+        .session(SessionScope::root(SessionId::new("root")))
         .output_store(store)
         .expect("store installed")
         .options(CodingAgentOptions::default().with_tool_output_limit("shell", 4096))
@@ -202,7 +202,7 @@ async fn an_opaque_reference_recovers_the_middle_of_truncated_remote_output() {
     // A fresh runner represents resume: only the same store and session ID are
     // needed, with a new environment that knows nothing about the old command.
     let resumed = ToolRunner::new(CodingToolSet::empty(), Arc::new(MockEnvironment::linux()))
-        .session_id(SessionId::new("root"))
+        .session(SessionScope::root(SessionId::new("root")))
         .output_store(store.clone())
         .expect("installed");
     let page = resumed
@@ -221,7 +221,7 @@ async fn an_opaque_reference_recovers_the_middle_of_truncated_remote_output() {
     assert_eq!(page["next_offset"], 1_100_006);
     assert_eq!(page["eof"], false);
     let denied = resumed
-        .session_id(SessionId::new("unrelated"))
+        .session(SessionScope::root(SessionId::new("unrelated")))
         .run(
             &ToolCall::function("read-2", "read_tool_output", json!({"reference":reference})),
             CancellationToken::new(),

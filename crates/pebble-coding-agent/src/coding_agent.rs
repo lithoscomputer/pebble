@@ -153,13 +153,12 @@ pub enum CodingAgentBuildError {
 
     /// The stored record's format version is one this build does not read.
     #[error(
-        "session record format version {version} is not one this build reads (it reads up to \
-         {supported})"
+        "session record format version {version} is not supported (this build requires {supported})"
     )]
     UnsupportedRecord {
         /// The version the record declares.
         version:   u32,
-        /// The newest version this build reads.
+        /// The format this build requires.
         supported: u32,
     },
 
@@ -286,8 +285,7 @@ pub struct PromptOutput {
 /// An owned view of a coding agent at one committed event boundary.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CodingAgentSnapshot {
-    session_id:          String,
-    stream_id:           String,
+    session:             SessionScope,
     state:               CodingAgentState,
     provider:            String,
     model:               String,
@@ -302,16 +300,22 @@ pub struct CodingAgentSnapshot {
 }
 
 impl CodingAgentSnapshot {
+    /// The identity and ancestry captured by this snapshot.
+    #[must_use]
+    pub const fn session(&self) -> &SessionScope {
+        &self.session
+    }
+
     /// The durable session identifier.
     #[must_use]
     pub fn session_id(&self) -> &str {
-        &self.session_id
+        self.session.session_id().as_str()
     }
 
     /// The root event-stream identifier.
     #[must_use]
     pub fn stream_id(&self) -> &str {
-        &self.stream_id
+        self.session.root_session_id().as_str()
     }
 
     /// What the session was doing when captured.
@@ -412,7 +416,7 @@ impl fmt::Debug for CodingAgentObservation {
 
 /// What a builder resumes from, when it resumes at all.
 enum ResumeSource {
-    Record(SessionRecord, ResumeMode),
+    Record(Box<SessionRecord>, ResumeMode),
     Export(Box<WarmState>),
 }
 
@@ -614,7 +618,7 @@ impl CodingAgentBuilder {
         }
         let inner = match self.resume {
             Some(ResumeSource::Record(record, mode)) => {
-                let mut inner = CodingRuntime::from_record(record, &mode, self.inner)?;
+                let mut inner = CodingRuntime::from_record(*record, &mode, self.inner)?;
                 if let Err(source) = inner.initialize().await {
                     let _ = inner.shutdown(ShutdownReason::Error).await;
                     return Err(CodingAgentBuildError::Initialization {
@@ -1254,7 +1258,7 @@ impl CodingAgent {
         mode: ResumeMode,
     ) -> CodingAgentBuilder {
         let mut builder = CodingAgentBuilder::new(client, environment);
-        builder.resume = Some(ResumeSource::Record(record, mode));
+        builder.resume = Some(ResumeSource::Record(Box::new(record), mode));
         builder
     }
 
@@ -1414,8 +1418,7 @@ impl CodingAgent {
 
     fn snapshot_at(&self, committed_event_seq: u64) -> CodingAgentSnapshot {
         CodingAgentSnapshot {
-            session_id: self.inner.id().to_owned(),
-            stream_id: self.inner.root_session_id().to_owned(),
+            session: self.inner.session().clone(),
             state: self.inner.state(),
             provider: self.inner.provider().to_owned(),
             model: self.inner.model().to_owned(),
@@ -1500,8 +1503,8 @@ impl CodingAgent {
 
     /// The acting session and the root shared by its tree.
     #[must_use]
-    pub const fn session_scope(&self) -> &SessionScope {
-        self.inner.session_scope()
+    pub const fn session(&self) -> &SessionScope {
+        self.inner.session()
     }
 
     /// The session identifier as text for display and storage.

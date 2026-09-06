@@ -9,15 +9,9 @@
 //! # Stability
 //!
 //! The serialized form is public API and carries a
-//! [`format_version`](SessionRecord::format_version). Evolution is additive:
-//! new optional fields and new variants may appear within a version, and a
-//! record written by an older pebble always restores. A change that older
-//! records cannot express bumps the version and ships a migration.
-//!
-//! Every payload is typed rather than free JSON, which is what makes token
-//! usage round-trip exactly. Absent and `null` members both fall back to their
-//! defaults, so a record never fails to restore over a field it does not
-//! carry.
+//! [`format_version`](SessionRecord::format_version). This build requires the
+//! current format. Ancestry must be explicit; older identities are not
+//! inferred.
 
 use std::time::SystemTime;
 
@@ -26,22 +20,14 @@ mod tool_call;
 use lithos_llm::types::{ContentPart, ToolCall, ToolResult};
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::SessionScope;
 use crate::compaction::CompactionReason;
 use crate::types::{InputContent, TokenUsage, rfc3339_millis};
 
 /// The record format version this build writes.
 ///
-/// Version 3 stores a single typed tool input. Formats 1 and 2 are converted
-/// on read; their raw function argument text takes precedence when present.
-pub const SESSION_RECORD_FORMAT_VERSION: u32 = 3;
-
-/// The version assumed for a record that names none.
-///
-/// Version 1 is the first format pebble ever wrote, so an unversioned document
-/// can only be a version 1 record.
-const fn default_format_version() -> u32 {
-    1
-}
+/// Version 4 stores the canonical session scope, including parent and depth.
+pub const SESSION_RECORD_FORMAT_VERSION: u32 = 4;
 
 /// One session, stored.
 ///
@@ -52,15 +38,10 @@ const fn default_format_version() -> u32 {
 #[non_exhaustive]
 pub struct SessionRecord {
     /// The format this record was written in.
-    #[serde(default = "default_format_version")]
     pub format_version: u32,
 
-    /// The session's identifier, which a resumed session keeps.
-    pub session_id: String,
-
-    /// The parent session, when this session was a subagent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub parent_session_id: Option<String>,
+    /// The identity and ancestry a resumed session keeps.
+    pub scope: SessionScope,
 
     /// The provider the session last resolved to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -94,31 +75,28 @@ pub struct SessionRecord {
 }
 
 impl SessionRecord {
-    /// Starts a record for `session_id`, stamped with the current time.
+    /// Starts a record for `scope`, stamped with the current time.
     #[must_use]
-    pub fn new(session_id: impl Into<String>) -> Self {
+    pub fn new(scope: SessionScope) -> Self {
         let now = SystemTime::now();
         Self {
-            format_version:    SESSION_RECORD_FORMAT_VERSION,
-            session_id:        session_id.into(),
-            parent_session_id: None,
-            provider:          None,
-            model:             None,
-            created_at:        now,
-            updated_at:        now,
-            last_event_seq:    0,
-            messages:          Vec::new(),
+            format_version: SESSION_RECORD_FORMAT_VERSION,
+            scope,
+            provider: None,
+            model: None,
+            created_at: now,
+            updated_at: now,
+            last_event_seq: 0,
+            messages: Vec::new(),
         }
     }
 
     /// Whether this build can restore the record.
     ///
-    /// Pebble reads every format version up to the one it writes and refuses a
-    /// newer one, because a newer record may depend on state this build does
-    /// not keep.
+    /// Only the current format is supported.
     #[must_use]
     pub const fn is_supported(&self) -> bool {
-        self.format_version <= SESSION_RECORD_FORMAT_VERSION
+        self.format_version == SESSION_RECORD_FORMAT_VERSION
     }
 
     /// Advances the event cursor to include events already held by the sink.
@@ -143,49 +121,6 @@ impl SessionRecord {
             _ => None,
         }
     }
-
-    /// Brings a record written by an older pebble up to the format this build
-    /// writes.
-    ///
-    /// Every supported version is migrated explicitly here and keeps a frozen
-    /// fixture under `tests/fixtures`. A version this build does not know —
-    /// newer than it writes, or older than pebble ever wrote — is refused with
-    /// a typed error rather than read on a guess.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RecordMigrationError::UnsupportedVersion`] for a format
-    /// version this build cannot read.
-    pub fn migrate(self) -> Result<Self, RecordMigrationError> {
-        match self.format_version {
-            SESSION_RECORD_FORMAT_VERSION => Ok(self),
-            1 | 2 => Ok(Self {
-                format_version: SESSION_RECORD_FORMAT_VERSION,
-                ..self
-            }),
-            version => Err(RecordMigrationError::UnsupportedVersion {
-                version,
-                supported: SESSION_RECORD_FORMAT_VERSION,
-            }),
-        }
-    }
-}
-
-/// A stored record could not be brought up to this build's format.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum RecordMigrationError {
-    /// The record's format version is one this build does not read.
-    #[error(
-        "session record format version {version} is not one this build reads (it reads up to \
-         {supported})"
-    )]
-    UnsupportedVersion {
-        /// The version the record declares.
-        version:   u32,
-        /// The newest version this build reads.
-        supported: u32,
-    },
 }
 
 /// One stored conversation turn.
@@ -331,6 +266,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::SessionId;
     use crate::types::Message;
 
     fn moment() -> SystemTime {
@@ -517,23 +453,20 @@ mod tests {
     }
 
     #[test]
-    fn a_record_without_a_format_version_reads_as_version_one() {
-        let record: SessionRecord = serde_json::from_value(json!({
-            "session_id": "ses_1",
-            "created_at": "2026-01-01T00:00:00.500Z",
-            "updated_at": "2026-01-01T00:00:00.500Z",
-        }))
-        .expect("an unversioned record reads as version 1");
-
-        assert_eq!(record.format_version, 1);
-        assert!(record.is_supported());
-        assert_eq!(record.last_event_seq, 0);
-        assert!(record.messages.is_empty());
+    fn a_record_requires_explicit_scope_and_version() {
+        assert!(
+            serde_json::from_value::<SessionRecord>(json!({
+                "session_id": "ses_1",
+                "created_at": "2026-01-01T00:00:00.500Z",
+                "updated_at": "2026-01-01T00:00:00.500Z",
+            }))
+            .is_err()
+        );
     }
 
     #[test]
     fn a_newer_format_version_is_not_supported() {
-        let mut record = SessionRecord::new("ses_1");
+        let mut record = SessionRecord::new(SessionScope::root(SessionId::new("ses_1")));
         assert!(record.is_supported());
 
         record.format_version = SESSION_RECORD_FORMAT_VERSION + 1;
@@ -543,7 +476,7 @@ mod tests {
 
     #[test]
     fn reconciling_an_event_cursor_only_moves_it_forward() {
-        let mut record = SessionRecord::new("ses_1");
+        let mut record = SessionRecord::new(SessionScope::root(SessionId::new("ses_1")));
         record.last_event_seq = 41;
 
         record.advance_event_cursor(45);
@@ -555,17 +488,18 @@ mod tests {
 
     #[test]
     fn a_new_record_names_the_current_format() {
-        let record = SessionRecord::new("ses_1");
+        let record = SessionRecord::new(SessionScope::root(SessionId::new("ses_1")));
 
         assert_eq!(record.format_version, SESSION_RECORD_FORMAT_VERSION);
-        assert_eq!(record.session_id, "ses_1");
+        assert_eq!(record.scope.session_id().as_str(), "ses_1");
         assert_eq!(record.created_at, record.updated_at);
     }
 
     #[test]
     fn a_whole_record_survives_a_json_round_trip() {
-        let mut record = SessionRecord::new("ses_1");
-        record.parent_session_id = Some("ses_root".into());
+        let mut record = SessionRecord::new(SessionScope::root(SessionId::new("ses_1")));
+        record.scope =
+            SessionScope::root(SessionId::new("ses_root")).child(SessionId::new("ses_1"));
         record.provider = Some("anthropic".into());
         record.model = Some("claude-sonnet-5".into());
         record.created_at = moment();

@@ -283,6 +283,18 @@ builder.permission_level(PermissionLevel::ReadWrite)
 
 `CodingAgentBuilder::permission_level` installs the built-in permission policy and records its level together. The last call selects the level, regardless of where `.options(...)` appears. Subagents inherit the policy.
 
+`pebble_agent::SessionScope`, re-exported by `pebble_coding_agent`, is the shared
+identity for a session tree. `TurnContext::session()`, `ToolCallRequest::session()`,
+and both tool contexts' `session()` methods expose it. A
+`ToolPermissionPolicy::permission(&self, session, tool)` can use the root,
+immediate parent, and depth in both discovery and invocation. The same middleware
+instance can serve many concurrent roots and their descendants.
+
+Generic agents and standalone tool runners get fresh root identities by default.
+Use their builder's `session(scope)` to supply a scope. A coding agent's scope is
+set at creation or restored from its record; spawned children derive theirs from
+the parent. Applications use `agent.session()` to read it.
+
 For a custom policy or approval flow, install `PermissionMiddleware` directly. `CodingAgentOptions::with_recorded_permission_level` records metadata only; it does not enforce permissions. Add a `ToolApprovalService` with `PermissionMiddleware::with_approval` when calls that are not auto-approved should remain visible and ask for approval. Without an approval service, those tools are hidden and direct attempts are denied.
 
 Optional seams follow the same rule. Pebble ships no implementation and
@@ -434,9 +446,10 @@ additive: new variants and new optional fields. Consumers should ignore members
 they do not know and tolerate variants they do not know.
 
 `pebble_coding_agent::state::SessionRecord` is also public API. Its format
-version changes when a stored shape changes. Version 2 stores user and steering
-content as ordered content parts and stores compaction as its own turn kind.
-`SessionRecord::migrate` upgrades version 1 records before resume.
+version changes when a stored shape changes. Version 4 stores a required `scope`
+with the session ID, root ID, immediate parent ID, and depth. This build requires
+version 4; it does not infer ancestry from older records. Warm exports preserve
+the same scope.
 
 Ignoring an unknown member is free; tolerating an unknown *variant* is the
 reader's own work, because a variant a build has never heard of fails the whole

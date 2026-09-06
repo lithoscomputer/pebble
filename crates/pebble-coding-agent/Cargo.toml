@@ -33,8 +33,6 @@ tokio = { workspace = true, features = [
 ] }
 tokio-util.workspace = true
 tracing.workspace = true
-# Session identifiers. Pinned to the version lithos-llm already resolves, so
-# the shared lockfile gains no entry.
 uuid = { version = "1.18.1", features = ["v4"] }
 
 # Signalling a command's process group without writing unsafe code.

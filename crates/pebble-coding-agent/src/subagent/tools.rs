@@ -15,8 +15,7 @@ use lithos_llm::types::ToolDefinition;
 use serde_json::json;
 
 use super::SubagentSupervisor;
-use crate::SessionScope;
-use crate::tool::{NativeTool, RegisteredTool, ToolContext, ToolError, required_str};
+use crate::tool::{NativeTool, RegisteredTool, ToolError, required_str};
 use crate::types::ToolSource;
 
 /// The four tools a session drives its own children with.
@@ -27,17 +26,6 @@ pub(crate) fn subagent_tools(supervisor: &SubagentSupervisor) -> Vec<RegisteredT
         wait_tool(supervisor.clone()),
         close_agent_tool(supervisor.clone()),
     ]
-}
-
-/// The calling session scope required to spawn a child.
-///
-/// A child inherits the root of its parent's tree, so root-scoped tools — one
-/// shared todo list — cover the whole tree. Both spawn-tool families read
-/// their scope through this one function, error string included.
-pub(crate) fn require_session_scope(context: &ToolContext) -> Result<&SessionScope, ToolError> {
-    context
-        .session_scope()
-        .ok_or_else(|| ToolError::execution("A subagent can only be spawned from inside a session"))
 }
 
 /// Starts a child on a task and answers with its identifier.
@@ -62,7 +50,7 @@ fn spawn_agent_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
             let supervisor = supervisor.clone();
             Box::pin(async move {
                 let task = required_str(&arguments, "task")?;
-                let parent = require_session_scope(&context)?;
+                let parent = context.session();
                 supervisor.spawn(parent, task.to_owned())
             })
         }),

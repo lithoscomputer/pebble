@@ -35,7 +35,7 @@ use std::{env, io};
 
 use async_trait::async_trait;
 use lithos_llm::Client;
-use pebble_agent::{ToolDescriptor, ToolScheduling};
+use pebble_agent::{SessionScope, ToolDescriptor, ToolScheduling};
 use pebble_coding_agent::environment::{Environment, LocalEnvironment};
 use pebble_coding_agent::events::{CodingAgentEvent, EventSink, EventSinkError};
 use pebble_coding_agent::state::SessionRecord;
@@ -67,7 +67,7 @@ async fn main() -> AppResult {
 struct NotesPermission;
 
 impl ToolPermissionPolicy for NotesPermission {
-    fn permission(&self, tool: &ToolDescriptor) -> ToolPermission {
+    fn permission(&self, _session: &SessionScope, tool: &ToolDescriptor) -> ToolPermission {
         match tool.id().as_str() {
             "save_note" | "read_note" | "wait_for_cancel" => ToolPermission::Allow,
             _ => ToolPermission::Deny {
@@ -254,7 +254,7 @@ impl Store {
         let mut record: SessionRecord =
             serde_json::from_slice(&fs::read(self.directory.join("session.json")).await?)?;
         let log = self.events.state.lock().await;
-        if log.stream.as_deref() != Some(record.session_id.as_str())
+        if log.stream.as_deref() != Some(record.scope.session_id().as_str())
             || record.last_event_seq > log.last_seq
         {
             return Err(io::Error::other(

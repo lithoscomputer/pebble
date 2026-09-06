@@ -15,6 +15,7 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use crate::SessionScope;
 use crate::control::{AgentControlHandle, CompletionReadiness, Control};
 use crate::conversation::ConversationProjection;
 use crate::error::{AgentBuildError, AgentError, Result};
@@ -190,6 +191,7 @@ impl Default for AgentConfig {
 /// Collects the required model service and optional agent behavior.
 #[must_use = "a builder does nothing until `build` is called"]
 pub struct AgentBuilder {
+    session:          SessionScope,
     model_service:    Arc<dyn ModelService>,
     model:            String,
     system_prompt:    String,
@@ -207,6 +209,7 @@ pub struct AgentBuilder {
 impl AgentBuilder {
     fn new(service: impl ModelService + 'static, model: impl Into<String>) -> Self {
         Self {
+            session:          SessionScope::default(),
             model_service:    Arc::new(service),
             model:            model.into(),
             system_prompt:    String::new(),
@@ -220,6 +223,12 @@ impl AgentBuilder {
             config:           AgentConfig::default(),
             control:          None,
         }
+    }
+
+    /// Sets the identity shared by this agent's lifecycle and tool calls.
+    pub fn session(mut self, session: SessionScope) -> Self {
+        self.session = session;
+        self
     }
 
     /// Binds the agent to a control handle created before it, with
@@ -331,6 +340,7 @@ impl AgentBuilder {
             tool_system = tool_system.middleware(middleware);
         }
         Ok(Agent {
+            session: self.session,
             model_service: self.model_service,
             model: self.model,
             system_prompt: self.system_prompt,
@@ -362,12 +372,19 @@ pub enum AgentState {
 /// An owned, immutable view of an agent's current state.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentSnapshot {
+    session:  SessionScope,
     state:    AgentState,
     model:    String,
     messages: Vec<Message>,
 }
 
 impl AgentSnapshot {
+    /// The identity and ancestry captured by this snapshot.
+    #[must_use]
+    pub const fn session(&self) -> &SessionScope {
+        &self.session
+    }
+
     /// The lifecycle state captured by this snapshot.
     #[must_use]
     pub const fn state(&self) -> AgentState {
@@ -429,6 +446,7 @@ impl PromptOutcome {
 
 /// One provider-neutral active conversation.
 pub struct Agent {
+    session:       SessionScope,
     model_service: Arc<dyn ModelService>,
     model:         String,
     system_prompt: String,
@@ -442,6 +460,12 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// The identity and ancestry of this agent.
+    #[must_use]
+    pub const fn session(&self) -> &SessionScope {
+        &self.session
+    }
+
     /// Starts a builder with an injected model service and model selector.
     pub fn builder(service: impl ModelService + 'static, model: impl Into<String>) -> AgentBuilder {
         AgentBuilder::new(service, model)
@@ -513,6 +537,7 @@ impl Agent {
     #[must_use]
     pub fn snapshot(&self) -> AgentSnapshot {
         AgentSnapshot {
+            session:  self.session.clone(),
             state:    self.state(),
             model:    self.model.clone(),
             messages: self.messages.clone(),
@@ -655,7 +680,8 @@ impl Agent {
                     self.commit_steering_message(message, attribution);
                 }
                 if let Some(lifecycle) = self.lifecycle.clone() {
-                    let context = TurnContext::new(&self.model, turn_count, &self.messages);
+                    let context =
+                        TurnContext::new(&self.session, &self.model, turn_count, &self.messages);
                     let prepared = lifecycle.before_model(context, &round_cancel).await;
                     // Nothing is open here: the last turn's tool calls were
                     // answered before the loop came back around, so aborting
@@ -674,7 +700,8 @@ impl Agent {
 
                 let tools = self.discover_tools(turn_count).await?;
                 if let Some(lifecycle) = self.lifecycle.clone() {
-                    let context = TurnContext::new(&self.model, turn_count, &self.messages);
+                    let context =
+                        TurnContext::new(&self.session, &self.model, turn_count, &self.messages);
                     let prepared = lifecycle
                         .after_tool_discovery(context, &tools, &round_cancel)
                         .await;
@@ -690,7 +717,8 @@ impl Agent {
                         .map_err(|source| AgentError::Lifecycle { source })?;
                 }
                 let prepared = if let Some(lifecycle) = self.lifecycle.as_ref() {
-                    let context = TurnContext::new(&self.model, turn_count, &self.messages);
+                    let context =
+                        TurnContext::new(&self.session, &self.model, turn_count, &self.messages);
                     tokio::select! {
                         biased;
                         () = prompt_cancel.cancelled() => return Err(AgentError::Aborted),
@@ -740,7 +768,8 @@ impl Agent {
                 // that fails is held to the same rule: the calls are answered
                 // as `Cancelled` before its error ends the prompt.
                 if let Some(lifecycle) = self.lifecycle.clone() {
-                    let context = TurnContext::new(&self.model, turn, &self.messages);
+                    let context =
+                        TurnContext::new(&self.session, &self.model, turn, &self.messages);
                     match lifecycle
                         .after_model(context, &response, &round_cancel)
                         .await
@@ -793,7 +822,8 @@ impl Agent {
                         continue 'prompt;
                     }
                     if let Some(lifecycle) = self.lifecycle.clone() {
-                        let context = TurnContext::new(&self.model, turn, &self.messages);
+                        let context =
+                            TurnContext::new(&self.session, &self.model, turn, &self.messages);
                         let boundary_action = lifecycle
                             .after_answer(context, &response, prompt_cancel)
                             .await
@@ -855,7 +885,12 @@ impl Agent {
     async fn discover_tools(&self, turn: usize) -> Result<ToolCatalog> {
         let tools = self
             .tool_system
-            .discover(TurnContext::new(&self.model, turn, &self.messages))
+            .discover(TurnContext::new(
+                &self.session,
+                &self.model,
+                turn,
+                &self.messages,
+            ))
             .await
             .map_err(|source| AgentError::ToolSystem { source })?;
         let mut names = HashSet::new();
@@ -882,7 +917,7 @@ impl Agent {
         let Some(lifecycle) = self.lifecycle.clone() else {
             return Ok(message);
         };
-        let context = TurnContext::new(&self.model, turn, &self.messages);
+        let context = TurnContext::new(&self.session, &self.model, turn, &self.messages);
         lifecycle
             .prepare_follow_up(context, message, cancel)
             .await
@@ -1126,7 +1161,7 @@ impl Agent {
             .tool_system
             .execute_with(
                 tools,
-                turn,
+                TurnContext::new(&self.session, &self.model, turn, &self.messages),
                 call.clone(),
                 cancel.child_token(),
                 Some(self.events.clone()),

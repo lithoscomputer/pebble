@@ -173,7 +173,7 @@ pub(crate) fn read_output_tool(store: Arc<dyn ToolOutputStore>) -> RegisteredToo
                         .filter(|n| (1..=MAX_OUTPUT_READ_BYTES).contains(n))
                         .ok_or_else(|| ToolError::invalid_arguments("limit must be between 1 and 16384"))?,
                 };
-                let scope = context.session_scope().ok_or_else(|| ToolError::unavailable("Output retrieval requires a session"))?;
+                let scope = context.session();
                 let page = storage_call(context.cancel(), store.read(scope, reference, offset, limit)).await?;
                 let expected = page.total_bytes.saturating_sub(offset).min(limit as u64);
                 if page.bytes.len() as u64 != expected {

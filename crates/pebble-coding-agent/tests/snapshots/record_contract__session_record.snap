@@ -3,8 +3,13 @@ source: crates/pebble-coding-agent/tests/record_contract.rs
 expression: rendered
 ---
 {
-  "format_version": 3,
-  "session_id": "ses_root",
+  "format_version": 4,
+  "scope": {
+    "session_id": "ses_root",
+    "root_session_id": "ses_root",
+    "parent_session_id": null,
+    "depth": 0
+  },
   "provider": "anthropic",
   "model": "claude-sonnet-5",
   "created_at": "2026-01-01T00:00:00.500Z",

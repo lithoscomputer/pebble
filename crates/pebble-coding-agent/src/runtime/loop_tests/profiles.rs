@@ -590,7 +590,7 @@ async fn a_child_is_shown_its_parents_tools_without_the_person_to_ask() {
         .clone();
 
     let agent_id = supervisor
-        .spawn(parent.session_scope(), "work".to_owned())
+        .spawn(parent.session(), "work".to_owned())
         .expect("the spawn succeeds");
     supervisor
         .wait_with_cancel(&agent_id, &CancellationToken::new())
@@ -720,7 +720,7 @@ async fn a_child_is_never_told_to_ask_the_user_a_question() {
         .expect("the parent was given a factory")
         .clone();
     let agent_id = supervisor
-        .spawn(parent.session_scope(), "work".to_owned())
+        .spawn(parent.session(), "work".to_owned())
         .expect("the spawn succeeds");
     supervisor
         .wait_with_cancel(&agent_id, &CancellationToken::new())

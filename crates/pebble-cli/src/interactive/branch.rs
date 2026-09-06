@@ -6,8 +6,8 @@ use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
 use lithos_llm::types::ContentPart;
-use pebble_coding_agent::InputContent;
 use pebble_coding_agent::events::{CodingEvent, EventSink as _};
+use pebble_coding_agent::{InputContent, SessionId, SessionScope};
 use tokio::fs;
 
 use super::menu::{Menu, Purpose};
@@ -68,7 +68,7 @@ async fn bookmarks(store: &Store) -> Result<BTreeMap<String, u64>> {
 async fn create(root: &Path, source: &Store, mut checkpoint: Checkpoint) -> Result<String> {
     let target = Store::open(root, None).await?;
     let id = target.id();
-    let old_root = checkpoint.record.session_id.clone();
+    let old_root = checkpoint.record.scope.session_id().to_string();
     let seq = checkpoint.record.last_event_seq;
     let name = format!("{} · branch", checkpoint.metadata.name);
     let source_id = source.id();
@@ -77,8 +77,7 @@ async fn create(root: &Path, source: &Store, mut checkpoint: Checkpoint) -> Resu
         checkpoint.metadata.name.clone_from(&name);
         checkpoint.metadata.forked_from = Some(source_id.clone());
         checkpoint.metadata.forked_at = Some(seq);
-        checkpoint.record.session_id.clone_from(&id);
-        checkpoint.record.parent_session_id = None;
+        checkpoint.record.scope = SessionScope::root(SessionId::new(id.clone()));
     };
     let mut shell_records = shell::records(source).await?;
     let mut reader = source.reader().await?;
@@ -405,7 +404,7 @@ mod tests {
         let metadata = serde_json::from_value(
             json!({"id":source.id(),"name":"Original","cwd":root.path(),"model":"gpt-5.6","permission":"ReadWrite","reasoning":null,"subagents":false,"updated_at":0}),
         )?;
-        let mut record = SessionRecord::new("old-root");
+        let mut record = SessionRecord::new(SessionScope::root(SessionId::new("old-root")));
         source
             .record(
                 &CodingAgentEvent::new(
@@ -463,7 +462,7 @@ mod tests {
         );
         assert_eq!(checkpoint.record.last_event_seq, 1);
         assert!(checkpoint.record.messages.is_empty());
-        assert_eq!(checkpoint.record.session_id, branch_id);
+        assert_eq!(checkpoint.record.scope.session_id().as_str(), branch_id);
         assert_eq!(
             checkpoint.metadata.forked_from.as_deref(),
             Some(source.id().as_str())

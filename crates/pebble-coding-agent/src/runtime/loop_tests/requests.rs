@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 
 use super::super::testing::wait_for_event;
 use super::*;
+use crate::SessionScope;
 use crate::task_reminder::TASK_REMINDER_TEXT;
 use crate::test_support::message_text;
 use crate::tool::{
@@ -32,7 +33,7 @@ impl NamedToolPermissionPolicy {
 }
 
 impl ToolPermissionPolicy for NamedToolPermissionPolicy {
-    fn permission(&self, tool: &ToolDescriptor) -> ToolPermission {
+    fn permission(&self, _session: &SessionScope, tool: &ToolDescriptor) -> ToolPermission {
         self.decisions
             .iter()
             .find_map(|(id, permission)| (id == &tool.id().as_str()).then(|| permission.clone()))

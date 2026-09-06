@@ -90,9 +90,7 @@ pub(crate) async fn execute_shell_command(
         "Injecting environment variables into a tool call"
     );
     let writer = if let Some(store) = &ctx.output_store {
-        let scope = ctx
-            .session_scope()
-            .ok_or_else(|| ToolError::unavailable("Output capture requires a session"))?;
+        let scope = ctx.session();
         let call_id = ctx
             .tool_call_id()
             .ok_or_else(|| ToolError::unavailable("Output capture requires a tool call ID"))?;

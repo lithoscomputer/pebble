@@ -282,7 +282,7 @@ pub(super) async fn reconcile(store: &Store) -> Result<()> {
         if event.seq > checkpoint.record.last_event_seq {
             break;
         }
-        if event.session_id == checkpoint.record.session_id
+        if event.session_id == checkpoint.record.scope.session_id().as_str()
             && let CodingEvent::UserInput { text, .. } = event.event
         {
             for record in &mut records {

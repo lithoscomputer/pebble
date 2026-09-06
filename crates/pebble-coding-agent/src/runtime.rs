@@ -57,7 +57,7 @@ use crate::policy::{CompactionPolicy, ContextPolicy};
 use crate::profile::{AgentProfile, EnvContext, ModelFacts, SubagentSupport, builtin_profile};
 use crate::profiles::{FileEditToolKind, ProfileDeps};
 use crate::prompt_transform::{SystemPromptContext, SystemPromptTransform};
-use crate::record::{RecordMigrationError, SessionRecord};
+use crate::record::{SESSION_RECORD_FORMAT_VERSION, SessionRecord};
 use crate::redact::{NoRedaction, Redactor};
 use crate::search::SearchProvider;
 use crate::skills::{Skill, SkillExpansion, discover_skills};
@@ -430,14 +430,25 @@ impl CodingRuntimeBuilder {
     /// model selector resolves to nothing, or the resolved model's catalog
     /// entry names no harness pebble can run.
     pub(crate) fn build(self) -> StdResult<CodingRuntime, CodingAgentBuildError> {
-        self.build_with_id(new_session_id(), SystemTime::now())
+        let id = SessionId::fresh();
+        let scope = match self.child.as_ref() {
+            Some(child) => child.parent.child(id),
+            None => SessionScope::root(id),
+        };
+        self.build_with_scope(scope, SystemTime::now())
     }
 
-    fn build_with_id(
+    fn build_with_scope(
         mut self,
-        id: SessionId,
+        session_scope: SessionScope,
         created_at: SystemTime,
     ) -> StdResult<CodingRuntime, CodingAgentBuildError> {
+        let id = session_scope.session_id().clone();
+        // Restored children retain the same root-only integration rules as
+        // children built by the supervisor.
+        if !session_scope.is_root() {
+            self.human_input = None;
+        }
         if let Some(level) = self.permission_level {
             self.options.permission_level = Some(level);
             self.tool_middleware
@@ -522,31 +533,28 @@ impl CodingRuntimeBuilder {
 
         // A child was placed in its tree by whoever spawned it; a root names
         // itself and starts the tree's budget.
-        let (parent_session_id, root_session_id, depth, open_sessions, observer, inherited_emitter) =
-            match self.child {
-                Some(child) => (
-                    Some(child.parent.session_id().clone()),
-                    child.parent.root_session_id().clone(),
-                    child.depth,
-                    child.open_sessions,
-                    child.observer,
-                    Some(child.event_emitter),
-                ),
-                None => (
-                    None,
-                    id.clone(),
-                    0,
-                    OpenSessions::root(self.subagent_limits),
-                    self.child_observer,
-                    None,
-                ),
-            };
+        let depth = session_scope.depth();
+        let (open_sessions, observer, inherited_emitter) = match self.child {
+            Some(child) => (
+                child.open_sessions,
+                child.observer,
+                Some(child.event_emitter),
+            ),
+            None => (
+                OpenSessions::root(self.subagent_limits),
+                self.child_observer,
+                None,
+            ),
+        };
 
         let (emitter, pump) = if let Some(emitter) = inherited_emitter {
             (emitter, None)
         } else {
             let (emitter, pump) = EventPump::new(self.events);
-            let emitter = emitter.in_stream(root_session_id.to_string());
+            let mut emitter = emitter.in_stream(session_scope.root_session_id().to_string());
+            if let Some(parent) = session_scope.parent_session_id() {
+                emitter = emitter.for_child(parent.as_str());
+            }
             (emitter, Some(tokio::spawn(pump.run())))
         };
 
@@ -569,7 +577,6 @@ impl CodingRuntimeBuilder {
                 event_emitter: emitter.clone(),
                 observer,
                 open_sessions,
-                depth,
             }))
         });
         // Asked for whether or not there is a supervisor: a profile answers
@@ -600,8 +607,7 @@ impl CodingRuntimeBuilder {
                 memory_tokens: 0,
                 skills_tokens: 0,
             }),
-            session_scope: SessionScope::root(root_session_id).child(id),
-            parent_session_id,
+            session_scope,
             created_at,
             config: self.options,
             conversation: Arc::new(Mutex::new(ConversationState::new(History::default()))),
@@ -731,11 +737,6 @@ fn profile_kind(
         })
 }
 
-/// A fresh session identifier.
-fn new_session_id() -> SessionId {
-    SessionId::new(format!("ses_{}", uuid::Uuid::new_v4()))
-}
-
 /// Where an outside task names why it is about to cancel a prompt.
 ///
 /// [`CodingRuntime::interrupt_reason_handle`] hands one out before the prompt
@@ -802,8 +803,6 @@ pub(crate) struct CodingRuntime {
     model_context:     Arc<SessionModel>,
     resources:         Arc<PromptResources>,
     session_scope:     SessionScope,
-    /// The session that spawned this one, for a child. A root has none.
-    parent_session_id: Option<SessionId>,
     created_at:        SystemTime,
     config:            CodingAgentOptions,
     /// The conversation and what the current prompt has accumulated, shared
@@ -898,17 +897,18 @@ impl CodingRuntime {
         mode: &ResumeMode,
         deps: CodingRuntimeBuilder,
     ) -> StdResult<Self, CodingAgentBuildError> {
-        let record = record.migrate().map_err(|error| match error {
-            RecordMigrationError::UnsupportedVersion { version, supported } => {
-                CodingAgentBuildError::UnsupportedRecord { version, supported }
-            }
-        })?;
+        if !record.is_supported() {
+            return Err(CodingAgentBuildError::UnsupportedRecord {
+                version:   record.format_version,
+                supported: SESSION_RECORD_FORMAT_VERSION,
+            });
+        }
 
         let recorded = match mode {
             ResumeMode::RecordedModel => {
                 let route = record.recorded_route().ok_or_else(|| {
                     CodingAgentBuildError::RecordedRouteMissing {
-                        session_id: record.session_id.clone(),
+                        session_id: record.scope.session_id().to_string(),
                     }
                 })?;
                 Some(route)
@@ -923,9 +923,8 @@ impl CodingRuntime {
         let mut deps = deps;
         deps.model = Some(selector);
         deps.events.resume_after_seq = record.last_event_seq;
-        let built =
-            deps.build_with_id(SessionId::new(record.session_id.clone()), record.created_at);
-        let mut session = match (built, &recorded) {
+        let built = deps.build_with_scope(record.scope, record.created_at);
+        let session = match (built, &recorded) {
             // An exact route the client cannot reach is its own failure, and
             // never a reason to run the conversation somewhere else.
             (Err(CodingAgentBuildError::ModelSelection { source, .. }), Some(_)) => {
@@ -950,11 +949,6 @@ impl CodingRuntime {
         session
             .conversation()
             .replace_history(History::from_stored_messages(&record.messages));
-        // The parentage the record carries is restored, so storing a resumed
-        // child again says the same thing. The tree itself is not: a resumed
-        // child has no supervisor above it, and rebuilding one is the
-        // application's to do.
-        session.parent_session_id = record.parent_session_id.map(SessionId::new);
         Ok(session)
     }
 
@@ -1039,8 +1033,7 @@ impl CodingRuntime {
     /// Public callers take records between prompts, after the prompt's event
     /// barrier has committed its complete history.
     pub(crate) fn to_record(&self) -> SessionRecord {
-        let mut record = SessionRecord::new(self.session_scope.session_id().to_string());
-        record.parent_session_id = self.parent_session_id.as_ref().map(ToString::to_string);
+        let mut record = SessionRecord::new(self.session_scope.clone());
         record.provider = Some(self.model_context.provider.clone());
         record.model = Some(self.model_context.model.clone());
         record.created_at = self.created_at;
@@ -1278,13 +1271,8 @@ impl CodingRuntime {
     /// stream, and stored records all key on this, so a session that could
     /// be re-rooted afterwards could be detached from the tree that owns
     /// it.
-    pub(crate) const fn session_scope(&self) -> &SessionScope {
+    pub(crate) const fn session(&self) -> &SessionScope {
         &self.session_scope
-    }
-
-    /// The root identity as text for event and snapshot boundaries.
-    pub(crate) fn root_session_id(&self) -> &str {
-        self.session_scope.root_session_id().as_str()
     }
 
     /// Which harness this session runs.
@@ -2295,7 +2283,7 @@ mod tests {
         assert_eq!(session.model_facts().context_window_tokens, 200_000);
         assert_eq!(session.state(), CodingAgentState::Idle);
         assert!(session.id().starts_with("ses_"));
-        assert_eq!(session.root_session_id(), session.id());
+        assert_eq!(session.session().root_session_id().as_str(), session.id());
     }
 
     #[tokio::test]
@@ -2760,7 +2748,7 @@ mod tests {
         .expect("the record restores");
 
         assert_eq!(resumed.id(), session.id());
-        assert_eq!(resumed.root_session_id(), session.id());
+        assert_eq!(resumed.session().root_session_id().as_str(), session.id());
         assert_eq!(resumed.history().turns(), session.history().turns());
         assert_eq!(record.provider.as_deref(), Some("test"));
         assert_eq!(record.model.as_deref(), Some("model"));
@@ -2840,7 +2828,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_record_from_a_newer_pebble_is_refused() {
-        let mut record = SessionRecord::new("ses_1");
+        let mut record = SessionRecord::new(SessionScope::root(SessionId::new("ses_1")));
         record.format_version = SESSION_RECORD_FORMAT_VERSION + 1;
 
         let error = CodingRuntime::from_record(

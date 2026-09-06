@@ -1,10 +1,6 @@
 //! Contract tests for the stored session record.
 //!
-//! A record is written by one build of pebble and read by another, so its JSON
-//! form is reviewed like a specification. The snapshot pins the shape this
-//! build writes. `fixtures/session_record_v1.json` is a frozen version 1
-//! document: it is never regenerated, and the test that reads it fails the day
-//! a change stops older records from resuming.
+//! The snapshot and fixture pin the current record format.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,14 +9,15 @@ use lithos_llm::types::{
     ContentPart, Message as LlmMessage, ReasoningContent, Role, ToolArguments, ToolCall, ToolInput,
     ToolResult,
 };
+use pebble_agent::{SessionId, SessionScope};
 use pebble_coding_agent::events::{CompactionReason, TokenUsage};
 use pebble_coding_agent::state::{
     History, Message, SESSION_RECORD_FORMAT_VERSION, SessionRecord, StoredMessage,
 };
 use serde_json::json;
 
-/// The frozen version 1 record. Read by the resume test; never rewritten.
-const SAMPLE_RECORD_V1: &str = include_str!("fixtures/session_record_v1.json");
+/// A record with complete ancestry and typed tool input.
+const SAMPLE_RECORD: &str = include_str!("fixtures/session_record_v4.json");
 
 fn moment() -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(1_767_225_600_500)
@@ -101,7 +98,7 @@ fn every_turn() -> Vec<Message> {
 }
 
 fn sample_record() -> SessionRecord {
-    let mut record = SessionRecord::new("ses_root");
+    let mut record = SessionRecord::new(SessionScope::root(SessionId::new("ses_root")));
     record.provider = Some("anthropic".into());
     record.model = Some("claude-sonnet-5".into());
     record.created_at = moment();
@@ -121,17 +118,14 @@ fn the_session_record_keeps_its_serialized_shape() {
 }
 
 #[test]
-fn the_stored_version_one_record_still_resumes() {
+fn the_stored_record_restores_history_and_accounting() {
     let record: SessionRecord =
-        serde_json::from_str(SAMPLE_RECORD_V1).expect("a version 1 record still parses");
+        serde_json::from_str(SAMPLE_RECORD).expect("the current record parses");
 
-    assert_eq!(record.format_version, 1);
+    assert_eq!(record.format_version, SESSION_RECORD_FORMAT_VERSION);
     assert!(record.is_supported());
-    assert_eq!(record.session_id, "ses_root");
+    assert_eq!(record.scope.session_id().as_str(), "ses_root");
     assert_eq!(record.last_event_seq, 41);
-    let migrated = record.clone().migrate().expect("version 1 migrates");
-    assert_eq!(migrated.format_version, SESSION_RECORD_FORMAT_VERSION);
-    assert_eq!(migrated.messages, record.messages);
 
     let history = History::from_stored_messages(&record.messages);
     assert_eq!(history.len(), 5);
@@ -166,20 +160,9 @@ fn the_stored_version_one_record_still_resumes() {
 }
 
 #[test]
-fn the_stored_version_two_record_still_resumes() {
-    let record: SessionRecord =
-        serde_json::from_str(include_str!("fixtures/session_record_v2.json"))
-            .expect("a version 2 record still parses");
-    assert_eq!(record.format_version, 2);
-    let migrated = record.migrate().expect("version 2 migrates");
-    assert_eq!(migrated.format_version, SESSION_RECORD_FORMAT_VERSION);
-    assert_eq!(migrated.messages, sample_record().messages);
-}
-
-#[test]
 fn a_record_with_unknown_members_still_parses() {
     let mut document: serde_json::Value =
-        serde_json::from_str(SAMPLE_RECORD_V1).expect("the fixture parses as JSON");
+        serde_json::from_str(SAMPLE_RECORD).expect("the fixture parses as JSON");
     let object = document.as_object_mut().expect("a record is an object");
     object.insert("workspace".to_owned(), json!("/work/pebble"));
     object.insert("future_field".to_owned(), json!({ "nested": [1, 2, 3] }));
@@ -195,7 +178,7 @@ fn a_record_with_unknown_members_still_parses() {
     let record: SessionRecord =
         serde_json::from_value(document).expect("unknown members are ignored");
     let expected: SessionRecord =
-        serde_json::from_str(SAMPLE_RECORD_V1).expect("the fixture still parses");
+        serde_json::from_str(SAMPLE_RECORD).expect("the fixture still parses");
 
     assert_eq!(record, expected);
 }
@@ -203,21 +186,14 @@ fn a_record_with_unknown_members_still_parses() {
 #[test]
 fn a_record_missing_its_optional_members_still_parses() {
     let record: SessionRecord = serde_json::from_value(json!({
-        "session_id": "ses_root",
+        "format_version": SESSION_RECORD_FORMAT_VERSION,
+        "scope": SessionScope::root(SessionId::new("ses_root")),
         "created_at": "2026-01-01T00:00:00.500Z",
         "updated_at": "2026-01-01T00:00:00.500Z",
     }))
     .expect("a minimal record parses");
 
-    assert_eq!(record.format_version, 1);
-    assert_eq!(
-        record
-            .clone()
-            .migrate()
-            .expect("the implicit version migrates")
-            .format_version,
-        SESSION_RECORD_FORMAT_VERSION
-    );
+    assert_eq!(record.format_version, SESSION_RECORD_FORMAT_VERSION);
     assert_eq!(record.last_event_seq, 0);
     assert!(record.messages.is_empty());
     assert!(History::from_stored_messages(&record.messages).is_empty());
@@ -226,8 +202,8 @@ fn a_record_missing_its_optional_members_still_parses() {
 #[test]
 fn a_record_whose_members_are_null_still_resumes() {
     let record: SessionRecord = serde_json::from_value(json!({
-        "format_version": 1,
-        "session_id": "ses_root",
+        "format_version": SESSION_RECORD_FORMAT_VERSION,
+        "scope": SessionScope::root(SessionId::new("ses_root")),
         "created_at": "2026-01-01T00:00:00.500Z",
         "updated_at": "2026-01-01T00:00:00.500Z",
         "last_event_seq": null,

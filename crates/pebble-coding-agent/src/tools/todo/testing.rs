@@ -6,6 +6,7 @@ use crate::test_support::MockEnvironment;
 use crate::tool::{CodingEventEmitter, ToolContext};
 use crate::tools::testing::context;
 use crate::types::CodingEvent;
+use crate::{SessionId, SessionScope};
 
 /// An emitter that keeps what it was given, so a test can assert on the
 /// changes a runtime announced.
@@ -39,19 +40,20 @@ impl CodingEventEmitter for CollectingEmitter {
 /// both.
 pub(super) fn context_for(session: &str, root: &str) -> ToolContext {
     context(MockEnvironment::default())
-        .with_session(
-            crate::SessionScope::root(crate::SessionId::new(root))
-                .child(crate::SessionId::new(session)),
-        )
+        .with_session({
+            let scope = SessionScope::root(SessionId::new(root));
+            if session == root {
+                scope
+            } else {
+                scope.child(SessionId::new(session))
+            }
+        })
         .with_coding_event_emitter(Arc::new(CollectingEmitter::default()))
 }
 
 /// A call that publishes what it changes to `emitter`.
 pub(super) fn context_emitting(emitter: Arc<CollectingEmitter>) -> ToolContext {
     context(MockEnvironment::default())
-        .with_session(
-            crate::SessionScope::root(crate::SessionId::new("ses_a"))
-                .child(crate::SessionId::new("ses_a")),
-        )
+        .with_session(SessionScope::root(SessionId::new("ses_a")))
         .with_coding_event_emitter(emitter)
 }

@@ -27,6 +27,7 @@ use tokio::time::timeout;
 
 use super::super::testing::{builder, wait_for_event};
 use super::*;
+use crate::SessionId;
 use crate::event::{EventSink, EventSinkError};
 use crate::human_input::{Answer, HumanInputError, HumanInputProvider, Question};
 use crate::subagent::{
@@ -176,7 +177,7 @@ async fn background_agent_notifications_are_batched_into_one_parent_turn() {
     // a time so each takes the script entry meant for it.
     let first = supervisor
         .spawn_with_parent_notification(
-            parent.session_scope(),
+            parent.session(),
             "first task".to_owned(),
             "Inspect first".to_owned(),
         )
@@ -187,7 +188,7 @@ async fn background_agent_notifications_are_batched_into_one_parent_turn() {
         .expect("the first child answers");
     let second = supervisor
         .spawn_with_parent_notification(
-            parent.session_scope(),
+            parent.session(),
             "second task".to_owned(),
             "Inspect second".to_owned(),
         )
@@ -254,7 +255,7 @@ async fn background_agent_output_is_not_parsed_for_skill_references() {
         .clone();
     let child = supervisor
         .spawn_with_parent_notification(
-            parent.session_scope(),
+            parent.session(),
             "clean up".to_owned(),
             "Clean scratch files".to_owned(),
         )
@@ -390,7 +391,7 @@ async fn shutdown_cleans_up_subagents_before_emitting_session_ended() {
         .expect("the test session was given a factory")
         .clone();
     let agent_id = supervisor
-        .spawn(session.session_scope(), "task".to_owned())
+        .spawn(session.session(), "task".to_owned())
         .expect("the spawn succeeds");
     let mut events = session.subscribe();
 
@@ -474,7 +475,7 @@ async fn a_child_cannot_ask_a_person_a_question() {
         .await
         .expect("the parent's prompt succeeds");
     let agent_id = supervisor
-        .spawn(parent.session_scope(), "probe too".to_owned())
+        .spawn(parent.session(), "probe too".to_owned())
         .expect("the spawn succeeds");
     supervisor
         .wait_with_cancel(&agent_id, &CancellationToken::new())
@@ -558,15 +559,13 @@ async fn a_grandchilds_news_reaches_the_root_stream() {
     let mut events = parent.subscribe();
 
     let child_id = supervisor
-        .spawn(parent.session_scope(), "delegate".to_owned())
+        .spawn(parent.session(), "delegate".to_owned())
         .expect("the spawn succeeds");
     let child = first_child(&children);
     let grandchild = child
         .supervisor
         .spawn(
-            &parent
-                .session_scope()
-                .child(crate::SessionId::new(child.id.clone())),
+            &parent.session().child(SessionId::new(child.id.clone())),
             "the leaf task".to_owned(),
         )
         .expect("a child may spawn a child of its own");
@@ -577,8 +576,9 @@ async fn a_grandchilds_news_reaches_the_root_stream() {
         .supervisor
         .spawn(
             &parent
-                .session_scope()
-                .child(crate::SessionId::new(grandchild_session.id.clone())),
+                .session()
+                .child(SessionId::new(child.id.clone()))
+                .child(SessionId::new(grandchild_session.id.clone())),
             "the deepest task".to_owned(),
         )
         .expect("a grandchild may spawn a child of its own");
@@ -662,15 +662,13 @@ async fn a_shutdown_joins_every_task_in_a_tree() {
         .expect("the test session was given a factory")
         .clone();
     let child_id = supervisor
-        .spawn(parent.session_scope(), "delegate".to_owned())
+        .spawn(parent.session(), "delegate".to_owned())
         .expect("the spawn succeeds");
     let child = first_child(&children);
     let grandchild = child
         .supervisor
         .spawn(
-            &parent
-                .session_scope()
-                .child(crate::SessionId::new(child.id.clone())),
+            &parent.session().child(SessionId::new(child.id.clone())),
             "the leaf task".to_owned(),
         )
         .expect("a child may spawn a child of its own");
@@ -776,7 +774,7 @@ async fn a_childs_events_reach_the_parents_durable_stream() {
         .clone();
 
     let agent_id = supervisor
-        .spawn(parent.session_scope(), "task".to_owned())
+        .spawn(parent.session(), "task".to_owned())
         .expect("the spawn succeeds");
     supervisor
         .wait_with_cancel(&agent_id, &CancellationToken::new())
@@ -868,7 +866,7 @@ async fn a_child_inherits_only_marked_tools_and_its_parents_middleware() {
         .clone();
 
     let agent_id = supervisor
-        .spawn(parent.session_scope(), "work".to_owned())
+        .spawn(parent.session(), "work".to_owned())
         .expect("the spawn succeeds");
     supervisor
         .wait_with_cancel(&agent_id, &CancellationToken::new())
@@ -944,7 +942,7 @@ async fn parent_parked_on_a_background_child() -> (CodingRuntime, Arc<ScriptedPr
         .clone();
     supervisor
         .spawn_with_parent_notification(
-            parent.session_scope(),
+            parent.session(),
             "take your time".to_owned(),
             "Slow task".to_owned(),
         )
@@ -1043,4 +1041,84 @@ async fn a_session_cancelled_while_the_parent_waits_on_a_child_closes() {
         CodingAgentState::Closed,
         "the session's own cancellation closes it, wherever the prompt was"
     );
+}
+
+#[tokio::test]
+async fn a_spawned_child_passes_its_scope_to_inherited_policy_and_tools() {
+    use pebble_agent::ToolDescriptor;
+
+    use crate::SessionScope;
+    use crate::tool::{PermissionMiddleware, ToolPermission, ToolPermissionPolicy};
+
+    struct CaptureScope(Arc<Mutex<Vec<SessionScope>>>);
+    impl ToolPermissionPolicy for CaptureScope {
+        fn permission(&self, session: &SessionScope, tool: &ToolDescriptor) -> ToolPermission {
+            if tool.id().as_str() == "probe" {
+                self.0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(session.clone());
+            }
+            ToolPermission::Allow
+        }
+    }
+    let policy_scopes = Arc::new(Mutex::new(Vec::new()));
+    let tool_scopes = Arc::new(Mutex::new(Vec::new()));
+    let captured = tool_scopes.clone();
+    let tool = RegisteredTool::function(
+        "probe",
+        "Probe",
+        json!({"type":"object"}),
+        move |context, _| {
+            captured
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(context.session().clone());
+            async { Ok("probed".to_owned()) }
+        },
+    )
+    .allow_in_subagents();
+    let (mut parent, _) = TestSession::new(vec![
+        ScriptedCall::response(tool_call_response("probe", "call", json!({}))),
+        ScriptedCall::response(text_response("done")),
+    ])
+    .tools([tool])
+    .tool_middleware(Arc::new(PermissionMiddleware::new(Arc::new(CaptureScope(
+        policy_scopes.clone(),
+    )))))
+    .with_subagents()
+    .build();
+    let supervisor = parent.subagent_supervisor().expect("subagents enabled");
+    let child_id = supervisor
+        .spawn(parent.session(), "probe".to_owned())
+        .expect("spawns");
+    supervisor
+        .wait_with_cancel(&child_id, &CancellationToken::new())
+        .await
+        .expect("child finishes");
+    let scopes = tool_scopes
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    assert_eq!(scopes.len(), 1);
+    let child = &scopes[0];
+    assert_eq!(
+        child.parent_session_id(),
+        Some(parent.session().session_id())
+    );
+    assert_eq!(child.root_session_id(), parent.session().root_session_id());
+    assert_eq!(child.depth(), 1);
+    let policies = policy_scopes
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    assert!(
+        policies.len() >= 2,
+        "discovery and invocation both consult policy"
+    );
+    assert!(policies.iter().all(|scope| scope == child));
+    parent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("shuts down");
 }

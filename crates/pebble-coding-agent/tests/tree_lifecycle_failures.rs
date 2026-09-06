@@ -224,10 +224,7 @@ impl Probe {
         let _execution = Execution(self);
         self.ready
             .send(Ready::Tool(self.actor, Started {
-                scope:  context
-                    .session_scope()
-                    .expect("session tool has a scope")
-                    .clone(),
+                scope:  context.session().clone(),
                 cancel: context.cancel().clone(),
             }))
             .expect("readiness receiver lives");

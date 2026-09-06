@@ -32,31 +32,13 @@ mod testing;
 pub use self::runtime::TodoRuntime;
 
 /// The list identifier for a session-scoped tool.
-///
-/// # Errors
-///
-/// Returns a [`ToolError`] of kind
-/// [`Unavailable`](crate::tools::ToolErrorKind::Unavailable) outside a session,
-/// which is the only place these tools have no list to write.
-fn session_todo_scope(
-    ctx: &ToolContext,
-    kind: TodoListKind,
-    tool_name: &str,
-) -> Result<String, ToolError> {
-    ctx.session_id()
-        .map(|session_id| kind.list_id(session_id.as_str()))
-        .ok_or_else(|| ToolError::unavailable(format!("{tool_name} requires an active session")))
+fn session_todo_scope(ctx: &ToolContext, kind: TodoListKind) -> String {
+    kind.list_id(ctx.session().session_id().as_str())
 }
 
 /// The list identifier the task tools share across a session tree.
-///
-/// The root of the tree names the list, so a child writes to its parent's. A
-/// session with no root recorded falls back to its own identity, which is what
-/// a session outside a tree is.
-fn anthropic_task_scope(ctx: &ToolContext) -> Result<String, ToolError> {
-    ctx.root_session_id()
-        .map(|session_id| TodoListKind::AnthropicTasks.list_id(session_id.as_str()))
-        .ok_or_else(|| ToolError::unavailable("task tools require an active session"))
+fn anthropic_task_scope(ctx: &ToolContext) -> String {
+    TodoListKind::AnthropicTasks.list_id(ctx.session().root_session_id().as_str())
 }
 
 /// One status as the plan and task tools spell it.
@@ -212,7 +194,7 @@ pub fn make_update_plan_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
         Arc::new(move |args, ctx| {
             let runtime = Arc::clone(&runtime);
             Box::pin(async move {
-                let list_id = session_todo_scope(&ctx, TodoListKind::OpenAiPlan, "update_plan")?;
+                let list_id = session_todo_scope(&ctx, TodoListKind::OpenAiPlan);
                 let plan = args.get("plan").and_then(Value::as_array).ok_or_else(|| {
                     ToolError::invalid_arguments("Missing required parameter: plan")
                 })?;
@@ -341,7 +323,7 @@ pub fn make_todo_list_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
         ), Arc::new(move |args, ctx| {
             let runtime = Arc::clone(&runtime);
             Box::pin(async move {
-                let list_id = session_todo_scope(&ctx, TodoListKind::KimiTodos, "TodoList")?;
+                let list_id = session_todo_scope(&ctx, TodoListKind::KimiTodos);
 
                 // Reading is `todos` left out entirely, which is different
                 // from sending an empty list to clear it.
@@ -475,7 +457,7 @@ pub fn make_task_create_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
         Arc::new(move |args, ctx| {
             let runtime = Arc::clone(&runtime);
             Box::pin(async move {
-                let list_id = anthropic_task_scope(&ctx)?;
+                let list_id = anthropic_task_scope(&ctx);
                 let subject = required_str(&args, "subject")?.to_owned();
                 let description = required_str(&args, "description")?.to_owned();
                 let task_id = runtime.next_task_id(&list_id);
@@ -529,7 +511,7 @@ pub fn make_task_update_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
         Arc::new(move |args, ctx| {
             let runtime = Arc::clone(&runtime);
             Box::pin(async move {
-                let list_id = anthropic_task_scope(&ctx)?;
+                let list_id = anthropic_task_scope(&ctx);
                 let task_id = required_str(&args, "taskId")?.to_owned();
 
                 let status = args
@@ -586,7 +568,7 @@ pub fn make_task_get_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
         Arc::new(move |args, ctx| {
             let runtime = Arc::clone(&runtime);
             Box::pin(async move {
-                let list_id = anthropic_task_scope(&ctx)?;
+                let list_id = anthropic_task_scope(&ctx);
                 let task_id = required_str(&args, "taskId")?.to_owned();
 
                 let Some(snapshot) = runtime.snapshot(&list_id) else {
@@ -619,7 +601,7 @@ pub fn make_task_list_tool(runtime: Arc<TodoRuntime>) -> RegisteredTool {
         Arc::new(move |_args, ctx| {
             let runtime = Arc::clone(&runtime);
             Box::pin(async move {
-                let list_id = anthropic_task_scope(&ctx)?;
+                let list_id = anthropic_task_scope(&ctx);
                 let snapshot = runtime.snapshot(&list_id);
                 let items: &[TodoProjection] = snapshot.as_ref().map_or(&[], |list| &list.items);
                 if items.is_empty() {
@@ -786,7 +768,6 @@ mod tests {
     use super::*;
     use crate::test_support::MockEnvironment;
     use crate::tools::testing::context;
-    use crate::types::ToolErrorKind;
 
     fn openai_list(session: &str) -> String {
         TodoListKind::OpenAiPlan.list_id(session)
@@ -1290,27 +1271,22 @@ Blocks: #4"
 
     // --- scoping ---
 
-    /// Every todo tool writes a list keyed by a session, so one called outside
-    /// a session says so rather than writing somewhere nobody reads.
     #[tokio::test]
-    async fn a_todo_tool_called_outside_a_session_is_unavailable() {
+    async fn standalone_contexts_can_keep_separate_plans() {
         let runtime = Arc::new(TodoRuntime::new());
         let plan = make_update_plan_tool(Arc::clone(&runtime));
-        let tasks = make_task_list_tool(runtime);
-        let bare = || context(MockEnvironment::default());
-
-        let error = (plan.executor)(json!({"plan": []}), bare())
-            .await
-            .map(|output| output.text())
-            .expect_err("there is no session to scope the plan to");
-        assert_eq!(error.message(), "update_plan requires an active session");
-        assert_eq!(error.kind(), ToolErrorKind::Unavailable);
-
-        let error = (tasks.executor)(json!({}), bare())
-            .await
-            .map(|output| output.text())
-            .expect_err("there is no session to scope the list to");
-        assert_eq!(error.message(), "task tools require an active session");
+        let first = context(MockEnvironment::default());
+        let second = context(MockEnvironment::default());
+        let first_id = session_todo_scope(&first, TodoListKind::OpenAiPlan);
+        let second_id = session_todo_scope(&second, TodoListKind::OpenAiPlan);
+        (plan.executor)(
+            json!({"plan": [{"step": "work", "status": "pending"}]}),
+            first,
+        )
+        .await
+        .expect("standalone plan succeeds");
+        assert!(runtime.snapshot(&first_id).is_some());
+        assert!(runtime.snapshot(&second_id).is_none());
     }
 
     /// An entry's identity is its text within its list, so the same words in

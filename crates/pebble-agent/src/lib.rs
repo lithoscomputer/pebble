@@ -43,6 +43,8 @@
 //! ```
 
 mod agent;
+mod session;
+pub use self::session::{SessionId, SessionScope};
 mod control;
 mod conversation;
 mod error;

@@ -274,6 +274,7 @@ mod tests {
     use std::time::Duration;
 
     use pebble_coding_agent::events::CodingEvent;
+    use pebble_coding_agent::{SessionId, SessionScope};
 
     use super::*;
 
@@ -333,7 +334,7 @@ mod tests {
             forked_from:  None,
             forked_at:    None,
         };
-        let mut record = SessionRecord::new("root");
+        let mut record = SessionRecord::new(SessionScope::root(SessionId::new("root")));
         record.advance_event_cursor(1);
         store.checkpoint(&metadata, record).await?;
         assert!(store.load().await.is_ok());

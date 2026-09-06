@@ -21,6 +21,7 @@ use super::execution::CodingToolService;
 use super::registry::{
     RegisteredTool, ToolDefinitionWithSource, ToolEnvProvider, ToolRegistrationError, ToolRegistry,
 };
+use crate::SessionScope;
 use crate::config::{CodingAgentOptions, NativeToolOptions};
 use crate::environment::Environment;
 use crate::event::{EventOptions, EventPump, EventSink, EventSinkError};
@@ -32,11 +33,6 @@ use crate::tools::{
     make_shell_tool_with_options, make_web_fetch_tool, make_web_search_tool, make_write_file_tool,
 };
 use crate::types::{CodingAgentEvent, ToolSummary};
-use crate::{SessionId, SessionScope};
-
-/// The session identifier a runner stamps on its events when the application
-/// names none.
-const DEFAULT_SESSION_ID: &str = "standalone";
 
 /// A selection of tools, described the way a session would describe them.
 ///
@@ -173,7 +169,7 @@ pub struct ToolRunner {
     output_store:      Option<Arc<dyn ToolOutputStore>>,
     tool_env_provider: Option<Arc<dyn ToolEnvProvider>>,
     on_event:          Option<ToolEventCallback>,
-    session_id:        SessionId,
+    session:           SessionScope,
 }
 
 impl ToolRunner {
@@ -189,7 +185,7 @@ impl ToolRunner {
             output_store: None,
             tool_env_provider: None,
             on_event: None,
-            session_id: SessionId::new(DEFAULT_SESSION_ID),
+            session: SessionScope::default(),
         }
     }
 
@@ -233,10 +229,10 @@ impl ToolRunner {
         self
     }
 
-    /// Names the session the runner's events are stamped with.
+    /// Sets the identity shared by discovery, calls, and events.
     #[must_use]
-    pub fn session_id(mut self, session_id: SessionId) -> Self {
-        self.session_id = session_id;
+    pub fn session(mut self, session: SessionScope) -> Self {
+        self.session = session;
         self
     }
 
@@ -282,6 +278,10 @@ impl ToolRunner {
             sink,
             ..EventOptions::default()
         });
+        let mut emitter = emitter.in_stream(self.session.root_session_id().to_string());
+        if let Some(parent) = self.session.parent_session_id() {
+            emitter = emitter.for_child(parent.as_str());
+        }
         let pump = tokio::spawn(pump.run());
 
         let redactor = self
@@ -293,7 +293,7 @@ impl ToolRunner {
             Arc::clone(&self.environment),
             Arc::clone(&self.options),
             emitter.clone(),
-            SessionScope::root(self.session_id.clone()),
+            self.session.clone(),
             redactor,
         );
         if let Some(store) = &self.output_store {
@@ -310,12 +310,20 @@ impl ToolRunner {
 
         let messages: [Message; 0] = [];
         let result = match system
-            .discover(TurnContext::new("standalone", 0, &messages))
+            .discover(TurnContext::new(&self.session, "standalone", 0, &messages))
             .await
         {
             Ok(catalog) => {
                 service.begin_standalone(call);
-                match system.execute(&catalog, 0, call.clone(), cancel).await {
+                match system
+                    .execute(
+                        &catalog,
+                        TurnContext::new(&self.session, "standalone", 0, &messages),
+                        call.clone(),
+                        cancel,
+                    )
+                    .await
+                {
                     Ok(outcome) => Ok(service.complete_standalone(call, outcome)),
                     // The started event is out, so the failure is answered
                     // before it ends the run.
@@ -364,7 +372,7 @@ impl fmt::Debug for ToolRunner {
         formatter
             .debug_struct("ToolRunner")
             .field("tools", &self.registry.names())
-            .field("session_id", &self.session_id)
+            .field("session", &self.session)
             .field("tool_middleware", &self.tool_middleware.len())
             .field("has_event_callback", &self.on_event.is_some())
             .finish_non_exhaustive()

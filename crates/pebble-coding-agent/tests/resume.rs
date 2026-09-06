@@ -14,6 +14,7 @@ use lithos_llm::Client;
 use lithos_llm::catalog::Catalog;
 use lithos_llm::client::ClientBuild;
 use lithos_llm::types::{Message as LlmMessage, Request, Role};
+use pebble_agent::{SessionId, SessionScope};
 use pebble_coding_agent::environment::Environment;
 use pebble_coding_agent::events::{CodingAgentEvent, EventSink, EventSinkError};
 use pebble_coding_agent::extensions::{Answer, HumanInputError, HumanInputProvider, Question};
@@ -29,8 +30,8 @@ use pebble_coding_agent::{
 };
 use tokio_util::sync::CancellationToken;
 
-/// The frozen version 1 record, which names a route the test catalog lacks.
-const SAMPLE_RECORD_V1: &str = include_str!("fixtures/session_record_v1.json");
+/// The current format fixture, which names a route the test catalog lacks.
+const SAMPLE_RECORD_V1: &str = include_str!("fixtures/session_record_v4.json");
 
 /// A second provider offering a model called `model`, like the `test` provider
 /// does, so a resume that matched on the model name alone could pick the
@@ -261,7 +262,7 @@ async fn a_record_naming_an_unavailable_route_is_refused_rather_than_rerouted() 
 
 #[tokio::test]
 async fn a_record_naming_no_route_is_refused_on_the_recorded_model() {
-    let record = SessionRecord::new("ses_unrouted");
+    let record = SessionRecord::new(SessionScope::root(SessionId::new("ses_unrouted")));
     let (client, _) = scripted_client(vec![ScriptedCall::response(text_response("never"))]);
 
     let error = CodingAgent::resume(client, environment(), record, ResumeMode::RecordedModel)
@@ -355,7 +356,7 @@ async fn the_frozen_version_one_record_resumes_through_the_public_api() {
     )
     .build()
     .await
-    .expect("the version 1 record resumes");
+    .expect("the fixture resumes");
 
     assert_eq!(resumed.id(), "ses_root");
     assert_eq!(resumed.history().len(), 5);
@@ -444,7 +445,7 @@ async fn event_numbering_continues_where_the_record_left_off() {
     let (client, _) = scripted_client(vec![ScriptedCall::response(text_response("one"))]);
     let (mut record, _, _) = stored_session(client, "test/model").await;
     let recorded_seq = record.last_event_seq;
-    let stream_id = record.session_id.clone();
+    let stream_id = record.scope.session_id().to_string();
     assert!(recorded_seq > 0, "the first session published events");
     let durable_seq = recorded_seq + 3;
     record.advance_event_cursor(durable_seq);

@@ -393,7 +393,7 @@ async fn a_committed_event_with_lost_acknowledgment_advances_resume_without_repl
     assert!(
         events
             .iter()
-            .all(|event| event.stream_id() == old.session_id)
+            .all(|event| event.stream_id() == old.scope.root_session_id().as_str())
     );
     assert!(events.windows(2).all(|pair| pair[0].seq + 1 == pair[1].seq));
     Ok(())

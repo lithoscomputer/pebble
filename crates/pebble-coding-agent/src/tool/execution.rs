@@ -665,6 +665,7 @@ mod tests {
     use tokio::task::JoinHandle;
 
     use super::*;
+    use crate::SessionId;
     use crate::environment::EnvironmentError;
     use crate::error::Result as PebbleResult;
     use crate::event::{EventOptions, EventPump};
@@ -744,7 +745,7 @@ mod tests {
             Arc::new(MockEnvironment::default()),
             Arc::new(CodingAgentOptions::default()),
             events.emitter.clone(),
-            SessionScope::root(crate::SessionId::new("ses_1")),
+            SessionScope::root(SessionId::new("ses_1")),
             redactor,
         ))
     }
@@ -767,7 +768,12 @@ mod tests {
         let catalog = discover(service).await;
         service.begin_standalone(call);
         let outcome = system
-            .execute(&catalog, 0, call.clone(), cancel)
+            .execute(
+                &catalog,
+                agent::TurnContext::new(&service.session_scope, "test/model", 0, &[]),
+                call.clone(),
+                cancel,
+            )
             .await
             .expect("the call completes");
         service.complete_standalone(call, outcome)
@@ -777,7 +783,7 @@ mod tests {
         let messages: [Message; 0] = [];
         agent::ToolService::discover(
             service.as_ref(),
-            agent::TurnContext::new("test/model", 0, &messages),
+            agent::TurnContext::new(&service.session_scope, "test/model", 0, &messages),
         )
         .await
         .expect("discovery succeeds")

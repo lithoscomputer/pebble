@@ -482,7 +482,7 @@ async fn termination_restores_modes_and_saves_the_session() {
     let checkpoint: serde_json::Value =
         serde_json::from_slice(&fs::read(session.join("checkpoint.json")).expect("checkpoint"))
             .expect("valid checkpoint");
-    assert!(checkpoint["record"]["session_id"].is_string());
+    assert!(checkpoint["record"]["scope"]["session_id"].is_string());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1131,8 +1131,8 @@ async fn clone_fork_tree_and_bookmarks_preserve_original_history() {
         .expect("clone");
     assert_eq!(clone["record"]["messages"], original["record"]["messages"]);
     assert_ne!(
-        clone["record"]["session_id"],
-        original["record"]["session_id"]
+        clone["record"]["scope"]["session_id"],
+        original["record"]["scope"]["session_id"]
     );
     assert_eq!(clone["metadata"]["forked_from"], original["metadata"]["id"]);
     terminal.send(b"/tree\r").await;

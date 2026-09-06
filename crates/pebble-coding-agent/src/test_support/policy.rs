@@ -2,6 +2,7 @@
 
 use pebble_agent::ToolDescriptor;
 
+use crate::SessionScope;
 use crate::tool::{ToolPermission, ToolPermissionPolicy};
 
 /// A policy that denies exactly one tool, by its stable identity, and allows
@@ -10,7 +11,7 @@ use crate::tool::{ToolPermission, ToolPermissionPolicy};
 pub struct DenyTool(pub &'static str);
 
 impl ToolPermissionPolicy for DenyTool {
-    fn permission(&self, tool: &ToolDescriptor) -> ToolPermission {
+    fn permission(&self, _session: &SessionScope, tool: &ToolDescriptor) -> ToolPermission {
         if tool.id().as_str() == self.0 {
             ToolPermission::Deny {
                 reason: format!("{} denied by tool permission policy", tool.id()),
@@ -26,7 +27,7 @@ impl ToolPermissionPolicy for DenyTool {
 pub struct FixedPermission(pub ToolPermission);
 
 impl ToolPermissionPolicy for FixedPermission {
-    fn permission(&self, _tool: &ToolDescriptor) -> ToolPermission {
+    fn permission(&self, _session: &SessionScope, _tool: &ToolDescriptor) -> ToolPermission {
         self.0.clone()
     }
 }

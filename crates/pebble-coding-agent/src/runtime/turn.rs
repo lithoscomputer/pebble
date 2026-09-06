@@ -17,7 +17,6 @@ use tokio_util::sync::CancellationToken;
 use super::control::{actor_from_attribution, input_message, input_source_from_attribution};
 use super::retry::RetryEventBridge;
 use super::{CodingRuntime, PromptResources, PromptTotals, SessionModel, StateMachine};
-use crate::SessionId;
 use crate::coding_agent::CodingInput;
 use crate::compaction::{
     CompactionControl, CompactionOutcome, CompactionReason, CompactionRequest, check_context_usage,
@@ -44,6 +43,7 @@ use crate::types::{
     InputContent, InputSource, LlmOutputKind, LlmRetryPhase, Message, SkillActivationSource,
     TokenUsage,
 };
+use crate::{SessionId, SessionScope};
 
 /// How many failed response streams Pebble replays after the first attempt.
 const STREAM_CONSUME_RETRIES: u32 = 3;
@@ -86,7 +86,7 @@ pub(super) struct CodingAgentBridge {
     /// afresh by [`begin_prompt`](Self::begin_prompt) for every prompt.
     prompt_cancel:     Arc<Mutex<CancellationToken>>,
     compaction:        CompactionControl,
-    session_scope:     crate::SessionScope,
+    session_scope:     SessionScope,
     context_policy:    Option<Arc<dyn ContextPolicy>>,
     compaction_policy: Option<Arc<dyn CompactionPolicy>>,
     subagents:         Option<SubagentSupervisor>,
@@ -1005,6 +1005,7 @@ impl CodingRuntime {
         };
         let mut builder =
             agent::Agent::builder(model_service, self.model_context.model_selector.clone())
+                .session(self.session_scope.clone())
                 .system_prompt(self.resources.system_prompt.clone())
                 .messages(messages)
                 .tool_service(bridge.tools.clone())

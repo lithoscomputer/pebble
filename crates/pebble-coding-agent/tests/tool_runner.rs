@@ -123,7 +123,7 @@ fn runner_with(
     let recorder = Arc::clone(&log);
     let runner = ToolRunner::new(CodingToolSet::core(), environment)
         .options(options)
-        .session_id(SessionId::new("runner-1"))
+        .session(SessionScope::root(SessionId::new("runner-1")))
         .on_event(move |event| {
             recorder
                 .0
@@ -445,9 +445,12 @@ async fn a_runner_delivers_session_scope_separately_from_the_tool_call_id() {
         move |context, _| {
             let expected = expected.clone();
             async move {
-                assert_eq!(context.session_scope(), Some(&expected));
-                assert_eq!(context.session_id(), Some(expected.session_id()));
-                assert_eq!(context.root_session_id(), Some(expected.root_session_id()));
+                assert_eq!(context.session(), &expected);
+                assert_eq!(context.session().session_id(), expected.session_id());
+                assert_eq!(
+                    context.session().root_session_id(),
+                    expected.root_session_id()
+                );
                 assert_eq!(context.tool_call_id(), Some("model-call"));
                 Ok("identified".to_owned())
             }
@@ -457,7 +460,7 @@ async fn a_runner_delivers_session_scope_separately_from_the_tool_call_id() {
         .with_tool(tool)
         .expect("tool registered");
     let result = ToolRunner::new(tools, mock_environment())
-        .session_id(scope.session_id().clone())
+        .session(scope)
         .run(
             &ToolCall::function("model-call", "inspect_identity", json!({})),
             CancellationToken::new(),

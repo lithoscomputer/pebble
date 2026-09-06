@@ -16,13 +16,13 @@ use tokio_util::sync::CancellationToken;
 use super::error::ToolError;
 use super::native::{NativeTool, ToolVocabulary};
 use super::permissions::known_tool_category;
+use crate::SessionScope;
 use crate::environment::Environment;
 use crate::event::{OutputCaptureStats, SessionBoundEmitter};
 use crate::human_input::HumanInputProvider;
 use crate::output::ToolOutputStore;
 use crate::redact::{NoRedaction, Redactor};
 use crate::types::{CodingEvent, ToolCategory, ToolSource, ToolSummary};
-use crate::{SessionId, SessionScope};
 
 /// The narrow handle a running tool publishes events through.
 ///
@@ -108,7 +108,7 @@ pub struct ToolContext {
     /// Extra environment variables for a command this call runs.
     pub(crate) tool_env_provider:    Option<Arc<dyn ToolEnvProvider>>,
     /// The calling session and the root shared by its tree.
-    session_scope:                   Option<SessionScope>,
+    session_scope:                   SessionScope,
     /// The model-native identifier of this call.
     pub(crate) tool_call_id:         Option<String>,
     /// Where the tool publishes events.
@@ -146,22 +146,6 @@ impl ToolContext {
         self.tool_env_provider.as_ref()
     }
 
-    /// The session that called the tool, when the call runs inside one.
-    #[must_use]
-    pub fn session_id(&self) -> Option<&SessionId> {
-        self.session_scope.as_ref().map(SessionScope::session_id)
-    }
-
-    /// The root of the session tree this call belongs to. Equal to
-    /// [`session_id`](Self::session_id) in a root session; a child inherits
-    /// its parent's root.
-    #[must_use]
-    pub fn root_session_id(&self) -> Option<&SessionId> {
-        self.session_scope
-            .as_ref()
-            .map(SessionScope::root_session_id)
-    }
-
     /// The model-native identifier of this call.
     #[must_use]
     pub fn tool_call_id(&self) -> Option<&str> {
@@ -187,7 +171,7 @@ impl ToolContext {
         &self.redactor
     }
 
-    /// A context that has an environment and nothing else.
+    /// A context with an environment and a fresh root identity.
     #[must_use]
     pub fn new(env: Arc<dyn Environment>) -> Self {
         Self {
@@ -196,7 +180,7 @@ impl ToolContext {
             output_store: None,
             output_artifacts: Arc::default(),
             tool_env_provider: None,
-            session_scope: None,
+            session_scope: SessionScope::default(),
             tool_call_id: None,
             coding_event_emitter: None,
             human_input: None,
@@ -214,14 +198,14 @@ impl ToolContext {
     /// Sets the calling session and the root of its session tree.
     #[must_use]
     pub fn with_session(mut self, session_scope: SessionScope) -> Self {
-        self.session_scope = Some(session_scope);
+        self.session_scope = session_scope;
         self
     }
 
-    /// The calling session and its tree, absent for a call outside a session.
+    /// The calling session and its ancestry.
     #[must_use]
-    pub const fn session_scope(&self) -> Option<&SessionScope> {
-        self.session_scope.as_ref()
+    pub const fn session(&self) -> &SessionScope {
+        &self.session_scope
     }
 
     /// Sets the model-native identifier of this call.
@@ -295,17 +279,6 @@ impl ToolContext {
         if let Some(emitter) = self.coding_event_emitter.as_ref() {
             emitter.record_tool_output_stats(stats);
         }
-    }
-
-    /// Whether this call is running in the root of its session tree.
-    ///
-    /// False outside a session, because a tool that is root-only needs a
-    /// session to be root of.
-    #[must_use]
-    pub fn is_root_session(&self) -> bool {
-        self.session_scope
-            .as_ref()
-            .is_some_and(SessionScope::is_root)
     }
 }
 
@@ -871,6 +844,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+    use crate::SessionId;
     use crate::event::{EventOptions, EventPump};
     use crate::human_input::{Answer, HumanInputError, Question};
     use crate::test_support::MockEnvironment;
@@ -1236,23 +1210,16 @@ mod tests {
     }
 
     #[test]
-    fn a_context_outside_a_session_is_not_a_root_session() {
-        assert!(!context().is_root_session());
-        assert!(
-            context()
-                .with_session(
-                    crate::SessionScope::root(crate::SessionId::new("ses_1"))
-                        .child(crate::SessionId::new("ses_1"))
-                )
-                .is_root_session()
-        );
-        assert!(
-            !context()
-                .with_session(
-                    crate::SessionScope::root(crate::SessionId::new("ses_1"))
-                        .child(crate::SessionId::new("ses_2"))
-                )
-                .is_root_session()
+    fn standalone_contexts_have_distinct_roots_and_explicit_children_keep_ancestry() {
+        let first = context();
+        let second = context();
+        assert!(first.session().is_root());
+        assert_ne!(first.session(), second.session());
+        let child = context().with_session(first.session().child(SessionId::new("child")));
+        assert!(!child.session().is_root());
+        assert_eq!(
+            child.session().parent_session_id(),
+            Some(first.session().session_id())
         );
     }
 

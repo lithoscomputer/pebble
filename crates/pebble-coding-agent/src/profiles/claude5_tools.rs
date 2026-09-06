@@ -25,7 +25,7 @@ use tokio::time;
 use super::definition;
 use crate::config::NativeToolOptions;
 use crate::search::SearchProvider;
-use crate::subagent::{SubagentResult, SubagentStatus, SubagentSupervisor, require_session_scope};
+use crate::subagent::{SubagentResult, SubagentStatus, SubagentSupervisor};
 use crate::tool::{
     NativeTool, RegisteredTool, ToolError, optional_integer_arg, required_str, whole_number,
 };
@@ -251,7 +251,7 @@ fn make_agent_tool(supervisor: SubagentSupervisor) -> RegisteredTool {
                     .get("run_in_background")
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
-                let parent = require_session_scope(&context)?;
+                let parent = context.session();
 
                 if run_in_background {
                     let task_id = supervisor.spawn_with_parent_notification(
@@ -639,7 +639,7 @@ mod tests {
 
     /// A call made from inside `parent`.
     fn call_in(parent: &CodingRuntime) -> ToolContext {
-        context(MockEnvironment::linux()).with_session(parent.session_scope().clone())
+        context(MockEnvironment::linux()).with_session(parent.session().clone())
     }
 
     #[tokio::test]
@@ -760,7 +760,7 @@ mod tests {
         let supervisor = supervisor_of(&parent);
         let task_id = supervisor
             .spawn_with_parent_notification(
-                parent.session_scope(),
+                parent.session(),
                 "Inspect".to_owned(),
                 "Inspect explicitly".to_owned(),
             )
@@ -797,7 +797,7 @@ mod tests {
         let parent = parent_answering("defaulted report");
         let supervisor = supervisor_of(&parent);
         let task_id = supervisor
-            .spawn(parent.session_scope(), "Inspect".to_owned())
+            .spawn(parent.session(), "Inspect".to_owned())
             .expect("the spawn succeeds");
         supervisor
             .wait_with_cancel(&task_id, &CancellationToken::new())
@@ -859,7 +859,7 @@ mod tests {
         let parent = parent_answering("child report");
         let supervisor = supervisor_of(&parent);
         let task_id = supervisor
-            .spawn(parent.session_scope(), "Inspect".to_owned())
+            .spawn(parent.session(), "Inspect".to_owned())
             .expect("the spawn succeeds");
         supervisor
             .wait_with_cancel(&task_id, &CancellationToken::new())

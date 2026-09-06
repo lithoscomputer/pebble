@@ -8,7 +8,5 @@
 //! before resume.
 
 pub use crate::history::History;
-pub use crate::record::{
-    RecordMigrationError, SESSION_RECORD_FORMAT_VERSION, SessionRecord, StoredMessage,
-};
+pub use crate::record::{SESSION_RECORD_FORMAT_VERSION, SessionRecord, StoredMessage};
 pub use crate::types::{InputContent, Message};
