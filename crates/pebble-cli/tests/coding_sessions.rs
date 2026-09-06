@@ -15,8 +15,11 @@ use axum::middleware::{Next, from_fn};
 use lithos_llm::Client;
 use lithos_llm::catalog::Catalog;
 use lithos_llm::credentials::{Credentials, SecretValue, StaticCredentials};
+use lithos_llm::middleware::RetryPolicy;
 use pebble_coding_agent::environment::LocalEnvironment;
-use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent, EventSink, EventSinkError};
+use pebble_coding_agent::events::{
+    CodingAgentEvent, CodingEvent, EventSink, EventSinkError, LlmRetryPhase,
+};
 use pebble_coding_agent::{CodingAgent, CodingAgentOptions, ShutdownReason};
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -297,5 +300,103 @@ async fn oversized_output_is_bounded_on_the_wire_and_in_events() {
         })
         .collect();
     assert_eq!(completions.len(), 1);
+    twin.stop().await;
+}
+
+#[tokio::test]
+async fn a_broken_stream_after_an_edit_does_not_execute_the_edit_twice() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut broken = answer("Checking the edit.");
+    broken["close_after_chunks"] = json!(3);
+    let mut twin = Twin::start(vec![
+        scenario(
+            1,
+            "Implement task.sh",
+            shell("edit", "echo 'echo FIXED' >> task.sh; bash task.sh"),
+        ),
+        scenario(2, "FIXED", broken),
+        scenario(
+            3,
+            "FIXED",
+            shell(
+                "check",
+                "test \"$(bash task.sh)\" = FIXED && echo CHECK_PASSED",
+            ),
+        ),
+        scenario(
+            4,
+            "CHECK_PASSED",
+            answer("Implemented and checked task.sh."),
+        ),
+    ])
+    .await;
+    let events = Arc::new(EventLog::default());
+    let mut agent = twin
+        .agent(
+            workspace.path(),
+            CodingAgentOptions::default()
+                .with_context_compaction(false)
+                .with_turn_replay(
+                    RetryPolicy::exponential()
+                        .max_attempts(2)
+                        .initial_delay(Duration::from_millis(1))
+                        .jitter(false),
+                ),
+            &events,
+        )
+        .await;
+    let report = timeout(PATIENCE, agent.prompt("Implement task.sh"))
+        .await
+        .unwrap();
+    assert_eq!(
+        report.result.unwrap().text.as_deref(),
+        Some("Implemented and checked task.sh.")
+    );
+    assert_eq!(report.usage.input, 30);
+    assert_eq!(report.usage.output, 15);
+    agent.shutdown(ShutdownReason::Completed).await.unwrap();
+
+    assert_eq!(
+        fs::read_to_string(workspace.path().join("task.sh")).unwrap(),
+        "echo FIXED\n"
+    );
+    let requests = twin.requests();
+    assert_eq!(
+        requests.len(),
+        4,
+        "edit, interrupted response, replay, final answer"
+    );
+    assert_eq!(
+        requests[1]["input"], requests[2]["input"],
+        "replay keeps the committed edit and its result"
+    );
+    assert!(tool_output(&requests[2], "edit").contains("FIXED"));
+    assert!(tool_output(&requests[3], "check").contains("CHECK_PASSED"));
+    let published = events.take();
+    let completions: Vec<_> = published
+        .iter()
+        .filter_map(|event| match &event.event {
+            CodingEvent::ToolCallCompleted {
+                tool_call_id,
+                is_error,
+                ..
+            } => {
+                assert!(!is_error);
+                Some(tool_call_id.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(completions, ["edit", "check"]);
+    assert_eq!(
+        published
+            .iter()
+            .filter(|event| matches!(event.event, CodingEvent::LlmRetry {
+                phase: LlmRetryPhase::Consume,
+                ..
+            }))
+            .count(),
+        1
+    );
     twin.stop().await;
 }
