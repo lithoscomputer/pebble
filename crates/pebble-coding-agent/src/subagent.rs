@@ -112,12 +112,23 @@ impl Default for SubagentLimits {
     }
 }
 
-/// Whether an agent may spawn subagents, and how many the tree may hold open.
+/// Whether an agent may spawn subagents, how many the tree may hold open, and
+/// what of the root's project briefing a child is given.
 ///
 /// Pebble builds the children itself, so this is the whole of what an
 /// application decides. The default is enabled with the default limits; give it
 /// to [`CodingAgentBuilder::subagents`](crate::CodingAgentBuilder::subagents)
 /// to turn subagents on.
+///
+/// A child is given a task, not a project briefing: by default it loads no
+/// memory files and discovers no skills, because paying for the briefing again
+/// in every child is how a tree of agents spends a context window on nothing.
+/// An application whose children should read the project's documents and see
+/// its skills the way the root did asks for that with
+/// [`with_inherited_memory`](Self::with_inherited_memory) and
+/// [`with_inherited_skills`](Self::with_inherited_skills); the child then
+/// loads the parent's configured memory files and searches the parent's
+/// configured skill directories when it initializes.
 ///
 /// ```
 /// use pebble_coding_agent::subagents::{SubagentLimits, SubagentOptions};
@@ -125,12 +136,18 @@ impl Default for SubagentLimits {
 /// let options = SubagentOptions::default().with_limits(SubagentLimits::new(3));
 /// assert!(options.is_enabled());
 /// assert_eq!(options.limits().max_open_sessions, 3);
+/// assert!(!options.inherits_memory() && !options.inherits_skills());
 /// assert!(!SubagentOptions::disabled().is_enabled());
+///
+/// let briefed = options.with_inherited_memory().with_inherited_skills();
+/// assert!(briefed.inherits_memory() && briefed.inherits_skills());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubagentOptions {
-    enabled: bool,
-    limits:  SubagentLimits,
+    enabled:        bool,
+    limits:         SubagentLimits,
+    inherit_memory: bool,
+    inherit_skills: bool,
 }
 
 impl SubagentOptions {
@@ -138,8 +155,10 @@ impl SubagentOptions {
     #[must_use]
     pub fn enabled() -> Self {
         Self {
-            enabled: true,
-            limits:  SubagentLimits::default(),
+            enabled:        true,
+            limits:         SubagentLimits::default(),
+            inherit_memory: false,
+            inherit_skills: false,
         }
     }
 
@@ -148,7 +167,7 @@ impl SubagentOptions {
     pub fn disabled() -> Self {
         Self {
             enabled: false,
-            limits:  SubagentLimits::default(),
+            ..Self::enabled()
         }
     }
 
@@ -156,6 +175,22 @@ impl SubagentOptions {
     #[must_use]
     pub const fn with_limits(mut self, limits: SubagentLimits) -> Self {
         self.limits = limits;
+        self
+    }
+
+    /// The same options, with every child loading the memory files its
+    /// parent was configured with.
+    #[must_use]
+    pub const fn with_inherited_memory(mut self) -> Self {
+        self.inherit_memory = true;
+        self
+    }
+
+    /// The same options, with every child discovering skills in the
+    /// directories its parent was configured with.
+    #[must_use]
+    pub const fn with_inherited_skills(mut self) -> Self {
+        self.inherit_skills = true;
         self
     }
 
@@ -169,6 +204,25 @@ impl SubagentOptions {
     #[must_use]
     pub const fn limits(&self) -> SubagentLimits {
         self.limits
+    }
+
+    /// Whether a child loads its parent's memory files.
+    #[must_use]
+    pub const fn inherits_memory(&self) -> bool {
+        self.inherit_memory
+    }
+
+    /// Whether a child searches its parent's skill directories.
+    #[must_use]
+    pub const fn inherits_skills(&self) -> bool {
+        self.inherit_skills
+    }
+
+    /// The same options, turned on; for the crate's own tests.
+    #[cfg(test)]
+    pub(crate) const fn turned_on(mut self) -> Self {
+        self.enabled = true;
+        self
     }
 }
 

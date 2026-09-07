@@ -152,9 +152,8 @@ pub(crate) struct CodingRuntimeBuilder {
     prompt_transform:     Option<Arc<dyn SystemPromptTransform>>,
     context_policy:       Option<Arc<dyn ContextPolicy>>,
     compaction_policy:    Option<Arc<dyn CompactionPolicy>>,
-    subagents_enabled:    bool,
+    subagents:            SubagentOptions,
     child_observer:       Option<ChildObserver>,
-    subagent_limits:      SubagentLimits,
     child:                Option<ChildIdentity>,
 }
 
@@ -180,9 +179,8 @@ impl CodingRuntimeBuilder {
             prompt_transform: None,
             context_policy: None,
             compaction_policy: None,
-            subagents_enabled: false,
+            subagents: SubagentOptions::disabled(),
             child_observer: None,
-            subagent_limits: SubagentLimits::default(),
             child: None,
         }
     }
@@ -380,15 +378,14 @@ impl CodingRuntimeBuilder {
     /// tool middleware its parent had, and never a
     /// [`HumanInputProvider`]: a child cannot ask a person a question.
     pub(crate) fn subagents(mut self, options: SubagentOptions) -> Self {
-        self.subagents_enabled = options.is_enabled();
-        self.subagent_limits = options.limits();
+        self.subagents = options;
         self
     }
 
     /// Sees each child this session's tree builds, for the crate's own tests.
     #[cfg(test)]
     pub(crate) fn observe_children(mut self, observer: ChildObserver) -> Self {
-        self.subagents_enabled = true;
+        self.subagents = self.subagents.turned_on();
         self.child_observer = Some(observer);
         self
     }
@@ -529,7 +526,7 @@ impl CodingRuntimeBuilder {
                 Some(child.event_emitter),
             ),
             None => (
-                OpenSessions::root(self.subagent_limits),
+                OpenSessions::root(self.subagents.limits()),
                 self.child_observer,
                 None,
             ),
@@ -546,7 +543,7 @@ impl CodingRuntimeBuilder {
             (emitter, Some(tokio::spawn(pump.run())))
         };
 
-        let supervisor = self.subagents_enabled.then(|| {
+        let supervisor = self.subagents.is_enabled().then(|| {
             SubagentSupervisor::new(Arc::new(ChildDeps {
                 client: self.client.clone(),
                 model_selector: handle.to_string(),
@@ -557,7 +554,7 @@ impl CodingRuntimeBuilder {
                 tool_middleware: self.tool_middleware.clone(),
                 context_policy: self.context_policy.clone(),
                 compaction_policy: self.compaction_policy.clone(),
-                options: child_options(&self.options),
+                options: child_options(&self.options, &self.subagents),
                 tool_env_provider: self.tool_env_provider.clone(),
                 redactor: Arc::clone(&self.redactor),
                 search_provider: self.search_provider.clone(),
@@ -638,14 +635,25 @@ impl CodingRuntimeBuilder {
 /// Everything that bounds or governs the child comes across unchanged — the
 /// tool middleware, the permission level, the output budgets, the
 /// wall-clock budget — so a factory cannot be handed anything wider than the
-/// parent had. What does not come across is what the root loads once: the
-/// memory files and the skill directories. A child is given a task, not a
-/// project briefing, and paying for the briefing again in every child is how a
-/// tree of agents spends a context window on nothing.
-fn child_options(parent: &CodingAgentOptions) -> CodingAgentOptions {
+/// parent had. What does not come across by default is what the root loads
+/// once: the memory files and the skill directories. A child is given a task,
+/// not a project briefing, and paying for the briefing again in every child is
+/// how a tree of agents spends a context window on nothing. An application
+/// whose children must read the project's documents and see its skills the way
+/// the root did says so on its [`SubagentOptions`], and the child then
+/// initializes from the same paths its parent was given.
+fn child_options(parent: &CodingAgentOptions, subagents: &SubagentOptions) -> CodingAgentOptions {
     CodingAgentOptions {
-        memory_files: Vec::new(),
-        skill_dirs: Vec::new(),
+        memory_files: if subagents.inherits_memory() {
+            parent.memory_files.clone()
+        } else {
+            Vec::new()
+        },
+        skill_dirs: if subagents.inherits_skills() {
+            parent.skill_dirs.clone()
+        } else {
+            Vec::new()
+        },
         ..parent.clone()
     }
 }

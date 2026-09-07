@@ -302,7 +302,10 @@ advertises no tool without one: an `extensions::HumanInputProvider` (no
 provider, no question tool), an `extensions::SearchProvider` (no provider, no
 `web_search`), an `extensions::Redactor` for process output and failed tool
 call messages, and a
-`subagents::SubagentOptions` for subagents.
+`subagents::SubagentOptions` for subagents. A child is given a task, not the
+project briefing: it loads no memory files and discovers no skills unless the
+options ask for them with `with_inherited_memory` and `with_inherited_skills`,
+which give a child the parent's configured memory files and skill directories.
 
 ## Native embedding extensions
 

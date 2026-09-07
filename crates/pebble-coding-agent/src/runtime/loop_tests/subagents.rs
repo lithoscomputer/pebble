@@ -28,7 +28,7 @@ use serde_json::json;
 use tokio::runtime::Handle;
 use tokio::time::{sleep, timeout};
 
-use super::super::testing::{builder, wait_for_event};
+use super::super::testing::{TestProfile, builder, wait_for_event};
 use super::*;
 use crate::SessionId;
 use crate::event::{EventSink, EventSinkError};
@@ -37,8 +37,8 @@ use crate::subagent::{
     ChildObserver, SubagentLimits, SubagentResult, SubagentStatus, SubagentSupervisor,
 };
 use crate::test_support::{
-    MockEnvironment, ScriptedProvider, message_text, multi_tool_call_response, routed_client,
-    scripted_client,
+    MockEnvironment, RoutedProvider, ScriptedProvider, message_text, multi_tool_call_response,
+    routed_client, scripted_client,
 };
 use crate::types::ToolErrorKind;
 
@@ -1331,4 +1331,167 @@ async fn a_request_that_names_two_lanes_fails_loudly() {
         .shutdown(ShutdownReason::Completed)
         .await
         .expect("the session shuts down");
+}
+
+// --- What a child is told about the project ---
+
+/// The names of the tools `request` offers the model.
+fn tool_names(request: &Request) -> Vec<String> {
+    request
+        .tools()
+        .iter()
+        .map(|tool| tool.name.clone())
+        .collect()
+}
+
+/// A parent on a project with one memory file and one skill, spawning one
+/// child on `task` and waiting for it, with `subagents` deciding what the
+/// child is told about the project.
+///
+/// Answers the parent, the provider (the root lane and one lane keyed on the
+/// task), and the sink the whole tree's events land in.
+fn briefed_parent(
+    subagents: SubagentOptions,
+    task: &str,
+) -> (CodingRuntime, Arc<RoutedProvider>, Arc<TreeSink>) {
+    let environment = Arc::new(MockEnvironment {
+        files: HashMap::from([
+            ("/work/AGENTS.md".to_owned(), "Sign every note".to_owned()),
+            (
+                "/skills/commit/SKILL.md".to_owned(),
+                "---\nname: commit\ndescription: Make a commit\n---\nDo commit".to_owned(),
+            ),
+        ]),
+        glob_results: vec!["/skills/commit/SKILL.md".to_owned()],
+        ..MockEnvironment::linux()
+    });
+    let (client, provider) = routed_client(
+        ScriptedProvider::new(vec![
+            ScriptedCall::response(tool_call_response(
+                "spawn_agent",
+                "spawn",
+                json!({ "task": task }),
+            )),
+            ScriptedCall::response(tool_call_response("wait", "wait", json!({}))),
+            ScriptedCall::response(text_response("parent done")),
+        ]),
+        vec![(task, ScriptedProvider::new(answers("child done")))],
+    );
+    let sink = Arc::new(TreeSink::default());
+    let parent = CodingRuntime::builder(client)
+        .model("test/model")
+        .environment(environment)
+        .with_profile(TestProfile::shared())
+        .options(CodingAgentOptions {
+            memory_files: vec!["/work/AGENTS.md".to_owned()],
+            skill_dirs: vec!["/skills".to_owned()],
+            ..CodingAgentOptions::default()
+        })
+        .event_sink(Arc::clone(&sink) as Arc<dyn EventSink>)
+        .subagents(subagents)
+        .build()
+        .expect("the parent builds");
+    (parent, provider, sink)
+}
+
+/// The memory files and the skills the one child of `parent` reported
+/// loading, read from the tree's durable stream.
+fn child_briefing(sink: &TreeSink, parent: &CodingRuntime) -> (Vec<String>, Vec<String>) {
+    let recorded = sink.recorded();
+    let child_events = recorded
+        .iter()
+        .filter(|event| event.parent_session_id.as_deref() == Some(parent.id()));
+    let mut memory = None;
+    let mut skills = None;
+    for event in child_events {
+        match &event.event {
+            CodingEvent::MemoryLoaded { files, .. } => {
+                memory = Some(files.iter().map(|file| file.path.clone()).collect());
+            }
+            CodingEvent::SkillsDiscovered { skills: found, .. } => {
+                skills = Some(found.iter().map(|skill| skill.name.clone()).collect());
+            }
+            _ => {}
+        }
+    }
+    (
+        memory.expect("the child reported its memory"),
+        skills.expect("the child reported its skills"),
+    )
+}
+
+/// A child is given a task, not the project briefing its root paid for once:
+/// no memory files, no skill directories, and so no skill tool.
+#[tokio::test]
+async fn a_child_is_given_no_project_briefing_by_default() {
+    let task = "child: leave a note";
+    let (mut parent, provider, sink) = briefed_parent(SubagentOptions::enabled(), task);
+    parent.initialize().await.expect("initialization succeeds");
+
+    let output = parent
+        .prompt("delegate")
+        .await
+        .expect("the prompt succeeds");
+    parent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the parent shuts down");
+
+    assert_eq!(output.as_deref(), Some("parent done"));
+    let root = provider.root().requests();
+    assert!(
+        tool_names(&root[0]).contains(&"use_skill".to_owned()),
+        "the root discovered the skill: {:?}",
+        tool_names(&root[0])
+    );
+    let (memory, skills) = child_briefing(&sink, &parent);
+    assert!(memory.is_empty(), "{memory:?}");
+    assert!(skills.is_empty(), "{skills:?}");
+    let child = provider.lane(task).requests();
+    assert!(
+        !tool_names(&child[0]).contains(&"use_skill".to_owned()),
+        "a child with no skills has no skill tool: {:?}",
+        tool_names(&child[0])
+    );
+}
+
+/// An application whose children should read the project's documents and see
+/// its skills the way the root did asks for both, and the child then
+/// initializes from the parent's configured paths.
+#[tokio::test]
+async fn a_child_reads_the_parents_memory_and_skills_when_the_application_asks() {
+    let task = "child: leave a signed note";
+    let (mut parent, provider, sink) = briefed_parent(
+        SubagentOptions::enabled()
+            .with_inherited_memory()
+            .with_inherited_skills(),
+        task,
+    );
+    parent.initialize().await.expect("initialization succeeds");
+
+    let output = parent
+        .prompt("delegate")
+        .await
+        .expect("the prompt succeeds");
+    parent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the parent shuts down");
+
+    assert_eq!(output.as_deref(), Some("parent done"));
+    let (memory, skills) = child_briefing(&sink, &parent);
+    assert_eq!(memory, ["/work/AGENTS.md"]);
+    assert_eq!(skills, ["commit"]);
+    let child = provider.lane(task).requests();
+    let names = tool_names(&child[0]);
+    assert!(names.contains(&"use_skill".to_owned()), "{names:?}");
+    let system = child[0]
+        .messages()
+        .first()
+        .map(message_text)
+        .unwrap_or_default();
+    assert!(
+        system.contains("# Available Skills") && system.contains("`commit`"),
+        "the child's prompt lists the skills it discovered: {system}"
+    );
 }
