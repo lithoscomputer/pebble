@@ -731,6 +731,14 @@ fn profile_kind(
         })
 }
 
+/// Where one prompt starts: with new input, or from where the history stopped.
+enum PromptStart {
+    /// Commit this input, then ask the model.
+    Input(CodingInput),
+    /// Ask the model on the history as it stands.
+    Continue,
+}
+
 /// Where an outside task names why it is about to cancel a prompt.
 ///
 /// [`CodingRuntime::interrupt_reason_handle`] hands one out before the prompt
@@ -1639,7 +1647,40 @@ impl CodingRuntime {
         input: impl Into<CodingInput>,
         cancel: Option<&CancellationToken>,
     ) -> Result<Option<String>> {
-        let input = input.into();
+        self.run_prompt(PromptStart::Input(input.into()), cancel)
+            .await
+    }
+
+    /// Continues the prompt the history left unfinished, without new input.
+    ///
+    /// The history is unfinished when it ends with input the model has not
+    /// answered: a user turn, or the results of the tool calls the model asked
+    /// for. The model is asked again on the history as it stands and the
+    /// prompt then runs to completion as
+    /// [`prompt_with_cancellation`](Self::prompt_with_cancellation) would;
+    /// the tool calls that already have their results are not run again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Agent`] carrying
+    /// [`AgentError::NothingToContinue`](pebble_agent::AgentError::NothingToContinue)
+    /// when the history is empty or ends with the model's own turn, and
+    /// otherwise fails as `prompt_with_cancellation` does.
+    pub(crate) async fn continue_prompt(
+        &mut self,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Option<String>> {
+        self.run_prompt(PromptStart::Continue, cancel).await
+    }
+
+    /// Runs one prompt, from new input or from where the history stopped, with
+    /// the bookkeeping every prompt shares: the wall-clock timer, the
+    /// cancellation links, the state transitions, and the durability barrier.
+    async fn run_prompt(
+        &mut self,
+        start: PromptStart,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Option<String>> {
         self.conversation().begin_prompt();
         if self.state.current() == CodingAgentState::Closed {
             return Err(Error::SessionClosed);
@@ -1655,9 +1696,13 @@ impl CodingRuntime {
         let event_link = link_cancellation(&event_failure, &prompt_cancel);
 
         let timer = self.start_wall_clock_timer(&prompt_cancel);
-        let result = self
-            .process_input(input, SkillExpansion::Apply, &prompt_cancel)
-            .await;
+        let result = match start {
+            PromptStart::Input(input) => {
+                self.process_input(input, SkillExpansion::Apply, &prompt_cancel)
+                    .await
+            }
+            PromptStart::Continue => self.continue_input(&prompt_cancel).await,
+        };
         self.conversation().finish_prompt_timing();
 
         if let Some(link) = caller_link {

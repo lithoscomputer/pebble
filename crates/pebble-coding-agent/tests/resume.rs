@@ -7,27 +7,30 @@
 //! initializing again. These tests drive every one of those paths the way an
 //! application does.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lithos_llm::Client;
 use lithos_llm::catalog::Catalog;
 use lithos_llm::client::ClientBuild;
-use lithos_llm::types::{Message as LlmMessage, Request, Role};
-use pebble_agent::{SessionId, SessionScope};
+use lithos_llm::types::{ErrorKind as LlmErrorKind, Message as LlmMessage, Request, Role};
+use pebble_agent::{AgentError, SessionId, SessionScope};
 use pebble_coding_agent::environment::Environment;
-use pebble_coding_agent::events::{CodingAgentEvent, EventSink, EventSinkError};
+use pebble_coding_agent::events::{CodingAgentEvent, CodingAgentState, EventSink, EventSinkError};
 use pebble_coding_agent::extensions::{Answer, HumanInputError, HumanInputProvider, Question};
 use pebble_coding_agent::state::{
     Message, SESSION_RECORD_FORMAT_VERSION, SessionRecord, StoredMessage,
 };
 use pebble_coding_agent::test_support::{
-    MockEnvironment, ScriptedCall, ScriptedProvider, TEST_CATALOG, message_text, scripted_client,
-    scripted_client_builder, text_response,
+    MockEnvironment, ScriptedCall, ScriptedFailure, ScriptedProvider, TEST_CATALOG, message_text,
+    scripted_client, scripted_client_builder, text_response, tool_call_response,
 };
+use pebble_coding_agent::tools::RegisteredTool;
 use pebble_coding_agent::{
-    CodingAgent, CodingAgentBuildError, CodingAgentOptions, ResumeMode, ShutdownReason,
+    CodingAgent, CodingAgentBuildError, CodingAgentOptions, Error, ResumeMode, ShutdownReason,
 };
+use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 /// The current format fixture, which names a route the test catalog lacks.
@@ -339,6 +342,135 @@ async fn a_resume_builder_refuses_a_model_of_its_own() {
         matches!(error, CodingAgentBuildError::ModelConflictsWithResume),
         "{error:?}"
     );
+}
+
+/// A tool whose every run is an effect the world keeps, counted in `runs`.
+fn appending_tool(runs: Arc<AtomicUsize>) -> RegisteredTool {
+    RegisteredTool::function(
+        "append",
+        "Appends one line to the log",
+        json!({"type": "object"}),
+        move |_context, _arguments| {
+            runs.fetch_add(1, Ordering::SeqCst);
+            async { Ok("appended".to_owned()) }
+        },
+    )
+}
+
+/// The prompt that a failed model call left unfinished continues on the
+/// fallback route from the tool results it had committed: the model is asked
+/// once, on the history as it stands, and the effect is not repeated.
+#[tokio::test]
+async fn an_unfinished_prompt_continues_on_another_model_without_repeating_its_effect() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    // The primary asks for the effect, then fails for good on its next call.
+    let (client, _) = ambiguous_client(vec![
+        ScriptedCall::response(tool_call_response("append", "call_1", json!({}))),
+        ScriptedCall::Failure(ScriptedFailure::terminal(
+            LlmErrorKind::Server,
+            "overloaded",
+        )),
+    ]);
+    let mut agent = CodingAgent::builder(client, environment())
+        .model("test/model")
+        .tools([appending_tool(Arc::clone(&runs))])
+        .build()
+        .await
+        .expect("the agent builds");
+    let failed = agent.prompt("append once").await;
+    assert!(matches!(failed.result, Err(Error::Llm(_))), "{failed:?}");
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the effect happened");
+    let record = agent.to_record();
+    assert!(
+        matches!(
+            record.messages.last(),
+            Some(StoredMessage::ToolResults { .. })
+        ),
+        "the record stops at the tool results: {:?}",
+        record.messages
+    );
+    agent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the agent shuts down");
+
+    let (client, fallback) = ambiguous_client(vec![ScriptedCall::response(text_response(
+        "appended, done",
+    ))]);
+    let mut resumed = CodingAgent::resume(
+        client,
+        environment(),
+        record,
+        ResumeMode::UseModel("bare/model".into()),
+    )
+    .tools([appending_tool(Arc::clone(&runs))])
+    .build()
+    .await
+    .expect("the record resumes on the fallback route");
+
+    let report = resumed.continue_prompt().await;
+
+    let output = report.result.expect("the continuation succeeds");
+    assert_eq!(output.text.as_deref(), Some("appended, done"));
+    assert_eq!(runs.load(Ordering::SeqCst), 1, "the effect is not repeated");
+    let requests = fallback.requests();
+    assert_eq!(requests.len(), 1, "the fallback was asked once");
+    let roles: Vec<Role> = requests[0]
+        .messages()
+        .iter()
+        .map(LlmMessage::role)
+        .collect();
+    assert_eq!(
+        roles,
+        [Role::System, Role::User, Role::Assistant, Role::Tool],
+        "the history as it stood, and no new input"
+    );
+    assert_eq!(requests[0].messages()[3].tool_call_id(), Some("call_1"));
+    let turns = resumed.history().turns().to_vec();
+    assert_eq!(turns.len(), 4, "only the answer was committed: {turns:?}");
+    assert!(matches!(turns[3], Message::Assistant { .. }));
+    assert_eq!(resumed.provider(), "bare");
+    assert_eq!(resumed.state(), CodingAgentState::Idle);
+    resumed
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the resumed agent shuts down");
+}
+
+#[tokio::test]
+async fn a_finished_conversation_has_nothing_to_continue() {
+    let (client, _) = scripted_client(vec![ScriptedCall::response(text_response("one"))]);
+    let (record, history, _) = stored_session(client, "test/model").await;
+    let (client, provider) = scripted_client(vec![ScriptedCall::response(text_response("two"))]);
+    let mut resumed = CodingAgent::resume(client, environment(), record, ResumeMode::RecordedModel)
+        .build()
+        .await
+        .expect("the record resumes");
+
+    let report = resumed.continue_prompt().await;
+
+    assert!(
+        matches!(
+            report.result,
+            Err(Error::Agent(AgentError::NothingToContinue))
+        ),
+        "{report:?}"
+    );
+    assert_eq!(provider.call_count(), 0, "the model was not asked");
+    assert_eq!(resumed.history().turns(), history.as_slice());
+    assert_eq!(resumed.state(), CodingAgentState::Idle);
+    let next = resumed.prompt("second").await;
+    assert_eq!(
+        next.result
+            .expect("the agent is still usable")
+            .text
+            .as_deref(),
+        Some("two")
+    );
+    resumed
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the resumed agent shuts down");
 }
 
 // --- What the record carries ---

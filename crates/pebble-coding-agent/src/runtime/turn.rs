@@ -932,6 +932,31 @@ impl CodingRuntime {
             });
         }
 
+        let message = input_message(content_after_skill_expansion(content, &expanded), source);
+        self.drive_agent(Some(message), prompt_cancel).await
+    }
+
+    /// Continues the unfinished prompt through the shared generic agent loop,
+    /// committing nothing before the model is asked.
+    pub(super) async fn continue_input(
+        &mut self,
+        prompt_cancel: &CancellationToken,
+    ) -> Result<Option<String>> {
+        if self.state.current() == CodingAgentState::Closed {
+            return Err(Error::SessionClosed);
+        }
+        self.check_pump().await?;
+        self.state.transition(CodingAgentState::Thinking);
+        self.drive_agent(None, prompt_cancel).await
+    }
+
+    /// Runs the generic loop, from `message` or from the conversation as it
+    /// stands, and maps how it ended onto this session.
+    async fn drive_agent(
+        &mut self,
+        message: Option<agent::UserMessage>,
+        prompt_cancel: &CancellationToken,
+    ) -> Result<Option<String>> {
         self.ensure_coding_agent()?;
         let bridge = self
             .coding_bridge
@@ -943,12 +968,10 @@ impl CodingRuntime {
             .take()
             .ok_or_else(|| Error::InvalidState("the coding agent was not built".to_owned()))?;
 
-        let result = agent
-            .prompt_with_cancellation(
-                input_message(content_after_skill_expansion(content, &expanded), source),
-                prompt_cancel,
-            )
-            .await;
+        let result = match message {
+            Some(message) => agent.prompt_with_cancellation(message, prompt_cancel).await,
+            None => agent.continue_prompt_with_cancellation(prompt_cancel).await,
+        };
         self.coding_agent = Some(agent);
         bridge.finish_inference();
         // A failed stream cancels the generic loop. Recover its exact error

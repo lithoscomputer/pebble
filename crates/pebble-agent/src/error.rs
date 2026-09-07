@@ -51,6 +51,10 @@ pub enum AgentError {
     /// The input carried no content.
     #[error("the user message must contain at least one content part")]
     EmptyInput,
+    /// The conversation has no unfinished prompt to continue: it is empty, or
+    /// its last message is the model's own.
+    #[error("the conversation ends with the model's answer, so there is no prompt to continue")]
+    NothingToContinue,
     /// Two tools resolved to the same model-visible name for one turn.
     #[error("tool `{name}` was resolved more than once for one turn")]
     DuplicateTool {
