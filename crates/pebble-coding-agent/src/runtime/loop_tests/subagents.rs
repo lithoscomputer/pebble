@@ -18,13 +18,15 @@
 
 use std::collections::HashMap;
 use std::iter;
+use std::result::Result as StdResult;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
 use lithos_llm::types::{ContentPart, Request, Role};
+use pebble_agent::{ToolCallNext, ToolCallRequest, ToolMiddleware, ToolOutcome, ToolSystemError};
 use serde_json::json;
 use tokio::runtime::Handle;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use super::super::testing::{builder, wait_for_event};
 use super::*;
@@ -1153,6 +1155,77 @@ fn first_user_message(request: &Request) -> String {
         .find(|message| message.role() == Role::User)
         .map(message_text)
         .unwrap_or_default()
+}
+
+/// A middleware that yields before every call, and longer before a spawn.
+///
+/// A middleware that runs a hook process yields between the calls of a round,
+/// and how long each hook takes is up to the machine. This one makes the
+/// unlucky order the certain one: the spawn's hook outlasts the wait's, so a
+/// scheduler that ran the two side by side would run the wait first, before
+/// the child it waits for exists.
+struct YieldingMiddleware;
+
+#[async_trait::async_trait]
+impl ToolMiddleware for YieldingMiddleware {
+    async fn call(
+        &self,
+        request: ToolCallRequest,
+        next: ToolCallNext<'_>,
+    ) -> StdResult<ToolOutcome, ToolSystemError> {
+        let delay = if request.call().name == "spawn_agent" {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_millis(1)
+        };
+        sleep(delay).await;
+        next.run(request).await
+    }
+}
+
+/// A model that spawns a child and waits for it in one round is a plausible
+/// turn: the tools are described together and the work is one thought. The
+/// wait must see the spawn's child, however long the middleware in front of
+/// each call takes, which is why the subagent tools are scheduled in model
+/// order rather than side by side.
+#[tokio::test]
+async fn a_wait_beside_its_spawn_in_one_round_sees_the_child_when_middleware_yields() {
+    let task = "child: count the files";
+    let (client, provider) = routed_client(
+        ScriptedProvider::new(vec![
+            ScriptedCall::response(multi_tool_call_response(vec![
+                ("spawn_agent", "spawn", json!({ "task": task })),
+                ("wait", "wait", json!({})),
+            ])),
+            ScriptedCall::response(text_response("parent done")),
+        ]),
+        vec![(task, ScriptedProvider::new(answers("counted 3 files")))],
+    );
+    let mut parent = builder(client)
+        .subagents(SubagentOptions::enabled())
+        .tool_middleware(Arc::new(YieldingMiddleware))
+        .build()
+        .expect("the parent builds");
+    parent.initialize().await.expect("initialization succeeds");
+
+    let output = parent
+        .prompt("delegate the count")
+        .await
+        .expect("the prompt succeeds");
+
+    assert_eq!(output.as_deref(), Some("parent done"));
+    let root = provider.root().requests();
+    assert_eq!(root.len(), 2, "the parent asked twice");
+    let waited = tool_result_text(&root[1], "wait");
+    assert!(
+        waited.contains("Agent completed (success: true") && waited.contains("counted 3 files"),
+        "the wait reported the child its own round spawned: {waited}"
+    );
+    assert_eq!(provider.lane(task).call_count(), 1);
+    parent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the parent shuts down");
 }
 
 // --- One script per session ---
