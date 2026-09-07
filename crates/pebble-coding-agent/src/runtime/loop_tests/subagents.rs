@@ -21,6 +21,7 @@ use std::iter;
 use std::sync::{Mutex, PoisonError};
 use std::time::Duration;
 
+use lithos_llm::types::{ContentPart, Request, Role};
 use serde_json::json;
 use tokio::runtime::Handle;
 use tokio::time::timeout;
@@ -33,7 +34,10 @@ use crate::human_input::{Answer, HumanInputError, HumanInputProvider, Question};
 use crate::subagent::{
     ChildObserver, SubagentLimits, SubagentResult, SubagentStatus, SubagentSupervisor,
 };
-use crate::test_support::{MockEnvironment, ScriptedProvider, scripted_client};
+use crate::test_support::{
+    MockEnvironment, ScriptedProvider, message_text, multi_tool_call_response, routed_client,
+    scripted_client,
+};
 use crate::types::ToolErrorKind;
 
 /// The identifier the blocked child is supervised under, so a script can name
@@ -1121,4 +1125,137 @@ async fn a_spawned_child_passes_its_scope_to_inherited_policy_and_tools() {
         .shutdown(ShutdownReason::Completed)
         .await
         .expect("shuts down");
+}
+
+// --- One round, spawn and wait ---
+
+/// The text of the tool result answering `tool_call_id` in `request`.
+fn tool_result_text(request: &Request, tool_call_id: &str) -> String {
+    request
+        .messages()
+        .iter()
+        .filter(|message| message.role() == Role::Tool)
+        .flat_map(|message| message.content().iter())
+        .find_map(|part| match part {
+            ContentPart::ToolResult(result) if result.tool_call_id == tool_call_id => {
+                Some(result_text(result).into_owned())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the request carries a result for {tool_call_id}"))
+}
+
+/// The first user message of `request`.
+fn first_user_message(request: &Request) -> String {
+    request
+        .messages()
+        .iter()
+        .find(|message| message.role() == Role::User)
+        .map(message_text)
+        .unwrap_or_default()
+}
+
+// --- One script per session ---
+
+/// Two children and their parent each answer from their own lane, so what
+/// each session is told never depends on which of them asked first.
+#[tokio::test]
+async fn each_session_in_a_tree_answers_from_its_own_lane() {
+    let alpha = "child alpha: take a note";
+    let beta = "child beta: report";
+    let (client, provider) = routed_client(
+        ScriptedProvider::new(vec![
+            ScriptedCall::response(multi_tool_call_response(vec![
+                ("spawn_agent", "spawn_alpha", json!({ "task": alpha })),
+                ("spawn_agent", "spawn_beta", json!({ "task": beta })),
+            ])),
+            ScriptedCall::response(tool_call_response("wait", "wait", json!({}))),
+            ScriptedCall::response(text_response("both reported")),
+        ]),
+        vec![
+            (
+                alpha,
+                ScriptedProvider::new(vec![
+                    ScriptedCall::response(tool_call_response("note", "note", json!({}))),
+                    ScriptedCall::response(text_response("alpha done")),
+                ]),
+            ),
+            (beta, ScriptedProvider::new(answers("beta done"))),
+        ],
+    );
+    let mut parent = builder(client)
+        .tools([noop_tool("note").allow_in_subagents()])
+        .subagents(SubagentOptions::enabled())
+        .build()
+        .expect("the parent builds");
+    parent.initialize().await.expect("initialization succeeds");
+
+    let output = parent
+        .prompt("delegate to two children")
+        .await
+        .expect("the prompt succeeds");
+
+    assert_eq!(output.as_deref(), Some("both reported"));
+    let root = provider.root().requests();
+    assert_eq!(root.len(), 3);
+    assert!(
+        root.iter()
+            .all(|request| first_user_message(request).contains("delegate"))
+    );
+    let waited = tool_result_text(&root[2], "wait");
+    assert!(
+        waited.contains("alpha done") && waited.contains("beta done"),
+        "{waited}"
+    );
+
+    let alpha_requests = provider.lane(alpha).requests();
+    assert_eq!(
+        alpha_requests.len(),
+        2,
+        "alpha asked once per round of its own script"
+    );
+    assert!(
+        alpha_requests
+            .iter()
+            .all(|request| first_user_message(request).contains(alpha))
+    );
+    assert_eq!(tool_result_text(&alpha_requests[1], "note"), "ok");
+    let beta_requests = provider.lane(beta).requests();
+    assert_eq!(beta_requests.len(), 1);
+    assert!(first_user_message(&beta_requests[0]).contains(beta));
+    parent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the parent shuts down");
+}
+
+/// A first prompt that names two lanes cannot be routed, and the test learns
+/// that from the prompt's failure rather than from a wrong answer.
+#[tokio::test]
+async fn a_request_that_names_two_lanes_fails_loudly() {
+    let (client, _provider) = routed_client(ScriptedProvider::new(answers("never")), vec![
+        ("alpha", ScriptedProvider::new(answers("alpha"))),
+        ("beta", ScriptedProvider::new(answers("beta"))),
+    ]);
+    let mut session = builder(client).build().expect("the session builds");
+    session.initialize().await.expect("initialization succeeds");
+
+    let error = session
+        .prompt("alpha and beta")
+        .await
+        .expect_err("two lanes match");
+
+    match error {
+        Error::Llm(error) => {
+            assert!(
+                error.to_string().contains("names [\"alpha\", \"beta\"]"),
+                "{error}"
+            );
+        }
+        other => panic!("expected the routing error, found {other:?}"),
+    }
+    session
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the session shuts down");
 }

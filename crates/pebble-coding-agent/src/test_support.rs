@@ -14,6 +14,9 @@
 //! to — registered on a real [`Client`](lithos_llm::Client), so everything
 //! between the session and the provider is the code that runs in production.
 //!
+//! [`RoutedProvider`] is a [`ScriptedProvider`] per session, for a test of a
+//! session tree whose parent and children would otherwise race one script.
+//!
 //! [`DenyTool`] and [`FixedPermission`] are the two permission policies a
 //! test of tool middleware usually needs.
 //!
@@ -22,10 +25,12 @@
 
 mod environment_contract;
 mod policy;
+mod routed;
 mod scripted;
 
 pub use self::environment_contract::{EnvironmentContract, EnvironmentContractError};
 pub use self::policy::{DenyTool, FixedPermission};
+pub use self::routed::{RoutedProvider, routed_client};
 pub use self::scripted::{
     ScriptedCall, ScriptedCompletion, ScriptedFailure, ScriptedItem, ScriptedProvider,
     TEST_CATALOG, client_from, custom_tool_call_response, events_for, message_text,
