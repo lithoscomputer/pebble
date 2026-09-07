@@ -511,6 +511,7 @@ async fn initializing_reports_the_skills_it_found() {
                 profile,
                 source_dirs,
                 skills,
+                ..
             } => Some((profile.clone(), source_dirs.clone(), skills.clone())),
             _ => None,
         })

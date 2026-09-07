@@ -798,6 +798,38 @@ pub struct SkillSummary {
     pub description: String,
 }
 
+/// A `SKILL.md` file, or a skill directory, that discovery skipped.
+///
+/// Discovery never fails a session over one broken skill; it skips the file
+/// and carries on. This is the record of what it skipped, so an application
+/// can tell a person which file to fix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedSkill {
+    /// The file that was skipped, or the directory that could not be searched.
+    pub path:    String,
+    /// Why it was skipped.
+    pub reason:  SkippedSkillReason,
+    /// The failure, rendered for a person.
+    pub message: String,
+}
+
+/// Why discovery skipped a skill file or directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SkippedSkillReason {
+    /// The configured directory could not be searched for `*/SKILL.md`.
+    ///
+    /// A directory that does not exist is not an error and is not reported;
+    /// this is a search that failed.
+    UnsearchableDirectory,
+    /// The file was found but could not be read.
+    UnreadableFile,
+    /// The file was read but is not a skill: its frontmatter is missing,
+    /// unterminated, or names no skill.
+    Malformed,
+}
+
 /// How a skill was activated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1213,6 +1245,13 @@ pub enum CodingEvent {
         source_dirs: Vec<String>,
         /// The skills that were found.
         skills:      Vec<SkillSummary>,
+        /// The files and directories discovery had to skip, so an application
+        /// can report a broken skill without reading every file itself.
+        ///
+        /// Absent from streams recorded before it existed, which read back as
+        /// nothing skipped.
+        #[serde(default)]
+        skipped:     Vec<SkippedSkill>,
     },
     /// A skill was activated.
     SkillActivated {
@@ -1544,12 +1583,14 @@ impl CodingEvent {
                 profile,
                 source_dirs,
                 skills,
+                skipped,
             } => {
                 info!(
                     session_id,
                     profile = profile.as_str(),
                     skill_count = skills.len(),
                     source_dir_count = source_dirs.len(),
+                    skipped_count = skipped.len(),
                     "Agent skills discovered"
                 );
             }
@@ -2362,6 +2403,7 @@ mod tests {
                 name:        "review".into(),
                 description: "Review a diff".into(),
             }],
+            skipped:     Vec::new(),
         };
         let value = serde_json::to_value(&event).expect("serializes");
         assert_eq!(value["SkillsDiscovered"]["profile"], json!("claude-5"));

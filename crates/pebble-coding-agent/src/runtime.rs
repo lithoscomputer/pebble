@@ -61,8 +61,8 @@ use crate::redact::{NoRedaction, Redactor};
 use crate::search::SearchProvider;
 use crate::skills::{Skill, SkillExpansion, discover_skills};
 use crate::subagent::{
-    ChildDeps, ChildIdentity, ChildObserver, OpenSessions, SubagentEventCallback, SubagentLimits,
-    SubagentOptions, SubagentSupervisor,
+    ChildDeps, ChildIdentity, ChildObserver, OpenSessions, SubagentEventCallback, SubagentOptions,
+    SubagentSupervisor,
 };
 use crate::tool::{
     NativeTool, PermissionLevelPolicy, PermissionMiddleware, RegisteredTool, StaticEnvProvider,
@@ -1084,7 +1084,8 @@ impl CodingRuntime {
             budget_bytes:       MEMORY_BUDGET_BYTES,
         });
 
-        Arc::make_mut(&mut self.resources).skills = skills?;
+        let discovered = skills?;
+        Arc::make_mut(&mut self.resources).skills = discovered.skills;
         self.emit(CodingEvent::SkillsDiscovered {
             profile,
             source_dirs: self.config.skill_dirs.clone(),
@@ -1094,6 +1095,7 @@ impl CodingRuntime {
                 .iter()
                 .map(Skill::to_summary)
                 .collect(),
+            skipped: discovered.skipped,
         });
         // The one tool that cannot be built by the builder: what it loads is
         // discovered here, and a session that discovered no skills advertises

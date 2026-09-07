@@ -21,7 +21,7 @@ pub use crate::types::{
     ContextWindowSnapshot, ContextWindowStaleness, ContextWindowWarning, CostSource,
     ExecOutputTail, ExecOutputTailTrace, INITIAL_SUBAGENT_GENERATION, InputContent, InputSource,
     LlmOutputKind, LlmRetryPhase, MemoryFileSummary, PermissionLevel, SkillActivationSource,
-    SkillSummary, TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoListProjection,
-    TodoProjection, TodoStatus, TodoUpdatedProps, TokenUsage, ToolCategory, ToolErrorKind,
-    ToolSource, ToolSummary,
+    SkillSummary, SkippedSkill, SkippedSkillReason, TodoCreatedProps, TodoDeletedProps,
+    TodoListKind, TodoListProjection, TodoProjection, TodoStatus, TodoUpdatedProps, TokenUsage,
+    ToolCategory, ToolErrorKind, ToolSource, ToolSummary,
 };
