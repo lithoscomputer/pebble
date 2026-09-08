@@ -12,6 +12,7 @@
 use std::sync::Arc;
 
 use lithos_llm::types::ToolDefinition;
+use pebble_agent::ToolScheduling;
 use serde_json::json;
 
 use super::SubagentSupervisor;
@@ -19,6 +20,16 @@ use crate::tool::{NativeTool, RegisteredTool, ToolError, required_str};
 use crate::types::ToolSource;
 
 /// The four tools a session drives its own children with.
+///
+/// Every one of them is scheduled [`Sequential`](ToolScheduling::Sequential),
+/// so a round that holds more than one runs them in the order the model wrote
+/// them. A spawn changes the tree a wait, a send, or a close in the same round
+/// reads, and a model that spawns a child and waits for it in one turn is an
+/// ordinary turn. Run side by side, the wait could look at the tree before the
+/// spawn's middleware had let the spawn happen, and answer that nothing was
+/// running. Sequential is the rule the registry already has for a call whose
+/// state other calls read; it costs nothing here, because three of the four
+/// return at once and the fourth blocks whatever runs beside it.
 pub(crate) fn subagent_tools(supervisor: &SubagentSupervisor) -> Vec<RegisteredTool> {
     vec![
         spawn_agent_tool(supervisor.clone()),
@@ -26,6 +37,9 @@ pub(crate) fn subagent_tools(supervisor: &SubagentSupervisor) -> Vec<RegisteredT
         wait_tool(supervisor.clone()),
         close_agent_tool(supervisor.clone()),
     ]
+    .into_iter()
+    .map(|tool| tool.with_scheduling(ToolScheduling::Sequential))
+    .collect()
 }
 
 /// Starts a child on a task and answers with its identifier.

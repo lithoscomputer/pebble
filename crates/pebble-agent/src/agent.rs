@@ -578,7 +578,7 @@ impl Agent {
     /// prompt is aborted, context preparation fails, or the model call
     /// fails.
     pub async fn prompt(&mut self, message: impl Into<UserMessage>) -> Result<PromptOutcome> {
-        self.prompt_inner(message.into(), None).await
+        self.prompt_inner(Some(message.into()), None).await
     }
 
     /// Processes one input until it completes or `cancel` is cancelled.
@@ -601,21 +601,73 @@ impl Agent {
         message: impl Into<UserMessage>,
         cancel: &CancellationToken,
     ) -> Result<PromptOutcome> {
-        self.prompt_inner(message.into(), Some(cancel)).await
+        self.prompt_inner(Some(message.into()), Some(cancel)).await
+    }
+
+    /// Continues the prompt the conversation left unfinished, without new
+    /// input.
+    ///
+    /// A prompt is unfinished when the conversation ends with something the
+    /// model has not answered: a user message, or the results of the tool
+    /// calls the model asked for. That is what a conversation looks like after
+    /// a model call failed for good, or after it was restored from a record
+    /// taken at that point. The model is asked again on the conversation as it
+    /// stands, nothing is committed before that call, and the prompt then runs
+    /// to completion exactly as [`prompt`](Self::prompt) would, follow-ups
+    /// included. Tool calls that already have their results are not run again.
+    ///
+    /// Dropping the future after work starts permanently closes the agent, as
+    /// with `prompt`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::NothingToContinue`] when the conversation is
+    /// empty or ends with the model's own message, and otherwise fails as
+    /// `prompt` does.
+    pub async fn continue_prompt(&mut self) -> Result<PromptOutcome> {
+        self.prompt_inner(None, None).await
+    }
+
+    /// Continues the unfinished prompt until it completes or `cancel` is
+    /// cancelled.
+    ///
+    /// # Errors
+    ///
+    /// As [`continue_prompt`](Self::continue_prompt), with the cancellation
+    /// contract of
+    /// [`prompt_with_cancellation`](Self::prompt_with_cancellation).
+    pub async fn continue_prompt_with_cancellation(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> Result<PromptOutcome> {
+        self.prompt_inner(None, Some(cancel)).await
+    }
+
+    /// Whether the conversation ends with input the model has not answered.
+    fn has_unfinished_prompt(&self) -> bool {
+        self.messages
+            .last()
+            .is_some_and(|message| matches!(message.role(), Role::User | Role::Tool))
     }
 
     #[tracing::instrument(
         name = "agent_prompt",
         skip_all,
-        fields(model = %self.model, input_part_count = message.content.len())
+        fields(
+            model = %self.model,
+            input_part_count = message.as_ref().map_or(0, |message| message.content.len()),
+            continued = message.is_none(),
+        )
     )]
     async fn prompt_inner(
         &mut self,
-        message: UserMessage,
+        message: Option<UserMessage>,
         parent_cancel: Option<&CancellationToken>,
     ) -> Result<PromptOutcome> {
-        if message.content.is_empty() {
-            return Err(AgentError::EmptyInput);
+        match &message {
+            Some(message) if message.content.is_empty() => return Err(AgentError::EmptyInput),
+            None if !self.has_unfinished_prompt() => return Err(AgentError::NothingToContinue),
+            Some(_) | None => {}
         }
         let Some(prompt_cancel) = self.control.begin_prompt(parent_cancel) else {
             return Err(AgentError::Closed);
@@ -651,9 +703,11 @@ impl Agent {
         true
     }
 
+    /// Runs the loop from `first_message`, or from the conversation as it
+    /// stands when there is none to commit first.
     async fn process_prompt(
         &mut self,
-        first_message: UserMessage,
+        first_message: Option<UserMessage>,
         prompt_cancel: &CancellationToken,
     ) -> Result<PromptOutcome> {
         let mut next_message = first_message;
@@ -661,7 +715,9 @@ impl Agent {
         let mut tool_call_count = 0;
 
         'prompt: loop {
-            self.commit_user_message(next_message);
+            if let Some(message) = next_message.take() {
+                self.commit_user_message(message);
+            }
 
             let final_response = loop {
                 if prompt_cancel.is_cancelled() {
@@ -816,9 +872,10 @@ impl Agent {
                         continue;
                     }
                     if let Some(follow_up) = self.control.pop_follow_up() {
-                        next_message = self
-                            .prepare_follow_up(follow_up, turn, prompt_cancel)
-                            .await?;
+                        next_message = Some(
+                            self.prepare_follow_up(follow_up, turn, prompt_cancel)
+                                .await?,
+                        );
                         continue 'prompt;
                     }
                     if let Some(lifecycle) = self.lifecycle.clone() {
@@ -868,9 +925,10 @@ impl Agent {
             };
 
             if let Some(follow_up) = self.control.pop_follow_up() {
-                next_message = self
-                    .prepare_follow_up(follow_up, turn_count.saturating_sub(1), prompt_cancel)
-                    .await?;
+                next_message = Some(
+                    self.prepare_follow_up(follow_up, turn_count.saturating_sub(1), prompt_cancel)
+                        .await?,
+                );
                 continue 'prompt;
             }
 
@@ -1722,6 +1780,103 @@ mod tests {
         assert_eq!(outcome.tool_call_count(), 0);
         assert_eq!(agent.messages().len(), 2);
         assert_eq!(agent.state(), AgentState::Idle);
+    }
+
+    /// A conversation as a failed model call leaves it: the model asked for a
+    /// tool, the tool answered, and the next call never came back.
+    fn conversation_paused_on_a_tool_result() -> Vec<Message> {
+        vec![
+            Message::text(Role::User, "work"),
+            Message::new(Role::Assistant, [ContentPart::ToolCall(
+                ToolCall::function("call_1", "inspect", json!({})),
+            )]),
+            Message::new(Role::Tool, [ContentPart::ToolResult(ToolResult {
+                tool_call_id: "call_1".to_owned(),
+                name:         Some("inspect".to_owned()),
+                content:      vec![ContentPart::Text {
+                    text: "inspected".to_owned(),
+                }],
+                is_error:     false,
+            })])
+            .with_tool_call_id("call_1"),
+        ]
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_prompt_continues_from_its_committed_tool_results() {
+        let ran = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&ran);
+        let tool = Tool::function(
+            "inspect",
+            "Inspect",
+            json!({"type": "object"}),
+            move |_context, _arguments| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                async { Ok("inspected".into()) }
+            },
+        )
+        .expect("the inspect tool is valid");
+        let (model, requests) = ScriptedModel::recording([text_response("finished")]);
+        let mut agent = Agent::builder(model, "test/model")
+            .tools([tool])
+            .messages(conversation_paused_on_a_tool_result())
+            .build()
+            .expect("the agent builds");
+        let mut events = agent.subscribe();
+
+        let outcome = agent
+            .continue_prompt()
+            .await
+            .expect("the continuation succeeds");
+
+        assert_eq!(outcome.text(), "finished");
+        assert_eq!(outcome.turn_count(), 1);
+        assert_eq!(outcome.tool_call_count(), 0);
+        assert_eq!(
+            ran.load(Ordering::SeqCst),
+            0,
+            "the answered call is not run again"
+        );
+        let requests = requests.lock().expect("the request lock is healthy");
+        assert_eq!(requests.len(), 1);
+        let roles: Vec<Role> = requests[0].messages().iter().map(Message::role).collect();
+        assert_eq!(roles, [Role::User, Role::Assistant, Role::Tool]);
+        assert_eq!(agent.messages().len(), 4, "only the answer was committed");
+        assert_eq!(agent.messages()[3].role(), Role::Assistant);
+        assert_eq!(agent.state(), AgentState::Idle);
+        let events = drained(&mut events);
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::UserMessage { .. })),
+            "no user message was committed: {events:?}"
+        );
+        assert!(matches!(events.first(), Some(AgentEvent::PromptStarted)));
+    }
+
+    #[tokio::test]
+    async fn a_finished_conversation_has_nothing_to_continue() {
+        let mut agent = Agent::builder(ScriptedModel::new([text_response("done")]), "test/model")
+            .build()
+            .expect("the agent builds");
+        let empty = agent.continue_prompt().await;
+        assert!(
+            matches!(empty, Err(AgentError::NothingToContinue)),
+            "{empty:?}"
+        );
+
+        agent.prompt("work").await.expect("the prompt succeeds");
+        let mut events = agent.subscribe();
+
+        let answered = agent.continue_prompt().await;
+
+        assert!(
+            matches!(answered, Err(AgentError::NothingToContinue)),
+            "{answered:?}"
+        );
+        assert_eq!(agent.messages().len(), 2, "nothing was committed");
+        assert_eq!(agent.state(), AgentState::Idle);
+        assert!(drained(&mut events).is_empty(), "no prompt was started");
     }
 
     #[tokio::test]

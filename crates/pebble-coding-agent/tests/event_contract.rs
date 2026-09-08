@@ -22,8 +22,9 @@ use pebble_coding_agent::events::{
     ContextWindowSnapshot, ContextWindowStaleness, ContextWindowWarning, CostSource, ErrorData,
     ErrorKind, EventSinkError, ExecOutputTail, InputContent, InputSource, LlmOutputKind,
     LlmRetryPhase, MemoryFileSummary, PermissionLevel, ReasoningOutput, SkillActivationSource,
-    SkillSummary, TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoStatus, TodoUpdatedProps,
-    TokenUsage, ToolCategory, ToolErrorKind, ToolSource, ToolSummary,
+    SkillSummary, SkippedSkill, SkippedSkillReason, TodoCreatedProps, TodoDeletedProps,
+    TodoListKind, TodoStatus, TodoUpdatedProps, TokenUsage, ToolCategory, ToolErrorKind,
+    ToolSource, ToolSummary,
 };
 use pebble_coding_agent::{Error, InterruptReason};
 use serde::Serialize;
@@ -265,6 +266,11 @@ fn every_variant() -> Vec<CodingEvent> {
             skills:      vec![SkillSummary {
                 name:        "review".into(),
                 description: "Review a diff".into(),
+            }],
+            skipped:     vec![SkippedSkill {
+                path:    "/work/.skills/broken/SKILL.md".into(),
+                reason:  SkippedSkillReason::Malformed,
+                message: "Missing YAML frontmatter delimiters".into(),
             }],
         },
         CodingEvent::SkillActivated {

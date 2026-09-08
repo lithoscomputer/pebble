@@ -287,6 +287,13 @@ expression: render(&every_variant())
           "name": "review",
           "description": "Review a diff"
         }
+      ],
+      "skipped": [
+        {
+          "path": "/work/.skills/broken/SKILL.md",
+          "reason": "malformed",
+          "message": "Missing YAML frontmatter delimiters"
+        }
       ]
     }
   },

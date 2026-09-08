@@ -1314,6 +1314,51 @@ impl CodingAgent {
         self.prompt_inner(input, Some(cancel)).await
     }
 
+    /// Continues the prompt the conversation left unfinished, without new
+    /// input.
+    ///
+    /// A prompt is unfinished when the history ends with input the model has
+    /// not answered: the prompt itself, or the results of the tool calls the
+    /// model asked for. That is what a record holds when a model call failed
+    /// after tool effects were committed, and what an agent resumed from that
+    /// record, on the same model or on another through
+    /// [`ResumeMode::UseModel`], carries on from here: the model is asked
+    /// again on the history as it stands, nothing is committed before that
+    /// call, no tool effect is repeated, and the prompt then runs to
+    /// completion as [`prompt`](Self::prompt) would. The report is the same
+    /// report `prompt` gives.
+    ///
+    /// A resumed agent loads memory, discovers skills, and builds its system
+    /// prompt for the model it runs on before this call, so a handoff to
+    /// another model asks that model with a prompt written for it.
+    ///
+    /// Dropping the future after work starts closes the agent, as with
+    /// `prompt`.
+    ///
+    /// # Errors
+    ///
+    /// The report contains [`Error::Agent`] carrying
+    /// [`AgentError::NothingToContinue`](pebble_agent::AgentError::NothingToContinue)
+    /// when the history is empty or ends with the model's own turn, and
+    /// otherwise the failures `prompt` reports.
+    pub async fn continue_prompt(&mut self) -> PromptReport {
+        self.continue_inner(None).await
+    }
+
+    /// Continues the unfinished prompt until it completes or `cancel` fires.
+    ///
+    /// # Errors
+    ///
+    /// As [`continue_prompt`](Self::continue_prompt), with the cancellation
+    /// contract of
+    /// [`prompt_with_cancellation`](Self::prompt_with_cancellation).
+    pub async fn continue_prompt_with_cancellation(
+        &mut self,
+        cancel: &CancellationToken,
+    ) -> PromptReport {
+        self.continue_inner(Some(cancel)).await
+    }
+
     /// Replaces older conversation turns with a model-generated summary.
     ///
     /// Dropping this future after compaction starts closes the agent. Call
@@ -1357,6 +1402,16 @@ impl CodingAgent {
         cancel: Option<&CancellationToken>,
     ) -> PromptReport {
         let result = self.inner.prompt_with_cancellation(input, cancel).await;
+        self.report(result)
+    }
+
+    async fn continue_inner(&mut self, cancel: Option<&CancellationToken>) -> PromptReport {
+        let result = self.inner.continue_prompt(cancel).await;
+        self.report(result)
+    }
+
+    /// The report of a prompt that ended with `result`.
+    fn report(&self, result: Result<Option<String>, Error>) -> PromptReport {
         PromptReport {
             result:          result.map(|text| PromptOutput {
                 text,

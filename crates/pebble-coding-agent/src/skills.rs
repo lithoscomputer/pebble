@@ -15,10 +15,10 @@ use std::result::Result as StdResult;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
-use crate::environment::Environment;
+use crate::environment::{EnvResult, Environment};
 use crate::error::{Error, InterruptReason, Result};
 use crate::tool::{NativeTool, ToolVocabulary};
-use crate::types::SkillSummary;
+use crate::types::{SkillSummary, SkippedSkill, SkippedSkillReason};
 
 /// The placeholder a template uses to say where the rest of the input goes.
 ///
@@ -56,8 +56,8 @@ impl Skill {
 
 /// Why a `SKILL.md` file could not be read as a skill.
 ///
-/// Discovery skips a file that fails to parse, so these reach an application
-/// only when it parses a file itself.
+/// Discovery skips a file that fails to parse and reports the failure's text
+/// on the [`SkippedSkill`] it records for the file.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub(crate) enum SkillParseError {
@@ -308,16 +308,26 @@ pub(crate) fn format_skills_prompt_section(skills: &[Skill], vocabulary: ToolVoc
     lines.join("\n")
 }
 
+/// What one discovery found, and what it had to skip.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SkillDiscovery {
+    /// The skills that were found, sorted by name.
+    pub(crate) skills:  Vec<Skill>,
+    /// The files and directories that were skipped, in discovery order.
+    pub(crate) skipped: Vec<SkippedSkill>,
+}
+
 /// Discovers the skills in the given directories.
 ///
 /// Each directory is searched one level deep for `<name>/SKILL.md`. A directory
 /// that cannot be searched, a file that cannot be read, and a file that does
 /// not parse are all skipped: one broken skill must not cost a session the
-/// rest.
+/// rest. Each skip is recorded on the result, so an application can tell a
+/// person which file to fix without reading every skill itself.
 ///
 /// Directories are searched in order and a later one wins, so an application
 /// lists shared directories before the ones that should override them. The
-/// result is sorted by skill name.
+/// skills are sorted by name.
 ///
 /// Returns [`Error::Interrupted`] when `cancel` fires, which is checked around
 /// every search and every read.
@@ -325,35 +335,64 @@ pub(crate) async fn discover_skills(
     env: &dyn Environment,
     dirs: &[String],
     cancel: &CancellationToken,
-) -> Result<Vec<Skill>> {
+) -> Result<SkillDiscovery> {
     let mut by_name: HashMap<String, Skill> = HashMap::new();
+    let mut skipped = Vec::new();
 
     for dir in dirs {
-        for path in skill_files(env, dir, cancel).await? {
-            let Some(content) = read_skill_file(env, &path, cancel).await? else {
+        let paths = match skill_files(env, dir, cancel).await? {
+            Ok(paths) => paths,
+            Err(error) => {
+                debug!(dir, %error, "Skill directory could not be searched, skipping");
+                skipped.push(SkippedSkill {
+                    path:    dir.clone(),
+                    reason:  SkippedSkillReason::UnsearchableDirectory,
+                    message: error.to_string(),
+                });
                 continue;
+            }
+        };
+        for path in paths {
+            let content = match read_skill_file(env, &path, cancel).await? {
+                Ok(content) => content,
+                Err(error) => {
+                    debug!(path, %error, "Skill file could not be read, skipping");
+                    skipped.push(SkippedSkill {
+                        path,
+                        reason: SkippedSkillReason::UnreadableFile,
+                        message: error.to_string(),
+                    });
+                    continue;
+                }
             };
             match parse_skill(&content) {
                 Ok(skill) => {
                     by_name.insert(skill.name.clone(), skill);
                 }
-                Err(error) => debug!(path, %error, "Skill file did not parse, skipping"),
+                Err(error) => {
+                    debug!(path, %error, "Skill file did not parse, skipping");
+                    skipped.push(SkippedSkill {
+                        path,
+                        reason: SkippedSkillReason::Malformed,
+                        message: error.to_string(),
+                    });
+                }
             }
         }
     }
 
     let mut skills: Vec<Skill> = by_name.into_values().collect();
     skills.sort_by(|left, right| left.name.cmp(&right.name));
-    Ok(skills)
+    Ok(SkillDiscovery { skills, skipped })
 }
 
-/// The `SKILL.md` files one directory holds, or none when it cannot be
+/// The `SKILL.md` files one directory holds, or the reason it could not be
 /// searched.
 async fn skill_files(
     env: &dyn Environment,
     dir: &str,
     cancel: &CancellationToken,
-) -> Result<Vec<String>> {
+) -> Result<EnvResult<Vec<String>>> {
     if cancel.is_cancelled() {
         return Err(Error::Interrupted(InterruptReason::Cancelled));
     }
@@ -364,18 +403,15 @@ async fn skill_files(
         return Err(Error::Interrupted(InterruptReason::Cancelled));
     }
 
-    Ok(found.unwrap_or_else(|error| {
-        debug!(dir, %error, "Skill directory could not be searched, skipping");
-        Vec::new()
-    }))
+    Ok(found)
 }
 
-/// Reads one skill file, answering `None` for anything discovery skips.
+/// Reads one skill file, or the reason it could not be read.
 async fn read_skill_file(
     env: &dyn Environment,
     path: &str,
     cancel: &CancellationToken,
-) -> Result<Option<String>> {
+) -> Result<EnvResult<String>> {
     if cancel.is_cancelled() {
         return Err(Error::Interrupted(InterruptReason::Cancelled));
     }
@@ -386,9 +422,7 @@ async fn read_skill_file(
         return Err(Error::Interrupted(InterruptReason::Cancelled));
     }
 
-    Ok(read
-        .inspect_err(|error| debug!(path, %error, "Skill file could not be read, skipping"))
-        .ok())
+    Ok(read)
 }
 
 #[cfg(test)]
@@ -644,7 +678,8 @@ Review staged and unstaged changes, then create a well-crafted commit.
 
         let skills = discover_skills(&env, &dirs(&["/skills"]), &CancellationToken::new())
             .await
-            .expect("discovery succeeds");
+            .expect("discovery succeeds")
+            .skills;
 
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "commit");
@@ -652,7 +687,7 @@ Review staged and unstaged changes, then create a well-crafted commit.
     }
 
     #[tokio::test]
-    async fn a_file_that_does_not_parse_is_skipped() {
+    async fn a_file_that_does_not_parse_is_skipped_and_reported() {
         let env = environment(
             &[
                 ("/skills/good/SKILL.md", "---\nname: good\n---\nGood"),
@@ -661,30 +696,61 @@ Review staged and unstaged changes, then create a well-crafted commit.
             &["/skills/good/SKILL.md", "/skills/bad/SKILL.md"],
         );
 
-        let skills = discover_skills(&env, &dirs(&["/skills"]), &CancellationToken::new())
+        let discovery = discover_skills(&env, &dirs(&["/skills"]), &CancellationToken::new())
             .await
             .expect("discovery succeeds");
 
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].name, "good");
+        assert_eq!(discovery.skills.len(), 1);
+        assert_eq!(discovery.skills[0].name, "good");
+        assert_eq!(discovery.skipped, [SkippedSkill {
+            path:    "/skills/bad/SKILL.md".to_owned(),
+            reason:  SkippedSkillReason::Malformed,
+            message: SkillParseError::MissingFrontmatter.to_string(),
+        }]);
     }
 
     #[tokio::test]
-    async fn a_file_that_cannot_be_read_is_skipped() {
+    async fn a_file_that_cannot_be_read_is_skipped_and_reported() {
         let env = environment(&[], &["/skills/gone/SKILL.md"]);
 
-        let skills = discover_skills(&env, &dirs(&["/skills"]), &CancellationToken::new())
+        let discovery = discover_skills(&env, &dirs(&["/skills"]), &CancellationToken::new())
             .await
             .expect("discovery succeeds");
 
-        assert!(skills.is_empty());
+        assert!(discovery.skills.is_empty());
+        assert_eq!(discovery.skipped.len(), 1);
+        assert_eq!(discovery.skipped[0].path, "/skills/gone/SKILL.md");
+        assert_eq!(
+            discovery.skipped[0].reason,
+            SkippedSkillReason::UnreadableFile
+        );
+        assert!(
+            !discovery.skipped[0].message.is_empty(),
+            "the environment's reason is carried"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_clean_discovery_reports_nothing_skipped() {
+        let env = environment(
+            &[("/skills/good/SKILL.md", "---\nname: good\n---\nGood")],
+            &["/skills/good/SKILL.md"],
+        );
+
+        let discovery = discover_skills(&env, &dirs(&["/skills"]), &CancellationToken::new())
+            .await
+            .expect("discovery succeeds");
+
+        assert_eq!(discovery.skills.len(), 1);
+        assert!(discovery.skipped.is_empty());
     }
 
     #[tokio::test]
     async fn no_directories_discover_nothing() {
         let skills = discover_skills(&MockEnvironment::default(), &[], &CancellationToken::new())
             .await
-            .expect("discovery succeeds");
+            .expect("discovery succeeds")
+            .skills;
 
         assert!(skills.is_empty());
     }
@@ -714,7 +780,8 @@ Review staged and unstaged changes, then create a well-crafted commit.
             &CancellationToken::new(),
         )
         .await
-        .expect("discovery succeeds");
+        .expect("discovery succeeds")
+        .skills;
 
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].description, "Project commit");
@@ -732,7 +799,8 @@ Review staged and unstaged changes, then create a well-crafted commit.
 
         let skills = discover_skills(&env, &dirs(&["/skills"]), &CancellationToken::new())
             .await
-            .expect("discovery succeeds");
+            .expect("discovery succeeds")
+            .skills;
 
         assert_eq!(
             skills

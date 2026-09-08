@@ -61,8 +61,8 @@ use crate::redact::{NoRedaction, Redactor};
 use crate::search::SearchProvider;
 use crate::skills::{Skill, SkillExpansion, discover_skills};
 use crate::subagent::{
-    ChildDeps, ChildIdentity, ChildObserver, OpenSessions, SubagentEventCallback, SubagentLimits,
-    SubagentOptions, SubagentSupervisor,
+    ChildDeps, ChildIdentity, ChildObserver, OpenSessions, SubagentEventCallback, SubagentOptions,
+    SubagentSupervisor,
 };
 use crate::tool::{
     NativeTool, PermissionLevelPolicy, PermissionMiddleware, RegisteredTool, StaticEnvProvider,
@@ -152,9 +152,8 @@ pub(crate) struct CodingRuntimeBuilder {
     prompt_transform:     Option<Arc<dyn SystemPromptTransform>>,
     context_policy:       Option<Arc<dyn ContextPolicy>>,
     compaction_policy:    Option<Arc<dyn CompactionPolicy>>,
-    subagents_enabled:    bool,
+    subagents:            SubagentOptions,
     child_observer:       Option<ChildObserver>,
-    subagent_limits:      SubagentLimits,
     child:                Option<ChildIdentity>,
 }
 
@@ -180,9 +179,8 @@ impl CodingRuntimeBuilder {
             prompt_transform: None,
             context_policy: None,
             compaction_policy: None,
-            subagents_enabled: false,
+            subagents: SubagentOptions::disabled(),
             child_observer: None,
-            subagent_limits: SubagentLimits::default(),
             child: None,
         }
     }
@@ -380,15 +378,14 @@ impl CodingRuntimeBuilder {
     /// tool middleware its parent had, and never a
     /// [`HumanInputProvider`]: a child cannot ask a person a question.
     pub(crate) fn subagents(mut self, options: SubagentOptions) -> Self {
-        self.subagents_enabled = options.is_enabled();
-        self.subagent_limits = options.limits();
+        self.subagents = options;
         self
     }
 
     /// Sees each child this session's tree builds, for the crate's own tests.
     #[cfg(test)]
     pub(crate) fn observe_children(mut self, observer: ChildObserver) -> Self {
-        self.subagents_enabled = true;
+        self.subagents = self.subagents.turned_on();
         self.child_observer = Some(observer);
         self
     }
@@ -529,7 +526,7 @@ impl CodingRuntimeBuilder {
                 Some(child.event_emitter),
             ),
             None => (
-                OpenSessions::root(self.subagent_limits),
+                OpenSessions::root(self.subagents.limits()),
                 self.child_observer,
                 None,
             ),
@@ -546,7 +543,7 @@ impl CodingRuntimeBuilder {
             (emitter, Some(tokio::spawn(pump.run())))
         };
 
-        let supervisor = self.subagents_enabled.then(|| {
+        let supervisor = self.subagents.is_enabled().then(|| {
             SubagentSupervisor::new(Arc::new(ChildDeps {
                 client: self.client.clone(),
                 model_selector: handle.to_string(),
@@ -557,7 +554,7 @@ impl CodingRuntimeBuilder {
                 tool_middleware: self.tool_middleware.clone(),
                 context_policy: self.context_policy.clone(),
                 compaction_policy: self.compaction_policy.clone(),
-                options: child_options(&self.options),
+                options: child_options(&self.options, &self.subagents),
                 tool_env_provider: self.tool_env_provider.clone(),
                 redactor: Arc::clone(&self.redactor),
                 search_provider: self.search_provider.clone(),
@@ -638,14 +635,25 @@ impl CodingRuntimeBuilder {
 /// Everything that bounds or governs the child comes across unchanged — the
 /// tool middleware, the permission level, the output budgets, the
 /// wall-clock budget — so a factory cannot be handed anything wider than the
-/// parent had. What does not come across is what the root loads once: the
-/// memory files and the skill directories. A child is given a task, not a
-/// project briefing, and paying for the briefing again in every child is how a
-/// tree of agents spends a context window on nothing.
-fn child_options(parent: &CodingAgentOptions) -> CodingAgentOptions {
+/// parent had. What does not come across by default is what the root loads
+/// once: the memory files and the skill directories. A child is given a task,
+/// not a project briefing, and paying for the briefing again in every child is
+/// how a tree of agents spends a context window on nothing. An application
+/// whose children must read the project's documents and see its skills the way
+/// the root did says so on its [`SubagentOptions`], and the child then
+/// initializes from the same paths its parent was given.
+fn child_options(parent: &CodingAgentOptions, subagents: &SubagentOptions) -> CodingAgentOptions {
     CodingAgentOptions {
-        memory_files: Vec::new(),
-        skill_dirs: Vec::new(),
+        memory_files: if subagents.inherits_memory() {
+            parent.memory_files.clone()
+        } else {
+            Vec::new()
+        },
+        skill_dirs: if subagents.inherits_skills() {
+            parent.skill_dirs.clone()
+        } else {
+            Vec::new()
+        },
         ..parent.clone()
     }
 }
@@ -721,6 +729,14 @@ fn profile_kind(
             model:   handle.to_string(),
             profile: named.to_owned(),
         })
+}
+
+/// Where one prompt starts: with new input, or from where the history stopped.
+enum PromptStart {
+    /// Commit this input, then ask the model.
+    Input(CodingInput),
+    /// Ask the model on the history as it stands.
+    Continue,
 }
 
 /// Where an outside task names why it is about to cancel a prompt.
@@ -1084,7 +1100,8 @@ impl CodingRuntime {
             budget_bytes:       MEMORY_BUDGET_BYTES,
         });
 
-        Arc::make_mut(&mut self.resources).skills = skills?;
+        let discovered = skills?;
+        Arc::make_mut(&mut self.resources).skills = discovered.skills;
         self.emit(CodingEvent::SkillsDiscovered {
             profile,
             source_dirs: self.config.skill_dirs.clone(),
@@ -1094,6 +1111,7 @@ impl CodingRuntime {
                 .iter()
                 .map(Skill::to_summary)
                 .collect(),
+            skipped: discovered.skipped,
         });
         // The one tool that cannot be built by the builder: what it loads is
         // discovered here, and a session that discovered no skills advertises
@@ -1629,7 +1647,40 @@ impl CodingRuntime {
         input: impl Into<CodingInput>,
         cancel: Option<&CancellationToken>,
     ) -> Result<Option<String>> {
-        let input = input.into();
+        self.run_prompt(PromptStart::Input(input.into()), cancel)
+            .await
+    }
+
+    /// Continues the prompt the history left unfinished, without new input.
+    ///
+    /// The history is unfinished when it ends with input the model has not
+    /// answered: a user turn, or the results of the tool calls the model asked
+    /// for. The model is asked again on the history as it stands and the
+    /// prompt then runs to completion as
+    /// [`prompt_with_cancellation`](Self::prompt_with_cancellation) would;
+    /// the tool calls that already have their results are not run again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Agent`] carrying
+    /// [`AgentError::NothingToContinue`](pebble_agent::AgentError::NothingToContinue)
+    /// when the history is empty or ends with the model's own turn, and
+    /// otherwise fails as `prompt_with_cancellation` does.
+    pub(crate) async fn continue_prompt(
+        &mut self,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Option<String>> {
+        self.run_prompt(PromptStart::Continue, cancel).await
+    }
+
+    /// Runs one prompt, from new input or from where the history stopped, with
+    /// the bookkeeping every prompt shares: the wall-clock timer, the
+    /// cancellation links, the state transitions, and the durability barrier.
+    async fn run_prompt(
+        &mut self,
+        start: PromptStart,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Option<String>> {
         self.conversation().begin_prompt();
         if self.state.current() == CodingAgentState::Closed {
             return Err(Error::SessionClosed);
@@ -1645,9 +1696,13 @@ impl CodingRuntime {
         let event_link = link_cancellation(&event_failure, &prompt_cancel);
 
         let timer = self.start_wall_clock_timer(&prompt_cancel);
-        let result = self
-            .process_input(input, SkillExpansion::Apply, &prompt_cancel)
-            .await;
+        let result = match start {
+            PromptStart::Input(input) => {
+                self.process_input(input, SkillExpansion::Apply, &prompt_cancel)
+                    .await
+            }
+            PromptStart::Continue => self.continue_input(&prompt_cancel).await,
+        };
         self.conversation().finish_prompt_timing();
 
         if let Some(link) = caller_link {

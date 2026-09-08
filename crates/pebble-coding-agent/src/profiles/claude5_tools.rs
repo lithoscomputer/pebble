@@ -196,6 +196,11 @@ pub(crate) fn make_claude5_web_fetch_tool(
 /// handle the model polls; this one is Claude 5's background-agent contract,
 /// where a finished child announces itself and the model only asks when it
 /// deliberately wants to block. Both drive the same supervisor.
+///
+/// Scheduled [`Sequential`](ToolScheduling::Sequential) for the reason
+/// pebble's own family is: a launch changes the tree the other three read,
+/// and a round that launches an agent and then asks for its output must see
+/// the launch first, however long the middleware in front of each call takes.
 pub(crate) fn background_agent_tools(supervisor: &SubagentSupervisor) -> Vec<RegisteredTool> {
     vec![
         make_agent_tool(supervisor.clone()),
@@ -203,6 +208,9 @@ pub(crate) fn background_agent_tools(supervisor: &SubagentSupervisor) -> Vec<Reg
         make_task_stop_tool(supervisor.clone()),
         make_send_message_tool(supervisor.clone()),
     ]
+    .into_iter()
+    .map(|tool| tool.with_scheduling(ToolScheduling::Sequential))
+    .collect()
 }
 
 /// How a finished child's turn reads to the parent.
