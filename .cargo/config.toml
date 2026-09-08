@@ -1,4 +1,0 @@
-# lithos-llm is a private repository fetched over ssh. Cargo's built-in
-# fetcher has no ssh-agent access, so let the git CLI do the fetch.
-[net]
-git-fetch-with-cli = true

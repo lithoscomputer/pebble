@@ -453,8 +453,7 @@ with the event held as raw JSON, then parse the payload on its own.
 ## Setup
 
 Pebble depends on `lithos-llm` as a git dependency pinned to one commit. The
-repository is private and fetched over ssh, so load an ssh key that can read
-it first.
+repository is public, so Cargo fetches it over HTTPS with no credentials.
 
 Install the locked tools and prepare the repository:
 

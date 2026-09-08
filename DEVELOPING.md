@@ -24,9 +24,7 @@ optional `models.toml` over the upstream catalog and supplies an application-own
 
 Pebble is a library crate. It depends on `lithos-llm` as a git dependency
 pinned to one commit (`rev`) in the workspace `Cargo.toml`. The repository is
-private and is fetched over ssh, so an ssh key with read access to
-`lithoscomputer/lithos-llm` must be loaded. `.cargo/config.toml` sets
-`net.git-fetch-with-cli` so Cargo uses the git CLI and your ssh agent.
+public, so Cargo fetches it over HTTPS with no credentials.
 
 To move the pin: push the lithos-llm commit (a branch under review is fine),
 change `rev` in `Cargo.toml` to the full sha, run `cargo update lithos-llm`,
@@ -153,10 +151,8 @@ each night. Both workflows test these native platforms:
 - Linux x86_64;
 - Linux arm64.
 
-The workflows check out only this repository. They cannot build until the
-runner holds an ssh key that can read the private `lithos-llm` repository, so
-both fail at dependency fetch until a deploy key or token is configured.
-Verify changes locally with `mise run check` in the meantime.
+The workflows check out only this repository. `lithos-llm` is public, so the
+dependency fetch needs no credentials.
 
 ## Cargo.lock policy
 
