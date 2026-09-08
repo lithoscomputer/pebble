@@ -49,6 +49,13 @@ const REASONING_HEADROOM_TOKENS: u32 = 16_384;
 /// How much of a rendered turn the summarization transcript keeps.
 const TRANSCRIPT_FIELD_BYTES: usize = 500;
 
+/// What the summarizing call's one user message opens with, ahead of the
+/// rendered transcript.
+///
+/// Test support reads it too: a scripted provider that routes requests by
+/// their opening prompt has to look past this preamble to find that prompt.
+pub(crate) const SUMMARY_TRANSCRIPT_PREAMBLE: &str = "Here is the conversation to summarize:\n\n";
+
 /// Why a conversation compaction ran.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -487,7 +494,7 @@ pub(crate) async fn compact_context(
             request.instructions,
         ))
         .user(format!(
-            "Here is the conversation to summarize:\n\n{}",
+            "{SUMMARY_TRANSCRIPT_PREAMBLE}{}",
             render_turns_for_summary(&history.turns()[..preserve_start])
         ))
         .max_output_tokens(max_tokens)

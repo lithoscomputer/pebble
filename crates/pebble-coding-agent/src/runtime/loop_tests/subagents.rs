@@ -37,8 +37,8 @@ use crate::subagent::{
     ChildObserver, SubagentLimits, SubagentResult, SubagentStatus, SubagentSupervisor,
 };
 use crate::test_support::{
-    MockEnvironment, RoutedProvider, ScriptedProvider, message_text, multi_tool_call_response,
-    routed_client, scripted_client,
+    MockEnvironment, RoutedProvider, ScriptedCompletion, ScriptedProvider, message_text,
+    multi_tool_call_response, routed_client, scripted_client,
 };
 use crate::types::ToolErrorKind;
 
@@ -1331,6 +1331,76 @@ async fn a_request_that_names_two_lanes_fails_loudly() {
         .shutdown(ShutdownReason::Completed)
         .await
         .expect("the session shuts down");
+}
+
+/// A parent that compacts after spawning a child sends a transcript quoting
+/// the child's task. The summary is the parent's, and answers from the
+/// parent's lane, because a lane is keyed on the opening line and not on
+/// everything the transcript happens to mention.
+#[tokio::test]
+async fn a_parents_summary_answers_from_the_parents_lane() {
+    let task = "child: count the files";
+    let (client, provider) = routed_client(
+        ScriptedProvider::new(vec![
+            ScriptedCall::response(tool_call_response(
+                "spawn_agent",
+                "spawn",
+                json!({ "task": task }),
+            )),
+            ScriptedCall::response(tool_call_response("wait", "wait", json!({}))),
+            ScriptedCall::response(text_response("parent done")),
+            ScriptedCall::response(text_response("done after compaction")),
+        ])
+        .completing(vec![ScriptedCompletion::response(text_response(
+            "The parent delegated a count.",
+        ))]),
+        vec![(task, ScriptedProvider::new(answers("counted 3 files")))],
+    );
+    let mut parent = builder(client)
+        .model("test/small")
+        .options(CodingAgentOptions {
+            enable_context_compaction: true,
+            compaction_preserve_turns: 1,
+            ..CodingAgentOptions::default()
+        })
+        .subagents(SubagentOptions::enabled())
+        .build()
+        .expect("the parent builds");
+    parent.initialize().await.expect("initialization succeeds");
+    let mut events = parent.subscribe();
+
+    let delegated = parent
+        .prompt("delegate the count")
+        .await
+        .expect("the first prompt succeeds");
+    assert_eq!(delegated.as_deref(), Some("parent done"));
+
+    // A prompt large enough to cross the small model's threshold, so the
+    // parent summarizes the turns that quote the spawn before asking again.
+    let compacted = parent
+        .prompt(&"x".repeat(400))
+        .await
+        .expect("the second prompt succeeds");
+
+    assert_eq!(compacted.as_deref(), Some("done after compaction"));
+    let published = settled(&mut parent, &mut events).await;
+    assert!(
+        published
+            .iter()
+            .any(|event| matches!(event, CodingEvent::CompactionCompleted { .. })),
+        "the parent compacted: {published:?}"
+    );
+    let summaries = provider.root().completion_requests();
+    assert_eq!(summaries.len(), 1, "the parent's lane summarized once");
+    assert!(
+        first_user_message(&summaries[0]).contains(task),
+        "the transcript quotes the child's task, and routed to the parent all the same"
+    );
+    assert_eq!(
+        provider.lane(task).completion_count(),
+        0,
+        "the child's lane was never asked for a summary"
+    );
 }
 
 // --- What a child is told about the project ---
