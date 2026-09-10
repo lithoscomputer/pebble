@@ -268,18 +268,29 @@ impl EmbeddedPrompt {
 
 /// The memory text every profile appends to its system prompt.
 pub(crate) fn memory_prompt_suffix<'a>(memory: impl IntoIterator<Item = &'a str>) -> String {
-    let mut memory = memory.into_iter();
-    let Some(first) = memory.next() else {
-        return String::new();
-    };
-
-    let mut section = String::from("\n\n");
-    section.push_str(first);
-    for document in memory {
-        section.push_str("\n\n");
-        section.push_str(document);
+    let body = join_sections(memory);
+    if body.is_empty() {
+        String::new()
+    } else {
+        format!("\n\n{body}")
     }
-    section
+}
+
+/// The text `sections` make with a blank line between each and the next, and
+/// nothing around them.
+///
+/// This is how memory documents follow one another in a system prompt, and
+/// what [`ProjectMemory::text`](crate::ProjectMemory::text) hands an
+/// application, so the two never disagree.
+pub(crate) fn join_sections<'a>(sections: impl IntoIterator<Item = &'a str>) -> String {
+    let mut text = String::new();
+    for (index, section) in sections.into_iter().enumerate() {
+        if index > 0 {
+            text.push_str("\n\n");
+        }
+        text.push_str(section);
+    }
+    text
 }
 
 /// The skills text every profile appends to its system prompt.

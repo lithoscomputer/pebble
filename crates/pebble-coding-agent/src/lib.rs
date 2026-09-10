@@ -14,8 +14,10 @@
 //! policies and approval service contracts also in [`tools`].
 //! Durable state is in [`state`]. Optional application services — human input,
 //! search, redaction, the prompt transform — are in [`extensions`], and
-//! subagent configuration is in [`subagents`]. The runtime underneath is not
-//! public.
+//! subagent configuration is in [`subagents`]. [`ProjectMemory`] is the loader
+//! an agent reads its memory files with, for an application that gives the
+//! same instructions to a model call of its own. The runtime underneath is
+//! not public.
 
 mod char_boundary;
 mod coding_agent;
@@ -76,6 +78,7 @@ pub use self::compaction::{
 };
 pub use self::config::{CodingAgentOptions, CodingAgentOptionsError};
 pub use self::error::{CompactionError, Error, InterruptReason, Result, TaskKind};
+pub use self::memory::{MemoryDocument, ProjectMemory};
 pub use self::runtime::SteeringLease;
 pub use self::skills::SkillExpansionError;
 pub use self::types::{InputContent, InputSource};

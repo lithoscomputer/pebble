@@ -719,6 +719,9 @@ impl agent::EventProjection for CodingAgentBridge {
                     generation: *generation,
                 });
             }
+            agent::AgentEvent::ToolRoundsExhausted { limit } => {
+                self.emit(CodingEvent::ToolRoundsExhausted { limit: *limit });
+            }
             _ => {}
         }
     }
@@ -995,6 +998,10 @@ impl CodingRuntime {
             }
             Err(agent::AgentError::Aborted) => Err(self.prompt_aborted().await),
             Err(agent::AgentError::Model { source }) => Err(self.emit_llm_error(source)),
+            Err(agent::AgentError::ToolRoundsExhausted { limit }) => {
+                self.check_pump().await?;
+                Err(Error::ToolRoundsExhausted { limit })
+            }
             Err(error) => {
                 self.check_pump().await?;
                 Err(Error::Agent(error))
@@ -1025,6 +1032,7 @@ impl CodingRuntime {
             speed: self.config.speed,
             turn_replay: self.config.turn_replay,
             max_turn_replays: STREAM_CONSUME_RETRIES,
+            max_tool_rounds: self.config.max_tool_rounds,
             ..agent::AgentConfig::default()
         };
         let mut builder =

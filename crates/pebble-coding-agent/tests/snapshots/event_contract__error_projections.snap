@@ -20,6 +20,10 @@ expression: render(&projections)
     "message": "interrupted: cancelled"
   },
   {
+    "kind": "tool_rounds_exhausted",
+    "message": "the prompt reached its limit of 3 tool rounds"
+  },
+  {
     "kind": "event_stream",
     "message": "recording a session event: the event log is not writable",
     "source_chain": [

@@ -161,6 +161,19 @@ pub enum Error {
     #[error("interrupted: {0}")]
     Interrupted(InterruptReason),
 
+    /// The model asked for tools again after the prompt had run every tool
+    /// round [`CodingAgentOptions::with_max_tool_rounds`] allows.
+    ///
+    /// The calls of that turn were recorded as `Cancelled` without running,
+    /// history is paired, and the agent is open for the next prompt.
+    ///
+    /// [`CodingAgentOptions::with_max_tool_rounds`]: crate::CodingAgentOptions::with_max_tool_rounds
+    #[error("the prompt reached its limit of {limit} tool rounds")]
+    ToolRoundsExhausted {
+        /// The configured limit, which is also how many rounds ran.
+        limit: usize,
+    },
+
     /// A background task stopped before it completed its work.
     #[error("{task} task failed")]
     Task {
@@ -202,6 +215,7 @@ impl Error {
             Self::InvalidState(_) => ErrorKind::InvalidState,
             Self::ToolExecution(_) => ErrorKind::ToolExecution,
             Self::Interrupted(_) => ErrorKind::Interrupted,
+            Self::ToolRoundsExhausted { .. } => ErrorKind::ToolRoundsExhausted,
             Self::Task { .. } => ErrorKind::Task,
             Self::EventSink(_) | Self::EventQueueFull { .. } => ErrorKind::EventStream,
         }
@@ -225,6 +239,7 @@ impl Error {
             | Self::InvalidState(_)
             | Self::ToolExecution(_)
             | Self::Interrupted(_)
+            | Self::ToolRoundsExhausted { .. }
             | Self::Task { .. }
             | Self::EventSink(_)
             | Self::EventQueueFull { .. } => None,
@@ -259,6 +274,8 @@ pub enum ErrorKind {
     ToolExecution,
     /// The prompt was interrupted before it finished.
     Interrupted,
+    /// The prompt ran out of tool rounds.
+    ToolRoundsExhausted,
     /// A background task stopped before it completed its work.
     Task,
     /// The durable event stream failed.
@@ -529,6 +546,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tool_rounds_exhausted_names_the_limit() {
+        let error = Error::ToolRoundsExhausted { limit: 3 };
+        assert_eq!(
+            error.to_string(),
+            "the prompt reached its limit of 3 tool rounds"
+        );
+        assert_eq!(error.kind(), ErrorKind::ToolRoundsExhausted);
+        assert!(error.llm_source().is_none());
+        assert_eq!(
+            serde_json::to_value(ErrorData::from(&error).kind).expect("kind serializes"),
+            serde_json::json!("tool_rounds_exhausted")
+        );
+    }
+
     #[tokio::test]
     async fn task_error_preserves_the_join_failure() {
         let task = tokio::spawn(pending::<()>());
@@ -573,6 +605,10 @@ mod tests {
             (
                 Error::Interrupted(InterruptReason::Cancelled),
                 ErrorKind::Interrupted,
+            ),
+            (
+                Error::ToolRoundsExhausted { limit: 2 },
+                ErrorKind::ToolRoundsExhausted,
             ),
             (
                 Error::EventSink(EventSinkError::new("write failed")),

@@ -116,6 +116,14 @@ pub enum AgentEvent {
         /// The session-wide interrupt generation, counted from one.
         generation: u64,
     },
+    /// The model asked for tools after the prompt had run every tool round
+    /// its budget allows. The calls were answered as `Cancelled` without
+    /// running, and the prompt ends with
+    /// [`AgentError::ToolRoundsExhausted`](crate::AgentError::ToolRoundsExhausted).
+    ToolRoundsExhausted {
+        /// The configured limit, which is also how many rounds ran.
+        limit: usize,
+    },
     /// The prompt and all queued follow-up input completed.
     PromptCompleted {
         /// The final response.

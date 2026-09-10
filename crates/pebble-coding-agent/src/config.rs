@@ -153,6 +153,8 @@ pub struct CodingAgentOptions {
     pub(crate) compaction_preserve_turns: usize,
     /// How long one prompt may take before the session cancels itself.
     pub(crate) wall_clock_timeout: Option<Duration>,
+    /// How many tool rounds one prompt may run. Absent sets no limit.
+    pub(crate) max_tool_rounds: Option<usize>,
     /// How the session spaces the turn replays it owns.
     ///
     /// A stream that fails **after** the model produced visible output is
@@ -212,6 +214,7 @@ impl fmt::Debug for CodingAgentOptions {
             )
             .field("compaction_preserve_turns", &self.compaction_preserve_turns)
             .field("wall_clock_timeout", &self.wall_clock_timeout)
+            .field("max_tool_rounds", &self.max_tool_rounds)
             .field("turn_replay", &self.turn_replay)
             .finish()
     }
@@ -238,6 +241,7 @@ impl Default for CodingAgentOptions {
             compaction_threshold_percent: 80,
             compaction_preserve_turns: 6,
             wall_clock_timeout: None,
+            max_tool_rounds: None,
             turn_replay: AgentConfig::default().turn_replay,
         }
     }
@@ -400,6 +404,33 @@ impl CodingAgentOptions {
     #[must_use]
     pub const fn with_wall_clock_timeout(mut self, timeout: Duration) -> Self {
         self.wall_clock_timeout = Some(timeout);
+        self
+    }
+
+    /// Sets how many tool rounds one prompt may run. Without this call there
+    /// is no limit.
+    ///
+    /// A tool round is one model turn that asks for tools, followed by the
+    /// execution of those calls; the limit is not a count of individual calls.
+    /// The budget covers one call to
+    /// [`CodingAgent::prompt`](crate::CodingAgent::prompt) or
+    /// [`continue_prompt`](crate::CodingAgent::continue_prompt), queued
+    /// follow-ups included, and starts over with the next one. Once `rounds`
+    /// rounds have run, the model is still asked for its answer: a turn that
+    /// answers with text completes the prompt as usual, and a turn that asks
+    /// for tools again ends it with
+    /// [`Error::ToolRoundsExhausted`](crate::Error::ToolRoundsExhausted). The
+    /// calls of that turn are recorded as `Cancelled` without running, so
+    /// history stays paired, and the stream carries
+    /// [`ToolRoundsExhausted`](crate::events::CodingEvent::ToolRoundsExhausted).
+    /// With `0`, the first turn that asks for tools ends the prompt this way.
+    /// The agent stays open for the next prompt.
+    ///
+    /// Subagents built from these options share the limit, applied to each of
+    /// their own prompts.
+    #[must_use]
+    pub const fn with_max_tool_rounds(mut self, rounds: usize) -> Self {
+        self.max_tool_rounds = Some(rounds);
         self
     }
 

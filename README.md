@@ -106,7 +106,11 @@ contract. The environment a session acts through is in
 tool runner are in `pebble_coding_agent::tools`. Durable session state is in
 `pebble_coding_agent::state`. Optional application services are in
 `pebble_coding_agent::extensions`. Subagent configuration is in
-`pebble_coding_agent::subagents`. The internal runtime is not public.
+`pebble_coding_agent::subagents`. `ProjectMemory` is the loader an agent reads
+its memory files with — explicit paths, one 32 KB budget, duplicate text
+skipped, the file that crosses the budget cut and marked — so an application
+that puts the same instructions into a model call of its own loads them by the
+same rules. The internal runtime is not public.
 
 Take a `CodingAgentControlHandle` before calling `prompt` when another task
 must steer, follow up, cancel compaction, abort a prompt, close the agent, or
@@ -222,6 +226,16 @@ event stream attributes to the agent, to continue from where it stopped. A
 second cut in the same prompt is reported and left as it stands. A tool call
 the limit cut short never reaches pebble: `lithos-llm` drops it and reports a
 `truncated_tool_call` warning, which pebble passes on as a `Warning` event.
+
+`CodingAgentOptions::with_max_tool_rounds` bounds how many tool rounds one
+prompt may run, where a round is one model turn that asks for tools plus the
+execution of those calls. Without it there is no limit. Once the rounds are
+spent the model is still asked for its answer; a turn that asks for tools
+instead ends the prompt with `Error::ToolRoundsExhausted`, its calls recorded
+as `Cancelled` without running and a `ToolRoundsExhausted` event on the stream.
+The agent stays open and the next prompt gets a fresh budget. A workflow that
+runs an agent to reach a decision uses this to cap the cost of one decision and
+to fall back to a default when the agent does not reach one.
 
 Applications use `lithos-llm` directly to build clients and use its public
 model types. The Pebble packages do not re-export their dependencies.
