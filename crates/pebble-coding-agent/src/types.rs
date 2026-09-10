@@ -20,7 +20,9 @@ use std::fmt;
 use std::ops::Deref;
 use std::time::SystemTime;
 
-use lithos_llm::types::{ContentPart, Message as LlmMessage, Role, ToolCall, ToolResult};
+use lithos_llm::types::{
+    ContentPart, Message as LlmMessage, ReasoningOutput, Role, ToolCall, ToolResult,
+};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub use self::actor::Actor;
@@ -37,7 +39,6 @@ pub use self::todo::{
 pub use self::tool::{PermissionLevel, ToolCategory, ToolErrorKind, ToolSource, ToolSummary};
 use crate::compaction::{CompactionReason, CompactionResult, is_threshold_reason};
 use crate::error::ErrorData;
-use crate::reasoning::ReasoningOutput;
 use crate::record::StoredMessage;
 
 /// The concatenated text of one message's `Text` content parts.

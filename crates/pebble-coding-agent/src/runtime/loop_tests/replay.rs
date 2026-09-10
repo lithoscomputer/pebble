@@ -11,12 +11,11 @@ use std::time::Duration;
 
 use lithos_llm::middleware::RetryPolicy;
 use lithos_llm::types::{
-    ContentPart, FinishReason, RetryClassification, StreamEvent, ToolCall, Warning,
+    ContentPart, FinishReason, ReasoningOutput, RetryClassification, StreamEvent, ToolCall, Warning,
 };
 use tokio::time::timeout;
 
 use super::*;
-use crate::reasoning::ReasoningOutput;
 use crate::test_support::{
     reasoning_delta_events, reasoning_response, responses_reasoning_response, text_delta_events,
     tool_call_events, with_finish_reason,

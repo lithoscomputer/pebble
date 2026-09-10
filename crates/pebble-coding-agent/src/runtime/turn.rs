@@ -33,7 +33,6 @@ use crate::history::History;
 use crate::loop_detection::detect_loop;
 use crate::policy::{CompactionPolicy, ContextPolicy, ContextPreparation};
 use crate::profile::ModelFacts;
-use crate::reasoning::ReasoningOutput;
 use crate::skills::{ExpandedInput, SkillExpansion, expand_skill};
 use crate::subagent::SubagentSupervisor;
 use crate::task_reminder::maybe_task_reminder;
@@ -555,7 +554,7 @@ impl CodingAgentBridge {
         self.finish_inference();
         let text = response.text();
         let tool_calls = tool_calls_of(response);
-        let reasoning = ReasoningOutput::from_content(&response.content);
+        let reasoning = response.reasoning();
         let provider_parts = provider_parts_of(response);
         let usage = TokenUsage::from(response.usage);
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);

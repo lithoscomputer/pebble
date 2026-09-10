@@ -36,7 +36,6 @@ mod policy;
 mod profile;
 mod profiles;
 mod prompt_transform;
-mod reasoning;
 mod record;
 mod redact;
 mod runtime;
