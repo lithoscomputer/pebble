@@ -8,6 +8,7 @@ use clap::ValueEnum;
 use lithos_llm::Client;
 use lithos_llm::catalog::{Catalog, CatalogModel, CatalogProvider};
 use lithos_llm::client::{ClientBuild, ProviderBuildCause};
+use lithos_llm::credentials::{self, ConventionalCredentials};
 use lithos_llm::middleware::{RetryMiddleware, RetryPolicy};
 use lithos_llm::resolver::ResolvedRoute;
 use lithos_llm::types::Request;
@@ -177,17 +178,24 @@ pub(crate) struct ModelChoice {
 }
 
 pub(crate) async fn model_choices(client: &Client, auth: &AuthStore) -> Result<Vec<ModelChoice>> {
-    let credentials = auth.snapshot().await?;
+    let snapshot = auth.snapshot().await?;
+    let readiness = credentials::readiness(client.catalog().providers(), &snapshot).await;
     let mut choices = Vec::new();
     for provider in client.catalog().providers() {
-        let status = credentials.resolve(provider).await;
+        let status = if readiness.is_ready(provider.id()) {
+            None
+        } else if let Some(issue) = readiness.issue(provider.id()) {
+            Some(issue.to_string())
+        } else {
+            Some(not_configured_hint(provider))
+        };
         for model in provider.models() {
             let unavailable = if !client.available_providers().contains(provider.id()) {
                 Some("provider adapter unavailable in this build".into())
             } else if let Err(error) = check_profile(provider, model) {
                 Some(error.to_string())
             } else {
-                status.as_ref().err().map(ToString::to_string)
+                status.clone()
             };
             let selector = format!("{}/{}", provider.id(), model.id());
             choices.push(ModelChoice {
@@ -198,6 +206,22 @@ pub(crate) async fn model_choices(client: &Client, auth: &AuthStore) -> Result<V
         }
     }
     Ok(choices)
+}
+
+/// The operator-facing line for a provider the credential store holds
+/// nothing for. `readiness` reports such a provider as silence, so the hint
+/// names what would configure it.
+fn not_configured_hint(provider: &CatalogProvider) -> String {
+    let names = ConventionalCredentials::new().secret_names(provider);
+    if names.is_empty() {
+        format!("run `pebble auth login {}`", provider.id())
+    } else {
+        format!(
+            "set {} or run `pebble auth login {}`",
+            names.join(" or "),
+            provider.id()
+        )
+    }
 }
 
 fn check_profile(provider: &CatalogProvider, model: &CatalogModel) -> Result<()> {

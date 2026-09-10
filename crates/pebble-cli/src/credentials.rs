@@ -203,7 +203,17 @@ impl CredentialProvider for AuthStore {
             .map_err(|_| CredentialError::NotConfigured {
                 provider: provider.id().clone(),
             })?;
-        file.resolve(provider)
+        file.credentials(provider).await
+    }
+}
+
+#[async_trait]
+impl CredentialProvider for AuthFile {
+    async fn credentials(
+        &self,
+        provider: &CatalogProvider,
+    ) -> Result<Credentials, CredentialError> {
+        self.resolve(provider)
             .await
             .map(|resolved| resolved.credentials)
     }
