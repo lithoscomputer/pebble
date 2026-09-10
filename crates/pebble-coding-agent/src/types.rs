@@ -844,7 +844,7 @@ pub enum SkillActivationSource {
 /// Which built-in coding-agent harness a session is driving.
 ///
 /// The identifier comes from the model catalog: pebble reads
-/// `metadata.pebble.profile` for the resolved model, falling back to the
+/// `metadata.agent.profile` for the resolved model, falling back to the
 /// provider's default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

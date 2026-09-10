@@ -169,6 +169,11 @@ base_url = "http://localhost:8080/v1"
 Or set `PEBBLE_OPENAI_BASE_URL`. Existing credentials for that provider apply
 to the configured endpoint.
 
+A `PEBBLE_<PROVIDER>_BASE_URL` override also enables the provider, so it works
+for providers that ship disabled in the built-in catalog, such as `openrouter`
+and `fireworks`. In `models.toml`, set `enabled = true` on the provider table
+instead.
+
 To add a provider using the OpenAI Responses protocol:
 
 ```toml
@@ -182,7 +187,7 @@ base_url = "http://localhost:8080/v1"
 auth = { type = "bearer" }
 default_model = "coding"
 
-[providers.my-proxy.metadata.pebble]
+[providers.my-proxy.metadata.agent]
 profile = "openai"
 
 [providers.my-proxy.models.coding]
@@ -197,7 +202,7 @@ values for your model. Use `pebble auth login my-proxy` or configure its
 environment source. Select it with `/model my-proxy/coding` or
 `pebble exec --model my-proxy/coding "your prompt"`.
 
-`metadata.pebble.profile` selects the coding tools and instructions the model
+`metadata.agent.profile` selects the coding tools and instructions the model
 expects. Supported identifiers are `anthropic`, `claude-5`, `openai`, `gemini`,
 `kimi`, `gpt56`, and `gpt6`. Model metadata overrides provider metadata per field.
 Pebble rejects unknown profiles before use. A custom catalog entry cannot add

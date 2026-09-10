@@ -5,7 +5,7 @@
 //! it expects them under, and a checked-in system prompt written the way it was
 //! trained to read one. A session never names a profile — it names a model, and
 //! [`builtin_profile`](crate::profile::builtin_profile) turns the catalog's
-//! `metadata.pebble.profile` into the harness that model expects.
+//! `metadata.agent.profile` into the harness that model expects.
 //!
 //! What is shared sits here: the prompt assembly every profile ends with, the
 //! environment block every prompt embeds, the tools every profile starts from,

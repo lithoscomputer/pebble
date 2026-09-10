@@ -124,15 +124,15 @@ pub enum CodingAgentBuildError {
     /// Neither the model nor its provider says which harness the model expects.
     #[error(
         "model {model} names no agent profile: neither it nor its provider carries \
-         `metadata.pebble.profile`"
+         `metadata.agent.profile`"
     )]
     MissingProfileMetadata {
         /// The model that was resolved.
         model: String,
     },
 
-    /// The `pebble` metadata is present but not shaped as pebble reads it.
-    #[error("reading the `pebble` catalog metadata for model {model}")]
+    /// The `agent` metadata is present but not shaped as pebble reads it.
+    #[error("reading the `agent` catalog metadata for model {model}")]
     InvalidProfileMetadata {
         /// The model that was resolved.
         model:  String,

@@ -48,7 +48,7 @@ api_model = "model"
 capabilities = { text = true, tools = true }
 limits = { context_tokens = 200000, max_output_tokens = 32000 }
 
-[providers.bare.models.model.metadata.pebble]
+[providers.bare.models.model.metadata.agent]
 profile = "anthropic"
 "#;
 

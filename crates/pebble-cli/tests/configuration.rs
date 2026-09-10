@@ -150,7 +150,7 @@ base_url = "http://127.0.0.1:1/v1"
 display_name = "Custom fixture"
 api_model = "gpt-5.6"
 capabilities = { text = true, tools = true }
-metadata.pebble.profile = "gpt56"
+metadata.agent.profile = "gpt56"
 "#,
     )
     .unwrap();
