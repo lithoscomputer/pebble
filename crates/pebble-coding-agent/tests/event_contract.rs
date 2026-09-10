@@ -181,6 +181,7 @@ fn every_variant() -> Vec<CodingEvent> {
             details: serde_json::json!({"usage_percent": 92.5}),
         },
         CodingEvent::LoopDetected,
+        CodingEvent::ToolRoundsExhausted { limit: 3 },
         CodingEvent::SteeringInjected {
             text:    "also update the changelog".into(),
             content: None,
@@ -416,6 +417,7 @@ fn error_projections_keep_their_serialized_shape() {
         ErrorData::from(&Error::InvalidState("no active round".into())),
         ErrorData::from(&Error::ToolExecution("shell exited 1".into())),
         ErrorData::from(&Error::Interrupted(InterruptReason::Cancelled)),
+        ErrorData::from(&Error::ToolRoundsExhausted { limit: 3 }),
         ErrorData::from(&Error::EventSink(EventSinkError::new(
             "the event log is not writable",
         ))),

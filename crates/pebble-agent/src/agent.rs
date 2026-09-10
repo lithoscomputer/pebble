@@ -167,6 +167,20 @@ pub struct AgentConfig {
     pub turn_replay:       RetryPolicy,
     /// Hard limit on replays after the first response stream opens.
     pub max_turn_replays:  u32,
+    /// The most tool rounds one prompt may run. `None` sets no limit.
+    ///
+    /// A tool round is one model turn that asks for tools, followed by the
+    /// execution of those calls; it is not a count of individual calls. The
+    /// budget covers one call to [`Agent::prompt`] or
+    /// [`Agent::continue_prompt`], queued follow-up input included, and starts
+    /// over with the next one. Once `limit` rounds have run, the model is
+    /// still asked for its answer: a turn that answers with text completes
+    /// the prompt as usual, and a turn that asks for tools again ends it with
+    /// [`AgentError::ToolRoundsExhausted`] instead. The calls of that turn
+    /// are answered as `Cancelled` without running, so history stays paired,
+    /// and [`AgentEvent::ToolRoundsExhausted`] is emitted. With `Some(0)`,
+    /// the first turn that asks for tools ends the prompt this way.
+    pub max_tool_rounds:   Option<usize>,
     /// Events held for each live subscriber.
     pub event_capacity:    usize,
 }
@@ -183,6 +197,7 @@ impl Default for AgentConfig {
                 .jitter(true)
                 .max_attempts(DEFAULT_REPLAY_ATTEMPTS),
             max_turn_replays:  3,
+            max_tool_rounds:   None,
             event_capacity:    DEFAULT_EVENT_CAPACITY,
         }
     }
@@ -713,6 +728,7 @@ impl Agent {
         let mut next_message = first_message;
         let mut turn_count = 0;
         let mut tool_call_count = 0;
+        let mut tool_round_count = 0;
 
         'prompt: loop {
             if let Some(message) = next_message.take() {
@@ -904,6 +920,20 @@ impl Agent {
                     }
                     break response;
                 }
+
+                // The budget counts rounds that ran. A turn that asks for
+                // tools once it is spent is committed, like any other, but
+                // its calls are answered as `Cancelled` without running, so
+                // the history the prompt leaves behind stays paired.
+                if let Some(limit) = self.config.max_tool_rounds
+                    && tool_round_count >= limit
+                {
+                    let results = self.answer_calls_as_cancelled(turn, &calls, &tools).await;
+                    self.commit_tool_results(&calls, &results, true);
+                    self.emit(AgentEvent::ToolRoundsExhausted { limit });
+                    return Err(AgentError::ToolRoundsExhausted { limit });
+                }
+                tool_round_count += 1;
                 tool_call_count += calls.len();
 
                 let execution = self
@@ -1957,6 +1987,194 @@ mod tests {
             &tool_message.content()[0],
             ContentPart::ToolResult(result) if !result.is_error
         ));
+    }
+
+    /// A response that asks for the counting tool once.
+    fn counting_call(id: &str) -> Response {
+        response([ContentPart::ToolCall(ToolCall::function(
+            id,
+            "count",
+            json!({}),
+        ))])
+    }
+
+    /// A tool that records how many times it ran.
+    fn counting_tool(executions: Arc<AtomicUsize>) -> Tool {
+        Tool::function(
+            "count",
+            "Counts its executions",
+            json!({"type": "object"}),
+            move |_context, _arguments| {
+                let executions = Arc::clone(&executions);
+                async move {
+                    executions.fetch_add(1, Ordering::SeqCst);
+                    Ok("counted".into())
+                }
+            },
+        )
+        .expect("the counting tool is valid")
+    }
+
+    /// An agent under `budget` whose model asks for the counting tool
+    /// `tool_turns` times in a row and then answers `done`, plus the counter
+    /// its tool bumps and the agent's event stream.
+    fn budgeted_agent(
+        budget: Option<usize>,
+        tool_turns: usize,
+        answers_afterwards: bool,
+    ) -> (Agent, Arc<AtomicUsize>, broadcast::Receiver<AgentEvent>) {
+        let mut script: Vec<Response> = (0..tool_turns)
+            .map(|index| counting_call(&format!("call_{index}")))
+            .collect();
+        if answers_afterwards {
+            script.push(text_response("done"));
+        }
+        let executions = Arc::new(AtomicUsize::new(0));
+        let agent = Agent::builder(ScriptedModel::new(script), "test/model")
+            .tools([counting_tool(Arc::clone(&executions))])
+            .config(AgentConfig {
+                max_tool_rounds: budget,
+                ..AgentConfig::default()
+            })
+            .build()
+            .expect("the agent builds");
+        let events = agent.subscribe();
+        (agent, executions, events)
+    }
+
+    /// Checks the shape of a prompt that ran out of tool rounds under `limit`:
+    /// exactly `limit` rounds ran, the refused turn is committed with its
+    /// calls answered as `Cancelled`, the event is published once, and the
+    /// agent is idle again.
+    async fn assert_exhausted_after(limit: usize) {
+        let (mut agent, executions, mut events) = budgeted_agent(Some(limit), limit + 1, false);
+
+        let error = agent
+            .prompt("work")
+            .await
+            .expect_err("the budget ends the prompt");
+
+        assert!(
+            matches!(error, AgentError::ToolRoundsExhausted { limit: seen } if seen == limit),
+            "unexpected error under a limit of {limit}: {error:?}"
+        );
+        assert_eq!(executions.load(Ordering::SeqCst), limit);
+        // The input, then one assistant turn and one tool-result turn for
+        // every round that ran and for the refused one.
+        let messages = agent.messages();
+        assert_eq!(messages.len(), 1 + 2 * (limit + 1));
+        let refused = messages
+            .last()
+            .expect("the refused turn's results are committed");
+        assert_eq!(refused.role(), Role::Tool);
+        assert!(matches!(
+            &refused.content()[0],
+            ContentPart::ToolResult(result)
+                if result.is_error && result.tool_call_id == format!("call_{limit}")
+        ));
+        let events = drained(&mut events);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::ToolStarted { .. }))
+                .count(),
+            limit,
+            "the refused calls never start"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    AgentEvent::ToolRoundsExhausted { limit: seen } if *seen == limit
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                AgentEvent::PromptCompleted { .. } | AgentEvent::PromptAborted
+            )),
+            "an exhausted prompt neither completes nor aborts: {events:?}"
+        );
+        assert_eq!(agent.state(), AgentState::Idle);
+    }
+
+    #[tokio::test]
+    async fn a_zero_round_budget_refuses_the_first_tool_turn() {
+        assert_exhausted_after(0).await;
+    }
+
+    #[tokio::test]
+    async fn one_tool_round_runs_before_the_budget_ends_the_prompt() {
+        assert_exhausted_after(1).await;
+    }
+
+    #[tokio::test]
+    async fn several_tool_rounds_run_before_the_budget_ends_the_prompt() {
+        assert_exhausted_after(3).await;
+    }
+
+    #[tokio::test]
+    async fn an_answer_within_the_budget_completes_the_prompt() {
+        let (mut agent, executions, mut events) = budgeted_agent(Some(2), 2, true);
+
+        let outcome = agent.prompt("work").await.expect("the prompt succeeds");
+
+        assert_eq!(outcome.text(), "done");
+        assert_eq!(outcome.turn_count(), 3);
+        assert_eq!(outcome.tool_call_count(), 2);
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+        assert!(
+            !drained(&mut events)
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolRoundsExhausted { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_budget_starts_over_with_each_prompt() {
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut agent = Agent::builder(
+            ScriptedModel::new([
+                counting_call("call_a"),
+                text_response("first"),
+                counting_call("call_b"),
+                text_response("second"),
+            ]),
+            "test/model",
+        )
+        .tools([counting_tool(Arc::clone(&executions))])
+        .config(AgentConfig {
+            max_tool_rounds: Some(1),
+            ..AgentConfig::default()
+        })
+        .build()
+        .expect("the agent builds");
+
+        let first = agent.prompt("one").await.expect("the first prompt fits");
+        let second = agent.prompt("two").await.expect("the second prompt fits");
+
+        assert_eq!(first.text(), "first");
+        assert_eq!(second.text(), "second");
+        assert_eq!(executions.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn without_a_budget_tool_rounds_are_unlimited() {
+        let (mut agent, executions, mut events) = budgeted_agent(None, 12, true);
+
+        let outcome = agent.prompt("work").await.expect("the prompt succeeds");
+
+        assert_eq!(outcome.text(), "done");
+        assert_eq!(outcome.tool_call_count(), 12);
+        assert_eq!(executions.load(Ordering::SeqCst), 12);
+        assert!(
+            !drained(&mut events)
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ToolRoundsExhausted { .. }))
+        );
     }
 
     #[tokio::test]

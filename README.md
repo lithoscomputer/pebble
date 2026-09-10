@@ -223,6 +223,16 @@ second cut in the same prompt is reported and left as it stands. A tool call
 the limit cut short never reaches pebble: `lithos-llm` drops it and reports a
 `truncated_tool_call` warning, which pebble passes on as a `Warning` event.
 
+`CodingAgentOptions::with_max_tool_rounds` bounds how many tool rounds one
+prompt may run, where a round is one model turn that asks for tools plus the
+execution of those calls. Without it there is no limit. Once the rounds are
+spent the model is still asked for its answer; a turn that asks for tools
+instead ends the prompt with `Error::ToolRoundsExhausted`, its calls recorded
+as `Cancelled` without running and a `ToolRoundsExhausted` event on the stream.
+The agent stays open and the next prompt gets a fresh budget. A workflow that
+runs an agent to reach a decision uses this to cap the cost of one decision and
+to fall back to a default when the agent does not reach one.
+
 Applications use `lithos-llm` directly to build clients and use its public
 model types. The Pebble packages do not re-export their dependencies.
 

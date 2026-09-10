@@ -70,6 +70,16 @@ pub enum AgentError {
     /// The current prompt was aborted.
     #[error("the agent prompt was aborted")]
     Aborted,
+    /// The model asked for tools again after the prompt had run every tool
+    /// round its [`AgentConfig::max_tool_rounds`](crate::AgentConfig) allows.
+    ///
+    /// The calls of that turn were answered as `Cancelled` without running,
+    /// and the conversation is left paired.
+    #[error("the prompt reached its limit of {limit} tool rounds")]
+    ToolRoundsExhausted {
+        /// The configured limit, which is also how many rounds ran.
+        limit: usize,
+    },
     /// The request could not be built from the current conversation.
     #[error("building the model request")]
     Request {

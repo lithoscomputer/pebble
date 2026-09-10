@@ -1089,6 +1089,17 @@ pub enum CodingEvent {
     },
     /// The loop detector fired.
     LoopDetected,
+    /// The model asked for tools after the prompt had run every tool round
+    /// its budget allows.
+    ///
+    /// The calls of that turn were recorded as `Cancelled` without running.
+    /// The prompt ends with
+    /// [`Error::ToolRoundsExhausted`](crate::Error::ToolRoundsExhausted), and
+    /// the session stays open.
+    ToolRoundsExhausted {
+        /// The configured limit, which is also how many rounds ran.
+        limit: usize,
+    },
     /// Steering was injected into the conversation.
     SteeringInjected {
         /// The steering text.
@@ -1431,6 +1442,9 @@ impl CodingEvent {
                 );
             }
             Self::LoopDetected => warn!(session_id, "Loop detected"),
+            Self::ToolRoundsExhausted { limit } => {
+                warn!(session_id, limit, "Tool round budget exhausted");
+            }
             Self::SteeringInjected { text, .. } => {
                 debug!(session_id, text_len = text.len(), "Steering injected");
             }

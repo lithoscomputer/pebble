@@ -161,6 +161,11 @@ expression: render(&every_variant())
   },
   "LoopDetected",
   {
+    "ToolRoundsExhausted": {
+      "limit": 3
+    }
+  },
+  {
     "SteeringInjected": {
       "text": "also update the changelog",
       "actor": {
