@@ -51,7 +51,7 @@ use crate::event::{Emitter, EventCapacity, EventOptions, EventPump, EventSink, E
 use crate::file_tracker::FileTracker;
 use crate::history::History;
 use crate::human_input::HumanInputProvider;
-use crate::memory::{MEMORY_BUDGET_BYTES, MemoryDocument, load_memory};
+use crate::memory::ProjectMemory;
 use crate::policy::{CompactionPolicy, ContextPolicy};
 use crate::profile::{AgentProfile, EnvContext, ModelFacts, SubagentSupport, builtin_profile};
 use crate::profiles::{FileEditToolKind, ProfileDeps};
@@ -1083,7 +1083,7 @@ impl CodingRuntime {
         // Independent reads of the environment, overlapped; the events they
         // feed stay in their documented order below.
         let (memory, skills) = tokio::join!(
-            load_memory(self.env.as_ref(), &self.config.memory_files, &cancel),
+            ProjectMemory::load(self.env.as_ref(), &self.config.memory_files, &cancel),
             discover_skills(self.env.as_ref(), &self.config.skill_dirs, &cancel),
         );
 
@@ -1091,13 +1091,13 @@ impl CodingRuntime {
         // The files are described, never quoted: the durable stream must not
         // carry the bytes of a project's own instructions. The same
         // descriptions are what a prompt transform is shown.
-        let memory_summaries: Vec<_> = memory.iter().map(MemoryDocument::to_summary).collect();
+        let memory_summaries = memory.summaries();
         self.memory_summaries.clone_from(&memory_summaries);
         self.emit(CodingEvent::MemoryLoaded {
             profile:            profile.clone(),
             files:              memory_summaries.clone(),
-            total_loaded_bytes: memory.iter().map(|document| document.loaded_bytes).sum(),
-            budget_bytes:       MEMORY_BUDGET_BYTES,
+            total_loaded_bytes: memory.loaded_bytes(),
+            budget_bytes:       ProjectMemory::BUDGET_BYTES,
         });
 
         let discovered = skills?;
@@ -1128,7 +1128,7 @@ impl CodingRuntime {
         // Measured once: memory and skills never change again, and the context
         // snapshot built every round reads these numbers instead of
         // re-tokenizing the same text.
-        Arc::make_mut(&mut self.resources).memory_tokens = memory_prompt_tokens(&memory);
+        Arc::make_mut(&mut self.resources).memory_tokens = memory_prompt_tokens(memory.documents());
         Arc::make_mut(&mut self.resources).skills_tokens =
             skills_prompt_tokens(&self.resources.skills, self.resources.registry.vocabulary());
 
@@ -1142,6 +1142,7 @@ impl CodingRuntime {
         // Built once and fixed for the session's life. Only the loaded text
         // reaches the profile; the file metadata is already on the stream.
         let memory: Vec<String> = memory
+            .into_documents()
             .into_iter()
             .map(|document| document.content)
             .collect();
@@ -2369,7 +2370,7 @@ mod tests {
             CodingEvent::MemoryLoaded {
                 files,
                 total_loaded_bytes: 0,
-                budget_bytes: MEMORY_BUDGET_BYTES,
+                budget_bytes: ProjectMemory::BUDGET_BYTES,
                 ..
             } if files.is_empty()
         ));

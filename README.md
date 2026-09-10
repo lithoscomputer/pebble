@@ -106,7 +106,11 @@ contract. The environment a session acts through is in
 tool runner are in `pebble_coding_agent::tools`. Durable session state is in
 `pebble_coding_agent::state`. Optional application services are in
 `pebble_coding_agent::extensions`. Subagent configuration is in
-`pebble_coding_agent::subagents`. The internal runtime is not public.
+`pebble_coding_agent::subagents`. `ProjectMemory` is the loader an agent reads
+its memory files with — explicit paths, one 32 KB budget, duplicate text
+skipped, the file that crosses the budget cut and marked — so an application
+that puts the same instructions into a model call of its own loads them by the
+same rules. The internal runtime is not public.
 
 Take a `CodingAgentControlHandle` before calling `prompt` when another task
 must steer, follow up, cancel compaction, abort a prompt, close the agent, or
