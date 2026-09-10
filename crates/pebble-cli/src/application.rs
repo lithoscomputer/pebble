@@ -138,6 +138,7 @@ fn build_client(
     let catalog = catalog.build().context("loading the model catalog")?;
     let ClientBuild { client, issues, .. } = Client::builder()
         .catalog(catalog)
+        .application("pebble")
         .credentials(auth)
         .middleware(RetryMiddleware::new(policy).observer(RetryEventObserver))
         .build()
