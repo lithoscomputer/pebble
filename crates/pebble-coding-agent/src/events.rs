@@ -7,13 +7,14 @@
 //! [`CodingAgent::subscribe`](crate::CodingAgent::subscribe). The serialized
 //! form of both event types is public API.
 
+pub use lithos_llm::types::ReasoningOutput;
+
 pub use crate::compaction::CompactionReason;
 pub use crate::error::{ErrorData, ErrorKind};
 pub use crate::event::{
     DEFAULT_EVENT_CAPACITY, DEFAULT_EVENT_SINK_TIMEOUT, EventCapacity, EventSink, EventSinkError,
     EventSinkTimeout,
 };
-pub use crate::reasoning::ReasoningOutput;
 pub use crate::runtime::RetryEventObserver;
 pub use crate::types::{
     Actor, AgentProfileKind, CodingAgentEvent, CodingAgentState, CodingEvent, CommandTermination,
