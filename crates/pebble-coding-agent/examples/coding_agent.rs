@@ -34,7 +34,7 @@ use std::{env, process};
 use lithos_llm::Client;
 use lithos_llm::catalog::Catalog;
 use lithos_llm::client::ClientBuild;
-use lithos_llm::credentials::EnvironmentCredentials;
+use lithos_llm::credentials::ConventionalCredentials;
 use lithos_llm::middleware::{RetryMiddleware, RetryPolicy};
 use pebble_coding_agent::environment::LocalEnvironment;
 use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent, RetryEventObserver, TokenUsage};
@@ -188,7 +188,7 @@ fn build_client(policy: RetryPolicy) -> Result<Client, Box<dyn StdError>> {
         .catalog(catalog)
         // Every provider's conventional environment variables, resolved per
         // call by lithos-llm. Nothing here reads a key.
-        .credentials(EnvironmentCredentials::conventional())
+        .credentials(ConventionalCredentials::new())
         .middleware(RetryMiddleware::new(policy).observer(RetryEventObserver))
         .build()?;
     // A provider whose adapter could not be built degrades the client rather

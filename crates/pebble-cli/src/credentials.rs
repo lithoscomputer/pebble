@@ -11,7 +11,7 @@ use anyhow::{Context as _, Result, bail};
 use async_trait::async_trait;
 use lithos_llm::catalog::{AuthScheme, CatalogProvider};
 use lithos_llm::credentials::{
-    CredentialError, CredentialHeader, CredentialProvider, Credentials, EnvironmentCredentials,
+    ConventionalCredentials, CredentialError, CredentialHeader, CredentialProvider, Credentials,
     SecretValue,
 };
 use serde::{Deserialize, Serialize};
@@ -253,9 +253,7 @@ impl AuthFile {
                 source:      "no authentication required".into(),
             });
         }
-        let environment = EnvironmentCredentials::conventional()
-            .credentials(provider)
-            .await;
+        let environment = ConventionalCredentials::new().credentials(provider).await;
         match environment {
             Ok(credentials) => {
                 let credentials = adapt_environment_credentials(provider, credentials)?;
@@ -267,15 +265,6 @@ impl AuthFile {
                     source: "environment".into(),
                 })
             }
-            Err(CredentialError::Environment {
-                source: env::VarError::NotUnicode(_),
-                variable,
-                ..
-            }) => Err(CredentialError::Environment {
-                provider: provider.id().clone(),
-                variable,
-                source: env::VarError::NotPresent,
-            }),
             Err(error) => {
                 if let Some(Entry::ApiKey { key }) = entry {
                     return Ok(ResolvedCredentials {
@@ -317,10 +306,9 @@ fn environment_secret(
 ) -> Result<SecretValue, CredentialError> {
     env::var(variable)
         .map(SecretValue::new)
-        .map_err(|_| CredentialError::Environment {
+        .map_err(|_| CredentialError::MissingSecret {
             provider: provider.id().clone(),
-            variable: variable.into(),
-            source:   env::VarError::NotPresent,
+            name:     variable.into(),
         })
 }
 

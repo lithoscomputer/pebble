@@ -58,7 +58,7 @@ default_model = "model"
 [providers.test.auth]
 type = "none"
 
-[providers.test.metadata.pebble]
+[providers.test.metadata.agent]
 profile = "openai"
 
 [providers.test.models.model]
@@ -66,10 +66,10 @@ display_name = "Test model"
 api_model = "model"
 capabilities = { text = true, tools = true }
 limits = { context_tokens = 200000, max_output_tokens = 32000 }
-
-[providers.test.models.model.metadata.pebble]
-profile = "anthropic"
 knowledge_cutoff = "May 2026"
+
+[providers.test.models.model.metadata.agent]
+profile = "anthropic"
 
 [providers.test.models.vision]
 display_name = "Test vision model"
@@ -77,7 +77,7 @@ api_model = "vision"
 capabilities = { text = true, images = true, tools = true }
 limits = { context_tokens = 200000, max_output_tokens = 32000 }
 
-[providers.test.models.vision.metadata.pebble]
+[providers.test.models.vision.metadata.agent]
 profile = "anthropic"
 
 [providers.test.models.thinking]
@@ -87,7 +87,7 @@ capabilities = { text = true, tools = true, reasoning = true }
 protocol_options = { reasoning_effort_levels = true }
 limits = { context_tokens = 200000, max_output_tokens = 32000 }
 
-[providers.test.models.thinking.metadata.pebble]
+[providers.test.models.thinking.metadata.agent]
 profile = "anthropic"
 
 [providers.test.models.always-thinking]
@@ -98,7 +98,7 @@ limits = { context_tokens = 200000, max_output_tokens = 32000 }
 
 # A model whose capabilities cannot say that it always reasons: it takes a
 # thinking budget rather than a named effort level, so the row says so itself.
-[providers.test.models.always-thinking.metadata.pebble]
+[providers.test.models.always-thinking.metadata.agent]
 profile = "anthropic"
 reasoning_by_default = true
 
@@ -108,7 +108,7 @@ api_model = "small"
 capabilities = { text = true, tools = true }
 limits = { context_tokens = 100, max_output_tokens = 100 }
 
-[providers.test.models.small.metadata.pebble]
+[providers.test.models.small.metadata.agent]
 profile = "anthropic"
 
 [providers.test.models.inherited]
@@ -119,7 +119,7 @@ api_model = "inherited"
 display_name = "Strange"
 api_model = "strange"
 
-[providers.test.models.strange.metadata.pebble]
+[providers.test.models.strange.metadata.agent]
 profile = "nonesuch"
 
 [providers.bare]

@@ -28,9 +28,14 @@ use crate::tool::NativeTool;
 
 /// Two models added to the shipped `anthropic` provider, for the two answers
 /// the shipped catalog cannot give on its own: a row that names no profile of
-/// its own, and one that names a profile pebble does not know.
+/// its own, and one that names a profile pebble does not know. OpenRouter
+/// ships disabled; the gateway cases below opt into it the way an operator
+/// would.
 const OVERLAY: &str = r#"
 schema_version = 1
+
+[providers.openrouter]
+enabled = true
 
 [providers.anthropic.models."pebble-test-inherits"]
 display_name = "Inherits the provider's profile"
@@ -40,7 +45,7 @@ api_model = "pebble-test-inherits"
 display_name = "Names a profile pebble does not know"
 api_model = "pebble-test-unknown"
 
-[providers.anthropic.models."pebble-test-unknown".metadata.pebble]
+[providers.anthropic.models."pebble-test-unknown".metadata.agent]
 profile = "nonesuch"
 "#;
 
@@ -645,7 +650,7 @@ api_model = "claude-5"
 capabilities = { text = true, tools = true }
 limits = { context_tokens = 200000, max_output_tokens = 32000 }
 
-[providers.test.models."claude-5".metadata.pebble]
+[providers.test.models."claude-5".metadata.agent]
 profile = "claude-5"
 "#;
 

@@ -48,7 +48,7 @@ use std::sync::Arc;
 
 use lithos_llm::Client;
 use lithos_llm::catalog::Catalog;
-use lithos_llm::credentials::EnvironmentCredentials;
+use lithos_llm::credentials::ConventionalCredentials;
 use lithos_llm::middleware::{RetryMiddleware, RetryPolicy};
 use pebble_coding_agent::events::RetryEventObserver;
 use pebble_coding_agent::environment::LocalEnvironment;
@@ -59,7 +59,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let policy = RetryPolicy::exponential().max_attempts(4);
     let client = Client::builder()
         .catalog(Catalog::builder().with_builtin().build()?)
-        .credentials(EnvironmentCredentials::conventional())
+        .credentials(ConventionalCredentials::new())
         .middleware(RetryMiddleware::new(policy).observer(RetryEventObserver))
         .build()?
         .client;
@@ -227,7 +227,7 @@ Applications use `lithos-llm` directly to build clients and use its public
 model types. The Pebble packages do not re-export their dependencies.
 
 **Credentials.** They belong to the client, and lithos-llm resolves them per
-call — `EnvironmentCredentials::conventional()` reads the usual variables
+call — `ConventionalCredentials::new()` reads the usual variables
 (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, and the rest), and an application with
 a vault implements lithos-llm's `CredentialProvider` instead. The agent libraries
 never see a key. `pebble-cli` supplies its own credential provider for saved keys
@@ -425,7 +425,7 @@ method for intentional replacements.
 ## Which harness a session runs
 
 Pebble never guesses. The model selector resolves through the client's catalog,
-and the resolved entry's `metadata.pebble.profile` names one of the six
+and the resolved entry's `metadata.agent.profile` names one of the six
 harnesses pebble ships — Claude, Claude 5, Gemini CLI, OpenAI, Codex, Kimi
 Code. That profile decides the system prompt, the starting tools, and the
 vocabulary those tools are named in, because a model trained inside a coding

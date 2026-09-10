@@ -77,8 +77,8 @@ use crate::types::{
 };
 use crate::{SessionId, SessionScope};
 
-/// The catalog metadata namespace pebble reads.
-const METADATA_NAMESPACE: &str = "pebble";
+/// The catalog metadata namespace every agent runtime reads.
+const METADATA_NAMESPACE: &str = "agent";
 
 /// How long a probe run inside the environment may take.
 const PROBE_TIMEOUT_MS: u64 = 5_000;
@@ -109,18 +109,16 @@ struct PromptTotals {
     cost_usd_micros: Option<u64>,
 }
 
-/// The `pebble` namespace of a catalog entry.
+/// The `agent` namespace of a catalog entry.
 ///
+/// The namespace is shared by every agent runtime that consumes the catalog.
 /// Unknown keys are ignored, because the namespace grows and an older pebble
 /// must keep reading a catalog a newer one wrote.
 #[derive(Debug, Default, Deserialize)]
-struct PebbleMetadata {
+struct AgentMetadata {
     /// Which harness the model expects.
     #[serde(default)]
     profile:              Option<String>,
-    /// How the model's training data is dated, as a person would write it.
-    #[serde(default)]
-    knowledge_cutoff:     Option<String>,
     /// Whether the model reasons without being asked to, where the capabilities
     /// alone do not say.
     #[serde(default)]
@@ -601,7 +599,11 @@ impl CodingRuntimeBuilder {
             ended: false,
             end_emitted: false,
             profile,
-            knowledge_cutoff: metadata.knowledge_cutoff.unwrap_or_default(),
+            knowledge_cutoff: route
+                .model()
+                .knowledge_cutoff()
+                .unwrap_or_default()
+                .to_owned(),
             tool_middleware: self.tool_middleware,
             env: environment,
             human_input: self.human_input,
@@ -679,21 +681,20 @@ fn resolve_route(
         })
 }
 
-/// The `pebble` namespace for a route, with the model's answers taking
+/// The `agent` namespace for a route, with the model's answers taking
 /// precedence over the provider's.
 ///
-/// Precedence is per member, not per namespace: a model that carries a
-/// `pebble` block naming only its knowledge cutoff still takes its profile from
-/// the provider.
+/// Precedence is per member, not per namespace: a model that carries an
+/// `agent` block saying only whether it reasons by default still takes its
+/// profile from the provider.
 fn effective_metadata(
     route: &ResolvedRoute,
     handle: &ModelHandle,
-) -> StdResult<PebbleMetadata, CodingAgentBuildError> {
+) -> StdResult<AgentMetadata, CodingAgentBuildError> {
     let model = read_metadata(route.model().metadata(), handle)?;
     let provider = read_metadata(route.provider().metadata(), handle)?;
-    Ok(PebbleMetadata {
+    Ok(AgentMetadata {
         profile:              model.profile.or(provider.profile),
-        knowledge_cutoff:     model.knowledge_cutoff.or(provider.knowledge_cutoff),
         reasoning_by_default: model.reasoning_by_default.or(provider.reasoning_by_default),
     })
 }
@@ -701,9 +702,9 @@ fn effective_metadata(
 fn read_metadata(
     metadata: &Metadata,
     handle: &ModelHandle,
-) -> StdResult<PebbleMetadata, CodingAgentBuildError> {
+) -> StdResult<AgentMetadata, CodingAgentBuildError> {
     metadata
-        .namespace::<PebbleMetadata>(METADATA_NAMESPACE)
+        .namespace::<AgentMetadata>(METADATA_NAMESPACE)
         .map(Option::unwrap_or_default)
         .map_err(|source| CodingAgentBuildError::InvalidProfileMetadata {
             model: handle.to_string(),
@@ -713,7 +714,7 @@ fn read_metadata(
 
 /// The harness the catalog says this model expects.
 fn profile_kind(
-    metadata: &PebbleMetadata,
+    metadata: &AgentMetadata,
     handle: &ModelHandle,
 ) -> StdResult<AgentProfileKind, CodingAgentBuildError> {
     let named = metadata.profile.as_deref().ok_or_else(|| {

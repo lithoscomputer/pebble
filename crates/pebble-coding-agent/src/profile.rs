@@ -194,7 +194,7 @@ impl ModelFacts {
     /// own: a model that takes a named reasoning effort level reasons unless it
     /// is told not to, and one that only takes a thinking budget does not. A
     /// catalog row that knows better says so with
-    /// `metadata.pebble.reasoning_by_default`, which
+    /// `metadata.agent.reasoning_by_default`, which
     /// [`CodingAgentBuilder`](crate::CodingAgentBuilder) applies
     /// on top of this.
     #[must_use]

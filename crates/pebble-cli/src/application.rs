@@ -205,25 +205,23 @@ fn check_profile(provider: &CatalogProvider, model: &CatalogModel) -> Result<()>
     #[derive(Default, serde::Deserialize)]
     struct ProfileMetadata {
         profile:               Option<String>,
-        #[serde(rename = "knowledge_cutoff")]
-        _knowledge_cutoff:     Option<String>,
         #[serde(rename = "reasoning_by_default")]
         _reasoning_by_default: Option<bool>,
     }
     let model = model
         .metadata()
-        .namespace::<ProfileMetadata>("pebble")
-        .context("invalid model metadata.pebble")?
+        .namespace::<ProfileMetadata>("agent")
+        .context("invalid model metadata.agent")?
         .unwrap_or_default();
     let provider = provider
         .metadata()
-        .namespace::<ProfileMetadata>("pebble")
-        .context("invalid provider metadata.pebble")?
+        .namespace::<ProfileMetadata>("agent")
+        .context("invalid provider metadata.agent")?
         .unwrap_or_default();
     let profile = model
         .profile
         .or(provider.profile)
-        .context("missing metadata.pebble.profile")?;
+        .context("missing metadata.agent.profile")?;
     anyhow::ensure!(
         AgentProfileKind::ALL
             .iter()
@@ -257,10 +255,12 @@ fn base_url_overrides() -> Vec<(String, String, String)> {
 /// A catalog layer that moves one built-in provider to `base_url`.
 ///
 /// Layers merge over the built-in catalog, so every model row keeps its
-/// limits, pricing, and harness; only where requests go changes.
+/// limits, pricing, and harness; only where requests go changes. Pointing a
+/// provider somewhere is opting into it, so the layer also enables providers
+/// that ship disabled.
 fn base_url_layer(provider: &str, base_url: &str) -> String {
     format!(
-        "schema_version = 1\n[providers.{}]\nbase_url = {}\n",
+        "schema_version = 1\n[providers.{}]\nbase_url = {}\nenabled = true\n",
         TomlKey(provider),
         TomlString(base_url)
     )
@@ -341,27 +341,27 @@ adapter = "openai"
 codec = "openai-responses"
 base_url = "http://127.0.0.1:1/v1"
 auth = { type = "none" }
-metadata.pebble.profile = "openai"
+metadata.agent.profile = "openai"
 [providers.local.models.ready]
 display_name = "Ready"
 api_model = "ready"
 capabilities = { text = true, tools = true }
-metadata.pebble.knowledge_cutoff = "Fixture date"
+knowledge_cutoff = "Fixture date"
 [providers.local.models.unsupported]
 display_name = "Unsupported"
 api_model = "unsupported"
-metadata.pebble.profile = "future-profile"
+metadata.agent.profile = "future-profile"
 [providers.local.models.malformed]
 display_name = "Malformed"
 api_model = "malformed"
-metadata.pebble.profile = 123
+metadata.agent.profile = 123
 [providers.private]
 display_name = "Private"
 adapter = "openai"
 codec = "openai-responses"
 base_url = "http://127.0.0.1:1/v1"
 auth = { type = "bearer" }
-metadata.pebble.profile = "openai"
+metadata.agent.profile = "openai"
 [providers.private.models.locked]
 display_name = "Locked"
 api_model = "locked"
@@ -371,7 +371,7 @@ adapter = "not-installed"
 codec = "openai-responses"
 base_url = "http://127.0.0.1:1/v1"
 auth = { type = "none" }
-metadata.pebble.profile = "openai"
+metadata.agent.profile = "openai"
 [providers.unavailable.models.disabled]
 display_name = "Disabled"
 api_model = "disabled"
@@ -392,7 +392,7 @@ api_model = "disabled"
         for (selector, reason) in [
             ("local/unsupported", "unsupported coding profile"),
             ("local/malformed", "invalid model metadata"),
-            ("private/locked", "credentials are not configured"),
+            ("private/locked", "PRIVATE_API_KEY"),
             ("unavailable/disabled", "adapter unavailable"),
         ] {
             let choice = choices
