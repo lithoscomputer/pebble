@@ -212,6 +212,7 @@ fn report_interrupt(reason: InterruptReason) {
     let what = match reason {
         InterruptReason::WallClockTimeout => "the prompt ran out of time",
         InterruptReason::Cancelled => "the prompt was interrupted",
+        InterruptReason::TurnLimit => "the prompt used its turn budget",
         _ => "the prompt was stopped",
     };
     print_err(&format!("error: {what}"));

@@ -9,15 +9,17 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::str;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use lithos_llm::types::ToolDefinition;
 use pebble_agent::ToolScheduling;
 use tokio::task;
 use tracing::{debug, warn};
 
+use crate::char_boundary::floor_char_boundary;
 use crate::config::NativeToolOptions;
-use crate::environment::{ExecOutcome, ExecRequest};
+use crate::environment::{ExecOutcome, ExecOutputSink, ExecOutputStream, ExecRequest};
 use crate::tool::{
     NativeTool, RegisteredTool, ToolContext, ToolError, optional_integer_arg, required_str,
 };
@@ -94,10 +96,128 @@ pub(crate) async fn execute_shell_command(
             env_vars: tool_env.as_ref(),
             cancel_token: Some(ctx.cancel.clone()),
             output_bytes_cap: Some(DEFAULT_TOOL_OUTPUT_RETENTION_BYTES),
+            output_sink: live_output_sink(ctx),
             ..ExecRequest::new(command)
         })
         .await
         .map_err(|error| no_process_result(ToolError::from(error)))
+}
+
+/// A sink that publishes the command's output as it is produced, when there is
+/// anywhere to publish it.
+///
+/// Each chunk becomes one [`CodingEvent::ToolCallOutputDelta`], stamped with
+/// the call by the context's emitter. The bytes are decoded per stream, so a
+/// multi-byte character the pipe split across two reads arrives whole, and
+/// the two streams keep their own decoders because a read of one never
+/// completes a character of the other. The deltas are the live feed: the
+/// rendered result the model reads is published once more on the call's
+/// completion, as for every other tool.
+///
+/// The feed is bounded by [`DEFAULT_TOOL_OUTPUT_RETENTION_BYTES`], the same
+/// budget the environment retains the process output against, so the event
+/// stream never carries more of a command's output than the session would
+/// keep. A command that writes past it streams its first budget's worth and
+/// then nothing; the completion event carries the head-and-tail rendering with
+/// the omitted count, which is where a reader learns how much more there was.
+fn live_output_sink(ctx: &ToolContext) -> Option<ExecOutputSink> {
+    let emitter = Arc::clone(ctx.coding_event_emitter.as_ref()?);
+    let state = Mutex::new(LiveOutput::default());
+    Some(Arc::new(move |stream: ExecOutputStream, chunk: &[u8]| {
+        let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(delta) = state.push(stream, chunk) {
+            emitter.emit(CodingEvent::ToolCallOutputDelta { delta });
+        }
+    }))
+}
+
+/// What the live feed of one command carries between chunks: a decoder per
+/// stream and how much of the budget is left.
+#[derive(Debug)]
+struct LiveOutput {
+    stdout:    Utf8ChunkDecoder,
+    stderr:    Utf8ChunkDecoder,
+    remaining: usize,
+}
+
+impl Default for LiveOutput {
+    fn default() -> Self {
+        Self {
+            stdout:    Utf8ChunkDecoder::default(),
+            stderr:    Utf8ChunkDecoder::default(),
+            remaining: DEFAULT_TOOL_OUTPUT_RETENTION_BYTES,
+        }
+    }
+}
+
+impl LiveOutput {
+    /// The text to publish for `chunk`, if any of the budget is left for it.
+    ///
+    /// A chunk that crosses the budget is cut at a character boundary, and
+    /// everything after it is dropped: the budget bounds the feed, not each
+    /// stream.
+    fn push(&mut self, stream: ExecOutputStream, chunk: &[u8]) -> Option<String> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let decoder = match stream {
+            ExecOutputStream::Stdout => &mut self.stdout,
+            _ => &mut self.stderr,
+        };
+        let mut delta = decoder.push(chunk)?;
+        if delta.len() > self.remaining {
+            delta.truncate(floor_char_boundary(&delta, self.remaining));
+        }
+        self.remaining -= delta.len();
+        (!delta.is_empty()).then_some(delta)
+    }
+}
+
+/// Decodes a byte stream that arrives in arbitrary pieces into text.
+///
+/// A piece may end in the middle of a UTF-8 sequence; those bytes wait for the
+/// next piece. A sequence that can never be valid is replaced with U+FFFD, as
+/// the captured output is when the command ends.
+#[derive(Debug, Default)]
+struct Utf8ChunkDecoder {
+    pending: Vec<u8>,
+}
+
+impl Utf8ChunkDecoder {
+    /// Adds `chunk` and returns the text that is decodable so far, if any.
+    fn push(&mut self, chunk: &[u8]) -> Option<String> {
+        self.pending.extend_from_slice(chunk);
+        let mut decoded = String::new();
+        loop {
+            match str::from_utf8(&self.pending) {
+                Ok(text) => {
+                    decoded.push_str(text);
+                    self.pending.clear();
+                    break;
+                }
+                Err(error) => {
+                    let valid_up_to = error.valid_up_to();
+                    // `from_utf8` checked these bytes already.
+                    decoded.push_str(
+                        str::from_utf8(&self.pending[..valid_up_to])
+                            .expect("the prefix below the error is valid UTF-8"),
+                    );
+                    match error.error_len() {
+                        // The tail may still become valid once more arrives.
+                        None => {
+                            self.pending.drain(..valid_up_to);
+                            break;
+                        }
+                        Some(invalid) => {
+                            decoded.push(char::REPLACEMENT_CHARACTER);
+                            self.pending.drain(..valid_up_to + invalid);
+                        }
+                    }
+                }
+            }
+        }
+        (!decoded.is_empty()).then_some(decoded)
+    }
 }
 
 /// Runs one command, renders it for the model, and publishes what the process
@@ -285,42 +405,57 @@ mod tests {
             ))
         }
 
-        /// The next published event, which must be the only one the tool
-        /// produced.
+        /// The one event the tool published besides the live output feed.
         ///
-        /// A marker is published after it, so "the tool published nothing
+        /// Output deltas are the command's bytes as they arrived, which these
+        /// tests do not assert on; [`live_output`](Self::live_output) does. A
+        /// marker is published after the call, so "the tool published nothing
         /// else" is decided by what arrives rather than by how long the test
         /// is willing to wait.
         async fn only_event(&mut self) -> CodingEvent {
+            let (deltas, mut others) = self.published().await;
+            drop(deltas);
+            assert_eq!(
+                others.len(),
+                1,
+                "the tool published more than one event: {others:?}"
+            );
+            others.remove(0)
+        }
+
+        /// The live output feed, joined, and every other event the tool
+        /// published.
+        async fn live_output(&mut self) -> (String, Vec<CodingEvent>) {
+            let (deltas, others) = self.published().await;
+            (deltas.concat(), others)
+        }
+
+        /// Everything the tool published, split into the output deltas and
+        /// the rest, all stamped with the session and the call.
+        async fn published(&mut self) -> (Vec<String>, Vec<CodingEvent>) {
             self.emitter
                 .emit("test-session".to_owned(), CodingEvent::SessionEnded);
-            let event = self.receiver.recv().await.expect("an event is published");
-            assert_eq!(event.session_id, "test-session");
-            assert_eq!(event.tool_call_id.as_deref(), Some("call_1"));
-            assert_eq!(
-                self.receiver
-                    .recv()
-                    .await
-                    .expect("the marker is published")
-                    .event,
-                CodingEvent::SessionEnded,
-                "the tool published more than one event"
-            );
-            event.event
+            let mut deltas = Vec::new();
+            let mut others = Vec::new();
+            loop {
+                let event = self.receiver.recv().await.expect("an event is published");
+                if event.event == CodingEvent::SessionEnded {
+                    return (deltas, others);
+                }
+                assert_eq!(event.session_id, "test-session");
+                assert_eq!(event.tool_call_id.as_deref(), Some("call_1"));
+                match event.event {
+                    CodingEvent::ToolCallOutputDelta { delta } => deltas.push(delta),
+                    other => others.push(other),
+                }
+            }
         }
 
         /// Asserts the tool published nothing at all.
         async fn no_events(&mut self) {
-            self.emitter
-                .emit("test-session".to_owned(), CodingEvent::SessionEnded);
-            assert_eq!(
-                self.receiver
-                    .recv()
-                    .await
-                    .expect("the marker is published")
-                    .event,
-                CodingEvent::SessionEnded
-            );
+            let (deltas, others) = self.published().await;
+            assert!(deltas.is_empty(), "{deltas:?}");
+            assert!(others.is_empty(), "{others:?}");
         }
 
         async fn finish(self) {
@@ -920,6 +1055,106 @@ mod tests {
                 .expect("captured_env_vars lock is not poisoned"),
             None
         );
+    }
+
+    /// The output a command produces is published while it runs, one delta
+    /// per chunk the environment read, on the same session and call as the
+    /// completion that follows. The environment here is a real process, so
+    /// the bytes travel the whole path from the pipe to the event.
+    #[tokio::test]
+    async fn a_running_command_publishes_its_output_as_deltas() {
+        let tool = make_shell_tool();
+        let mut events = Events::new();
+        let environment = Arc::new(LocalEnvironment::new(
+            current_dir().expect("a current directory"),
+        ));
+
+        let output = (tool.executor)(
+            json!({"command": "printf 'first '; printf 'second' >&2; printf 'third'"}),
+            context_for(environment).with_coding_event_emitter(events.bound()),
+        )
+        .await
+        .map(|output| output.text())
+        .expect("exit 0 is a successful tool result");
+        assert!(output.contains("stdout:\nfirst third"), "got: {output}");
+
+        let (deltas, others) = events.live_output().await;
+        // The two streams interleave in whatever order the pipes deliver, so
+        // each is checked for its own bytes rather than for a fixed order.
+        assert!(deltas.contains("first "), "got: {deltas}");
+        assert!(deltas.contains("third"), "got: {deltas}");
+        assert!(deltas.contains("second"), "got: {deltas}");
+        assert_eq!(deltas.len(), "first secondthird".len(), "got: {deltas}");
+        assert!(
+            matches!(others.as_slice(), [
+                CodingEvent::ToolProcessCompleted { .. }
+            ]),
+            "the process event is the only other event: {others:?}"
+        );
+        events.finish().await;
+    }
+
+    #[tokio::test]
+    async fn a_command_with_no_emitter_streams_nowhere_and_still_runs() {
+        let tool = make_shell_tool();
+        let environment = Arc::new(environment_with(exited("hello", "", 0, 1)));
+
+        let output = (tool.executor)(
+            json!({"command": "echo hello"}),
+            context_for(Arc::clone(&environment)),
+        )
+        .await
+        .map(|output| output.text())
+        .expect("exit 0 is a successful tool result");
+
+        assert!(output.contains("stdout:\nhello"), "got: {output}");
+    }
+
+    /// The live feed stops at the retention budget, so the event stream holds
+    /// no more of a command's output than the session keeps of it.
+    #[test]
+    fn the_live_feed_stops_at_the_retention_budget() {
+        let mut live = LiveOutput::default();
+        let chunk = "x".repeat(DEFAULT_TOOL_OUTPUT_RETENTION_BYTES - 2);
+
+        assert_eq!(
+            live.push(ExecOutputStream::Stdout, chunk.as_bytes())
+                .map(|delta| delta.len()),
+            Some(DEFAULT_TOOL_OUTPUT_RETENTION_BYTES - 2)
+        );
+        // The chunk that crosses the budget is cut at a character boundary:
+        // two bytes remain and `é` is two bytes, so `é` fits and `z` does not.
+        assert_eq!(
+            live.push(ExecOutputStream::Stderr, "éz".as_bytes())
+                .as_deref(),
+            Some("é")
+        );
+        assert_eq!(live.push(ExecOutputStream::Stdout, b"more"), None);
+        assert_eq!(live.push(ExecOutputStream::Stderr, b"more"), None);
+    }
+
+    #[test]
+    fn a_character_split_across_chunks_is_decoded_whole() {
+        let mut decoder = Utf8ChunkDecoder::default();
+        let bytes = "héllo".as_bytes();
+
+        // `é` is two bytes; the first chunk ends between them.
+        assert_eq!(decoder.push(&bytes[..2]).as_deref(), Some("h"));
+        assert_eq!(decoder.push(&bytes[2..]).as_deref(), Some("éllo"));
+        assert!(decoder.pending.is_empty());
+    }
+
+    #[test]
+    fn an_invalid_sequence_is_replaced_rather_than_held() {
+        let mut decoder = Utf8ChunkDecoder::default();
+
+        assert_eq!(
+            decoder.push(b"a\xffb").as_deref(),
+            Some("a\u{FFFD}b"),
+            "an unrecoverable byte is replaced and decoding continues past it"
+        );
+        assert_eq!(decoder.push(&[0xE2]), None, "a partial sequence waits");
+        assert_eq!(decoder.push(&[0x82, 0xAC]).as_deref(), Some("€"));
     }
 
     #[tokio::test]

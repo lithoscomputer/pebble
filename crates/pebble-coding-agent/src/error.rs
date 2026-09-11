@@ -31,6 +31,9 @@ pub enum InterruptReason {
     WallClockTimeout,
     /// A caller cancelled the prompt.
     Cancelled,
+    /// The prompt used every model turn
+    /// [`max_turns`](crate::CodingAgentOptions::with_max_turns) allowed it.
+    TurnLimit,
 }
 
 impl InterruptReason {
@@ -40,6 +43,7 @@ impl InterruptReason {
         match self {
             Self::WallClockTimeout => "wall clock timeout",
             Self::Cancelled => "cancelled",
+            Self::TurnLimit => "turn limit reached",
         }
     }
 }

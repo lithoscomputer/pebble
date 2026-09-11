@@ -3,6 +3,8 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
+use std::mem::take;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use tokio::time::{sleep, timeout};
@@ -10,9 +12,13 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::environment::{
-    EnvResult, Environment, EnvironmentError, EnvironmentErrorKind, ExecRequest, GrepOptions,
+    EnvResult, Environment, EnvironmentError, EnvironmentErrorKind, ExecOutputStream, ExecRequest,
+    GrepOptions,
 };
 use crate::types::CommandTermination;
+
+/// What a contract run's live-output sink records: each chunk with its stream.
+type LiveChunks = Arc<Mutex<Vec<(ExecOutputStream, Vec<u8>)>>>;
 
 /// A failed environment contract check.
 #[derive(Debug, thiserror::Error)]
@@ -419,6 +425,61 @@ exit 7"#,
             "capture reports retained bytes",
             &(capture.retained_bytes),
             &(outcome.result.stdout.len() + outcome.result.stderr.len()),
+        )?;
+        let live = LiveChunks::default();
+        let recorded = Arc::clone(&live);
+        let outcome = self
+            .step(
+                "live output reaches the sink",
+                env.exec(ExecRequest {
+                    output_bytes_cap: Some(4),
+                    cancel_token: Some(cancel.clone()),
+                    output_sink: Some(Arc::new(move |stream, chunk: &[u8]| {
+                        recorded
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push((stream, chunk.to_vec()));
+                    })),
+                    ..ExecRequest::new("printf 'live-stdout'; printf 'live-stderr' >&2")
+                }),
+            )
+            .await?;
+        equal(
+            "live output command succeeds",
+            &(outcome.result.is_success()),
+            &(true),
+        )?;
+        let chunks = take(&mut *live.lock().unwrap_or_else(PoisonError::into_inner));
+        let collect = |wanted: ExecOutputStream| -> Vec<u8> {
+            chunks
+                .iter()
+                .filter(|(stream, _)| *stream == wanted)
+                .flat_map(|(_, chunk)| chunk.iter().copied())
+                .collect()
+        };
+        equal(
+            "sink sees standard output uncapped and in order",
+            &(collect(ExecOutputStream::Stdout)),
+            &(b"live-stdout".to_vec()),
+        )?;
+        if outcome.streams_separated {
+            equal(
+                "sink sees standard error uncapped and in order",
+                &(collect(ExecOutputStream::Stderr)),
+                &(b"live-stderr".to_vec()),
+            )?;
+        } else {
+            equal(
+                "sink sees the merged streams uncapped",
+                &(collect(ExecOutputStream::Stdout).len()
+                    + collect(ExecOutputStream::Stderr).len()),
+                &("live-stdoutlive-stderr".len()),
+            )?;
+        }
+        equal(
+            "capped outcome still counts everything the sink saw",
+            &(outcome.output_capture().observed_bytes),
+            &("live-stdoutlive-stderr".len()),
         )?;
         let outcome = self
             .step(

@@ -751,11 +751,20 @@ impl agent::AgentLifecycle for CodingAgentBridge {
 
     async fn before_model(
         &self,
-        _context: agent::TurnContext<'_>,
+        context: agent::TurnContext<'_>,
         cancel: &CancellationToken,
     ) -> StdResult<agent::ConversationUpdate, agent::LifecycleError> {
         if cancel.is_cancelled() || self.prompt_cancel().is_cancelled() {
             return Ok(agent::ConversationUpdate::unchanged());
+        }
+        // `turn` counts the model turns this prompt has completed. Nothing is
+        // open here — the last turn's calls were answered before the loop came
+        // back around — so ending the prompt leaves the conversation paired,
+        // the way the wall clock does.
+        if let Some(max_turns) = self.config.max_turns
+            && context.turn() >= max_turns
+        {
+            return Err(self.record_boundary_error(Error::Interrupted(InterruptReason::TurnLimit)));
         }
 
         // Commit the input and any steering before work on the next request.

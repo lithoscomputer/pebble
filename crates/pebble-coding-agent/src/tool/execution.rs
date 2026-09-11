@@ -390,8 +390,10 @@ impl CodingToolService {
         // The same bounded output goes out twice on purpose: the delta is the
         // live-streaming feed and `ToolCallCompleted` is the durable record,
         // so a store keeps the completed event and drops deltas as ephemeral.
-        // No tool streams incremental deltas yet, which makes the two payloads
-        // equal today.
+        // A tool that streamed while it ran (the shell tool publishes each
+        // chunk of process output) has already fed the live feed; this last
+        // delta is the rendered result in the same channel, so a reader that
+        // follows only deltas still sees how the call ended.
         self.emit(&result.tool_call_id, CodingEvent::ToolCallOutputDelta {
             delta: text.into_owned(),
         });
