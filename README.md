@@ -87,9 +87,17 @@ and system-prompt construction happen inside the build. There is no separate
 initialization step to remember. `prompt` returns a `PromptReport` with token usage, known cost, and timing
 on success and failure. Its `result` contains either a `PromptOutput` with the
 final message and text, or the prompt error. Accounting covers accepted main-model
-responses in this session, including queued follow-ups. It excludes subagents,
-compaction, and model calls made inside tools. Known cost is a subtotal when some
-responses have no price. A dropped prompt future cannot return a report.
+responses in this session, including queued follow-ups, and the summary call of
+each compaction the prompt performed. It excludes subagents and model calls made
+inside tools. Known cost is a subtotal when some responses have no price. A
+dropped prompt future cannot return a report. The report also names every file
+the prompt wrote or edited (`files_touched`, sorted, the children's work
+included, deletions left out), the one it touched last, and the
+`provider/model` route it ended on. Its `compactions` list each compaction the
+prompt performed, in order, as a `CompactionAccount` with the facts the
+`Message::Compaction` turn records and the summary call's usage and cost: a
+breakdown of the report's usage and cost, not an addition to them, and a manual
+`compact` between prompts is on no report.
 
 `continue_prompt` continues a prompt the history left unfinished, without new
 input: the history ends with the prompt itself or with tool results the model
@@ -98,6 +106,79 @@ An agent resumed from that record, on the recorded model or on another one
 through `ResumeMode::UseModel`, is asked again on the history as it stands and
 repeats no tool effect. A history that ends with the model's own answer has
 nothing to continue, and the report says so.
+
+`CodingAgentBuilder::mcp_servers`, behind the `mcp` feature, names the MCP
+servers whose tools the agent gets: a child process spoken to over its
+standard streams, a server reached over HTTP (streamable HTTP or the older
+SSE transport), or a server launched in the environment and reached through
+the environment's route to its port, which is sandbox-driver's `PreviewUrls`
+facet handed over with `port_routes`. The servers start while the agent is
+built; every tool they advertise is registered under `mcp__{server}__{tool}`
+with `ToolSource::Mcp`, so middleware, history, output policy, cancellation
+and events treat it as any other tool. Each server's outcome is on the stream
+as `McpServerReady` or `McpServerFailed`, and a server that fails is skipped.
+A result the server marks `isError` is the tool's error text; a transport
+failure, a timeout or a cancellation is a failed call with a reason. The
+servers close when the agent shuts down. See `pebble_coding_agent::mcp`.
+
+`CodingAgentBuilder::fallback_routes` names the routes a prompt continues on
+when its model fails for a reason another route might not share (lithos-llm's
+`failover_eligible`: authentication, access, not-found and quota failures,
+rate limits, server and network errors, timeouts, stream decoding, and a
+refusal from the content filter). Each `FallbackRoute` is a selector and the
+request controls that route takes. On such a failure the agent takes its own
+record, closes the failed session, resumes the record on the next route with
+`ResumeMode::UseModel`, requeues the steering and follow-ups the failed session
+still held, and continues the prompt as `continue_prompt` would, so no tool
+effect repeats. Control handles and `subscribe` receivers taken before the
+prompt keep working; the stream carries `RouteFailover` from the new route;
+accounting spans both. Pebble executes the list it is given and nothing more:
+a route's own fallbacks are not consulted, a route that cannot be built ends
+the prompt with `Error::FallbackRoute`, and once the list is spent a model
+error ends the prompt as it would without one. `remaining_fallback_routes`
+says what is left, for a successor built from an export.
+
+`CodingAgentOptions::with_memory_discovery` and `with_skill_discovery` name
+a convention instead of a list. `MemoryDiscovery::from_git_root()` reads the
+profile's own instruction files (`AgentProfileKind::memory_filenames`:
+`AGENTS.md` and `CLAUDE.md` for the Claude harnesses, `AGENTS.md` and
+`.codex/instructions.md` for the Codex ones, `AGENTS.md` and `GEMINI.md` for
+Gemini, `AGENTS.md` alone for Kimi) in every directory from the repository
+root down to the working directory, root first; `from_root` and
+`working_directory` are the other two starts. `SkillDiscovery` lists the
+directories to search in precedence order, anchored at the working directory
+or the git root, and a directory the application `require`s is reported as
+`MissingDirectory` on `SkillsDiscovered` when it is not there. Pebble does the
+git probe, the walk, and the checks through the `Environment`; explicit
+`with_memory_files` and `with_skill_dirs` still work and come first.
+
+`pebble_coding_agent::projection::SessionProjection` folds one session
+tree's events into what a view or an accountant needs: the root's token
+counts and provider-reported cost, each descendant's, the context window,
+which tools ran and how often they failed, the MCP servers and whether they
+were called, skills, todo lists, the children and how they ended,
+compactions, and the files touched. It is serializable, so a view resumes
+from a stored value, and it keeps a `PromptDelta` for the prompt in progress,
+because a retained session spans stages: the root's spend, each descendant's,
+the child lifecycle counts, compactions, and files touched, all restarted at
+each prompt. It reports counts; pricing them from a catalog stays with the
+application.
+
+`pebble_coding_agent::steering::SteeringBus` is one control plane for many
+sessions: sessions attach at a key of the application's choosing (a stage, a
+node) and detach; a steer or an interrupt reaches every attached session; a
+steer that arrives with none attached waits on the bus, up to a cap, and
+drains into the next attachment; and a hold keeps an attached session's
+natural completion open while a party is paired with it. Sessions implement
+`SteerableSession`; `CodingAgentControlHandle` does natively. Every operation
+returns what it did, so the application records buffered and dropped steers
+in its own vocabulary and order.
+
+`CodingAgent::export_for_reuse(reason)` closes the agent and returns the
+export a successor continues from, its cursor already past the close, so an
+application no longer takes an export, shuts down, and advances the cursor by
+hand. `SessionRecord::resume_after(log_head)` is the rule for a record and an
+event log saved separately: the cursor moves up to the log's head, never back.
 
 The crate root contains the normal coding-agent path and the environment
 contract. The environment a session acts through is in
@@ -206,6 +287,17 @@ lets the agent spawn children for independent work. The command is the
 smallest application pebble ships, and its source is a worked example of what
 an embedding application supplies.
 
+The command line is a library first. `pebble-cli-core` holds the `exec`
+session (`session::run_prompt`: the events rendered as they happen, the answer
+on standard output, the summary after it, the agent shut down for the reason
+the prompt ended with), its `render::Renderer` and closing `Summary`, the
+`approval::TerminalApproval` prompt for tools the permission level does not
+allow outright, and the interactive session, credential store, and settings
+whole. The `pebble` binary is an argument parser over it. Another program that
+builds its own agent, with its own client, environment, tools, and settings,
+runs it through the same session and renderer instead of writing them again;
+fabro's `fabro exec` does.
+
 ## What an application has to supply
 
 **A client, with retry middleware.** Pebble takes a built `lithos_llm::Client`
@@ -237,6 +329,13 @@ The agent stays open and the next prompt gets a fresh budget. A workflow that
 runs an agent to reach a decision uses this to cap the cost of one decision and
 to fall back to a default when the agent does not reach one.
 
+`CodingAgentOptions::with_max_turns` bounds model responses instead. A prompt
+that has used its turns and would ask the model again ends with
+`Error::Interrupted(InterruptReason::TurnLimit)` at the boundary a wall-clock
+timeout uses: every tool call the last turn made has its result. The two
+budgets count different things and may be set together; whichever is reached
+first ends the prompt, with its own error.
+
 Applications use `lithos-llm` directly to build clients and use its public
 model types. The Pebble packages do not re-export their dependencies.
 
@@ -254,6 +353,15 @@ An application working in a container, a VM, or a remote workspace implements
 the trait over that instead, and nothing else in the crate changes.
 `pebble_coding_agent::test_support::MockEnvironment` stands in for a machine in tests,
 behind the `test-util` feature.
+
+An implementation over another machine does not write pebble's rules again.
+`pebble_coding_agent::environment::support` holds the pieces of the contract
+an adapter would otherwise hand-write: `validate_glob` refuses the patterns
+pebble refuses, in pebble's words; `tree_order` sorts a listing the way
+`list_directory` promises; `OutputCaptureBuffer` and `capture_stats` keep and
+count bounded process output; and `classify_exec_error` names the error kind a
+command that failed to run reports. `LocalEnvironment` uses the same helpers,
+so an adapter built on them passes the `EnvironmentContract` checks they cover.
 
 **Somewhere for the events to go, if they matter.**
 `CodingAgent::subscribe` hands out a bounded broadcast receiver, which is
@@ -319,15 +427,28 @@ the parent. Applications use `agent.session()` to read it.
 
 For a custom policy or approval flow, install `PermissionMiddleware` directly. `CodingAgentOptions::with_recorded_permission_level` records metadata only; it does not enforce permissions. Add a `ToolApprovalService` with `PermissionMiddleware::with_approval` when calls that are not auto-approved should remain visible and ask for approval. Without an approval service, those tools are hidden and direct attempts are denied.
 
-Optional seams follow the same rule. Pebble ships no implementation and
-advertises no tool without one: an `extensions::HumanInputProvider` (no
-provider, no question tool), an `extensions::SearchProvider` (no provider, no
-`web_search`), an `extensions::Redactor` for process output and failed tool
+Optional seams follow the same rule. Pebble installs no implementation by
+default and advertises no tool without one: an `extensions::HumanInputProvider`
+(no provider, no question tool), an `extensions::SearchProvider` (no provider,
+no `web_search`), an `extensions::Redactor` for process output and failed tool
 call messages, and a
 `subagents::SubagentOptions` for subagents. A child is given a task, not the
 project briefing: it loads no memory files and discovers no skills unless the
 options ask for them with `with_inherited_memory` and `with_inherited_skills`,
 which give a child the parent's configured memory files and skill directories.
+
+**Search providers.** Search is the one seam pebble ships implementations
+for, because the engines behind it are public HTTP APIs that every embedder
+would otherwise write the same way. With the `search-providers` feature, off
+by default, `pebble_coding_agent::search::providers::Brave` and
+`search::providers::Venice` implement `SearchProvider` over the Brave Search
+API and Venice's search endpoint. Each is built with `new(api_key, client)`
+from an API key and a `reqwest::Client` the application owns, so proxies, TLS,
+and timeouts stay the application's; `search::providers::default_client()`
+builds a client for an application with none. Which engine a session gets,
+from whichever key the application holds, is still the application's decision,
+made by handing the provider to `CodingAgentBuilder::search_provider`. Without
+the feature pebble depends on no HTTP client of its own.
 
 ## Native embedding extensions
 
@@ -350,7 +471,10 @@ the omitted bytes. Truncation does not make a successful tool call fail.
 Retaining complete tool output is an explicit anti-goal: Pebble does not store
 full output or provide a retrieval tool for discarded bytes. Environment
 adapters must continue draining process output after the capture limit is
-reached, while retaining only the bounded preview and byte counts.
+reached, while retaining only the bounded preview and byte counts;
+`environment::support::OutputCaptureBuffer` is that capture, and
+`environment::support::capture_stats` the counts for a driver that bounds
+output itself.
 
 **Context and compaction policy.** Install `extensions::ContextPolicy` with
 `CodingAgentBuilder::context_policy` to prepare the messages for each model

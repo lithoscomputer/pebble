@@ -17,8 +17,8 @@ use pebble_coding_agent::tools::PermissionLevel;
 use tokio::fs;
 
 use crate::credentials::AuthStore;
-use crate::exec::print_err;
 use crate::settings::Settings;
+use crate::terminal::print_err;
 
 pub(crate) const DEFAULT_MODEL: &str = "claude-sonnet-5";
 const BASE_URL_ENV_PREFIX: &str = "PEBBLE_";

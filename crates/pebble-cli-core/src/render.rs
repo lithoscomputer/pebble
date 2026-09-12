@@ -1,19 +1,21 @@
 //! Rendering the event stream to standard error.
 
 use std::collections::BTreeMap;
+use std::io::{self, Write as _};
 
-use pebble_coding_agent::PromptReport;
 use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent};
+use pebble_coding_agent::{CodingAgent, PromptReport};
 use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::exec::print_err;
+use crate::terminal::{print_err, print_err_fragment};
 
 /// How events reach the terminal.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Style {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Style {
     /// One readable line per event, with the model's text streamed.
+    #[default]
     Text,
     /// One JSON envelope per line, unchanged from the event stream.
     Json,
@@ -21,16 +23,29 @@ pub(crate) enum Style {
     Quiet,
 }
 
+/// Where the JSON envelopes of [`Style::Json`] go.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum JsonStream {
+    /// Standard error, beside the other diagnostics, leaving standard output
+    /// to the answer.
+    #[default]
+    Stderr,
+    /// Standard output, as the command's product, for a caller that reads
+    /// the event stream rather than the answer.
+    Stdout,
+}
+
 /// Reads the live stream until the agent closes.
-pub(crate) struct Renderer {
+pub struct Renderer {
     style:     Style,
+    json_to:   JsonStream,
     summary:   Summary,
     streaming: bool,
 }
 
 /// What the stream said, kept for the closing report.
 #[derive(Debug, Default)]
-pub(crate) struct Summary {
+pub struct Summary {
     tools:    BTreeMap<String, usize>,
     failures: usize,
     turns:    usize,
@@ -39,22 +54,28 @@ pub(crate) struct Summary {
 }
 
 impl Renderer {
-    pub(crate) fn new(style: Style) -> Self {
+    #[must_use]
+    pub fn new(style: Style) -> Self {
         Self {
             style,
+            json_to: JsonStream::default(),
             summary: Summary::default(),
             streaming: false,
         }
+    }
+
+    /// Sends [`Style::Json`] envelopes to `stream` instead of standard error.
+    #[must_use]
+    pub fn json_to(mut self, stream: JsonStream) -> Self {
+        self.json_to = stream;
+        self
     }
 
     /// Consumes the stream until it closes and answers with what it counted.
     ///
     /// The stream ends when the agent is shut down, which is what lets the
     /// caller join this task before the agent is dropped.
-    pub(crate) async fn run(
-        mut self,
-        mut events: broadcast::Receiver<CodingAgentEvent>,
-    ) -> Summary {
+    pub async fn run(mut self, mut events: broadcast::Receiver<CodingAgentEvent>) -> Summary {
         loop {
             match events.recv().await {
                 Ok(event) => {
@@ -80,7 +101,18 @@ impl Renderer {
         self.summary.observe(&event.event);
         match self.style {
             Style::Json => match serde_json::to_string(event) {
-                Ok(line) => print_err(&line),
+                Ok(line) => match self.json_to {
+                    JsonStream::Stderr => print_err(&line),
+                    // A closed pipe is the reader's choice; nothing can be
+                    // said to them about it.
+                    JsonStream::Stdout => {
+                        let mut stdout = io::stdout().lock();
+                        let _ = stdout
+                            .write_all(line.as_bytes())
+                            .and_then(|()| stdout.write_all(b"\n"))
+                            .and_then(|()| stdout.flush());
+                    }
+                },
                 Err(error) => print_err(&format!("error: rendering an event as JSON: {error}")),
             },
             Style::Text => self.render_text(&event.event),
@@ -212,7 +244,7 @@ impl Summary {
     }
 
     /// Prints what the prompt used, after the answer.
-    pub(crate) fn report(&self, outcome: &PromptReport, style: Style) {
+    pub fn report(&self, outcome: &PromptReport, style: Style) {
         if style != Style::Text {
             return;
         }
@@ -272,7 +304,21 @@ fn abbreviate(text: &str) -> String {
     flat.chars().take(LIMIT).collect::<String>() + "…"
 }
 
-#[expect(clippy::print_stderr, reason = "the command's stderr boundary")]
-fn print_err_fragment(text: &str) {
-    eprint!("{text}");
+/// Reports what became of each MCP server the agent was built with: they
+/// started while the agent was built, before any subscriber could hear the
+/// events, so the outcomes are read from the agent.
+pub fn report_mcp_servers(agent: &CodingAgent, style: Style) {
+    if style != Style::Text {
+        return;
+    }
+    for status in agent.snapshot().mcp_servers() {
+        match &status.error {
+            None => print_err(&format!(
+                "[mcp] {}: {} tool(s)",
+                status.server,
+                status.tools.len()
+            )),
+            Some(error) => print_err(&format!("[mcp] {} failed: {error}", status.server)),
+        }
+    }
 }

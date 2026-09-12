@@ -632,6 +632,78 @@ async fn a_prompt_that_outlasts_its_budget_ends_with_the_budget_as_its_reason() 
     assert_eq!(answer.as_deref(), Some("Should not reach this"));
 }
 
+// --- The turn budget ---
+
+#[tokio::test]
+async fn a_prompt_that_uses_its_turn_budget_ends_with_the_budget_as_its_reason() {
+    let (mut session, provider) = TestSession::new(vec![
+        ScriptedCall::response(tool_call_response("noop", "call_1", json!({}))),
+        ScriptedCall::response(tool_call_response("noop", "call_2", json!({}))),
+        ScriptedCall::response(text_response("Would keep going")),
+        ScriptedCall::response(text_response("Fresh budget")),
+    ])
+    .tools([noop_tool("noop")])
+    .options(CodingAgentOptions {
+        max_turns: Some(2),
+        enable_loop_detection: false,
+        ..CodingAgentOptions::default()
+    })
+    .build();
+
+    let error = timeout(PATIENCE, session.prompt("Keep calling tools"))
+        .await
+        .expect("the budget ends the prompt")
+        .expect_err("the prompt used its budget");
+
+    assert!(
+        matches!(error, Error::Interrupted(InterruptReason::TurnLimit)),
+        "{error:?}"
+    );
+    assert_eq!(
+        provider.call_count(),
+        2,
+        "the model was asked exactly as many times as the budget allows"
+    );
+    // Using the budget is the prompt's failure, not the session's: the last
+    // call has its result, the session is idle, and the next prompt starts a
+    // fresh count.
+    assert_eq!(session.state(), CodingAgentState::Idle);
+    assert!(
+        matches!(
+            session.history().turns().last(),
+            Some(Message::ToolResults { results, .. }) if results.len() == 1
+        ),
+        "the last turn's call still has its result: {:?}",
+        session.history().turns()
+    );
+    let answer = timeout(PATIENCE, session.prompt("Try again"))
+        .await
+        .expect("the next prompt runs")
+        .expect("the next prompt succeeds");
+    assert_eq!(answer.as_deref(), Some("Would keep going"));
+}
+
+#[tokio::test]
+async fn a_prompt_within_its_turn_budget_finishes_normally() {
+    let (mut session, _provider) = TestSession::new(vec![
+        ScriptedCall::response(tool_call_response("noop", "call_1", json!({}))),
+        ScriptedCall::response(text_response("done")),
+    ])
+    .tools([noop_tool("noop")])
+    .options(CodingAgentOptions {
+        max_turns: Some(2),
+        ..CodingAgentOptions::default()
+    })
+    .build();
+
+    let answer = timeout(PATIENCE, session.prompt("One tool then answer"))
+        .await
+        .expect("the prompt finishes")
+        .expect("the prompt succeeds");
+
+    assert_eq!(answer.as_deref(), Some("done"));
+}
+
 /// A session whose first turn calls `count` and then compacts, with the
 /// summarizing call held behind the returned gate.
 ///

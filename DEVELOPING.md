@@ -101,8 +101,11 @@ the serialized event stream and record format (`event_contract.rs`,
 and `e2e.rs` — the example's own flow, driven through the scripted provider
 and a real temporary directory, so it needs no credentials and no network.
 
-Tests that reach `pebble_coding_agent::test_support` need the `test-util` feature, which is
-why the test tasks pass `--all-features`.
+Tests that reach `pebble_coding_agent::test_support` need the `test-util`
+feature, and the search providers in `pebble_coding_agent::search::providers`
+need `search-providers` along with their tests, which is why the test tasks
+pass `--all-features`. The provider tests answer each search from a fake engine
+served by axum in the test process, so they need no key and no network.
 
 The `pebble` binary is tested with `trycmd`: each case under
 `crates/pebble-cli/tests/cmd/` names the arguments, the expected output on

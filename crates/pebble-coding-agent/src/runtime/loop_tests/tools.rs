@@ -24,7 +24,7 @@ use crate::environment::{Environment, ExecResult};
 use crate::error::ErrorKind;
 use crate::redact::Redactor;
 use crate::runtime::testing::{TestProfile, builder};
-use crate::search::{SearchError, SearchProvider, SearchRequest, SearchResult};
+use crate::search::seam::{SearchError, SearchProvider, SearchRequest, SearchResult};
 use crate::subagent::ChildObserver;
 use crate::test_support::{
     MockEnvironment, MutableMockEnvironment, ScriptedCompletion, ScriptedProvider, client_from,

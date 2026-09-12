@@ -24,7 +24,7 @@ use tokio::time;
 
 use super::definition;
 use crate::config::NativeToolOptions;
-use crate::search::SearchProvider;
+use crate::search::seam::SearchProvider;
 use crate::subagent::{SubagentResult, SubagentStatus, SubagentSupervisor};
 use crate::tool::{
     NativeTool, RegisteredTool, ToolError, optional_integer_arg, required_str, whole_number,

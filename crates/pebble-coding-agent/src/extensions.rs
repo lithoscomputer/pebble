@@ -12,6 +12,6 @@ pub use crate::prompt_transform::{
     SystemPromptContext, SystemPromptDecision, SystemPromptTransform,
 };
 pub use crate::redact::{NoRedaction, Redactor};
-pub use crate::search::{
+pub use crate::search::seam::{
     SearchError, SearchErrorKind, SearchProvider, SearchRequest, SearchResult,
 };

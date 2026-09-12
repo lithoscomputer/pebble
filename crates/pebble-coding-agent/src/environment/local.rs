@@ -18,10 +18,10 @@ use tokio::{fs, time};
 use tokio_util::sync::CancellationToken;
 
 use super::capture::OutputCaptureBuffer;
-use super::glob::WorkspaceGlob;
+use super::support::{ExecFailure, classify_exec_error, compile_glob, tree_order};
 use super::{
     DirEntry, EnvResult, Environment, EnvironmentError, EnvironmentErrorKind, ExecOutcome,
-    ExecRequest, ExecResult, GrepOptions,
+    ExecOutputSink, ExecOutputStream, ExecRequest, ExecResult, GrepOptions,
 };
 use crate::types::CommandTermination;
 
@@ -495,6 +495,7 @@ impl Environment for LocalEnvironment {
         spawn_blocking(move || {
             let mut entries = Vec::new();
             list_recursive(&full_path, "", 0, max_depth, &mut entries)?;
+            tree_order(&mut entries);
             Ok(entries)
         })
         .await
@@ -544,16 +545,7 @@ impl Environment for LocalEnvironment {
     }
 
     async fn glob(&self, pattern: &str, path: Option<&str>) -> EnvResult<Vec<String>> {
-        let compiled = WorkspaceGlob::try_new(pattern).map_err(|error| {
-            // The reason goes in the message because that is all the model
-            // reads; it has to see what was wrong to try again. The pattern is
-            // quoted as the model sent it. Nothing branches on the glob error,
-            // so it is not kept as a source, which would repeat the reason.
-            EnvironmentError::new(
-                EnvironmentErrorKind::InvalidInput,
-                format!("Invalid glob pattern {pattern:?}: {error}"),
-            )
-        })?;
+        let compiled = compile_glob(pattern)?;
 
         let base = path.map_or_else(
             || self.working_directory.clone(),
@@ -574,6 +566,7 @@ impl Environment for LocalEnvironment {
             env_vars,
             cancel_token,
             output_bytes_cap,
+            output_sink,
         } = request;
         let started = Instant::now();
 
@@ -603,7 +596,7 @@ impl Environment for LocalEnvironment {
 
         let mut child = builder.spawn().map_err(|error| {
             EnvironmentError::with_source(
-                EnvironmentErrorKind::Spawn,
+                classify_exec_error(ExecFailure::Start),
                 "Failed to start the command",
                 error,
             )
@@ -619,11 +612,15 @@ impl Environment for LocalEnvironment {
             stdout_pipe,
             output_bytes_cap,
             drain_stop.clone(),
+            output_sink
+                .clone()
+                .map(|sink| (sink, ExecOutputStream::Stdout)),
         ));
         let stderr_task = tokio::spawn(drain_pipe(
             stderr_pipe,
             output_bytes_cap,
             drain_stop.clone(),
+            output_sink.map(|sink| (sink, ExecOutputStream::Stderr)),
         ));
 
         let deadline = optional_timeout(timeout_ms);
@@ -633,7 +630,7 @@ impl Environment for LocalEnvironment {
         let (termination, exit_code) = tokio::select! {
             status = child.wait() => {
                 let status = status.map_err(|error| EnvironmentError::with_source(
-                    EnvironmentErrorKind::Io,
+                    classify_exec_error(ExecFailure::Collect),
                     "Failed to wait for the command",
                     error,
                 ))?;
@@ -658,13 +655,13 @@ impl Environment for LocalEnvironment {
             (!matches!(termination, CommandTermination::Exited)).then_some(OUTPUT_DRAIN_GRACE);
         let (stdout_buffer, stderr_buffer) =
             join_drains(stdout_task, stderr_task, &drain_stop, drain_grace).await?;
-        let (stdout_bytes, stdout_capture) = stdout_buffer.into_parts();
-        let (stderr_bytes, stderr_capture) = stderr_buffer.into_parts();
+        let (stdout, stdout_capture) = stdout_buffer.into_text();
+        let (stderr, stderr_capture) = stderr_buffer.into_text();
 
         Ok(ExecOutcome {
             result: ExecResult {
-                stdout: String::from_utf8_lossy(&stdout_bytes).into_owned(),
-                stderr: String::from_utf8_lossy(&stderr_bytes).into_owned(),
+                stdout,
+                stderr,
                 exit_code,
                 termination,
                 duration_ms,
@@ -684,7 +681,9 @@ struct WalkedFile {
     relative_path: String,
 }
 
-/// Lists a directory recursively, sorted by file name at every level.
+/// Lists a directory recursively, in the order the filesystem returns its
+/// entries. The caller puts the whole listing in tree order once, through the
+/// same `tree_order` an implementation over another machine uses.
 fn list_recursive(
     base: &Path,
     prefix: &str,
@@ -692,16 +691,14 @@ fn list_recursive(
     max_depth: usize,
     entries: &mut Vec<DirEntry>,
 ) -> EnvResult<()> {
-    let mut directory_entries: Vec<sync_fs::DirEntry> = sync_fs::read_dir(base)
+    let directory_entries = sync_fs::read_dir(base)
         .map_err(|error| {
             EnvironmentError::io(
                 format!("Failed to read directory {}", base.display()),
                 error,
             )
         })?
-        .filter_map(Result::ok)
-        .collect();
-    directory_entries.sort_by_key(sync_fs::DirEntry::file_name);
+        .filter_map(Result::ok);
 
     for entry in directory_entries {
         let metadata = entry.metadata().map_err(|error| {
@@ -859,10 +856,13 @@ fn walk_root(base: &Path, relative_start: &str) -> EnvResult<Option<(PathBuf, sy
 /// end of file may never come: a descendant that outlived the command holds
 /// the same pipe open. `read` is cancel-safe, so nothing already in the pipe
 /// is dropped by stopping between reads.
+/// Reads one pipe to its end, keeping what the cap allows and handing every
+/// chunk to the sink, when there is one, before the cap sees it.
 async fn drain_pipe<R>(
     pipe: Option<R>,
     output_bytes_cap: Option<usize>,
     stop: CancellationToken,
+    sink: Option<(ExecOutputSink, ExecOutputStream)>,
 ) -> OutputCaptureBuffer
 where
     R: AsyncRead + Unpin,
@@ -882,6 +882,9 @@ where
         match read {
             Ok(0) => return captured,
             Ok(read) => {
+                if let Some((sink, stream)) = &sink {
+                    sink(*stream, &chunk[..read]);
+                }
                 captured.push(&chunk[..read]);
             }
             Err(error) => {
@@ -927,7 +930,7 @@ async fn join_drain(
 ) -> EnvResult<OutputCaptureBuffer> {
     task.await.map_err(|error| {
         EnvironmentError::with_source(
-            EnvironmentErrorKind::Io,
+            classify_exec_error(ExecFailure::Collect),
             format!("Failed to collect command {stream}"),
             error,
         )
@@ -1462,6 +1465,7 @@ mod tests {
             Some(FailingReader { wrote: false }),
             None,
             CancellationToken::new(),
+            None,
         )
         .await;
 
@@ -1504,6 +1508,50 @@ mod tests {
                 outcome.output_capture(),
                 OutputCaptureStats::complete(outcome.result.stdout.len())
             );
+        }
+
+        /// The sink is fed from the drain, so it sees every byte in order,
+        /// however small the retention cap that bounds what the outcome keeps.
+        #[tokio::test]
+        async fn a_sink_sees_every_byte_the_command_writes_before_the_cap() {
+            use std::sync::{Arc, Mutex, PoisonError};
+
+            type Seen = Arc<Mutex<Vec<(ExecOutputStream, Vec<u8>)>>>;
+
+            let directory = TempDir::new("local-env");
+            let seen = Seen::default();
+            let recorded = Arc::clone(&seen);
+
+            let outcome = environment(&directory)
+                .exec(ExecRequest {
+                    timeout_ms: Some(5_000),
+                    output_bytes_cap: Some(4),
+                    output_sink: Some(Arc::new(move |stream, chunk: &[u8]| {
+                        recorded
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push((stream, chunk.to_vec()));
+                    })),
+                    ..ExecRequest::new("printf 'out-stream'; printf 'err-stream' >&2")
+                })
+                .await
+                .expect("the command runs");
+
+            let seen = seen.lock().unwrap_or_else(PoisonError::into_inner);
+            let bytes_of = |wanted: ExecOutputStream| -> Vec<u8> {
+                seen.iter()
+                    .filter(|(stream, _)| *stream == wanted)
+                    .flat_map(|(_, chunk)| chunk.iter().copied())
+                    .collect()
+            };
+            assert_eq!(bytes_of(ExecOutputStream::Stdout), b"out-stream");
+            assert_eq!(bytes_of(ExecOutputStream::Stderr), b"err-stream");
+            assert!(
+                outcome.result.stdout.len() <= 4,
+                "the cap still bounds the outcome: {:?}",
+                outcome.result.stdout
+            );
+            assert_eq!(outcome.output_capture().observed_bytes, 20);
         }
 
         #[tokio::test]

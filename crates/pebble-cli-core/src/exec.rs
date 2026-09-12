@@ -1,6 +1,6 @@
 //! The `exec` command: one prompt, run to completion.
 
-use std::io::{self, IsTerminal as _, Read as _, Write as _};
+use std::io::{self, IsTerminal as _, Read as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -12,22 +12,22 @@ use lithos_llm::middleware::RetryPolicy;
 use pebble_coding_agent::environment::LocalEnvironment;
 use pebble_coding_agent::subagents::SubagentOptions;
 use pebble_coding_agent::tools::PermissionLevel;
-use pebble_coding_agent::{
-    CodingAgent, CodingAgentOptions, Error as AgentError, InterruptReason, PromptOutput,
-    ShutdownReason,
-};
+use pebble_coding_agent::{CodingAgent, CodingAgentOptions, Error as AgentError, InterruptReason};
 use tokio::signal::ctrl_c;
+use tokio_util::sync::CancellationToken;
 
 use crate::application::{Application, DEFAULT_MODEL, PermissionArg, model_route};
-use crate::render::{Renderer, Style};
+use crate::render::{JsonStream, Style};
 use crate::resources;
+use crate::session::{SessionOptions, run_prompt};
 use crate::settings::project;
+use crate::terminal::print_err;
 
 /// The exit status when the prompt was interrupted or timed out.
 const INTERRUPTED: u8 = 130;
 
 #[derive(Debug, Args)]
-pub(crate) struct ExecArgs {
+pub struct ExecArgs {
     /// The prompt. Read from standard input when omitted.
     #[arg(value_name = "PROMPT")]
     prompt: Option<String>,
@@ -66,7 +66,7 @@ pub(crate) struct ExecArgs {
 }
 
 /// Runs the command and answers with the process exit code.
-pub(crate) async fn run(args: ExecArgs) -> ExitCode {
+pub async fn run(args: ExecArgs) -> ExitCode {
     let style = if args.json {
         Style::Json
     } else if args.quiet {
@@ -129,37 +129,27 @@ async fn exec(args: ExecArgs, style: Style) -> Result<Ending> {
     if args.subagents {
         builder = builder.subagents(SubagentOptions::enabled());
     }
-    let mut agent = builder.build().await.context("building the coding agent")?;
+    let agent = builder.build().await.context("building the coding agent")?;
 
-    let renderer = tokio::spawn(Renderer::new(style).run(agent.subscribe()));
-    let control = agent.control_handle();
-    let interrupt = tokio::spawn(async move {
-        if ctrl_c().await.is_ok() {
-            control.abort();
+    // Ctrl-C ends the prompt; the session shuts down as cancelled.
+    let cancel = CancellationToken::new();
+    let interrupt = tokio::spawn({
+        let cancel = cancel.clone();
+        async move {
+            if ctrl_c().await.is_ok() {
+                cancel.cancel();
+            }
         }
     });
-
-    let report = agent.prompt(prompt).await;
+    let report = run_prompt(agent, prompt, &cancel, SessionOptions {
+        style,
+        json_to: JsonStream::Stderr,
+        write_answer: true,
+    })
+    .await;
     interrupt.abort();
-    let reason = match &report.result {
-        Ok(_) => ShutdownReason::Completed,
-        Err(AgentError::Interrupted(_)) => ShutdownReason::Cancelled,
-        Err(_) => ShutdownReason::Error,
-    };
-    // Closing publishes what is queued and ends the stream, which is what
-    // lets the renderer be joined here and its summary come after the answer.
-    let shutdown = agent.shutdown(reason).await;
-    let summary = renderer.await.context("joining the event renderer")?;
-
-    if let Ok(outcome) = &report.result {
-        write_answer(outcome)?;
-    }
-    summary.report(&report, style);
-    match report.result {
-        Ok(_) => {
-            shutdown.context("shutting the agent down")?;
-            Ok(Ending::Answered)
-        }
+    match report?.result {
+        Ok(_) => Ok(Ending::Answered),
         Err(AgentError::Interrupted(reason)) => {
             report_interrupt(reason);
             Ok(Ending::Interrupted)
@@ -190,28 +180,11 @@ fn read_prompt(argument: Option<&str>) -> Result<String> {
     Ok(prompt)
 }
 
-/// Writes the final answer to standard output, ending it with one newline.
-fn write_answer(outcome: &PromptOutput) -> Result<()> {
-    let Some(text) = outcome.text.as_deref() else {
-        return Ok(());
-    };
-    let mut stdout = io::stdout().lock();
-    stdout
-        .write_all(text.as_bytes())
-        .and_then(|()| {
-            if text.ends_with('\n') {
-                Ok(())
-            } else {
-                stdout.write_all(b"\n")
-            }
-        })
-        .context("writing the answer")
-}
-
 fn report_interrupt(reason: InterruptReason) {
     let what = match reason {
         InterruptReason::WallClockTimeout => "the prompt ran out of time",
         InterruptReason::Cancelled => "the prompt was interrupted",
+        InterruptReason::TurnLimit => "the prompt used its turn budget",
         _ => "the prompt was stopped",
     };
     print_err(&format!("error: {what}"));
@@ -232,11 +205,6 @@ fn parse_duration(raw: &str) -> Result<Duration, String> {
         return Err("give the duration a unit, for example 30s, 10m, or 1h".to_owned());
     }
     humantime::parse_duration(raw).map_err(|error| error.to_string())
-}
-
-#[expect(clippy::print_stderr, reason = "the command's stderr boundary")]
-pub(crate) fn print_err(text: &str) {
-    eprintln!("{text}");
 }
 
 #[cfg(test)]

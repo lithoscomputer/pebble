@@ -14,18 +14,26 @@
 //! of the contract rather than implementation detail:
 //! [`format_lines_numbered`] is the exact `read_file` rendering, and
 //! [`ExecRequest::command`] is Bash source (see [`Environment::exec`]).
+//!
+//! [`support`] holds the pieces of the contract an implementation over another
+//! machine would otherwise write by hand — the glob grammar, the listing
+//! order, bounded output capture and its accounting, and the error kind a
+//! failed command reports — as the one implementation [`LocalEnvironment`]
+//! uses too.
 
 mod capture;
 mod glob;
 mod local;
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) mod mock;
+pub mod support;
 
 use std::collections::HashMap;
 use std::error::Error as StdError;
 use std::fmt::Write as _;
 use std::io::{self, ErrorKind};
 use std::result::Result as StdResult;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -289,6 +297,32 @@ fn sanitize_exec_output(text: &str) -> String {
     sanitized
 }
 
+/// Which of a command's two output streams a chunk came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ExecOutputStream {
+    /// The command's standard output.
+    Stdout,
+    /// The command's standard error.
+    Stderr,
+}
+
+/// Where an implementation hands each chunk of output as the command produces
+/// it.
+///
+/// Called from whatever task drains the process, once per read, with the bytes
+/// exactly as the command wrote them: before any retention cap, and split
+/// wherever the read happened to end, so a chunk may cut a UTF-8 sequence in
+/// two. A caller that shows the output as text decodes across chunks. The two
+/// streams may arrive interleaved and from different tasks, but the chunks of
+/// one stream arrive in order.
+///
+/// The sink must not block: it runs on the path that keeps the pipe from
+/// filling, and a sink that waits holds the command with it. Publishing to a
+/// queue is the intended use; the [`ExecOutcome`] the call returns is still
+/// the complete, capped record of what the command wrote.
+pub type ExecOutputSink = Arc<dyn Fn(ExecOutputStream, &[u8]) + Send + Sync>;
+
 /// One command to run.
 ///
 /// Build it with [`ExecRequest::new`] and struct-update syntax so a field
@@ -330,11 +364,14 @@ pub struct ExecRequest<'a> {
     /// Draining always continues past the cap, so a noisy command never
     /// deadlocks against a full pipe. `None` retains everything.
     pub output_bytes_cap: Option<usize>,
+    /// Where each chunk of output goes as the command produces it, beside
+    /// being captured for the outcome. `None` captures only.
+    pub output_sink:      Option<ExecOutputSink>,
 }
 
 impl<'a> ExecRequest<'a> {
-    /// A request that runs `command` with no timeout, no cancellation, and no
-    /// retention cap.
+    /// A request that runs `command` with no timeout, no cancellation, no
+    /// retention cap, and no live output.
     #[must_use]
     pub const fn new(command: &'a str) -> Self {
         Self {
@@ -344,6 +381,7 @@ impl<'a> ExecRequest<'a> {
             env_vars: None,
             cancel_token: None,
             output_bytes_cap: None,
+            output_sink: None,
         }
     }
 }
@@ -563,7 +601,10 @@ pub trait Environment: Send + Sync {
     /// [`output_bytes_cap`](ExecRequest::output_bytes_cap) set, each stream
     /// keeps a stable head and a rolling tail within the cap and reports what
     /// it dropped in [`ExecOutcome::stdout_capture`] and
-    /// [`ExecOutcome::stderr_capture`].
+    /// [`ExecOutcome::stderr_capture`]. With
+    /// [`output_sink`](ExecRequest::output_sink) set, every chunk also reaches
+    /// the sink as it is read, tagged with its stream and uncapped, before the
+    /// call returns.
     async fn exec(&self, request: ExecRequest<'_>) -> EnvResult<ExecOutcome>;
 }
 
@@ -839,5 +880,6 @@ mod tests {
         assert!(request.env_vars.is_none());
         assert!(request.cancel_token.is_none());
         assert_eq!(request.output_bytes_cap, None);
+        assert!(request.output_sink.is_none());
     }
 }

@@ -21,10 +21,10 @@ use pebble_coding_agent::events::{
     ContextWindowBreakdownItem, ContextWindowCategory, ContextWindowCountMethod,
     ContextWindowSnapshot, ContextWindowStaleness, ContextWindowWarning, CostSource, ErrorData,
     ErrorKind, EventSinkError, ExecOutputTail, InputContent, InputSource, LlmOutputKind,
-    LlmRetryPhase, MemoryFileSummary, PermissionLevel, ReasoningOutput, SkillActivationSource,
-    SkillSummary, SkippedSkill, SkippedSkillReason, TodoCreatedProps, TodoDeletedProps,
-    TodoListKind, TodoStatus, TodoUpdatedProps, TokenUsage, ToolCategory, ToolErrorKind,
-    ToolSource, ToolSummary,
+    LlmRetryPhase, McpToolSummary, MemoryFileSummary, PermissionLevel, ReasoningOutput,
+    SkillActivationSource, SkillSummary, SkippedSkill, SkippedSkillReason, TodoCreatedProps,
+    TodoDeletedProps, TodoListKind, TodoStatus, TodoUpdatedProps, TokenUsage, ToolCategory,
+    ToolErrorKind, ToolSource, ToolSummary,
 };
 use pebble_coding_agent::{Error, InterruptReason};
 use serde::Serialize;
@@ -182,6 +182,23 @@ fn every_variant() -> Vec<CodingEvent> {
         },
         CodingEvent::LoopDetected,
         CodingEvent::ToolRoundsExhausted { limit: 3 },
+        CodingEvent::McpServerReady {
+            server: "github".into(),
+            tools:  vec![McpToolSummary {
+                name:          "mcp__github__list_issues".into(),
+                original_name: "list_issues".into(),
+            }],
+        },
+        CodingEvent::McpServerFailed {
+            server: "filesystem".into(),
+            error:  "could not launch `npx`: No such file or directory".into(),
+        },
+        CodingEvent::RouteFailover {
+            from:    "anthropic/claude-sonnet-5".into(),
+            to:      "openai/gpt-5.6".into(),
+            attempt: 1,
+            error:   ErrorData::from(&rate_limited()),
+        },
         CodingEvent::SteeringInjected {
             text:    "also update the changelog".into(),
             content: None,

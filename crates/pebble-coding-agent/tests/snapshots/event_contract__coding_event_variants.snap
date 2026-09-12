@@ -166,6 +166,43 @@ expression: render(&every_variant())
     }
   },
   {
+    "McpServerReady": {
+      "server": "github",
+      "tools": [
+        {
+          "name": "mcp__github__list_issues",
+          "original_name": "list_issues"
+        }
+      ]
+    }
+  },
+  {
+    "McpServerFailed": {
+      "server": "filesystem",
+      "error": "could not launch `npx`: No such file or directory"
+    }
+  },
+  {
+    "RouteFailover": {
+      "from": "anthropic/claude-sonnet-5",
+      "to": "openai/gpt-5.6",
+      "attempt": 1,
+      "error": {
+        "kind": "llm",
+        "message": "slow down",
+        "llm_kind": "rate_limit",
+        "retry": {
+          "type": "after",
+          "after_millis": 2000
+        },
+        "provider": "openai",
+        "status": 429,
+        "provider_code": "rate_limit_exceeded",
+        "provider_retry_after_millis": 2000
+      }
+    }
+  },
+  {
     "SteeringInjected": {
       "text": "also update the changelog",
       "actor": {

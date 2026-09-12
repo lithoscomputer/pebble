@@ -40,15 +40,15 @@ pub(crate) use crate::coding_agent::{
     CodingAgentBuildError, CodingInput, PromptTiming, ResumeMode, ShutdownReason,
 };
 use crate::compaction::{
-    CompactionControl, CompactionOptions, CompactionOutcome, CompactionReason, CompactionRequest,
-    compact_context, estimate_active_context_usage,
+    CompactionAccount, CompactionControl, CompactionOptions, CompactionOutcome, CompactionReason,
+    CompactionRequest, compact_context, estimate_active_context_usage,
 };
 use crate::config::CodingAgentOptions;
 use crate::context_window::{memory_prompt_tokens, skills_prompt_tokens};
 use crate::environment::{Environment, ExecRequest};
 use crate::error::{Error, ErrorData, ErrorKind, InterruptReason, Result, TaskKind};
 use crate::event::{Emitter, EventCapacity, EventOptions, EventPump, EventSink, EventSinkTimeout};
-use crate::file_tracker::FileTracker;
+use crate::file_tracker::{FileTracker, PromptFiles};
 use crate::history::History;
 use crate::human_input::HumanInputProvider;
 use crate::memory::ProjectMemory;
@@ -58,7 +58,7 @@ use crate::profiles::{FileEditToolKind, ProfileDeps};
 use crate::prompt_transform::{SystemPromptContext, SystemPromptTransform};
 use crate::record::{SESSION_RECORD_FORMAT_VERSION, SessionRecord};
 use crate::redact::{NoRedaction, Redactor};
-use crate::search::SearchProvider;
+use crate::search::seam::SearchProvider;
 use crate::skills::{Skill, SkillExpansion, discover_skills};
 use crate::subagent::{
     ChildDeps, ChildIdentity, ChildObserver, OpenSessions, SubagentEventCallback, SubagentOptions,
@@ -75,7 +75,7 @@ use crate::types::{
     MemoryFileSummary, Message, PermissionLevel, SkillSummary, TokenUsage, ToolSummary,
     rfc3339_millis,
 };
-use crate::{SessionId, SessionScope};
+use crate::{SessionId, SessionScope, discovery};
 
 /// The catalog metadata namespace every agent runtime reads.
 const METADATA_NAMESPACE: &str = "agent";
@@ -102,11 +102,16 @@ pub(crate) struct WarmState {
 }
 
 /// What one prompt accumulated across every input it processed.
-#[derive(Clone, Copy, Debug, Default)]
+///
+/// `usage` and `cost_usd_micros` include the summary call of each entry in
+/// `compactions`, which is their breakdown, not an addition to them.
+#[derive(Clone, Debug, Default)]
 struct PromptTotals {
     timing:          PromptTiming,
     usage:           TokenUsage,
     cost_usd_micros: Option<u64>,
+    /// The compactions this prompt completed, in order.
+    compactions:     Vec<CompactionAccount>,
 }
 
 /// The `agent` namespace of a catalog entry.
@@ -131,6 +136,7 @@ struct AgentMetadata {
 /// merges whatever the application registered, and freezes the result into the
 /// session. Nothing mutates a registry afterwards.
 #[must_use = "a builder does nothing until `build` is called"]
+#[derive(Clone)]
 pub(crate) struct CodingRuntimeBuilder {
     client:               Client,
     model:                Option<String>,
@@ -224,6 +230,12 @@ impl CodingRuntimeBuilder {
     }
 
     /// Whether a model has been named on this builder.
+    /// The environment the session will act through, once named.
+    #[cfg(feature = "mcp")]
+    pub(crate) const fn environment_ref(&self) -> Option<&Arc<dyn Environment>> {
+        self.environment.as_ref()
+    }
+
     pub(crate) const fn has_model(&self) -> bool {
         self.model.is_some()
     }
@@ -336,6 +348,32 @@ impl CodingRuntimeBuilder {
     /// Sets how the session behaves.
     pub(crate) fn options(mut self, options: CodingAgentOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    /// Keeps a predecessor's live subscribers: the new pipeline publishes on
+    /// `published` instead of opening a channel of its own.
+    pub(crate) fn continue_publishing_on(
+        mut self,
+        published: broadcast::Sender<CodingAgentEvent>,
+    ) -> Self {
+        self.events.published = Some(published);
+        self
+    }
+
+    /// Replaces the request controls with a fallback route's, keeping every
+    /// other option as it was.
+    pub(crate) fn with_route_controls(
+        mut self,
+        reasoning_effort: Option<ReasoningEffort>,
+        speed: Option<Speed>,
+        max_tokens: Option<i64>,
+    ) -> Self {
+        self.options = self
+            .options
+            .with_reasoning_effort(reasoning_effort)
+            .with_speed(speed)
+            .with_max_tokens(max_tokens);
         self
     }
 
@@ -541,8 +579,12 @@ impl CodingRuntimeBuilder {
             (emitter, Some(tokio::spawn(pump.run())))
         };
 
+        // One collector for the whole tree below this session: children report
+        // what they touched into it, and the prompt's report reads it.
+        let prompt_files = PromptFiles::default();
         let supervisor = self.subagents.is_enabled().then(|| {
             SubagentSupervisor::new(Arc::new(ChildDeps {
+                parent_files: prompt_files.clone(),
                 client: self.client.clone(),
                 model_selector: handle.to_string(),
                 profile: Arc::clone(&profile),
@@ -592,7 +634,10 @@ impl CodingRuntimeBuilder {
             session_scope,
             created_at,
             config: self.options,
-            conversation: Arc::new(Mutex::new(ConversationState::new(History::default()))),
+            conversation: Arc::new(Mutex::new(ConversationState::new(
+                History::default(),
+                prompt_files,
+            ))),
             emitter,
             pump,
             state,
@@ -651,10 +696,20 @@ fn child_options(parent: &CodingAgentOptions, subagents: &SubagentOptions) -> Co
         } else {
             Vec::new()
         },
+        memory_discovery: if subagents.inherits_memory() {
+            parent.memory_discovery.clone()
+        } else {
+            None
+        },
         skill_dirs: if subagents.inherits_skills() {
             parent.skill_dirs.clone()
         } else {
             Vec::new()
+        },
+        skill_discovery: if subagents.inherits_skills() {
+            parent.skill_discovery.clone()
+        } else {
+            None
         },
         ..parent.clone()
     }
@@ -1079,13 +1134,66 @@ impl CodingRuntime {
             return Err(Error::Interrupted(InterruptReason::Cancelled));
         }
 
-        let profile = self.profile.profile_kind().as_str().to_owned();
+        let profile_kind = self.profile.profile_kind();
+        let profile = profile_kind.as_str().to_owned();
+
+        // The conventions the application named, resolved to paths: one git
+        // probe serves both when either asks for the root.
+        let needs_git_root = matches!(
+            self.config
+                .memory_discovery
+                .as_ref()
+                .map(discovery::MemoryDiscovery::root),
+            Some(discovery::MemoryRoot::GitRoot)
+        ) || self
+            .config
+            .skill_discovery
+            .as_ref()
+            .is_some_and(discovery::SkillDiscovery::needs_git_root);
+        let git_root = if needs_git_root {
+            discovery::git_root(self.env.as_ref(), &cancel).await?
+        } else {
+            None
+        };
+        let mut memory_files = match &self.config.memory_discovery {
+            Some(memory) => match memory.root() {
+                discovery::MemoryRoot::GitRoot => discovery::MemoryDiscovery::candidates(
+                    profile_kind,
+                    git_root.as_deref(),
+                    self.env.working_directory(),
+                ),
+                _ => {
+                    memory
+                        .resolve(self.env.as_ref(), profile_kind, &cancel)
+                        .await?
+                }
+            },
+            None => Vec::new(),
+        };
+        for path in &self.config.memory_files {
+            if !memory_files.contains(path) {
+                memory_files.push(path.clone());
+            }
+        }
+        let mut skill_dirs = self.config.skill_dirs.clone();
+        let mut skill_skipped = Vec::new();
+        if let Some(skills) = &self.config.skill_discovery {
+            let resolved = skills
+                .resolve(self.env.as_ref(), git_root.as_deref(), &cancel)
+                .await?;
+            for dir in resolved.dirs {
+                if !skill_dirs.contains(&dir) {
+                    skill_dirs.push(dir);
+                }
+            }
+            skill_skipped = resolved.skipped;
+        }
 
         // Independent reads of the environment, overlapped; the events they
         // feed stay in their documented order below.
         let (memory, skills) = tokio::join!(
-            ProjectMemory::load(self.env.as_ref(), &self.config.memory_files, &cancel),
-            discover_skills(self.env.as_ref(), &self.config.skill_dirs, &cancel),
+            ProjectMemory::load(self.env.as_ref(), &memory_files, &cancel),
+            discover_skills(self.env.as_ref(), &skill_dirs, &cancel),
         );
 
         let memory = memory?;
@@ -1103,16 +1211,17 @@ impl CodingRuntime {
 
         let discovered = skills?;
         Arc::make_mut(&mut self.resources).skills = discovered.skills;
+        skill_skipped.extend(discovered.skipped);
         self.emit(CodingEvent::SkillsDiscovered {
             profile,
-            source_dirs: self.config.skill_dirs.clone(),
+            source_dirs: skill_dirs,
             skills: self
                 .resources
                 .skills
                 .iter()
                 .map(Skill::to_summary)
                 .collect(),
-            skipped: discovered.skipped,
+            skipped: skill_skipped,
         });
         // The one tool that cannot be built by the builder: what it loads is
         // discovered here, and a session that discovered no skills advertises
@@ -1401,6 +1510,32 @@ impl CodingRuntime {
     /// provider priced it.
     pub(crate) fn last_prompt_cost_usd_micros(&self) -> Option<u64> {
         self.conversation().totals.cost_usd_micros
+    }
+
+    /// The files the last prompt wrote or edited, this session's and its
+    /// children's, in touch order, and the most recent of them.
+    pub(crate) fn last_prompt_files(&self) -> (Vec<String>, Option<String>) {
+        self.conversation().files.snapshot()
+    }
+
+    /// The compactions the last prompt completed, this session's own, in
+    /// order. A manual compaction between prompts belongs to no prompt.
+    pub(crate) fn last_prompt_compactions(&self) -> Vec<CompactionAccount> {
+        self.conversation().totals.compactions.clone()
+    }
+
+    /// The broadcast channel this session's live subscribers are on, for a
+    /// replacement that should keep them.
+    pub(crate) fn published_sender(&self) -> Option<broadcast::Sender<CodingAgentEvent>> {
+        self.emitter.published_sender()
+    }
+
+    /// The `provider/model` this session runs on.
+    pub(crate) fn route(&self) -> String {
+        format!(
+            "{}/{}",
+            self.model_context.provider, self.model_context.model
+        )
     }
 
     /// The shared conversation, locked.
@@ -1957,7 +2092,7 @@ impl CodingRuntime {
     }
 
     /// Publishes one event on this session's stream.
-    fn emit(&self, event: CodingEvent) {
+    pub(crate) fn emit(&self, event: CodingEvent) {
         self.emitter
             .emit(self.session_scope.session_id().to_string(), event);
     }

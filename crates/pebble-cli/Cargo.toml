@@ -4,23 +4,31 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
-description = "Command-line coding agent built on pebble-coding-agent"
+description = "Command-line coding agent built on pebble-coding-agent; the front end lives in pebble-cli-core"
 
 [[bin]]
 name = "pebble"
 path = "src/main.rs"
 
 [dependencies]
+clap = { version = "4.5.47", features = ["derive"] }
+pebble-cli-core = { path = "../pebble-cli-core" }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { version = "=1.1.4", features = ["pty", "termios"] }
+vte = "=0.14.1"
+
+[dev-dependencies]
+# The CLI cases answer the model from a deterministic OpenAI-compatible server
+# running in the test process, so the real codec and transport are exercised
+# with no key and no network. The Rust API scenarios beside them drive the
+# libraries the binary is built from.
 anyhow = "1.0.104"
 async-trait.workspace = true
+axum = "0.8"
 base64 = "=0.22.1"
-clap = { version = "4.5.47", features = ["derive"] }
-crossterm = "=0.29.0"
 futures-util.workspace = true
-fs2 = "=0.4.3"
-humantime = "2.2.0"
-# Every adapter the built-in catalog names, so no provider is reported as
-# unavailable at startup.
 lithos-llm = { workspace = true, features = [
   "runtime",
   "builtin-catalog",
@@ -30,32 +38,15 @@ lithos-llm = { workspace = true, features = [
   "openai",
   "openai-compatible",
 ] }
-pebble-coding-agent = { path = "../pebble-coding-agent" }
 pebble-agent = { path = "../pebble-agent" }
+pebble-coding-agent = { path = "../pebble-coding-agent" }
 serde.workspace = true
 serde_json.workspace = true
-similar = "=2.7.0"
 tempfile = "=3.27.0"
-termimad = "=0.34.1"
-tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal"] }
 tokio-util.workspace = true
-unicode-segmentation = "=1.12.0"
 unicode-width = "=0.2.2"
 uuid = { version = "=1.18.1", features = ["v4"] }
-
-[target.'cfg(unix)'.dependencies]
-rustix = { version = "=1.1.4", features = ["fs", "process"] }
-
-[target.'cfg(unix)'.dev-dependencies]
-rustix = { version = "=1.1.4", features = ["pty", "termios"] }
-vte = "=0.14.1"
-
-[dev-dependencies]
-# The CLI cases answer the model from a deterministic OpenAI-compatible server
-# running in the test process, so the real codec and transport are exercised
-# with no key and no network.
-axum = "0.8"
-tokio = { version = "1.49.0", features = ["net"] }
 trycmd = "1.2.1"
 twin-openai = { git = "https://github.com/lithoscomputer/twins", rev = "fedab8e6b9b8e2577bee7d93812a318d6adb4aa4" }
 

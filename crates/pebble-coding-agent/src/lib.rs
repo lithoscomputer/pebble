@@ -13,17 +13,19 @@
 //! Tool permissions are ordinary `pebble-agent` middleware, with the coding
 //! policies and approval service contracts also in [`tools`].
 //! Durable state is in [`state`]. Optional application services — human input,
-//! search, redaction, the prompt transform — are in [`extensions`], and
-//! subagent configuration is in [`subagents`]. [`ProjectMemory`] is the loader
-//! an agent reads its memory files with, for an application that gives the
-//! same instructions to a model call of its own. The runtime underneath is
-//! not public.
+//! search, redaction, the prompt transform — are in [`extensions`], the search
+//! providers pebble ships are in [`search`] behind the `search-providers`
+//! feature, and subagent configuration is in [`subagents`]. [`ProjectMemory`]
+//! is the loader an agent reads its memory files with, for an application
+//! that gives the same instructions to a model call of its own. The runtime
+//! underneath is not public.
 
 mod char_boundary;
 mod coding_agent;
 mod compaction;
 mod config;
 mod context_window;
+mod discovery;
 pub mod environment;
 mod error;
 mod event;
@@ -33,17 +35,21 @@ mod file_tracker;
 mod history;
 mod human_input;
 mod loop_detection;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 mod memory;
 mod policy;
 mod profile;
 mod profiles;
+pub mod projection;
 mod prompt_transform;
 mod record;
 mod redact;
 mod runtime;
-mod search;
+pub mod search;
 mod skills;
 pub mod state;
+pub mod steering;
 mod subagent;
 pub mod subagents;
 mod task_reminder;
@@ -70,13 +76,16 @@ pub use pebble_agent::{SessionId, SessionScope};
 pub use self::coding_agent::{
     CodingAgent, CodingAgentBuildError, CodingAgentBuilder, CodingAgentControlHandle,
     CodingAgentExport, CodingAgentObservation, CodingAgentSnapshot, CodingInput, ControlSnapshot,
-    PendingInput, PromptOutput, PromptReport, PromptTiming, ResumeMode, ShutdownReason,
-    SteeringMessage, SteeringOutcome,
+    FallbackRoute, PendingInput, PromptOutput, PromptReport, PromptTiming, ResumeMode,
+    ShutdownReason, SteeringMessage, SteeringOutcome,
 };
 pub use self::compaction::{
-    CompactionOptions, CompactionOutcome, CompactionReason, CompactionResult,
+    CompactionAccount, CompactionOptions, CompactionOutcome, CompactionReason, CompactionResult,
 };
 pub use self::config::{CodingAgentOptions, CodingAgentOptionsError};
+pub use self::discovery::{
+    MemoryDiscovery, MemoryRoot, ResolvedSkillDirs, SkillDiscovery, SkillSearch, SkillSearchBase,
+};
 pub use self::error::{CompactionError, Error, InterruptReason, Result, TaskKind};
 pub use self::memory::{MemoryDocument, ProjectMemory};
 pub use self::runtime::SteeringLease;

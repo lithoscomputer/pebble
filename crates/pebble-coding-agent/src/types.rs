@@ -829,6 +829,9 @@ pub enum SkippedSkillReason {
     /// The file was read but is not a skill: its frontmatter is missing,
     /// unterminated, or names no skill.
     Malformed,
+    /// A directory the application required a skill discovery to search
+    /// does not exist.
+    MissingDirectory,
 }
 
 /// How a skill was activated.
@@ -870,6 +873,18 @@ pub enum AgentProfileKind {
 }
 
 impl AgentProfileKind {
+    /// The instruction files this harness reads, in load order: the shared
+    /// `AGENTS.md` first, then the vendor's own name where it has one.
+    #[must_use]
+    pub const fn memory_filenames(self) -> &'static [&'static str] {
+        match self {
+            Self::Anthropic | Self::Claude5 => &["AGENTS.md", "CLAUDE.md"],
+            Self::OpenAi | Self::Gpt56 | Self::Gpt6 => &["AGENTS.md", ".codex/instructions.md"],
+            Self::Gemini => &["AGENTS.md", "GEMINI.md"],
+            Self::Kimi => &["AGENTS.md"],
+        }
+    }
+
     /// Every profile pebble ships.
     ///
     /// A slice rather than an array, so a profile added later does not change
@@ -903,6 +918,29 @@ impl fmt::Display for AgentProfileKind {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
+}
+
+/// What became of one MCP server the application configured, as the
+/// snapshot carries it: a view that starts after the agent was built reads
+/// the outcome here, since the event that reported it has already passed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerStatus {
+    /// The server's configured name.
+    pub server: String,
+    /// The tools it advertised, sorted by registered name; empty when it
+    /// failed.
+    pub tools:  Vec<McpToolSummary>,
+    /// Why it did not start, when it did not.
+    pub error:  Option<String>,
+}
+
+/// One tool an MCP server advertised, as the registry named it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpToolSummary {
+    /// The name the model calls: `mcp__{server}__{tool}`.
+    pub name:          String,
+    /// The server's own name for the tool.
+    pub original_name: String,
 }
 
 /// Something a session did, as seen by an observer.
@@ -1100,6 +1138,37 @@ pub enum CodingEvent {
     ToolRoundsExhausted {
         /// The configured limit, which is also how many rounds ran.
         limit: usize,
+    },
+    /// An MCP server the application configured started and its tools are
+    /// registered, each under `mcp__{server}__{tool}`.
+    McpServerReady {
+        /// The server's configured name.
+        server: String,
+        /// The tools it advertised, sorted by registered name.
+        tools:  Vec<McpToolSummary>,
+    },
+    /// An MCP server the application configured did not start; the session
+    /// runs without its tools.
+    McpServerFailed {
+        /// The server's configured name.
+        server: String,
+        /// Why it did not start.
+        error:  String,
+    },
+    /// The prompt moved to a fallback route after its model failed.
+    ///
+    /// The conversation continued as it stood: no tool effect was repeated.
+    /// Published by the session on its new route, after
+    /// [`SessionStarted`](Self::SessionStarted) reports that route.
+    RouteFailover {
+        /// The `provider/model` that failed.
+        from:    String,
+        /// The `provider/model` the prompt continues on.
+        to:      String,
+        /// How many routes the prompt has moved through, this one included.
+        attempt: u32,
+        /// The failure that ended the previous route.
+        error:   ErrorData,
     },
     /// Steering was injected into the conversation.
     SteeringInjected {
@@ -1445,6 +1514,37 @@ impl CodingEvent {
             Self::LoopDetected => warn!(session_id, "Loop detected"),
             Self::ToolRoundsExhausted { limit } => {
                 warn!(session_id, limit, "Tool round budget exhausted");
+            }
+            Self::McpServerReady { server, tools } => {
+                info!(
+                    session_id,
+                    server = server.as_str(),
+                    tools = tools.len(),
+                    "MCP server ready"
+                );
+            }
+            Self::McpServerFailed { server, error } => {
+                warn!(
+                    session_id,
+                    server = server.as_str(),
+                    error = error.as_str(),
+                    "MCP server failed"
+                );
+            }
+            Self::RouteFailover {
+                from,
+                to,
+                attempt,
+                error,
+            } => {
+                warn!(
+                    session_id,
+                    from = from.as_str(),
+                    to = to.as_str(),
+                    attempt,
+                    error = error.message.as_str(),
+                    "Route failover"
+                );
             }
             Self::SteeringInjected { text, .. } => {
                 debug!(session_id, text_len = text.len(), "Steering injected");

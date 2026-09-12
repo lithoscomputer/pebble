@@ -18,7 +18,9 @@ use pebble_coding_agent::test_support::{
     text_response, tool_call_response,
 };
 use pebble_coding_agent::tools::RegisteredTool;
-use pebble_coding_agent::{CodingAgent, CodingAgentOptions, Error, ShutdownReason};
+use pebble_coding_agent::{
+    CodingAgent, CodingAgentOptions, Error, InterruptReason, ShutdownReason,
+};
 use serde_json::{Value, json};
 use tokio::sync::broadcast;
 
@@ -297,6 +299,67 @@ async fn without_a_budget_tool_rounds_are_unlimited() {
         )),
         0
     );
+    agent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the agent shuts down");
+}
+
+/// The two budgets count different things and are enforced independently:
+/// `max_tool_rounds` refuses a turn that asks for tools past its limit, while
+/// `max_turns` ends the prompt before the model is asked again past its own.
+/// Whichever is reached first ends the prompt, with its own error.
+#[tokio::test]
+async fn both_budgets_apply_and_the_tighter_one_ends_the_prompt() {
+    // Two rounds fit the round budget; the turn budget stops the third ask.
+    let (mut agent, provider, executions) = agent_with(
+        vec![asks_for_a_tool(), asks_for_a_tool(), asks_for_a_tool()],
+        CodingAgentOptions::default()
+            .with_max_tool_rounds(5)
+            .with_max_turns(2),
+    )
+    .await;
+    let report = agent.prompt("work").await;
+    assert!(
+        matches!(
+            report.result,
+            Err(Error::Interrupted(InterruptReason::TurnLimit))
+        ),
+        "the turn budget ends the prompt first: {report:?}"
+    );
+    assert_eq!(
+        provider.call_count(),
+        2,
+        "two turns ran, the third was never asked"
+    );
+    assert_eq!(executions.load(Ordering::SeqCst), 2);
+    assert_eq!(agent.state(), CodingAgentState::Idle);
+    agent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the agent shuts down");
+
+    // One round fits the round budget; the second ask is refused before the
+    // turn budget is anywhere near spent.
+    let (mut agent, provider, executions) = agent_with(
+        vec![asks_for_a_tool(), asks_for_a_tool()],
+        CodingAgentOptions::default()
+            .with_max_tool_rounds(1)
+            .with_max_turns(5),
+    )
+    .await;
+    let report = agent.prompt("work").await;
+    assert!(
+        matches!(report.result, Err(Error::ToolRoundsExhausted { limit: 1 })),
+        "the round budget ends the prompt first: {report:?}"
+    );
+    assert_eq!(
+        provider.call_count(),
+        2,
+        "the refused turn was asked, then refused"
+    );
+    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    assert_eq!(agent.state(), CodingAgentState::Idle);
     agent
         .shutdown(ShutdownReason::Completed)
         .await

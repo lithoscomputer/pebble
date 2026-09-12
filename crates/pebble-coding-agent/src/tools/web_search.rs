@@ -6,7 +6,7 @@ use std::sync::Arc;
 use lithos_llm::types::ToolDefinition;
 use serde_json::Value;
 
-use crate::search::{SearchProvider, SearchRequest, SearchResult};
+use crate::search::seam::{SearchProvider, SearchRequest, SearchResult};
 use crate::tool::{NativeTool, RegisteredTool, optional_integer_arg, required_str};
 use crate::types::ToolSource;
 
@@ -108,7 +108,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::search::{SearchError, SearchErrorKind};
+    use crate::search::seam::{SearchError, SearchErrorKind};
     use crate::test_support::MockEnvironment;
     use crate::tool::ToolError;
     use crate::tools::testing::{context, schema_of};

@@ -32,7 +32,7 @@ use serde_json::Value;
 
 use crate::config::NativeToolOptions;
 use crate::profile::EnvContext;
-use crate::search::SearchProvider;
+use crate::search::seam::SearchProvider;
 use crate::skills::{Skill, format_skills_prompt_section};
 use crate::template::{TemplateContext, TemplateValue, render_named};
 use crate::tool::{NativeTool, RegisteredTool, ToolVocabulary};
@@ -388,7 +388,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::environment::Environment;
     use crate::profile::AgentProfile;
-    use crate::search::{SearchError, SearchRequest, SearchResult};
+    use crate::search::seam::{SearchError, SearchRequest, SearchResult};
     use crate::test_support::MockEnvironment;
     use crate::tool::{NativeTool, ToolContext, ToolRegistry};
     use crate::types::ToolSource;

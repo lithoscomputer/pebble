@@ -210,6 +210,11 @@ pub(crate) struct EventOptions {
     /// [`crate::state::SessionRecord::last_event_seq`] for a
     /// resumed one.
     pub(crate) resume_after_seq: u64,
+
+    /// The broadcast channel a predecessor's live subscribers are on, when
+    /// this pipeline replaces one in the same process and those subscribers
+    /// should keep receiving. Absent opens a new channel.
+    pub(crate) published: Option<broadcast::Sender<CodingAgentEvent>>,
 }
 
 impl fmt::Debug for EventOptions {
@@ -220,6 +225,10 @@ impl fmt::Debug for EventOptions {
             .field("sink", &self.sink.as_ref().map(|_| "<sink>"))
             .field("sink_timeout", &self.sink_timeout)
             .field("resume_after_seq", &self.resume_after_seq)
+            .field(
+                "published",
+                &self.published.as_ref().map(|_| "<predecessor's channel>"),
+            )
             .finish()
     }
 }
@@ -443,6 +452,14 @@ impl Emitter {
         }
     }
 
+    /// The broadcast channel live subscribers are on, while the pump that
+    /// owns it is running. A replacement pipeline publishes on it so those
+    /// subscribers keep receiving.
+    #[must_use]
+    pub(crate) fn published_sender(&self) -> Option<broadcast::Sender<CodingAgentEvent>> {
+        self.published.upgrade()
+    }
+
     /// The highest sequence number the pipeline has committed.
     ///
     /// With a durable sink, commitment means that sink accepted the event.
@@ -620,9 +637,10 @@ impl EventPump {
             sink,
             sink_timeout,
             resume_after_seq,
+            published,
         } = options;
         let (outbox, inbox) = mpsc::channel(capacity.get());
-        let (published, _) = broadcast::channel(capacity.get());
+        let published = published.unwrap_or_else(|| broadcast::channel(capacity.get()).0);
         let sequence = Arc::new(EventSequence::resuming_after(resume_after_seq));
         let state = Arc::new(EventPipelineState::new());
         let emitter = Emitter {
