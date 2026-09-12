@@ -74,6 +74,16 @@ pub struct ToolActivity {
     pub open:   u64,
 }
 
+/// How many child lifecycle events the tree recorded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubagentCounts {
+    pub spawned:       u64,
+    pub turns_started: u64,
+    pub completed:     u64,
+    pub failed:        u64,
+    pub closed:        u64,
+}
+
 /// One MCP server the session configured, and whether it has been called.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerProjection {
@@ -145,6 +155,10 @@ pub struct PromptDelta {
     pub context_window:    Option<ContextWindowSnapshot>,
     /// Tool calls started, across the tree.
     pub tool_calls:        u64,
+    /// What each descendant spent during the prompt, by session id.
+    pub descendants:       BTreeMap<String, DescendantAccount>,
+    /// Child lifecycle events during the prompt.
+    pub subagents:         SubagentCounts,
     /// Compactions the root completed during the prompt.
     pub compactions:       Vec<CompactionProjection>,
     /// Files written or edited during the prompt, across the tree, sorted.
@@ -153,6 +167,12 @@ pub struct PromptDelta {
 }
 
 impl PromptDelta {
+    /// What every descendant spent during the prompt, summed.
+    #[must_use]
+    pub fn descendant_usage(&self) -> (TokenUsage, Option<u64>) {
+        sum_accounts(self.descendants.values())
+    }
+
     fn touch(&mut self, paths: &[String]) {
         for path in paths {
             if !self.files_touched.contains(path) {
@@ -184,6 +204,8 @@ pub struct SessionProjection {
     /// Every MCP server the root configured, by name.
     pub mcp_servers:       BTreeMap<String, McpServerProjection>,
     pub skills:            SkillsProjection,
+    /// Child lifecycle events over the session's life.
+    pub subagent_counts:   SubagentCounts,
     /// Every todo list in the tree, by list id.
     pub todos:             BTreeMap<String, TodoListProjection>,
     pub subagents:         Vec<SubagentProjection>,
@@ -270,10 +292,14 @@ impl SessionProjection {
                         self.prompt.context_window = Some(window.clone());
                     }
                 } else if let Some(parent) = &event.parent_session_id {
-                    let account = self.descendant(&event.session_id, parent);
-                    account.usage = account.usage.saturating_add(*usage);
-                    add_cost(&mut account.cost_usd_micros, *cost_usd_micros);
-                    account.messages += 1;
+                    for account in [
+                        descendant(&mut self.descendants, &event.session_id, parent),
+                        descendant(&mut self.prompt.descendants, &event.session_id, parent),
+                    ] {
+                        account.usage = account.usage.saturating_add(*usage);
+                        add_cost(&mut account.cost_usd_micros, *cost_usd_micros);
+                        account.messages += 1;
+                    }
                 }
             }
             CodingEvent::ToolCallStarted {
@@ -379,6 +405,8 @@ impl SessionProjection {
                 task,
                 ..
             } if is_root => {
+                self.subagent_counts.spawned += 1;
+                self.prompt.subagents.spawned += 1;
                 if let Some(existing) = self.subagent_mut(agent_id) {
                     existing.status = SubagentStatus::Running;
                 } else {
@@ -391,6 +419,8 @@ impl SessionProjection {
                 }
             }
             CodingEvent::SubAgentTurnStarted { agent_id, .. } if is_root => {
+                self.subagent_counts.turns_started += 1;
+                self.prompt.subagents.turns_started += 1;
                 self.set_subagent_status(agent_id, SubagentStatus::Running);
             }
             CodingEvent::SubAgentCompleted {
@@ -399,6 +429,8 @@ impl SessionProjection {
                 turns_used,
                 ..
             } if is_root => {
+                self.subagent_counts.completed += 1;
+                self.prompt.subagents.completed += 1;
                 self.set_subagent_status(agent_id, SubagentStatus::Completed {
                     success:    *success,
                     turns_used: *turns_used,
@@ -407,11 +439,15 @@ impl SessionProjection {
             CodingEvent::SubAgentFailed {
                 agent_id, error, ..
             } if is_root => {
+                self.subagent_counts.failed += 1;
+                self.prompt.subagents.failed += 1;
                 self.set_subagent_status(agent_id, SubagentStatus::Failed {
                     error: error.clone(),
                 });
             }
             CodingEvent::SubAgentClosed { agent_id, .. } if is_root => {
+                self.subagent_counts.closed += 1;
+                self.prompt.subagents.closed += 1;
                 self.set_subagent_status(agent_id, SubagentStatus::Closed);
             }
             CodingEvent::CompactionCompleted {
@@ -432,7 +468,9 @@ impl SessionProjection {
                     self.prompt.compactions.push(compaction.clone());
                     self.compactions.push(compaction);
                 } else if let Some(parent) = &event.parent_session_id {
-                    self.descendant(&event.session_id, parent).compactions += 1;
+                    descendant(&mut self.descendants, &event.session_id, parent).compactions += 1;
+                    descendant(&mut self.prompt.descendants, &event.session_id, parent)
+                        .compactions += 1;
                 }
             }
             _ => {}
@@ -446,25 +484,10 @@ impl SessionProjection {
         }
     }
 
-    /// What every descendant spent, summed.
+    /// What every descendant spent over the session's life, summed.
     #[must_use]
     pub fn descendant_usage(&self) -> (TokenUsage, Option<u64>) {
-        let mut usage = TokenUsage::default();
-        let mut cost = None;
-        for account in self.descendants.values() {
-            usage = usage.saturating_add(account.usage);
-            add_cost(&mut cost, account.cost_usd_micros);
-        }
-        (usage, cost)
-    }
-
-    fn descendant(&mut self, session_id: &str, parent: &str) -> &mut DescendantAccount {
-        self.descendants
-            .entry(session_id.to_owned())
-            .or_insert_with(|| DescendantAccount {
-                parent: parent.to_owned(),
-                ..DescendantAccount::default()
-            })
+        sum_accounts(self.descendants.values())
     }
 
     fn subagent_mut(&mut self, agent_id: &str) -> Option<&mut SubagentProjection> {
@@ -478,6 +501,31 @@ impl SessionProjection {
             subagent.status = status;
         }
     }
+}
+
+fn descendant<'a>(
+    accounts: &'a mut BTreeMap<String, DescendantAccount>,
+    session_id: &str,
+    parent: &str,
+) -> &'a mut DescendantAccount {
+    accounts
+        .entry(session_id.to_owned())
+        .or_insert_with(|| DescendantAccount {
+            parent: parent.to_owned(),
+            ..DescendantAccount::default()
+        })
+}
+
+fn sum_accounts<'a>(
+    accounts: impl Iterator<Item = &'a DescendantAccount>,
+) -> (TokenUsage, Option<u64>) {
+    let mut usage = TokenUsage::default();
+    let mut cost = None;
+    for account in accounts {
+        usage = usage.saturating_add(account.usage);
+        add_cost(&mut cost, account.cost_usd_micros);
+    }
+    (usage, cost)
 }
 
 fn add_cost(total: &mut Option<u64>, cost: Option<u64>) {
@@ -568,7 +616,20 @@ mod tests {
         assert_eq!(descendant_usage.input, 7);
         assert_eq!(descendant_cost, None);
         assert_eq!(projection.descendants["ses_child"].parent, "ses_root");
+        assert_eq!(
+            projection.prompt.descendant_usage().0.input,
+            7,
+            "the prompt's delta keeps the descendants' spend apart from the root's"
+        );
         assert_eq!(projection.prompts, 1);
+
+        projection.apply(&root(CodingEvent::UserInput {
+            text:    "again".into(),
+            content: None,
+            source:  InputSource::Prompt,
+        }));
+        assert!(projection.prompt.descendants.is_empty());
+        assert_eq!(projection.descendants.len(), 1, "the lifetime map keeps it");
     }
 
     #[test]
@@ -755,6 +816,14 @@ mod tests {
             "a reused child stays one row"
         );
         assert_eq!(projection.subagents[0].status, SubagentStatus::Running);
+        assert_eq!(projection.subagent_counts, SubagentCounts {
+            spawned:       1,
+            turns_started: 1,
+            completed:     1,
+            failed:        0,
+            closed:        0,
+        });
+        assert_eq!(projection.prompt.subagents, projection.subagent_counts);
     }
 
     #[test]

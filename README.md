@@ -159,8 +159,10 @@ which tools ran and how often they failed, the MCP servers and whether they
 were called, skills, todo lists, the children and how they ended,
 compactions, and the files touched. It is serializable, so a view resumes
 from a stored value, and it keeps a `PromptDelta` for the prompt in progress,
-because a retained session spans stages. It reports counts; pricing them from
-a catalog stays with the application.
+because a retained session spans stages: the root's spend, each descendant's,
+the child lifecycle counts, compactions, and files touched, all restarted at
+each prompt. It reports counts; pricing them from a catalog stays with the
+application.
 
 `CodingAgent::export_for_reuse(reason)` closes the agent and returns the
 export a successor continues from, its cursor already past the close, so an
