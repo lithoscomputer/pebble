@@ -886,36 +886,17 @@ impl CodingAgentBuilder {
                 recipe: self.inner.clone(),
             })
         });
-        let inner = match self.resume {
-            Some(ResumeSource::Record(record, mode)) => {
-                let mut inner = CodingRuntime::from_record(*record, &mode, self.inner)?;
-                if let Err(source) = inner.initialize().await {
-                    let _ = inner.shutdown(ShutdownReason::Error).await;
-                    return Err(CodingAgentBuildError::Initialization {
-                        source: Box::new(source),
-                    });
+        let inner = match Self::build_runtime(self.resume, self.inner).await {
+            Ok(inner) => inner,
+            Err(error) => {
+                // The servers were started for an agent that will not exist:
+                // closed as the agent's own shutdown would close them, so no
+                // process or route outlives the failed build.
+                #[cfg(feature = "mcp")]
+                if let Some(mut servers) = mcp {
+                    servers.shutdown().await;
                 }
-                inner
-            }
-            Some(ResumeSource::Export(state)) => {
-                let mut inner = CodingRuntime::from_warm_state(*state, self.inner)?;
-                if let Err(source) = inner.start_from_warm_state().await {
-                    let _ = inner.shutdown(ShutdownReason::Error).await;
-                    return Err(CodingAgentBuildError::Initialization {
-                        source: Box::new(source),
-                    });
-                }
-                inner
-            }
-            None => {
-                let mut inner = self.inner.build()?;
-                if let Err(source) = inner.initialize().await {
-                    let _ = inner.shutdown(ShutdownReason::Error).await;
-                    return Err(CodingAgentBuildError::Initialization {
-                        source: Box::new(source),
-                    });
-                }
-                inner
+                return Err(error);
             }
         };
         let control = CodingControl::new(&inner);
@@ -943,6 +924,38 @@ impl CodingAgentBuilder {
             #[cfg(feature = "mcp")]
             mcp,
         })
+    }
+
+    /// Builds and initializes the runtime, fresh or from `resume`. A runtime
+    /// whose initialization fails is shut down before the error is returned.
+    async fn build_runtime(
+        resume: Option<ResumeSource>,
+        inner: CodingRuntimeBuilder,
+    ) -> Result<CodingRuntime, CodingAgentBuildError> {
+        let (mut runtime, started) = match resume {
+            Some(ResumeSource::Record(record, mode)) => {
+                let mut runtime = CodingRuntime::from_record(*record, &mode, inner)?;
+                let started = runtime.initialize().await;
+                (runtime, started)
+            }
+            Some(ResumeSource::Export(state)) => {
+                let mut runtime = CodingRuntime::from_warm_state(*state, inner)?;
+                let started = runtime.start_from_warm_state().await;
+                (runtime, started)
+            }
+            None => {
+                let mut runtime = inner.build()?;
+                let started = runtime.initialize().await;
+                (runtime, started)
+            }
+        };
+        if let Err(source) = started {
+            let _ = runtime.shutdown(ShutdownReason::Error).await;
+            return Err(CodingAgentBuildError::Initialization {
+                source: Box::new(source),
+            });
+        }
+        Ok(runtime)
     }
 }
 

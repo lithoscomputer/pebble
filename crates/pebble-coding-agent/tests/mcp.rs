@@ -27,7 +27,8 @@ use axum::routing::{get, post};
 use futures_util::{StreamExt as _, stream};
 use pebble_coding_agent::environment::{Environment, LocalEnvironment};
 use pebble_coding_agent::events::{
-    CodingAgentEvent, CodingEvent, McpServerStatus, McpToolSummary, PermissionLevel, ToolSource,
+    CodingAgentEvent, CodingEvent, McpServerStatus, McpToolSummary, PermissionLevel, ToolErrorKind,
+    ToolSource,
 };
 use pebble_coding_agent::mcp::{McpHttpProtocol, McpPlacement, McpServer, qualified_tool_name};
 use pebble_coding_agent::test_support::{
@@ -92,7 +93,9 @@ fn ready_events(published: &[CodingEvent]) -> Vec<(String, Vec<McpToolSummary>)>
     published
         .iter()
         .filter_map(|event| match event {
-            CodingEvent::McpServerReady { server, tools } => Some((server.clone(), tools.clone())),
+            CodingEvent::McpServerReady { server, tools, .. } => {
+                Some((server.clone(), tools.clone()))
+            }
             _ => None,
         })
         .collect()
@@ -102,7 +105,37 @@ fn failed_events(published: &[CodingEvent]) -> Vec<(String, String)> {
     published
         .iter()
         .filter_map(|event| match event {
-            CodingEvent::McpServerFailed { server, error } => Some((server.clone(), error.clone())),
+            CodingEvent::McpServerFailed { server, error, .. } => {
+                Some((server.clone(), error.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The startup time each server's outcome event reported, by name.
+fn startup_events(published: &[CodingEvent]) -> Vec<(String, u64)> {
+    published
+        .iter()
+        .filter_map(|event| match event {
+            CodingEvent::McpServerReady {
+                server, startup_ms, ..
+            }
+            | CodingEvent::McpServerFailed {
+                server, startup_ms, ..
+            } => Some((server.clone(), *startup_ms)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn disconnected_events(published: &[CodingEvent]) -> Vec<(String, String)> {
+    published
+        .iter()
+        .filter_map(|event| match event {
+            CodingEvent::McpServerDisconnected { server, error } => {
+                Some((server.clone(), error.clone()))
+            }
             _ => None,
         })
         .collect()
@@ -142,14 +175,19 @@ async fn a_stdio_servers_tools_reach_the_model_and_its_call_comes_back() {
 
     // Ready before the first prompt, tools registered with their source, and
     // the outcome on the snapshot for a view that starts now.
-    assert_eq!(agent.snapshot().mcp_servers(), [McpServerStatus {
-        server: "echo".to_owned(),
-        tools:  vec![McpToolSummary {
-            name:          "mcp__echo__echo".to_owned(),
-            original_name: "echo".to_owned(),
-        }],
-        error:  None,
+    let statuses: Vec<McpServerStatus> = agent.snapshot().mcp_servers().to_vec();
+    assert_eq!(statuses.len(), 1, "{statuses:?}");
+    let status = &statuses[0];
+    assert_eq!(status.server, "echo");
+    assert_eq!(status.tools, [McpToolSummary {
+        name:          "mcp__echo__echo".to_owned(),
+        original_name: "echo".to_owned(),
     }]);
+    assert_eq!(status.error, None);
+    assert!(
+        status.startup_ms > 0,
+        "launching a process and listing its tools takes time: {status:?}"
+    );
     let published = drained(&mut events);
     assert_eq!(
         ready_events(&published),
@@ -158,6 +196,11 @@ async fn a_stdio_servers_tools_reach_the_model_and_its_call_comes_back() {
             original_name: "echo".to_owned(),
         }])],
         "{published:?}"
+    );
+    assert_eq!(
+        startup_events(&published),
+        [("echo".to_owned(), status.startup_ms)],
+        "the event and the snapshot report the same startup time"
     );
     let tool = agent
         .snapshot()
@@ -275,7 +318,8 @@ async fn an_error_result_and_a_slow_call_reach_the_model_as_tool_errors() {
     let report = agent.prompt("wait").await;
 
     assert!(report.result.is_ok(), "{report:?}");
-    let completions = tool_completions(&drained(&mut events));
+    let published = drained(&mut events);
+    let completions = tool_completions(&published);
     assert_eq!(completions.len(), 1);
     assert!(
         completions[0].2,
@@ -288,6 +332,81 @@ async fn an_error_result_and_a_slow_call_reach_the_model_as_tool_errors() {
             .contains("did not answer within"),
         "{:?}",
         completions[0].1
+    );
+    let kinds: Vec<Option<ToolErrorKind>> = published
+        .iter()
+        .filter_map(|event| match event {
+            CodingEvent::ToolCallCompleted { error_kind, .. } => Some(*error_kind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [Some(ToolErrorKind::Timeout)],
+        "the completion names the timeout as its kind"
+    );
+    agent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the agent shuts down");
+}
+
+#[tokio::test]
+async fn a_server_that_dies_mid_call_is_reported_disconnected_once_and_later_calls_fail() {
+    let server = stdio_echo_server("echo").with_tool_timeout(Duration::from_secs(5));
+    let (mut agent, mut events) = agent_with(
+        vec![
+            ScriptedCall::response(tool_call_response(
+                "mcp__echo__echo",
+                "dies",
+                json!({"message": "__exit__"}),
+            )),
+            ScriptedCall::response(tool_call_response(
+                "mcp__echo__echo",
+                "after",
+                json!({"message": "still there?"}),
+            )),
+            ScriptedCall::response(tool_call_response(
+                "mcp__echo__echo",
+                "again",
+                json!({"message": "and now?"}),
+            )),
+            ScriptedCall::response(text_response("gone")),
+        ],
+        vec![server],
+    )
+    .await;
+    assert_eq!(ready_events(&drained(&mut events)).len(), 1);
+
+    let report = agent.prompt("poke").await;
+
+    assert!(report.result.is_ok(), "{report:?}");
+    let published = drained(&mut events);
+    let disconnected = disconnected_events(&published);
+    assert_eq!(disconnected.len(), 1, "reported once: {published:?}");
+    assert_eq!(disconnected[0].0, "echo");
+    assert!(!disconnected[0].1.is_empty(), "the close has a reason");
+    let completions = tool_completions(&published);
+    assert_eq!(completions.len(), 3, "{published:?}");
+    assert!(
+        completions.iter().all(|(_, _, is_error)| *is_error),
+        "every call after the death fails: {completions:?}"
+    );
+    for (_, output, _) in &completions[1..] {
+        assert!(
+            output.to_string().contains("connection is closed"),
+            "{output:?}"
+        );
+    }
+    let first_disconnect = published
+        .iter()
+        .position(|event| matches!(event, CodingEvent::McpServerDisconnected { .. }));
+    let first_completion = published
+        .iter()
+        .position(|event| matches!(event, CodingEvent::ToolCallCompleted { .. }));
+    assert!(
+        first_disconnect < first_completion,
+        "the disconnect is on the stream before the call that saw it completes: {published:?}"
     );
     agent
         .shutdown(ShutdownReason::Completed)
@@ -441,6 +560,101 @@ async fn a_streamable_http_server_is_reached_with_its_headers() {
         seen.iter().all(|token| token.as_deref() == Some("secret")),
         "every request carried the header: {seen:?}"
     );
+    agent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the agent shuts down");
+}
+
+#[tokio::test]
+async fn a_streamable_http_server_that_starts_listening_late_is_waited_for() {
+    let port = free_port().await;
+    let router = Router::new()
+        .route("/mcp", post(streamable))
+        .with_state(HttpEcho::default());
+    // The server binds its port only after the agent has started waiting for
+    // it, as one an application spawns just before building the agent does.
+    tokio::spawn(async move {
+        sleep(Duration::from_millis(500)).await;
+        let listener = TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("the port is free");
+        axum::serve(listener, router)
+            .await
+            .expect("the server runs");
+    });
+    let server = McpServer::new("late", McpPlacement::Http {
+        url:      format!("http://127.0.0.1:{port}/mcp"),
+        headers:  BTreeMap::new(),
+        protocol: McpHttpProtocol::StreamableHttp,
+    })
+    .with_startup_timeout(Duration::from_secs(5));
+    let (mut agent, mut events) = agent_with(
+        vec![
+            ScriptedCall::response(tool_call_response(
+                "mcp__late__echo",
+                "call_1",
+                json!({"message": "waited"}),
+            )),
+            ScriptedCall::response(text_response("done")),
+        ],
+        vec![server],
+    )
+    .await;
+
+    let published = drained(&mut events);
+    assert_eq!(ready_events(&published).len(), 1, "{published:?}");
+    let startups = startup_events(&published);
+    assert!(
+        startups[0].1 >= 300,
+        "the start waited for the server to listen: {startups:?}"
+    );
+    let report = agent.prompt("echo").await;
+    assert!(report.result.is_ok(), "{report:?}");
+    let completions = tool_completions(&drained(&mut events));
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].1, json!("echo: waited"));
+    agent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the agent shuts down");
+}
+
+#[tokio::test]
+async fn an_http_server_nothing_listens_for_fails_after_its_startup_timeout() {
+    let port = free_port().await;
+    let server = McpServer::new("absent", McpPlacement::Http {
+        url:      format!("http://127.0.0.1:{port}/mcp"),
+        headers:  BTreeMap::new(),
+        protocol: McpHttpProtocol::StreamableHttp,
+    })
+    .with_startup_timeout(Duration::from_secs(1));
+    let started = Instant::now();
+    let (mut agent, mut events) =
+        agent_with(vec![ScriptedCall::response(text_response("alone"))], vec![
+            server,
+        ])
+        .await;
+    let waited = started.elapsed();
+
+    assert!(
+        waited >= Duration::from_secs(1),
+        "the server is waited for until the startup timeout, not failed at once: {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(10),
+        "the startup timeout bounds the wait: {waited:?}"
+    );
+    let published = drained(&mut events);
+    let failed = failed_events(&published);
+    assert_eq!(failed.len(), 1, "{published:?}");
+    assert_eq!(failed[0].0, "absent");
+    assert_eq!(
+        failed[0].1,
+        "the server did not complete the MCP handshake within 1s"
+    );
+    assert!(ready_events(&published).is_empty());
+    assert!(startup_events(&published)[0].1 >= 1_000, "{published:?}");
     agent
         .shutdown(ShutdownReason::Completed)
         .await
@@ -731,15 +945,58 @@ async fn a_server_launched_in_the_environment_is_reached_through_its_port_and_st
         .expect("the agent shuts down");
 
     // The server is stopped with the agent: its port frees up.
-    let mut freed = false;
+    assert!(
+        port_frees_up(port).await,
+        "the server released port {port} after shutdown"
+    );
+    let _ = fs::remove_dir_all(&work);
+}
+
+/// Whether `port` becomes bindable within a few seconds.
+async fn port_frees_up(port: u16) -> bool {
     for _ in 0..50 {
         if TcpListener::bind(("127.0.0.1", port)).await.is_ok() {
-            freed = true;
-            break;
+            return true;
         }
         sleep(Duration::from_millis(100)).await;
     }
-    assert!(freed, "the server released port {port} after shutdown");
+    false
+}
+
+#[tokio::test]
+async fn a_build_that_fails_after_the_servers_started_stops_them() {
+    let work = tempdir();
+    let environment: Arc<dyn Environment> = Arc::new(LocalEnvironment::new(&work));
+    let port = free_port().await;
+    let server = McpServer::new("inside", McpPlacement::Environment {
+        command: vec![
+            "python3".to_owned(),
+            fixture("mcp_http_echo_server.py").display().to_string(),
+            port.to_string(),
+        ],
+        port,
+        env: BTreeMap::new(),
+        protocol: McpHttpProtocol::StreamableHttp,
+        path: Some("/mcp".to_owned()),
+    })
+    .with_startup_timeout(Duration::from_secs(15));
+    let (client, _provider) = client_from(ScriptedProvider::new(Vec::new()));
+
+    // The servers start before the runtime is built, and the runtime is
+    // built against a model the client does not know.
+    let built = CodingAgent::builder(client, Arc::clone(&environment))
+        .model("test/no-such-model")
+        .options(CodingAgentOptions::default().with_loop_detection(false))
+        .mcp_servers([server])
+        .build()
+        .await;
+
+    assert!(built.is_err(), "the unknown model fails the build");
+    drop(built);
+    assert!(
+        port_frees_up(port).await,
+        "the server launched for the failed build released port {port}"
+    );
     let _ = fs::remove_dir_all(&work);
 }
 
@@ -775,7 +1032,8 @@ async fn an_environment_server_that_never_listens_fails_within_its_startup_timeo
     );
     let mut events = agent.subscribe();
     agent.flush_events().await.expect("events flush");
-    let failed = failed_events(&drained(&mut events));
+    let published = drained(&mut events);
+    let failed = failed_events(&published);
     assert_eq!(failed.len(), 1);
     assert_eq!(failed[0].0, "silent");
     assert!(
@@ -783,6 +1041,17 @@ async fn an_environment_server_that_never_listens_fails_within_its_startup_timeo
         "{}",
         failed[0].1
     );
+    // The failure came from the startup timeout, so it took at least that
+    // long, and the snapshot says the same.
+    let startups = startup_events(&published);
+    assert_eq!(startups.len(), 1, "{published:?}");
+    assert!(
+        startups[0].1 >= 2_000,
+        "the failure waited out the startup timeout: {startups:?}"
+    );
+    let statuses = agent.snapshot().mcp_servers().to_vec();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].startup_ms, startups[0].1);
     agent
         .shutdown(ShutdownReason::Completed)
         .await

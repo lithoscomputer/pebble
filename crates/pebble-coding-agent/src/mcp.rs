@@ -12,7 +12,9 @@
 //! - [`McpPlacement::Stdio`]: a child process of the application, never of the
 //!   sandbox.
 //! - [`McpPlacement::Http`]: a server reached over HTTP, by the streamable HTTP
-//!   transport or the older SSE one.
+//!   transport or the older SSE one. The server gets the startup timeout to
+//!   start answering, so one the application spawns just before building the
+//!   agent is waited for rather than failed on the first refused connection.
 //! - [`McpPlacement::Environment`]: a server launched through
 //!   [`Environment::exec`] and reached over HTTP through the environment's
 //!   route to its port. The route is sandbox-driver's [`PreviewUrls`] facet,
@@ -30,7 +32,11 @@
 //! started, each reported as [`McpServerReady`](CodingEvent::McpServerReady).
 //! A tool result the server marks `isError` reaches the model as the tool's
 //! error text; a transport failure, a timeout, or a cancellation reaches it as
-//! a failed call with a reason.
+//! a failed call with a reason. A server whose connection closes during the
+//! session is reported once as
+//! [`McpServerDisconnected`](CodingEvent::McpServerDisconnected), by the call
+//! that first observed the close; every later call to its tools fails until
+//! the session ends.
 
 mod client;
 mod sse;
@@ -38,7 +44,7 @@ mod sse;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use client::{CallOutcome, Connection, DiscoveredTool};
 use lithos_llm::types::ToolDefinition;
@@ -74,7 +80,8 @@ impl McpServer {
     }
 
     /// Sets how long the server gets to complete the MCP handshake and list
-    /// its tools, launch included.
+    /// its tools, launch included. A server reached over HTTP gets the same
+    /// time to start answering at its URL.
     #[must_use]
     pub const fn with_startup_timeout(mut self, timeout: Duration) -> Self {
         self.startup_timeout = timeout;
@@ -130,7 +137,8 @@ pub enum McpPlacement {
         /// Whether the child sees only `env`, not the application's variables.
         clear_env:   bool,
     },
-    /// A server reached over HTTP from the application.
+    /// A server reached over HTTP from the application. It gets the startup
+    /// timeout to start answering at `url` before the handshake is tried.
     Http {
         /// The endpoint URL.
         url:      String,
@@ -206,43 +214,72 @@ fn sanitize_name(name: &str) -> String {
 #[derive(Clone, Debug)]
 pub(crate) enum McpServerOutcome {
     Ready {
-        server: String,
-        tools:  Vec<McpToolSummary>,
+        server:  String,
+        tools:   Vec<McpToolSummary>,
+        /// From launch to the tools being listed.
+        startup: Duration,
     },
     Failed {
-        server: String,
-        error:  String,
+        server:  String,
+        error:   String,
+        /// From launch to the failure.
+        startup: Duration,
     },
 }
 
 impl McpServerOutcome {
     pub(crate) fn to_status(&self) -> McpServerStatus {
         match self {
-            Self::Ready { server, tools } => McpServerStatus {
-                server: server.clone(),
-                tools:  tools.clone(),
-                error:  None,
+            Self::Ready {
+                server,
+                tools,
+                startup,
+            } => McpServerStatus {
+                server:     server.clone(),
+                tools:      tools.clone(),
+                error:      None,
+                startup_ms: whole_millis(*startup),
             },
-            Self::Failed { server, error } => McpServerStatus {
-                server: server.clone(),
-                tools:  Vec::new(),
-                error:  Some(error.clone()),
+            Self::Failed {
+                server,
+                error,
+                startup,
+            } => McpServerStatus {
+                server:     server.clone(),
+                tools:      Vec::new(),
+                error:      Some(error.clone()),
+                startup_ms: whole_millis(*startup),
             },
         }
     }
 
     pub(crate) fn to_event(&self) -> CodingEvent {
         match self {
-            Self::Ready { server, tools } => CodingEvent::McpServerReady {
-                server: server.clone(),
-                tools:  tools.clone(),
+            Self::Ready {
+                server,
+                tools,
+                startup,
+            } => CodingEvent::McpServerReady {
+                server:     server.clone(),
+                tools:      tools.clone(),
+                startup_ms: whole_millis(*startup),
             },
-            Self::Failed { server, error } => CodingEvent::McpServerFailed {
-                server: server.clone(),
-                error:  error.clone(),
+            Self::Failed {
+                server,
+                error,
+                startup,
+            } => CodingEvent::McpServerFailed {
+                server:     server.clone(),
+                error:      error.clone(),
+                startup_ms: whole_millis(*startup),
             },
         }
     }
+}
+
+/// `duration` in whole milliseconds, saturating.
+fn whole_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// One agent's MCP servers: started, their tools registered, and closed with
@@ -267,9 +304,12 @@ impl McpServers {
             outcomes:    Vec::with_capacity(servers.len()),
         };
         for server in servers {
+            let launched = Instant::now();
             // Boxed: the start future carries the readiness probe and the
             // route, and would otherwise weigh on every future above it.
-            match Box::pin(Connection::start(server, environment, routes)).await {
+            let started_in = Box::pin(Connection::start(server, environment, routes)).await;
+            let startup = launched.elapsed();
+            match started_in {
                 Ok((connection, tools)) => {
                     let connection = Arc::new(connection);
                     let mut summaries: Vec<McpToolSummary> = tools
@@ -285,19 +325,31 @@ impl McpServers {
                             .tools
                             .push(registered_tool(&connection, server, tool));
                     }
-                    tracing::info!(server = %server.name, tools = summaries.len(), "MCP server ready");
+                    tracing::info!(
+                        server = %server.name,
+                        tools = summaries.len(),
+                        startup_ms = whole_millis(startup),
+                        "MCP server ready"
+                    );
                     started.outcomes.push(McpServerOutcome::Ready {
                         server: server.name.clone(),
-                        tools:  summaries,
+                        tools: summaries,
+                        startup,
                     });
                     started.connections.push((server.name.clone(), connection));
                 }
                 Err(error) => {
                     let error = error.to_string();
-                    tracing::error!(server = %server.name, error = %error, "MCP server failed to start");
+                    tracing::error!(
+                        server = %server.name,
+                        error = %error,
+                        startup_ms = whole_millis(startup),
+                        "MCP server failed to start"
+                    );
                     started.outcomes.push(McpServerOutcome::Failed {
                         server: server.name.clone(),
                         error,
+                        startup,
                     });
                 }
             }
@@ -354,16 +406,25 @@ fn registered_tool(
         let server_name = server_name.clone();
         let original = original.clone();
         Box::pin(async move {
-            match connection
+            let outcome = connection
                 .call(&original, arguments, context.cancel())
-                .await
-            {
+                .await;
+            // The close is reported by the call that first observed it, on
+            // the stream of whichever session made that call; the flag on the
+            // connection keeps it to one report for the connection's life.
+            if let Some(error) = connection.unreported_disconnect() {
+                context.emit_coding_event(CodingEvent::McpServerDisconnected {
+                    server: server_name.clone(),
+                    error:  error.to_owned(),
+                });
+            }
+            match outcome {
                 CallOutcome::Ok(text) => Ok(text),
                 CallOutcome::ToolError(text) => Err(ToolError::execution(text)),
                 CallOutcome::Failed(message) => Err(ToolError::unavailable(format!(
                     "MCP server `{server_name}` failed the call to `{original}`: {message}"
                 ))),
-                CallOutcome::Timeout(timeout) => Err(ToolError::execution(format!(
+                CallOutcome::Timeout(timeout) => Err(ToolError::timeout(format!(
                     "MCP tool `{original}` on server `{server_name}` did not answer within {}s",
                     timeout.as_secs()
                 ))),

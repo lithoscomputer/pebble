@@ -41,6 +41,8 @@ pub enum ToolErrorKind {
     Unavailable,
     /// The tool ran and returned an error.
     Execution,
+    /// The tool did not answer within its configured time.
+    Timeout,
 }
 
 /// Byte counts for the output one tool call produced.

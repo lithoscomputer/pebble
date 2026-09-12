@@ -148,6 +148,12 @@ impl ToolError {
         Self::new(ToolErrorKind::Execution, message)
     }
 
+    /// The tool did not answer within its configured time.
+    #[must_use]
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self::new(ToolErrorKind::Timeout, message)
+    }
+
     /// The same failure, said differently to the model.
     ///
     /// The kind and the cause are kept, so this is how a caller adds what only
@@ -257,6 +263,10 @@ mod tests {
         assert_eq!(
             ToolError::execution("boom").kind(),
             ToolErrorKind::Execution
+        );
+        assert_eq!(
+            ToolError::timeout("too slow").kind(),
+            ToolErrorKind::Timeout
         );
     }
 

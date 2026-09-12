@@ -173,13 +173,21 @@ expression: render(&every_variant())
           "name": "mcp__github__list_issues",
           "original_name": "list_issues"
         }
-      ]
+      ],
+      "startup_ms": 842
     }
   },
   {
     "McpServerFailed": {
       "server": "filesystem",
-      "error": "could not launch `npx`: No such file or directory"
+      "error": "could not launch `npx`: No such file or directory",
+      "startup_ms": 4
+    }
+  },
+  {
+    "McpServerDisconnected": {
+      "server": "github",
+      "error": "transport closed"
     }
   },
   {
