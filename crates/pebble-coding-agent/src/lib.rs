@@ -49,6 +49,7 @@ mod runtime;
 pub mod search;
 mod skills;
 pub mod state;
+pub mod steering;
 mod subagent;
 pub mod subagents;
 mod task_reminder;

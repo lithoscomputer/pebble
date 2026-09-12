@@ -164,6 +164,16 @@ the child lifecycle counts, compactions, and files touched, all restarted at
 each prompt. It reports counts; pricing them from a catalog stays with the
 application.
 
+`pebble_coding_agent::steering::SteeringBus` is one control plane for many
+sessions: sessions attach at a key of the application's choosing (a stage, a
+node) and detach; a steer or an interrupt reaches every attached session; a
+steer that arrives with none attached waits on the bus, up to a cap, and
+drains into the next attachment; and a hold keeps an attached session's
+natural completion open while a party is paired with it. Sessions implement
+`SteerableSession`; `CodingAgentControlHandle` does natively. Every operation
+returns what it did, so the application records buffered and dropped steers
+in its own vocabulary and order.
+
 `CodingAgent::export_for_reuse(reason)` closes the agent and returns the
 export a successor continues from, its cursor already past the close, so an
 application no longer takes an export, shuts down, and advances the cursor by
