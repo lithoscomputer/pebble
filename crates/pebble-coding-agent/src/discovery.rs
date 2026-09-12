@@ -388,9 +388,8 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::environment::{ExecOutcome, ExecResult};
+    use crate::environment::ExecResult;
     use crate::test_support::MockEnvironment;
-    use crate::tools::OutputCaptureStats;
     use crate::types::CommandTermination;
 
     #[test]
@@ -432,17 +431,12 @@ mod tests {
 
     fn git_env(stdout: &str) -> MockEnvironment {
         MockEnvironment {
-            exec_result: ExecOutcome {
-                result:            ExecResult {
-                    stdout:      stdout.to_owned(),
-                    stderr:      String::new(),
-                    exit_code:   Some(0),
-                    termination: CommandTermination::Exited,
-                    duration_ms: 1,
-                },
-                streams_separated: true,
-                stdout_capture:    OutputCaptureStats::complete(stdout.len()),
-                stderr_capture:    OutputCaptureStats::complete(0),
+            exec_result: ExecResult {
+                stdout:      stdout.to_owned(),
+                stderr:      String::new(),
+                exit_code:   Some(0),
+                termination: CommandTermination::Exited,
+                duration_ms: 1,
             },
             ..MockEnvironment::linux()
         }

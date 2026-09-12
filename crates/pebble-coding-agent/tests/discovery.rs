@@ -7,16 +7,30 @@
 //! system prompt the model is given.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use lithos_llm::types::Role;
-use pebble_coding_agent::events::{CodingEvent, SkippedSkillReason};
+use pebble_coding_agent::events::{
+    CodingAgentEvent, CodingEvent, EventSink, EventSinkError, SkippedSkillReason,
+};
 use pebble_coding_agent::test_support::{
     MockEnvironment, ScriptedCall, ScriptedProvider, client_from, message_text, text_response,
 };
 use pebble_coding_agent::{
     CodingAgent, CodingAgentOptions, MemoryDiscovery, ShutdownReason, SkillDiscovery,
 };
+
+/// Keeps every event the agent records.
+struct Sink(Arc<Mutex<Vec<CodingEvent>>>);
+
+#[async_trait]
+impl EventSink for Sink {
+    async fn record(&self, event: &CodingAgentEvent) -> Result<(), EventSinkError> {
+        self.0.lock().expect("sink lock").push(event.event.clone());
+        Ok(())
+    }
+}
 
 /// A repository at `/home` whose working directory is `/home/test`, with the
 /// repository's instructions at the root and the project's beside the work.
@@ -147,18 +161,7 @@ async fn skill_discovery_resolves_its_directories_and_reports_a_missing_required
     let (client, _provider) = client_from(ScriptedProvider::new(vec![ScriptedCall::response(
         text_response("ok"),
     )]));
-    let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
-    struct Sink(Arc<std::sync::Mutex<Vec<CodingEvent>>>);
-    #[async_trait::async_trait]
-    impl pebble_coding_agent::events::EventSink for Sink {
-        async fn record(
-            &self,
-            event: &pebble_coding_agent::events::CodingAgentEvent,
-        ) -> Result<(), pebble_coding_agent::events::EventSinkError> {
-            self.0.lock().expect("sink lock").push(event.event.clone());
-            Ok(())
-        }
-    }
+    let recorded = Arc::new(Mutex::new(Vec::new()));
     let mut agent = CodingAgent::builder(client, Arc::new(repository()))
         .model("test/model")
         .options(
