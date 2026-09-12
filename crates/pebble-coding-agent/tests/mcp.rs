@@ -27,7 +27,7 @@ use axum::routing::{get, post};
 use futures_util::{StreamExt as _, stream};
 use pebble_coding_agent::environment::{Environment, LocalEnvironment};
 use pebble_coding_agent::events::{
-    CodingAgentEvent, CodingEvent, McpToolSummary, PermissionLevel, ToolSource,
+    CodingAgentEvent, CodingEvent, McpServerStatus, McpToolSummary, PermissionLevel, ToolSource,
 };
 use pebble_coding_agent::mcp::{McpHttpProtocol, McpPlacement, McpServer, qualified_tool_name};
 use pebble_coding_agent::test_support::{
@@ -140,7 +140,16 @@ async fn a_stdio_servers_tools_reach_the_model_and_its_call_comes_back() {
     )
     .await;
 
-    // Ready before the first prompt, tools registered with their source.
+    // Ready before the first prompt, tools registered with their source, and
+    // the outcome on the snapshot for a view that starts now.
+    assert_eq!(agent.snapshot().mcp_servers(), [McpServerStatus {
+        server: "echo".to_owned(),
+        tools:  vec![McpToolSummary {
+            name:          "mcp__echo__echo".to_owned(),
+            original_name: "echo".to_owned(),
+        }],
+        error:  None,
+    }]);
     let published = drained(&mut events);
     assert_eq!(
         ready_events(&published),
@@ -310,6 +319,17 @@ async fn a_server_that_does_not_start_is_reported_and_skipped() {
         1,
         "the other server started"
     );
+    let statuses = agent.snapshot().mcp_servers().to_vec();
+    assert_eq!(statuses.len(), 2, "{statuses:?}");
+    assert_eq!(statuses[0].server, "missing");
+    assert!(
+        statuses[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("could not launch"))
+    );
+    assert_eq!(statuses[1].server, "echo");
+    assert!(statuses[1].error.is_none());
     let report = agent.prompt("go on").await;
     assert_eq!(
         report
