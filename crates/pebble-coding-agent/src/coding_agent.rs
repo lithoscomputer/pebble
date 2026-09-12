@@ -18,7 +18,9 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::SessionScope;
-use crate::compaction::{CompactionControl, CompactionOptions, CompactionOutcome};
+use crate::compaction::{
+    CompactionAccount, CompactionControl, CompactionOptions, CompactionOutcome,
+};
 use crate::config::{CodingAgentOptions, CodingAgentOptionsError};
 use crate::environment::Environment;
 use crate::error::{Error, ErrorData, InterruptReason};
@@ -159,10 +161,11 @@ struct RouteTotals {
     timing:            PromptTiming,
     files_touched:     Vec<String>,
     last_file_touched: Option<String>,
+    compactions:       Vec<CompactionAccount>,
 }
 
 impl RouteTotals {
-    /// Adds what `runtime`'s last prompt spent and touched.
+    /// Adds what `runtime`'s last prompt spent, compacted, and touched.
     fn absorb(&mut self, runtime: &CodingRuntime) {
         self.usage = self.usage.saturating_add(runtime.last_prompt_usage());
         if let Some(cost) = runtime.last_prompt_cost_usd_micros() {
@@ -171,6 +174,7 @@ impl RouteTotals {
         let timing = runtime.last_prompt_timing();
         self.timing.inference = self.timing.inference.saturating_add(timing.inference);
         self.timing.tool = self.timing.tool.saturating_add(timing.tool);
+        self.compactions.extend(runtime.last_prompt_compactions());
         let (touched, last) = runtime.last_prompt_files();
         for path in touched {
             if !self.files_touched.contains(&path) {
@@ -395,10 +399,11 @@ impl CodingAgentExport {
 
 /// The outcome and observed accounting of one prompt, including failed prompts.
 ///
-/// Usage covers this session's accepted main-model responses and queued
-/// follow-ups. It excludes descendants, compaction, and model calls inside
-/// tools. An unfinished response may provide no usage. Cost sums known costs;
-/// `Some` does not certify that every charge was observed.
+/// Usage covers this session's accepted main-model responses, queued
+/// follow-ups, and the summary call of each compaction the prompt performed.
+/// It excludes descendants and model calls inside tools. An unfinished
+/// response may provide no usage. Cost sums known costs; `Some` does not
+/// certify that every charge was observed.
 ///
 /// Accounting remains available if the event sink fails. It does not prove
 /// those events were saved. Dropping a prompt future cannot return a report.
@@ -424,6 +429,12 @@ pub struct PromptReport {
     /// The `provider/model` the prompt ended on. After a failover this is the
     /// fallback route, not the route the prompt started on.
     pub route:             String,
+    /// Every compaction this prompt performed, in order, with the summary
+    /// call's usage and cost. A breakdown of `usage` and `cost_usd_micros`,
+    /// which already include those calls, not an addition to them. This
+    /// session's own: a child's compactions are not listed, and a manual
+    /// `compact` between prompts belongs to no prompt.
+    pub compactions:       Vec<CompactionAccount>,
 }
 
 /// The final output of a successful prompt.
@@ -1865,6 +1876,7 @@ impl CodingAgent {
             files_touched,
             last_file_touched: totals.last_file_touched,
             route: self.inner.route(),
+            compactions: totals.compactions,
         }
     }
 

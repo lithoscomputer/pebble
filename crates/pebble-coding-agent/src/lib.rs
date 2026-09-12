@@ -77,7 +77,7 @@ pub use self::coding_agent::{
     ShutdownReason, SteeringMessage, SteeringOutcome,
 };
 pub use self::compaction::{
-    CompactionOptions, CompactionOutcome, CompactionReason, CompactionResult,
+    CompactionAccount, CompactionOptions, CompactionOutcome, CompactionReason, CompactionResult,
 };
 pub use self::config::{CodingAgentOptions, CodingAgentOptionsError};
 pub use self::discovery::{
