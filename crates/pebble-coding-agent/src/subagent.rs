@@ -38,7 +38,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock, Weak};
 use std::time::Duration;
 
 use futures_util::future::join_all;
@@ -533,7 +533,7 @@ struct ParentNotificationState {
 struct SubAgent {
     status:              watch::Sender<SubagentStatus>,
     generation:          u64,
-    results:             HashMap<u64, StdResult<SubagentResult, ErrorData>>,
+    results:             HashMap<u64, Committed>,
     command_tx:          mpsc::Sender<StartTurn>,
     runner_stop:         CancellationToken,
     cleanup_done:        watch::Sender<bool>,
@@ -573,13 +573,29 @@ impl Drop for SubAgent {
     }
 }
 
+/// One generation's result, beside the ticket of the completion event that
+/// announced it, so a reader can wait for the announcement to be delivered
+/// before it acts on the result.
+struct Committed {
+    ticket: u64,
+    result: StdResult<SubagentResult, ErrorData>,
+}
+
 /// Everything one supervisor knows about its children.
 #[derive(Default)]
 struct SupervisorState {
-    agents:             HashMap<String, SubAgent>,
-    next_spawn_seq:     u64,
-    lifecycle_events:   VecDeque<CodingEvent>,
-    lifecycle_draining: bool,
+    agents:              HashMap<String, SubAgent>,
+    next_spawn_seq:      u64,
+    /// Queued lifecycle events, each with the ticket it was queued under.
+    lifecycle_events:    VecDeque<(u64, CodingEvent)>,
+    lifecycle_draining:  bool,
+    /// The ticket of the last lifecycle event queued.
+    lifecycle_queued:    u64,
+    /// The ticket of the last lifecycle event whose callback has returned.
+    lifecycle_delivered: u64,
+    /// Signalled whenever `lifecycle_delivered` moves, for a reader that
+    /// waits until the event announcing its result has been delivered.
+    delivered_changed:   Arc<Condvar>,
 }
 
 impl SupervisorState {
@@ -595,8 +611,13 @@ impl SupervisorState {
             .ok_or_else(|| unknown_agent(agent_id))
     }
 
-    fn queue_lifecycle_event(&mut self, event: CodingEvent) {
-        self.lifecycle_events.push_back(event);
+    /// Queues `event` and answers with the ticket [`wait_until_delivered`]
+    /// takes.
+    fn queue_lifecycle_event(&mut self, event: CodingEvent) -> u64 {
+        self.lifecycle_queued += 1;
+        self.lifecycle_events
+            .push_back((self.lifecycle_queued, event));
+        self.lifecycle_queued
     }
 }
 
@@ -728,10 +749,10 @@ impl Drop for DrainingGuard<'_> {
         if !self.armed {
             return;
         }
-        self.state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .lifecycle_draining = false;
+        let mut locked = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        locked.lifecycle_draining = false;
+        // A publisher waiting on an event this drain left behind takes over.
+        locked.delivered_changed.notify_all();
     }
 }
 
@@ -757,9 +778,9 @@ fn drain_lifecycle_events(
     let mut draining = DrainingGuard::new(state);
 
     loop {
-        let event = {
+        let (ticket, event) = {
             let mut locked = state.lock().unwrap_or_else(PoisonError::into_inner);
-            let Some(event) = locked.lifecycle_events.pop_front() else {
+            let Some(queued) = locked.lifecycle_events.pop_front() else {
                 // Finding the queue empty and clearing the flag are one
                 // critical section, so a publisher racing this exit either
                 // queues before the clear, and this loop takes the event, or
@@ -770,8 +791,9 @@ fn drain_lifecycle_events(
                 draining.disarm();
                 return;
             };
-            event
+            queued
         };
+        let _delivered = DeliveredGuard { state, ticket };
         let callback = event_callback
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -779,6 +801,54 @@ fn drain_lifecycle_events(
         if let Some(callback) = callback {
             callback(event);
         }
+    }
+}
+
+/// Marks one event delivered once its callback has returned, or panicked, so
+/// a publisher waiting on that ticket is never left waiting.
+struct DeliveredGuard<'a> {
+    state:  &'a Arc<Mutex<SupervisorState>>,
+    ticket: u64,
+}
+
+impl Drop for DeliveredGuard<'_> {
+    fn drop(&mut self) {
+        let mut locked = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        locked.lifecycle_delivered = locked.lifecycle_delivered.max(self.ticket);
+        locked.delivered_changed.notify_all();
+    }
+}
+
+/// Blocks until the event queued under `ticket` has been delivered.
+///
+/// A reader of a child's result calls this before acting on it, so the
+/// completion that announced the result reaches the parent's stream before
+/// anything the parent does next. [`drain_lifecycle_events`] delivers in
+/// ticket order, and the thread that committed the result drains right after
+/// committing, so the wait is as short as the callbacks ahead of the ticket:
+/// callbacks are synchronous and run with no lock held. A drain that a
+/// panicking callback ended early leaves the queue to whoever is waiting, who
+/// drains it from here.
+///
+/// A callback must not wait on the result its own event announces: that event
+/// is delivered only once the callback returns.
+fn wait_until_delivered(
+    state: &Arc<Mutex<SupervisorState>>,
+    event_callback: &Arc<RwLock<Option<SubagentEventCallback>>>,
+    ticket: u64,
+) {
+    loop {
+        let locked = state.lock().unwrap_or_else(PoisonError::into_inner);
+        if locked.lifecycle_delivered >= ticket {
+            return;
+        }
+        if !locked.lifecycle_draining {
+            drop(locked);
+            drain_lifecycle_events(state, event_callback);
+            continue;
+        }
+        let changed = Arc::clone(&locked.delivered_changed);
+        drop(changed.wait(locked).unwrap_or_else(PoisonError::into_inner));
     }
 }
 
@@ -877,16 +947,22 @@ impl SubagentHandle {
                 }
             }
 
-            agent.results.insert(generation, projected.clone());
-            agent
-                .status
-                .send_replace(SubagentStatus::Finished { reusable });
-            locked.queue_lifecycle_event(completion_event(
+            let ticket = locked.queue_lifecycle_event(completion_event(
                 &self.agent_id,
                 self.depth,
                 generation,
                 &projected,
             ));
+            let agent = locked
+                .agent_mut(&self.agent_id)
+                .expect("the agent was found under this same lock");
+            agent.results.insert(generation, Committed {
+                ticket,
+                result: projected,
+            });
+            agent
+                .status
+                .send_replace(SubagentStatus::Finished { reusable });
             TurnCommit::Finished
         };
 
@@ -1353,6 +1429,11 @@ impl SubagentSupervisor {
     /// is not going to read this result, and the child would otherwise keep
     /// working for nobody.
     ///
+    /// The answer follows the child's completion event onto the parent's
+    /// stream: a parent goes from this answer straight to its next model call,
+    /// and what that call publishes must come after the completion rather
+    /// than race it from the child's thread.
+    ///
     /// # Errors
     ///
     /// Returns a [`ToolError`] of kind
@@ -1383,8 +1464,12 @@ impl SubagentSupervisor {
                 let agent = state.agent(agent_id)?;
                 // Checked before the status, so a coalesced watch update cannot
                 // hide a generation that has already finished.
-                if let Some(result) = agent.results.get(&generation) {
-                    return result.clone().map_err(child_failure);
+                if let Some(committed) = agent.results.get(&generation) {
+                    let ticket = committed.ticket;
+                    let result = committed.result.clone();
+                    drop(state);
+                    wait_until_delivered(&self.state, &self.event_callback, ticket);
+                    return result.map_err(child_failure);
                 }
                 agent.status.borrow().clone()
             };
@@ -1518,19 +1603,21 @@ impl SubagentSupervisor {
                 let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
                 let mut ready = Vec::new();
                 let mut awaiting_result = false;
+                let mut last_ticket = 0;
                 for (agent_id, agent) in &state.agents {
                     let Some(notification) = agent.parent_notification.as_ref() else {
                         continue;
                     };
                     for generation in &notification.pending_generations {
-                        if let Some(result) = agent.results.get(generation) {
+                        if let Some(committed) = agent.results.get(generation) {
+                            last_ticket = last_ticket.max(committed.ticket);
                             ready.push((
                                 agent.spawn_seq,
                                 *generation,
                                 SubagentParentNotification {
                                     agent_id:    agent_id.clone(),
                                     description: notification.description.clone(),
-                                    result:      result.clone(),
+                                    result:      committed.result.clone(),
                                 },
                             ));
                         } else if agent.generation == *generation
@@ -1566,6 +1653,10 @@ impl SubagentSupervisor {
                                 .retain(|pending| *pending != generation);
                         }
                     }
+                    drop(state);
+                    // The batch becomes the parent's next turn, and that turn's
+                    // events follow every completion it reports.
+                    wait_until_delivered(&self.state, &self.event_callback, last_ticket);
                     return Ok(Some(batch));
                 }
                 if !awaiting_result {
@@ -2793,6 +2884,44 @@ mod tests {
             1,
             "{events:?}"
         );
+        supervisor.shutdown_all().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_waiter_is_answered_only_after_the_parent_heard_of_the_completion() {
+        // The completion callback stands in for a parent's event pipeline and
+        // is slow on purpose. A waiter answered before it returns is a parent
+        // whose next model call overtakes the child's completion on the
+        // stream. The wait runs on this thread and the child on a worker, so
+        // the callback cannot hold the waiter up by occupying its thread.
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::new(Mutex::new(Vec::new()));
+        let callback: SubagentEventCallback = {
+            let order = Arc::clone(&order);
+            Arc::new(move |event| {
+                if matches!(event, CodingEvent::SubAgentCompleted { .. }) {
+                    thread::sleep(Duration::from_millis(200));
+                    order
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push("the parent heard of the completion");
+                }
+            })
+        };
+        let (parent, supervisor) = parent_over(vec!["child result"]);
+        supervisor.set_event_callback(callback);
+        let agent_id = spawn(&supervisor, &parent, "task");
+
+        let result = supervisor.wait(&agent_id).await.expect("the child answers");
+        order
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push("the waiter was answered");
+
+        assert_eq!(result.output, "child result");
+        assert_eq!(*order.lock().unwrap_or_else(PoisonError::into_inner), [
+            "the parent heard of the completion",
+            "the waiter was answered"
+        ]);
         supervisor.shutdown_all().await;
     }
 
