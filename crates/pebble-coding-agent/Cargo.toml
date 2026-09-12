@@ -10,8 +10,9 @@ description = "Coding-agent library built on pebble-agent"
 # Test doubles (`pebble_coding_agent::test_support`) for embedding applications.
 test-util = []
 # MCP servers as tool sources (`pebble_coding_agent::mcp`): the `rmcp` client
-# over stdio and HTTP, and the route to a server launched in the environment.
-mcp = ["dep:rmcp", "dep:reqwest", "dep:sandbox-driver", "dep:sse-stream", "dep:url"]
+# over stdio and HTTP, and the `PortRoutes` contract an application implements
+# over its own sandbox to reach a server launched in the environment.
+mcp = ["dep:rmcp", "dep:reqwest", "dep:sse-stream", "dep:url"]
 # `pebble_coding_agent::search::providers`: Brave and Venice web search over
 # their public HTTP APIs, for an application that would rather not write them.
 search-providers = ["dep:reqwest"]
@@ -62,11 +63,6 @@ rmcp = { version = "=1.7.0", default-features = false, features = [
 ], optional = true }
 sse-stream = { version = "0.2", optional = true }
 url = { version = "2.5", optional = true }
-# The route from the embedding application to a port inside its sandbox:
-# sandbox-driver's `PreviewUrls` facet, which both embedders' sandboxes
-# already provide. Pinned to the revision fabro pins, because a trait object
-# only crosses the boundary when both sides name the same crate version.
-sandbox-driver = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "a92c0db6b6a122ca9b6df75de6615544f53c0d47", optional = true }
 
 # Signalling a command's process group without writing unsafe code.
 [target.'cfg(unix)'.dependencies]

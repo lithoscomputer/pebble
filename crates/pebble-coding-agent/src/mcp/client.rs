@@ -27,7 +27,6 @@ use rmcp::service::{
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use sandbox_driver::PreviewUrls;
 use serde_json::{Map, Value};
 use tokio::io::{AsyncBufReadExt as _, BufReader};
 use tokio::process::Command;
@@ -36,6 +35,7 @@ use tokio::time::error::Elapsed;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
+use super::routes::PortRoutes;
 use super::sse::SseClientTransport;
 use super::{McpHttpProtocol, McpPlacement, McpServer};
 use crate::environment::{Environment, ExecRequest};
@@ -177,10 +177,10 @@ impl EnvironmentProcess {
     }
 }
 
-/// The route the environment opened to an environment-hosted server's port,
+/// The route the application opened to an environment-hosted server's port,
 /// released when the connection closes.
 struct Route {
-    routes: Arc<dyn PreviewUrls>,
+    routes: Arc<dyn PortRoutes>,
     port:   u16,
 }
 
@@ -188,8 +188,8 @@ impl Route {
     /// Best effort: the sandbox's own release closes it anyway, so a failure
     /// is logged and nothing else.
     async fn release(&self) {
-        if let Err(error) = self.routes.release_preview_url(self.port).await {
-            tracing::warn!(port = self.port, error = %error, "releasing the MCP server's route failed");
+        if let Err(error) = self.routes.release(self.port).await {
+            tracing::warn!(port = self.port, error = %error.detail(), "releasing the MCP server's route failed");
         }
     }
 }
@@ -237,7 +237,7 @@ impl Connection {
     pub(super) async fn start(
         server: &McpServer,
         environment: &Arc<dyn Environment>,
-        routes: Option<&Arc<dyn PreviewUrls>>,
+        routes: Option<&Arc<dyn PortRoutes>>,
     ) -> Result<(Self, Vec<DiscoveredTool>), StartError> {
         let startup = server.startup_timeout;
         let tool_timeout = server.tool_timeout;
@@ -336,23 +336,25 @@ impl Connection {
                 let process =
                     launch_in_environment(environment, &server.name, command, env).await?;
                 cleanup.process = Some(process);
-                // The address pebble reaches the port at is the environment's
+                // The address pebble reaches the port at is the application's
                 // route to it, or the loopback address when the environment
-                // shares the host's network.
+                // shares the host's network. An application whose environment
+                // routes to no port says so through the same error, and the
+                // server is reported as having no route.
                 let (url, headers) = match routes {
-                    Some(routes) => match routes.preview_url(*port).await {
-                        Ok(preview) => {
+                    Some(routes) => match routes.route(*port).await {
+                        Ok(route) => {
                             cleanup.route = Some(Route {
                                 routes: Arc::clone(routes),
                                 port:   *port,
                             });
-                            (preview.url, preview.headers)
+                            (route.url, route.headers)
                         }
                         Err(error) => {
                             cleanup.run().await;
                             return Err(StartError::Route {
                                 port:   *port,
-                                reason: error.to_string(),
+                                reason: error.detail(),
                             });
                         }
                     },

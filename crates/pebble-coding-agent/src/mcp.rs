@@ -17,14 +17,17 @@
 //!   agent is waited for rather than failed on the first refused connection.
 //! - [`McpPlacement::Environment`]: a server launched through
 //!   [`Environment::exec`] and reached over HTTP through the environment's
-//!   route to its port. The route is sandbox-driver's [`PreviewUrls`] facet,
-//!   which the application hands over with
-//!   [`CodingAgentBuilder::port_routes`](crate::CodingAgentBuilder::port_routes)
-//!   and which every sandbox that forwards ports already provides, headers
-//!   included. Without one, the port is reached on the loopback address, which
-//!   is where a server in an environment that shares the host's network
-//!   listens. Pebble owns the route's lifetime: it is released when the server
-//!   fails to start and when the agent shuts down.
+//!   route to its port. The route is a [`PortRoutes`] the application
+//!   implements over its sandbox and hands over with
+//!   [`CodingAgentBuilder::port_routes`](crate::CodingAgentBuilder::port_routes):
+//!   fabro over its run sandbox's preview-URL facet, petri over its execution
+//!   environment's `preview_url`, each answering with the URL and headers that
+//!   reach the port. The trait is pebble's own, so an application shares no
+//!   sandbox crate with pebble to implement it. Without one, the port is
+//!   reached on the loopback address, which is where a server in an environment
+//!   that shares the host's network listens. Pebble owns the route's lifetime:
+//!   it is released when the server fails to start and when the agent shuts
+//!   down.
 //!
 //! A server that does not start (a launch error, a handshake that fails or
 //! times out) is reported as [`McpServerFailed`](CodingEvent::McpServerFailed)
@@ -39,6 +42,7 @@
 //! the session ends.
 
 mod client;
+mod routes;
 mod sse;
 
 use std::collections::BTreeMap;
@@ -48,7 +52,7 @@ use std::time::{Duration, Instant};
 
 use client::{CallOutcome, Connection, DiscoveredTool};
 use lithos_llm::types::ToolDefinition;
-pub use sandbox_driver::{PreviewUrl, PreviewUrls};
+pub use routes::{PortRoute, PortRouteError, PortRoutes};
 use serde_json::Value;
 
 use crate::environment::Environment;
@@ -148,11 +152,15 @@ pub enum McpPlacement {
         protocol: McpHttpProtocol,
     },
     /// A server launched in the session's environment and reached over HTTP
-    /// through the environment's route to its port.
+    /// through the environment's route to its port: the [`PortRoutes`] the
+    /// application handed over with
+    /// [`CodingAgentBuilder::port_routes`](crate::CodingAgentBuilder::port_routes),
+    /// or the loopback address without one.
     Environment {
         /// The program and its arguments, run through the environment's shell.
         command:  Vec<String>,
-        /// The port the server listens on inside the environment.
+        /// The port the server listens on inside the environment, which the
+        /// route is asked for.
         port:     u16,
         /// Variables layered over the environment's for the server process.
         env:      BTreeMap<String, String>,
@@ -296,7 +304,7 @@ impl McpServers {
     pub(crate) async fn start(
         servers: &[McpServer],
         environment: &Arc<dyn Environment>,
-        routes: Option<&Arc<dyn PreviewUrls>>,
+        routes: Option<&Arc<dyn PortRoutes>>,
     ) -> Self {
         let mut started = Self {
             connections: Vec::with_capacity(servers.len()),
