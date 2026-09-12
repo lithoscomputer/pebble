@@ -27,7 +27,8 @@ use axum::routing::{get, post};
 use futures_util::{StreamExt as _, stream};
 use pebble_coding_agent::environment::{Environment, LocalEnvironment};
 use pebble_coding_agent::events::{
-    CodingAgentEvent, CodingEvent, McpServerStatus, McpToolSummary, PermissionLevel, ToolSource,
+    CodingAgentEvent, CodingEvent, McpServerStatus, McpToolSummary, PermissionLevel, ToolErrorKind,
+    ToolSource,
 };
 use pebble_coding_agent::mcp::{McpHttpProtocol, McpPlacement, McpServer, qualified_tool_name};
 use pebble_coding_agent::test_support::{
@@ -317,7 +318,8 @@ async fn an_error_result_and_a_slow_call_reach_the_model_as_tool_errors() {
     let report = agent.prompt("wait").await;
 
     assert!(report.result.is_ok(), "{report:?}");
-    let completions = tool_completions(&drained(&mut events));
+    let published = drained(&mut events);
+    let completions = tool_completions(&published);
     assert_eq!(completions.len(), 1);
     assert!(
         completions[0].2,
@@ -330,6 +332,18 @@ async fn an_error_result_and_a_slow_call_reach_the_model_as_tool_errors() {
             .contains("did not answer within"),
         "{:?}",
         completions[0].1
+    );
+    let kinds: Vec<Option<ToolErrorKind>> = published
+        .iter()
+        .filter_map(|event| match event {
+            CodingEvent::ToolCallCompleted { error_kind, .. } => Some(*error_kind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        [Some(ToolErrorKind::Timeout)],
+        "the completion names the timeout as its kind"
     );
     agent
         .shutdown(ShutdownReason::Completed)

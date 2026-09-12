@@ -221,5 +221,9 @@ mod tests {
             serde_json::to_value(ToolErrorKind::InvalidArguments).expect("serializes"),
             json!("invalid_arguments")
         );
+        assert_eq!(
+            serde_json::to_value(ToolErrorKind::Timeout).expect("serializes"),
+            json!("timeout")
+        );
     }
 }

@@ -420,7 +420,7 @@ fn registered_tool(
                 CallOutcome::Failed(message) => Err(ToolError::unavailable(format!(
                     "MCP server `{server_name}` failed the call to `{original}`: {message}"
                 ))),
-                CallOutcome::Timeout(timeout) => Err(ToolError::execution(format!(
+                CallOutcome::Timeout(timeout) => Err(ToolError::timeout(format!(
                     "MCP tool `{original}` on server `{server_name}` did not answer within {}s",
                     timeout.as_secs()
                 ))),
