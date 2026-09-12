@@ -204,7 +204,8 @@ pub struct SessionProjection {
     /// Every MCP server the root configured, by name.
     pub mcp_servers:       BTreeMap<String, McpServerProjection>,
     pub skills:            SkillsProjection,
-    /// Child lifecycle events over the session's life.
+    /// Child lifecycle events over the session's life, across the tree: a
+    /// child's own children count.
     pub subagent_counts:   SubagentCounts,
     /// Every todo list in the tree, by list id.
     pub todos:             BTreeMap<String, TodoListProjection>,
@@ -399,12 +400,14 @@ impl SessionProjection {
                     }
                 }
             }
+            // Children spawn children: the rows and the counts are the
+            // tree's, whichever session recorded the event.
             CodingEvent::SubAgentSpawned {
                 agent_id,
                 depth,
                 task,
                 ..
-            } if is_root => {
+            } => {
                 self.subagent_counts.spawned += 1;
                 self.prompt.subagents.spawned += 1;
                 if let Some(existing) = self.subagent_mut(agent_id) {
@@ -418,7 +421,7 @@ impl SessionProjection {
                     });
                 }
             }
-            CodingEvent::SubAgentTurnStarted { agent_id, .. } if is_root => {
+            CodingEvent::SubAgentTurnStarted { agent_id, .. } => {
                 self.subagent_counts.turns_started += 1;
                 self.prompt.subagents.turns_started += 1;
                 self.set_subagent_status(agent_id, SubagentStatus::Running);
@@ -428,7 +431,7 @@ impl SessionProjection {
                 success,
                 turns_used,
                 ..
-            } if is_root => {
+            } => {
                 self.subagent_counts.completed += 1;
                 self.prompt.subagents.completed += 1;
                 self.set_subagent_status(agent_id, SubagentStatus::Completed {
@@ -438,14 +441,14 @@ impl SessionProjection {
             }
             CodingEvent::SubAgentFailed {
                 agent_id, error, ..
-            } if is_root => {
+            } => {
                 self.subagent_counts.failed += 1;
                 self.prompt.subagents.failed += 1;
                 self.set_subagent_status(agent_id, SubagentStatus::Failed {
                     error: error.clone(),
                 });
             }
-            CodingEvent::SubAgentClosed { agent_id, .. } if is_root => {
+            CodingEvent::SubAgentClosed { agent_id, .. } => {
                 self.subagent_counts.closed += 1;
                 self.prompt.subagents.closed += 1;
                 self.set_subagent_status(agent_id, SubagentStatus::Closed);
@@ -824,6 +827,17 @@ mod tests {
             closed:        0,
         });
         assert_eq!(projection.prompt.subagents, projection.subagent_counts);
+
+        // A grandchild is spawned by the child and counts for the tree.
+        projection.apply(&child(CodingEvent::SubAgentSpawned {
+            agent_id:   "a2".into(),
+            depth:      2,
+            task:       "deeper".into(),
+            generation: 1,
+        }));
+        assert_eq!(projection.subagent_counts.spawned, 2);
+        assert_eq!(projection.subagents.len(), 2);
+        assert_eq!(projection.subagents[1].depth, 2);
     }
 
     #[test]
