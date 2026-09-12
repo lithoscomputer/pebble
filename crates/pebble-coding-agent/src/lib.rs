@@ -41,6 +41,7 @@ mod memory;
 mod policy;
 mod profile;
 mod profiles;
+pub mod projection;
 mod prompt_transform;
 mod record;
 mod redact;

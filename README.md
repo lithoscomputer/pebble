@@ -152,6 +152,16 @@ or the git root, and a directory the application `require`s is reported as
 git probe, the walk, and the checks through the `Environment`; explicit
 `with_memory_files` and `with_skill_dirs` still work and come first.
 
+`pebble_coding_agent::projection::SessionProjection` folds one session
+tree's events into what a view or an accountant needs: the root's token
+counts and provider-reported cost, each descendant's, the context window,
+which tools ran and how often they failed, the MCP servers and whether they
+were called, skills, todo lists, the children and how they ended,
+compactions, and the files touched. It is serializable, so a view resumes
+from a stored value, and it keeps a `PromptDelta` for the prompt in progress,
+because a retained session spans stages. It reports counts; pricing them from
+a catalog stays with the application.
+
 `CodingAgent::export_for_reuse(reason)` closes the agent and returns the
 export a successor continues from, its cursor already past the close, so an
 application no longer takes an export, shuts down, and advances the cursor by

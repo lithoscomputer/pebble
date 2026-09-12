@@ -221,6 +221,34 @@ impl FileTracker {
     }
 }
 
+/// The paths a write, edit, or patch call will touch, read from its
+/// arguments alone, for a fold over the event stream that pairs a call's
+/// start with its completion. Reads and deletions name nothing.
+pub(crate) fn written_paths_from_arguments(tool_name: &str, arguments: &Value) -> Vec<String> {
+    match NativeTool::from_canonical_name(canonical_tool_name(tool_name)) {
+        Some(NativeTool::WriteFile | NativeTool::EditFile) => file_path(arguments)
+            .map(str::to_owned)
+            .into_iter()
+            .collect(),
+        Some(NativeTool::ApplyPatch) => patch_text(arguments)
+            .and_then(|patch| parse_apply_patch(patch).ok())
+            .map(|operations| {
+                operations
+                    .into_iter()
+                    .filter_map(|operation| match operation {
+                        PatchOperation::Add { path, .. } => Some(path),
+                        PatchOperation::Update { path, new_path, .. } => {
+                            Some(new_path.unwrap_or(path))
+                        }
+                        PatchOperation::Delete { .. } => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
 /// The patch text a call carried: raw text from the grammar tool, or a
 /// `patch` member where a harness wraps it in JSON.
 fn patch_text(arguments: &Value) -> Option<&str> {
