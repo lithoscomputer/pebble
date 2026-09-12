@@ -40,8 +40,8 @@ use crate::subagent::SubagentOptions;
 use crate::tool::{RegisteredTool, ToolEnvProvider, ToolRegistrationError};
 use crate::types::{
     Actor, AgentProfileKind, CodingAgentEvent, CodingAgentState, CodingEvent,
-    ContextWindowSnapshot, InputContent, InputSource, MemoryFileSummary, Message, PermissionLevel,
-    SkillSummary, TokenUsage, ToolSummary,
+    ContextWindowSnapshot, InputContent, InputSource, McpServerStatus, MemoryFileSummary, Message,
+    PermissionLevel, SkillSummary, TokenUsage, ToolSummary,
 };
 
 /// A route a prompt continues on when its model fails for a reason another
@@ -448,6 +448,7 @@ pub struct CodingAgentSnapshot {
     memory:              Vec<MemoryFileSummary>,
     skills:              Vec<SkillSummary>,
     tools:               Vec<ToolSummary>,
+    mcp_servers:         Vec<McpServerStatus>,
     context_window:      Option<ContextWindowSnapshot>,
     committed_event_seq: u64,
 }
@@ -523,6 +524,14 @@ impl CodingAgentSnapshot {
     #[must_use]
     pub fn tools(&self) -> &[ToolSummary] {
         &self.tools
+    }
+
+    /// What became of each MCP server the application configured, in
+    /// configuration order: its tools when it started, the reason when it
+    /// did not. Empty when none was configured.
+    #[must_use]
+    pub fn mcp_servers(&self) -> &[McpServerStatus] {
+        &self.mcp_servers
     }
 
     /// The latest context-window measurement.
@@ -1859,6 +1868,23 @@ impl CodingAgent {
         }
     }
 
+    /// What became of each configured MCP server, for the snapshot.
+    #[cfg(feature = "mcp")]
+    fn mcp_statuses(&self) -> Vec<McpServerStatus> {
+        self.mcp
+            .as_ref()
+            .map(McpServers::statuses)
+            .unwrap_or_default()
+    }
+
+    /// What became of each configured MCP server, for the snapshot: nothing
+    /// without the feature.
+    #[cfg(not(feature = "mcp"))]
+    #[expect(clippy::unused_self, reason = "the feature-gated twin reads the agent")]
+    fn mcp_statuses(&self) -> Vec<McpServerStatus> {
+        Vec::new()
+    }
+
     /// The fallback routes this agent has not moved to yet, in order.
     ///
     /// Empty when the builder named none or every one has been taken. A
@@ -1923,6 +1949,7 @@ impl CodingAgent {
             memory: self.inner.memory_summaries().to_vec(),
             skills: self.inner.skill_summaries(),
             tools: self.inner.tool_summaries(),
+            mcp_servers: self.mcp_statuses(),
             context_window: self.inner.context_window(),
             committed_event_seq,
         }

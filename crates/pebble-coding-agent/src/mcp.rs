@@ -47,7 +47,7 @@ use serde_json::Value;
 
 use crate::environment::Environment;
 use crate::tool::{RegisteredTool, ToolContext, ToolError};
-use crate::types::{CodingEvent, McpToolSummary, ToolSource};
+use crate::types::{CodingEvent, McpServerStatus, McpToolSummary, ToolSource};
 
 /// How long a server gets to close after the agent ends.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -216,6 +216,21 @@ pub(crate) enum McpServerOutcome {
 }
 
 impl McpServerOutcome {
+    pub(crate) fn to_status(&self) -> McpServerStatus {
+        match self {
+            Self::Ready { server, tools } => McpServerStatus {
+                server: server.clone(),
+                tools:  tools.clone(),
+                error:  None,
+            },
+            Self::Failed { server, error } => McpServerStatus {
+                server: server.clone(),
+                tools:  Vec::new(),
+                error:  Some(error.clone()),
+            },
+        }
+    }
+
     pub(crate) fn to_event(&self) -> CodingEvent {
         match self {
             Self::Ready { server, tools } => CodingEvent::McpServerReady {
@@ -299,6 +314,14 @@ impl McpServers {
     /// What became of each configured server, in configuration order.
     pub(crate) fn outcomes(&self) -> &[McpServerOutcome] {
         &self.outcomes
+    }
+
+    /// The same, as the snapshot carries it.
+    pub(crate) fn statuses(&self) -> Vec<McpServerStatus> {
+        self.outcomes
+            .iter()
+            .map(McpServerOutcome::to_status)
+            .collect()
     }
 
     /// Closes every connection, stops every owned process, and releases every

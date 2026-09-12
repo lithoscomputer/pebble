@@ -905,6 +905,20 @@ impl fmt::Display for AgentProfileKind {
     }
 }
 
+/// What became of one MCP server the application configured, as the
+/// snapshot carries it: a view that starts after the agent was built reads
+/// the outcome here, since the event that reported it has already passed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpServerStatus {
+    /// The server's configured name.
+    pub server: String,
+    /// The tools it advertised, sorted by registered name; empty when it
+    /// failed.
+    pub tools:  Vec<McpToolSummary>,
+    /// Why it did not start, when it did not.
+    pub error:  Option<String>,
+}
+
 /// One tool an MCP server advertised, as the registry named it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpToolSummary {
