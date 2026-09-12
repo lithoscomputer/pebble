@@ -237,6 +237,13 @@ The agent stays open and the next prompt gets a fresh budget. A workflow that
 runs an agent to reach a decision uses this to cap the cost of one decision and
 to fall back to a default when the agent does not reach one.
 
+`CodingAgentOptions::with_max_turns` bounds model responses instead. A prompt
+that has used its turns and would ask the model again ends with
+`Error::Interrupted(InterruptReason::TurnLimit)` at the boundary a wall-clock
+timeout uses: every tool call the last turn made has its result. The two
+budgets count different things and may be set together; whichever is reached
+first ends the prompt, with its own error.
+
 Applications use `lithos-llm` directly to build clients and use its public
 model types. The Pebble packages do not re-export their dependencies.
 

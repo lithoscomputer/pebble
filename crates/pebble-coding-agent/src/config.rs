@@ -80,6 +80,9 @@ pub enum CodingAgentOptionsError {
         /// The configured percentage.
         value: usize,
     },
+    /// A turn budget must allow at least one model turn.
+    #[error("max_turns must be at least 1, got 0")]
+    MaxTurns,
 }
 
 /// Everything one session's behavior is tuned by.
@@ -155,6 +158,8 @@ pub struct CodingAgentOptions {
     pub(crate) wall_clock_timeout: Option<Duration>,
     /// How many tool rounds one prompt may run. Absent sets no limit.
     pub(crate) max_tool_rounds: Option<usize>,
+    /// How many model turns one prompt may take before the session ends it.
+    pub(crate) max_turns: Option<usize>,
     /// How the session spaces the turn replays it owns.
     ///
     /// A stream that fails **after** the model produced visible output is
@@ -215,6 +220,7 @@ impl fmt::Debug for CodingAgentOptions {
             .field("compaction_preserve_turns", &self.compaction_preserve_turns)
             .field("wall_clock_timeout", &self.wall_clock_timeout)
             .field("max_tool_rounds", &self.max_tool_rounds)
+            .field("max_turns", &self.max_turns)
             .field("turn_replay", &self.turn_replay)
             .finish()
     }
@@ -242,6 +248,7 @@ impl Default for CodingAgentOptions {
             compaction_preserve_turns: 6,
             wall_clock_timeout: None,
             max_tool_rounds: None,
+            max_turns: None,
             turn_replay: AgentConfig::default().turn_replay,
         }
     }
@@ -258,6 +265,9 @@ impl CodingAgentOptions {
         let value = self.compaction_threshold_percent;
         if !(1..=100).contains(&value) {
             return Err(CodingAgentOptionsError::CompactionThreshold { value });
+        }
+        if self.max_turns == Some(0) {
+            return Err(CodingAgentOptionsError::MaxTurns);
         }
         Ok(())
     }
@@ -434,6 +444,28 @@ impl CodingAgentOptions {
         self
     }
 
+    /// Sets how many model turns one prompt may take.
+    ///
+    /// This bounds model responses, where
+    /// [`with_max_tool_rounds`](Self::with_max_tool_rounds) bounds rounds
+    /// that ask for tools; the two count different things and may be set
+    /// together.
+    ///
+    /// A turn is one model response. A prompt that has used `max_turns` of
+    /// them and would ask the model again ends instead with
+    /// [`Error::Interrupted`](crate::Error::Interrupted) carrying
+    /// [`InterruptReason::TurnLimit`](crate::InterruptReason::TurnLimit), at
+    /// the same boundary a wall-clock timeout ends it: every tool call the
+    /// last turn made has its result, and the agent stays open for the next
+    /// prompt, which gets a fresh budget. Follow-ups queued on a prompt share
+    /// its budget; a child session's prompts each get their own. Zero is
+    /// rejected when the agent is built.
+    #[must_use]
+    pub const fn with_max_turns(mut self, max_turns: usize) -> Self {
+        self.max_turns = Some(max_turns);
+        self
+    }
+
     /// Sets how the session spaces the turn replays it owns.
     ///
     /// A stream that fails after the model produced visible output is replayed
@@ -471,6 +503,19 @@ mod tests {
         assert!(config.user_instructions.is_none());
         assert!(config.permission_level.is_none());
         assert!(config.wall_clock_timeout.is_none());
+        assert!(config.max_turns.is_none());
+    }
+
+    #[test]
+    fn a_turn_budget_must_allow_a_turn() {
+        assert_eq!(
+            CodingAgentOptions::default().with_max_turns(0).validate(),
+            Err(CodingAgentOptionsError::MaxTurns)
+        );
+        assert_eq!(
+            CodingAgentOptions::default().with_max_turns(1).validate(),
+            Ok(())
+        );
     }
 
     #[test]

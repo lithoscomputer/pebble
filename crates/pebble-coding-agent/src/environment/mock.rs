@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use super::capture::capture_collected_stream;
 use super::{
     DirEntry, EnvResult, Environment, EnvironmentError, EnvironmentErrorKind, ExecOutcome,
-    ExecRequest, ExecResult, GrepOptions,
+    ExecOutputStream, ExecRequest, ExecResult, GrepOptions,
 };
 use crate::event::OutputCaptureStats;
 use crate::types::CommandTermination;
@@ -213,6 +213,7 @@ impl Environment for MockEnvironment {
             env_vars,
             cancel_token: _,
             output_bytes_cap,
+            output_sink,
         } = request;
 
         *self
@@ -248,6 +249,16 @@ impl Environment for MockEnvironment {
         }
 
         let mut result = self.exec_result.clone();
+        // The fixture is what the command "wrote", so the sink sees all of it
+        // before the cap does, the way a drained pipe would deliver it.
+        if let Some(sink) = output_sink {
+            if !result.stdout.is_empty() {
+                sink(ExecOutputStream::Stdout, result.stdout.as_bytes());
+            }
+            if !result.stderr.is_empty() {
+                sink(ExecOutputStream::Stderr, result.stderr.as_bytes());
+            }
+        }
         let stdout_capture = capture_collected_stream(&mut result.stdout, output_bytes_cap);
         let stderr_capture = capture_collected_stream(&mut result.stderr, output_bytes_cap);
 
@@ -574,6 +585,42 @@ mod tests {
             Some("echo hello".to_owned()),
             "the call is still recorded"
         );
+    }
+
+    #[tokio::test]
+    async fn a_sink_is_fed_the_fixture_before_the_cap_applies() {
+        use std::sync::Arc;
+
+        let environment = MockEnvironment {
+            exec_result: ExecResult {
+                stdout: "abcdefghijklmnopqrst".to_owned(),
+                stderr: "warned".to_owned(),
+                ..MockEnvironment::default().exec_result
+            },
+            ..MockEnvironment::default()
+        };
+        let seen: Arc<Mutex<Vec<(ExecOutputStream, String)>>> = Arc::default();
+        let recorded = Arc::clone(&seen);
+
+        let outcome = environment
+            .exec(ExecRequest {
+                output_bytes_cap: Some(8),
+                output_sink: Some(Arc::new(move |stream, chunk: &[u8]| {
+                    recorded
+                        .lock()
+                        .expect("seen lock is not poisoned")
+                        .push((stream, String::from_utf8_lossy(chunk).into_owned()));
+                })),
+                ..ExecRequest::new("noisy")
+            })
+            .await
+            .expect("the mock answers");
+
+        assert_eq!(outcome.result.stdout, "abcdqrst");
+        assert_eq!(*seen.lock().expect("seen lock is not poisoned"), vec![
+            (ExecOutputStream::Stdout, "abcdefghijklmnopqrst".to_owned()),
+            (ExecOutputStream::Stderr, "warned".to_owned()),
+        ]);
     }
 
     #[tokio::test]
