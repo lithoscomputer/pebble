@@ -159,14 +159,15 @@ git probe, the walk, and the checks through the `Environment`; explicit
 `pebble_coding_agent::projection::SessionProjection` folds one session
 tree's events into what a view or an accountant needs: the root's token
 counts and provider-reported cost, each descendant's, the context window,
-which tools ran and how often they failed, the MCP servers and whether they
-were called, skills, todo lists, the children and how they ended,
-compactions, and the files touched. It is serializable, so a view resumes
-from a stored value, and it keeps a `PromptDelta` for the prompt in progress,
-because a retained session spans stages: the root's spend, each descendant's,
-the child lifecycle counts, compactions, and files touched, all restarted at
-each prompt. It reports counts; pricing them from a catalog stays with the
-application.
+which tools ran and how often they failed, how many model calls were retried,
+the MCP servers and whether they were called, skills, todo lists, the
+children and how they ended, compactions, and the files touched. It is
+serializable, so a view resumes from a stored value, and it keeps a
+`PromptDelta` for the prompt in progress, because a retained session spans
+stages: the root's spend, each descendant's, the child lifecycle counts,
+retries, compactions, and files touched, all restarted at each prompt. It
+reports counts; pricing them from a catalog stays with the application. The
+`pebble` command's closing summary is this projection, read out.
 
 `pebble_coding_agent::steering::SteeringBus` is one control plane for many
 sessions: sessions attach at a key of the application's choosing (a stage, a

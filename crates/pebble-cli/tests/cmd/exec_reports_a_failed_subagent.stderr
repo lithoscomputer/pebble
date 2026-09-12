@@ -22,4 +22,5 @@ tools:  2 call(s), 0 failed
         spawn_agent x1, wait x1
 tokens: 30 in, 15 out, 0 reasoning, 0 cached (45 total)
 cost:   $0.0003
+subagents: 1 spawned, 0 turn(s), 0 tokens
 retries: 3
