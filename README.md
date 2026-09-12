@@ -87,12 +87,17 @@ and system-prompt construction happen inside the build. There is no separate
 initialization step to remember. `prompt` returns a `PromptReport` with token usage, known cost, and timing
 on success and failure. Its `result` contains either a `PromptOutput` with the
 final message and text, or the prompt error. Accounting covers accepted main-model
-responses in this session, including queued follow-ups. It excludes subagents,
-compaction, and model calls made inside tools. Known cost is a subtotal when some
-responses have no price. A dropped prompt future cannot return a report. The
-report also names every file the prompt wrote or edited (`files_touched`,
-sorted, the children's work included, deletions left out), the one it touched
-last, and the `provider/model` route it ended on.
+responses in this session, including queued follow-ups, and the summary call of
+each compaction the prompt performed. It excludes subagents and model calls made
+inside tools. Known cost is a subtotal when some responses have no price. A
+dropped prompt future cannot return a report. The report also names every file
+the prompt wrote or edited (`files_touched`, sorted, the children's work
+included, deletions left out), the one it touched last, and the
+`provider/model` route it ended on. Its `compactions` list each compaction the
+prompt performed, in order, as a `CompactionAccount` with the facts the
+`Message::Compaction` turn records and the summary call's usage and cost: a
+breakdown of the report's usage and cost, not an addition to them, and a manual
+`compact` between prompts is on no report.
 
 `continue_prompt` continues a prompt the history left unfinished, without new
 input: the history ends with the prompt itself or with tool results the model

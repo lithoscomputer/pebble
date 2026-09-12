@@ -194,6 +194,21 @@ impl CompactionResult {
         self.cost_usd_micros
     }
 
+    /// The accounting of this compaction, as a prompt's report carries it.
+    pub(crate) fn account(&self) -> CompactionAccount {
+        CompactionAccount {
+            reason:                  self.reason,
+            original_turn_count:     self.original_turn_count,
+            preserved_turn_count:    self.preserved_turn_count,
+            estimated_tokens_before: self.estimated_tokens_before,
+            summary_token_estimate:  self.summary_token_estimate,
+            tracked_file_count:      self.tracked_file_count,
+            summary_truncated:       self.summary_truncated,
+            usage:                   self.usage,
+            cost_usd_micros:         self.cost_usd_micros,
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn for_history(summary: String) -> Self {
         Self {
@@ -209,6 +224,35 @@ impl CompactionResult {
             cost_usd_micros: None,
         }
     }
+}
+
+/// The accounting of one completed compaction, as a prompt's report lists it.
+///
+/// The facts the `Message::Compaction` turn records, without the summary
+/// text, so an application that meters compaction reads the report and not
+/// the history back. `usage` and `cost_usd_micros` are the summary call's;
+/// the report's own totals already include them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionAccount {
+    /// Why the compaction ran.
+    pub reason:                  CompactionReason,
+    /// Turns present before compaction.
+    pub original_turn_count:     usize,
+    /// Turns preserved verbatim.
+    pub preserved_turn_count:    usize,
+    /// Estimated context tokens before compaction.
+    pub estimated_tokens_before: usize,
+    /// Estimated tokens in the generated summary.
+    pub summary_token_estimate:  usize,
+    /// Files represented in the compaction prompt.
+    pub tracked_file_count:      usize,
+    /// Whether Pebble truncated the generated summary to its visible budget.
+    pub summary_truncated:       bool,
+    /// Provider-reported token usage for the summarization call.
+    pub usage:                   TokenUsage,
+    /// Provider-reported or catalog-derived cost of the summarization call in
+    /// USD micros, when it was priced.
+    pub cost_usd_micros:         Option<u64>,
 }
 
 /// The result of asking Pebble to compact now.

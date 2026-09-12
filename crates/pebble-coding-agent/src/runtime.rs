@@ -40,8 +40,8 @@ pub(crate) use crate::coding_agent::{
     CodingAgentBuildError, CodingInput, PromptTiming, ResumeMode, ShutdownReason,
 };
 use crate::compaction::{
-    CompactionControl, CompactionOptions, CompactionOutcome, CompactionReason, CompactionRequest,
-    compact_context, estimate_active_context_usage,
+    CompactionAccount, CompactionControl, CompactionOptions, CompactionOutcome, CompactionReason,
+    CompactionRequest, compact_context, estimate_active_context_usage,
 };
 use crate::config::CodingAgentOptions;
 use crate::context_window::{memory_prompt_tokens, skills_prompt_tokens};
@@ -102,11 +102,16 @@ pub(crate) struct WarmState {
 }
 
 /// What one prompt accumulated across every input it processed.
-#[derive(Clone, Copy, Debug, Default)]
+///
+/// `usage` and `cost_usd_micros` include the summary call of each entry in
+/// `compactions`, which is their breakdown, not an addition to them.
+#[derive(Clone, Debug, Default)]
 struct PromptTotals {
     timing:          PromptTiming,
     usage:           TokenUsage,
     cost_usd_micros: Option<u64>,
+    /// The compactions this prompt completed, in order.
+    compactions:     Vec<CompactionAccount>,
 }
 
 /// The `agent` namespace of a catalog entry.
@@ -1441,6 +1446,12 @@ impl CodingRuntime {
     /// children's, in touch order, and the most recent of them.
     pub(crate) fn last_prompt_files(&self) -> (Vec<String>, Option<String>) {
         self.conversation().files.snapshot()
+    }
+
+    /// The compactions the last prompt completed, this session's own, in
+    /// order. A manual compaction between prompts belongs to no prompt.
+    pub(crate) fn last_prompt_compactions(&self) -> Vec<CompactionAccount> {
+        self.conversation().totals.compactions.clone()
     }
 
     /// The broadcast channel this session's live subscribers are on, for a

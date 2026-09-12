@@ -19,8 +19,8 @@ use super::retry::RetryEventBridge;
 use super::{CodingRuntime, PromptResources, PromptTotals, SessionModel, StateMachine};
 use crate::coding_agent::CodingInput;
 use crate::compaction::{
-    CompactionControl, CompactionOutcome, CompactionReason, CompactionRequest, check_context_usage,
-    compact_context,
+    CompactionControl, CompactionOutcome, CompactionReason, CompactionRequest, CompactionResult,
+    check_context_usage, compact_context,
 };
 use crate::config::CodingAgentOptions;
 use crate::context_window::{
@@ -245,6 +245,13 @@ impl ConversationState {
                     .saturating_add(cost),
             );
         }
+    }
+
+    /// Bills a completed compaction's summary call to this prompt and lists
+    /// the compaction on its report.
+    fn record_compaction(&mut self, result: &CompactionResult) {
+        self.accumulate_usage(result.usage(), result.cost_usd_micros());
+        self.totals.compactions.push(result.account());
     }
 
     fn push_assistant(&mut self, message: Message) {
@@ -476,7 +483,7 @@ impl CodingAgentBridge {
                 let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
                 // Summarization is part of this prompt's bill, but its usage
                 // does not describe the coding request's context window.
-                state.accumulate_usage(result.usage(), result.cost_usd_micros());
+                state.record_compaction(&result);
                 state.replace_history(history);
             }
             Ok(CompactionOutcome::Unchanged) => {}
