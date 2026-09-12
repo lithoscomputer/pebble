@@ -48,7 +48,7 @@ use crate::context_window::{memory_prompt_tokens, skills_prompt_tokens};
 use crate::environment::{Environment, ExecRequest};
 use crate::error::{Error, ErrorData, ErrorKind, InterruptReason, Result, TaskKind};
 use crate::event::{Emitter, EventCapacity, EventOptions, EventPump, EventSink, EventSinkTimeout};
-use crate::file_tracker::FileTracker;
+use crate::file_tracker::{FileTracker, PromptFiles};
 use crate::history::History;
 use crate::human_input::HumanInputProvider;
 use crate::memory::ProjectMemory;
@@ -131,6 +131,7 @@ struct AgentMetadata {
 /// merges whatever the application registered, and freezes the result into the
 /// session. Nothing mutates a registry afterwards.
 #[must_use = "a builder does nothing until `build` is called"]
+#[derive(Clone)]
 pub(crate) struct CodingRuntimeBuilder {
     client:               Client,
     model:                Option<String>,
@@ -339,6 +340,32 @@ impl CodingRuntimeBuilder {
         self
     }
 
+    /// Keeps a predecessor's live subscribers: the new pipeline publishes on
+    /// `published` instead of opening a channel of its own.
+    pub(crate) fn continue_publishing_on(
+        mut self,
+        published: broadcast::Sender<CodingAgentEvent>,
+    ) -> Self {
+        self.events.published = Some(published);
+        self
+    }
+
+    /// Replaces the request controls with a fallback route's, keeping every
+    /// other option as it was.
+    pub(crate) fn with_route_controls(
+        mut self,
+        reasoning_effort: Option<ReasoningEffort>,
+        speed: Option<Speed>,
+        max_tokens: Option<i64>,
+    ) -> Self {
+        self.options = self
+            .options
+            .with_reasoning_effort(reasoning_effort)
+            .with_speed(speed)
+            .with_max_tokens(max_tokens);
+        self
+    }
+
     /// Records every event durably before any subscriber sees it.
     ///
     /// A sink that refuses an event stops the prompt and closes the session: a
@@ -541,8 +568,12 @@ impl CodingRuntimeBuilder {
             (emitter, Some(tokio::spawn(pump.run())))
         };
 
+        // One collector for the whole tree below this session: children report
+        // what they touched into it, and the prompt's report reads it.
+        let prompt_files = PromptFiles::default();
         let supervisor = self.subagents.is_enabled().then(|| {
             SubagentSupervisor::new(Arc::new(ChildDeps {
+                parent_files: prompt_files.clone(),
                 client: self.client.clone(),
                 model_selector: handle.to_string(),
                 profile: Arc::clone(&profile),
@@ -592,7 +623,10 @@ impl CodingRuntimeBuilder {
             session_scope,
             created_at,
             config: self.options,
-            conversation: Arc::new(Mutex::new(ConversationState::new(History::default()))),
+            conversation: Arc::new(Mutex::new(ConversationState::new(
+                History::default(),
+                prompt_files,
+            ))),
             emitter,
             pump,
             state,
@@ -1403,6 +1437,26 @@ impl CodingRuntime {
         self.conversation().totals.cost_usd_micros
     }
 
+    /// The files the last prompt wrote or edited, this session's and its
+    /// children's, in touch order, and the most recent of them.
+    pub(crate) fn last_prompt_files(&self) -> (Vec<String>, Option<String>) {
+        self.conversation().files.snapshot()
+    }
+
+    /// The broadcast channel this session's live subscribers are on, for a
+    /// replacement that should keep them.
+    pub(crate) fn published_sender(&self) -> Option<broadcast::Sender<CodingAgentEvent>> {
+        self.emitter.published_sender()
+    }
+
+    /// The `provider/model` this session runs on.
+    pub(crate) fn route(&self) -> String {
+        format!(
+            "{}/{}",
+            self.model_context.provider, self.model_context.model
+        )
+    }
+
     /// The shared conversation, locked.
     fn conversation(&self) -> MutexGuard<'_, ConversationState> {
         self.conversation
@@ -1957,7 +2011,7 @@ impl CodingRuntime {
     }
 
     /// Publishes one event on this session's stream.
-    fn emit(&self, event: CodingEvent) {
+    pub(crate) fn emit(&self, event: CodingEvent) {
         self.emitter
             .emit(self.session_scope.session_id().to_string(), event);
     }

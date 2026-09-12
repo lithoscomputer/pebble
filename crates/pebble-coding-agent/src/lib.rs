@@ -70,8 +70,8 @@ pub use pebble_agent::{SessionId, SessionScope};
 pub use self::coding_agent::{
     CodingAgent, CodingAgentBuildError, CodingAgentBuilder, CodingAgentControlHandle,
     CodingAgentExport, CodingAgentObservation, CodingAgentSnapshot, CodingInput, ControlSnapshot,
-    PendingInput, PromptOutput, PromptReport, PromptTiming, ResumeMode, ShutdownReason,
-    SteeringMessage, SteeringOutcome,
+    FallbackRoute, PendingInput, PromptOutput, PromptReport, PromptTiming, ResumeMode,
+    ShutdownReason, SteeringMessage, SteeringOutcome,
 };
 pub use self::compaction::{
     CompactionOptions, CompactionOutcome, CompactionReason, CompactionResult,

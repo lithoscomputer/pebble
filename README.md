@@ -89,7 +89,10 @@ on success and failure. Its `result` contains either a `PromptOutput` with the
 final message and text, or the prompt error. Accounting covers accepted main-model
 responses in this session, including queued follow-ups. It excludes subagents,
 compaction, and model calls made inside tools. Known cost is a subtotal when some
-responses have no price. A dropped prompt future cannot return a report.
+responses have no price. A dropped prompt future cannot return a report. The
+report also names every file the prompt wrote or edited (`files_touched`,
+sorted, the children's work included, deletions left out), the one it touched
+last, and the `provider/model` route it ended on.
 
 `continue_prompt` continues a prompt the history left unfinished, without new
 input: the history ends with the prompt itself or with tool results the model
@@ -98,6 +101,23 @@ An agent resumed from that record, on the recorded model or on another one
 through `ResumeMode::UseModel`, is asked again on the history as it stands and
 repeats no tool effect. A history that ends with the model's own answer has
 nothing to continue, and the report says so.
+
+`CodingAgentBuilder::fallback_routes` names the routes a prompt continues on
+when its model fails for a reason another route might not share (lithos-llm's
+`failover_eligible`: authentication, access, not-found and quota failures,
+rate limits, server and network errors, timeouts, stream decoding, and a
+refusal from the content filter). Each `FallbackRoute` is a selector and the
+request controls that route takes. On such a failure the agent takes its own
+record, closes the failed session, resumes the record on the next route with
+`ResumeMode::UseModel`, requeues the steering and follow-ups the failed session
+still held, and continues the prompt as `continue_prompt` would, so no tool
+effect repeats. Control handles and `subscribe` receivers taken before the
+prompt keep working; the stream carries `RouteFailover` from the new route;
+accounting spans both. Pebble executes the list it is given and nothing more:
+a route's own fallbacks are not consulted, a route that cannot be built ends
+the prompt with `Error::FallbackRoute`, and once the list is spent a model
+error ends the prompt as it would without one. `remaining_fallback_routes`
+says what is left, for a successor built from an export.
 
 The crate root contains the normal coding-agent path and the environment
 contract. The environment a session acts through is in

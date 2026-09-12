@@ -1101,6 +1101,21 @@ pub enum CodingEvent {
         /// The configured limit, which is also how many rounds ran.
         limit: usize,
     },
+    /// The prompt moved to a fallback route after its model failed.
+    ///
+    /// The conversation continued as it stood: no tool effect was repeated.
+    /// Published by the session on its new route, after
+    /// [`SessionStarted`](Self::SessionStarted) reports that route.
+    RouteFailover {
+        /// The `provider/model` that failed.
+        from:    String,
+        /// The `provider/model` the prompt continues on.
+        to:      String,
+        /// How many routes the prompt has moved through, this one included.
+        attempt: u32,
+        /// The failure that ended the previous route.
+        error:   ErrorData,
+    },
     /// Steering was injected into the conversation.
     SteeringInjected {
         /// The steering text.
@@ -1445,6 +1460,21 @@ impl CodingEvent {
             Self::LoopDetected => warn!(session_id, "Loop detected"),
             Self::ToolRoundsExhausted { limit } => {
                 warn!(session_id, limit, "Tool round budget exhausted");
+            }
+            Self::RouteFailover {
+                from,
+                to,
+                attempt,
+                error,
+            } => {
+                warn!(
+                    session_id,
+                    from = from.as_str(),
+                    to = to.as_str(),
+                    attempt,
+                    error = error.message.as_str(),
+                    "Route failover"
+                );
             }
             Self::SteeringInjected { text, .. } => {
                 debug!(session_id, text_len = text.len(), "Steering injected");

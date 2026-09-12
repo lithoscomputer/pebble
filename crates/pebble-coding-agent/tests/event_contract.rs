@@ -182,6 +182,12 @@ fn every_variant() -> Vec<CodingEvent> {
         },
         CodingEvent::LoopDetected,
         CodingEvent::ToolRoundsExhausted { limit: 3 },
+        CodingEvent::RouteFailover {
+            from:    "anthropic/claude-sonnet-5".into(),
+            to:      "openai/gpt-5.6".into(),
+            attempt: 1,
+            error:   ErrorData::from(&rate_limited()),
+        },
         CodingEvent::SteeringInjected {
             text:    "also update the changelog".into(),
             content: None,

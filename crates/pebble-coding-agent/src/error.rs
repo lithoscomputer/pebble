@@ -145,6 +145,21 @@ pub enum Error {
     #[error("building the agent loop")]
     AgentBuild(#[source] pebble_agent::AgentBuildError),
 
+    /// A fallback route the session should have continued on could not be
+    /// built, so the prompt ended there.
+    ///
+    /// The conversation is intact in the record the failed session left; the
+    /// previous route's error is in the event stream as
+    /// [`Error`](crate::events::CodingEvent::Error).
+    #[error("fallback route {route} could not be built")]
+    FallbackRoute {
+        /// The `provider/model` selector of the route that failed to build.
+        route:  String,
+        /// Why it failed to build.
+        #[source]
+        source: Box<crate::CodingAgentBuildError>,
+    },
+
     /// A `/name` skill reference in user input was invalid.
     #[error("expanding a skill reference")]
     SkillExpansion(#[from] SkillExpansionError),
@@ -213,7 +228,7 @@ impl Error {
         match self {
             Self::Llm(_) => ErrorKind::Llm,
             Self::Compaction(_) => ErrorKind::Compaction,
-            Self::Agent(_) | Self::AgentBuild(_) => ErrorKind::Agent,
+            Self::Agent(_) | Self::AgentBuild(_) | Self::FallbackRoute { .. } => ErrorKind::Agent,
             Self::SkillExpansion(_) | Self::ToolRegistration(_) => ErrorKind::InvalidInput,
             Self::SessionClosed => ErrorKind::SessionClosed,
             Self::InvalidState(_) => ErrorKind::InvalidState,
@@ -237,6 +252,7 @@ impl Error {
             )
             | Self::Agent(_)
             | Self::AgentBuild(_)
+            | Self::FallbackRoute { .. }
             | Self::SkillExpansion(_)
             | Self::ToolRegistration(_)
             | Self::SessionClosed

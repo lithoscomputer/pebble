@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use lithos_llm::types::{ToolCall, ToolResult};
 use serde_json::Value;
@@ -32,6 +33,51 @@ struct FileOps {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct FileTracker {
     files: BTreeMap<String, FileOps>,
+}
+
+/// The files one prompt wrote or edited, across a session and its children.
+///
+/// Where [`FileTracker`] outlives prompts and exists for compaction, this is
+/// the prompt's own answer to "what did that change?", reset when a prompt
+/// begins and read into its report when it ends. It is shared between a
+/// session's conversation and the supervisor of its children: a child that
+/// finishes a turn adds what it touched, so a parent's report covers the whole
+/// tree. Cheap to clone; every clone reads and writes the same list.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PromptFiles(Arc<Mutex<PromptFilesState>>);
+
+#[derive(Debug, Default)]
+struct PromptFilesState {
+    /// Every path touched, in the order first touched, each once.
+    touched: Vec<String>,
+    /// The path touched most recently.
+    last:    Option<String>,
+}
+
+impl PromptFiles {
+    /// Records paths written or edited, in the order they were touched.
+    pub(crate) fn record(&self, paths: impl IntoIterator<Item = String>) {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        for path in paths {
+            if !state.touched.contains(&path) {
+                state.touched.push(path.clone());
+            }
+            state.last = Some(path);
+        }
+    }
+
+    /// Forgets everything, at the start of a prompt.
+    pub(crate) fn reset(&self) {
+        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        state.touched.clear();
+        state.last = None;
+    }
+
+    /// The paths touched so far, in touch order, and the most recent one.
+    pub(crate) fn snapshot(&self) -> (Vec<String>, Option<String>) {
+        let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        (state.touched.clone(), state.last.clone())
+    }
 }
 
 impl FileTracker {
@@ -90,7 +136,8 @@ impl FileTracker {
         output
     }
 
-    /// Records the file work in one round of answered tool calls.
+    /// Records the file work in one round of answered tool calls, and answers
+    /// with the paths that round wrote or edited, in call order.
     ///
     /// Calls and results are paired in order, which is the order the agent
     /// loop answers them in. A call whose result reports an error is skipped:
@@ -99,7 +146,8 @@ impl FileTracker {
         &mut self,
         tool_calls: &[ToolCall],
         results: &[ToolResult],
-    ) {
+    ) -> Vec<String> {
+        let mut written = Vec::new();
         for (call, result) in tool_calls.iter().zip(results) {
             if result.is_error {
                 continue;
@@ -117,17 +165,22 @@ impl FileTracker {
                 Some(NativeTool::WriteFile) => {
                     if let Some(path) = file_path(&arguments) {
                         self.record_write(path);
+                        written.push(path.to_owned());
                     }
                 }
                 Some(NativeTool::EditFile) => {
                     if let Some(path) = file_path(&arguments) {
                         self.record_edit(path);
+                        written.push(path.to_owned());
                     }
                 }
-                Some(NativeTool::ApplyPatch) => self.record_from_patch_arguments(&arguments),
+                Some(NativeTool::ApplyPatch) => {
+                    written.extend(self.record_from_patch_arguments(&arguments));
+                }
                 _ => {}
             }
         }
+        written
     }
 
     /// Reads the operations out of the patch the call carried.
@@ -142,22 +195,29 @@ impl FileTracker {
     /// them: this list exists so files can be revisited after compaction, and
     /// a deleted file cannot be. An update that moves a file records the
     /// destination, which is where the result lives now.
-    fn record_from_patch_arguments(&mut self, arguments: &Value) {
+    fn record_from_patch_arguments(&mut self, arguments: &Value) -> Vec<String> {
+        let mut written = Vec::new();
         let Some(patch) = patch_text(arguments) else {
-            return;
+            return written;
         };
         let Ok(operations) = parse_apply_patch(patch) else {
-            return;
+            return written;
         };
         for operation in operations {
             match operation {
-                PatchOperation::Add { path, .. } => self.record_write(&path),
+                PatchOperation::Add { path, .. } => {
+                    self.record_write(&path);
+                    written.push(path);
+                }
                 PatchOperation::Update { path, new_path, .. } => {
-                    self.record_edit(new_path.as_deref().unwrap_or(&path));
+                    let path = new_path.unwrap_or(path);
+                    self.record_edit(&path);
+                    written.push(path);
                 }
                 PatchOperation::Delete { .. } => {}
             }
         }
+        written
     }
 }
 

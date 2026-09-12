@@ -28,7 +28,7 @@ use crate::context_window::{
 };
 use crate::error::{Error, ErrorData, InterruptReason, Result};
 use crate::event::Emitter;
-use crate::file_tracker::FileTracker;
+use crate::file_tracker::{FileTracker, PromptFiles};
 use crate::history::History;
 use crate::loop_detection::detect_loop;
 use crate::policy::{CompactionPolicy, ContextPolicy, ContextPreparation};
@@ -108,6 +108,8 @@ pub(super) struct ConversationState {
     /// Whether the last applied projection includes a transient task reminder.
     projected_reminder: bool,
     pub(super) file_tracker: FileTracker,
+    /// What this prompt wrote or edited, the children's work included.
+    pub(super) files: PromptFiles,
     pub(super) totals: PromptTotals,
     pub(super) activated_skill_context_observed: bool,
     pub(super) context_window: Option<ContextWindowSnapshot>,
@@ -124,12 +126,14 @@ pub(super) struct ConversationState {
 
 impl ConversationState {
     /// A conversation that starts from `history`, with nothing accumulated.
-    pub(super) fn new(history: History) -> Self {
+    /// `files` is the collector this session's children report into.
+    pub(super) fn new(history: History, files: PromptFiles) -> Self {
         Self {
             history,
             dirty_from: None,
             projected_reminder: false,
             file_tracker: FileTracker::default(),
+            files,
             totals: PromptTotals::default(),
             activated_skill_context_observed: false,
             context_window: None,
@@ -147,6 +151,7 @@ impl ConversationState {
     /// projection.
     pub(super) fn begin_prompt(&mut self) {
         self.totals = PromptTotals::default();
+        self.files.reset();
         self.compaction_failed = false;
         self.pending_task_reminder = None;
         self.local_context_window = None;
@@ -191,7 +196,8 @@ impl ConversationState {
         if activated_a_skill(calls, results) {
             self.activated_skill_context_observed = true;
         }
-        self.file_tracker.record_from_tool_calls(calls, results);
+        let written = self.file_tracker.record_from_tool_calls(calls, results);
+        self.files.record(written);
         self.push(Message::ToolResults {
             results:   results.to_vec(),
             timestamp: SystemTime::now(),

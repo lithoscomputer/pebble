@@ -1565,3 +1565,73 @@ async fn a_child_reads_the_parents_memory_and_skills_when_the_application_asks()
         "the child's prompt lists the skills it discovered: {system}"
     );
 }
+
+/// What a child writes is the parent prompt's work: the parent's report names
+/// it, beside what the parent wrote itself, and a later prompt starts clean.
+#[tokio::test]
+async fn a_childs_writes_land_on_the_parents_prompt() {
+    let task = "child scribe: write the note";
+    let (client, _provider) = routed_client(
+        ScriptedProvider::new(vec![
+            ScriptedCall::response(tool_call_response(
+                "write_file",
+                "parent_write",
+                json!({ "file_path": "/home/test/parent.txt", "content": "mine" }),
+            )),
+            ScriptedCall::response(tool_call_response(
+                "spawn_agent",
+                "spawn",
+                json!({ "task": task }),
+            )),
+            ScriptedCall::response(tool_call_response("wait", "wait", json!({}))),
+            ScriptedCall::response(text_response("both written")),
+            ScriptedCall::response(text_response("nothing more")),
+        ]),
+        vec![(
+            task,
+            ScriptedProvider::new(vec![
+                ScriptedCall::response(tool_call_response(
+                    "write_file",
+                    "child_write",
+                    json!({ "file_path": "/home/test/child.txt", "content": "theirs" }),
+                )),
+                ScriptedCall::response(text_response("note written")),
+            ]),
+        )],
+    );
+    let mut parent = builder(client)
+        .tools([noop_tool("write_file").allow_in_subagents()])
+        .subagents(SubagentOptions::enabled())
+        .build()
+        .expect("the parent builds");
+    parent.initialize().await.expect("initialization succeeds");
+
+    let output = parent
+        .prompt("write, then delegate")
+        .await
+        .expect("the prompt succeeds");
+
+    assert_eq!(output.as_deref(), Some("both written"));
+    let (touched, last) = parent.last_prompt_files();
+    assert_eq!(
+        touched,
+        ["/home/test/parent.txt", "/home/test/child.txt"],
+        "the parent's write first, then the child's, in touch order"
+    );
+    assert_eq!(last.as_deref(), Some("/home/test/child.txt"));
+
+    let next = parent
+        .prompt("just talk")
+        .await
+        .expect("the prompt succeeds");
+    assert_eq!(next.as_deref(), Some("nothing more"));
+    assert_eq!(
+        parent.last_prompt_files(),
+        (Vec::new(), None),
+        "a new prompt starts with nothing touched"
+    );
+    parent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the parent shuts down");
+}

@@ -57,6 +57,7 @@ use crate::config::CodingAgentOptions;
 use crate::environment::Environment;
 use crate::error::{Error, ErrorData, ErrorKind, InterruptReason, Result, TaskKind};
 use crate::event::Emitter;
+use crate::file_tracker::PromptFiles;
 use crate::policy::{CompactionPolicy, ContextPolicy};
 use crate::profile::AgentProfile;
 use crate::redact::Redactor;
@@ -388,6 +389,9 @@ fn build_child(
 /// human-input provider, which is why a child can never ask a person a
 /// question.
 pub(crate) struct ChildDeps {
+    /// Where a child reports the files each of its turns touched, so the
+    /// parent's prompt report covers the tree.
+    pub(crate) parent_files:      PromptFiles,
     pub(crate) client:            Client,
     pub(crate) model_selector:    String,
     pub(crate) profile:           Arc<dyn AgentProfile>,
@@ -413,6 +417,7 @@ pub(crate) struct ChildDeps {
 }
 
 /// Where a child sits in its tree, and which budget it spends.
+#[derive(Clone)]
 pub(crate) struct ChildIdentity {
     /// This child's view of the tree's shared event pipeline.
     pub(crate) event_emitter: Emitter,
@@ -822,6 +827,8 @@ struct SubagentHandle {
     state:                 Weak<Mutex<SupervisorState>>,
     event_callback:        Arc<RwLock<Option<SubagentEventCallback>>>,
     notifications_changed: Arc<watch::Sender<u64>>,
+    /// The parent prompt's file collector, fed after every child turn.
+    parent_files:          PromptFiles,
     agent_id:              String,
     depth:                 usize,
 }
@@ -982,6 +989,10 @@ async fn run_subagent_session(
                         .len()
                         .saturating_sub(generation_start_turns),
                 });
+            // What the child touched belongs to the parent prompt that is
+            // waiting on it, so the parent's report covers the whole tree.
+            let (touched, _) = session.last_prompt_files();
+            handle.parent_files.record(touched);
             let reusable =
                 session.state() == CodingAgentState::Idle && !session.cancel_token().is_cancelled();
             match handle.commit_turn_result(generation, &result, reusable) {
@@ -1089,6 +1100,7 @@ impl SubagentSupervisor {
             state: Arc::downgrade(&self.state),
             event_callback: Arc::clone(&self.event_callback),
             notifications_changed: Arc::clone(&self.notifications_changed),
+            parent_files: self.deps.parent_files.clone(),
             agent_id,
             depth,
         }

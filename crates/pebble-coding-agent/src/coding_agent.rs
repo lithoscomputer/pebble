@@ -2,13 +2,15 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
 use lithos_llm::Client;
 use lithos_llm::catalog::MetadataError;
 use lithos_llm::resolver::ModelSelectionError;
-use lithos_llm::types::{ContentPart, ReasoningEffort, RequestBuildError, Speed};
+use lithos_llm::types::{
+    ContentPart, Error as LlmError, ReasoningEffort, RequestBuildError, Speed,
+};
 use pebble_agent::{
     AgentControlHandle, AgentPendingInput, QueueOutcome, ToolMiddleware, UserMessage,
 };
@@ -19,7 +21,7 @@ use crate::SessionScope;
 use crate::compaction::{CompactionControl, CompactionOptions, CompactionOutcome};
 use crate::config::{CodingAgentOptions, CodingAgentOptionsError};
 use crate::environment::Environment;
-use crate::error::{Error, InterruptReason};
+use crate::error::{Error, ErrorData, InterruptReason};
 use crate::event::{EventCapacity, EventSink, EventSinkTimeout};
 use crate::extensions::{CompactionPolicy, ContextPolicy};
 use crate::history::History;
@@ -35,10 +37,149 @@ use crate::search::SearchProvider;
 use crate::subagent::SubagentOptions;
 use crate::tool::{RegisteredTool, ToolEnvProvider, ToolRegistrationError};
 use crate::types::{
-    Actor, AgentProfileKind, CodingAgentEvent, CodingAgentState, ContextWindowSnapshot,
-    InputContent, InputSource, MemoryFileSummary, Message, PermissionLevel, SkillSummary,
-    TokenUsage, ToolSummary,
+    Actor, AgentProfileKind, CodingAgentEvent, CodingAgentState, CodingEvent,
+    ContextWindowSnapshot, InputContent, InputSource, MemoryFileSummary, Message, PermissionLevel,
+    SkillSummary, TokenUsage, ToolSummary,
 };
+
+/// A route a prompt continues on when its model fails for a reason another
+/// route might not share.
+///
+/// A route is a `provider/model` selector the client's catalog resolves, plus
+/// the request controls that route takes. It states its controls in full:
+/// `None` for one of them asks for the provider's default, as it does on
+/// [`CodingAgentOptions`]. Everything else about the session — its tools,
+/// its environment, its event sink, its middleware — is the same on every
+/// route.
+///
+/// ```
+/// use lithos_llm::types::ReasoningEffort;
+/// use pebble_coding_agent::FallbackRoute;
+///
+/// let route = FallbackRoute::new("openai/gpt-5.6")
+///     .with_reasoning_effort(Some(ReasoningEffort::High))
+///     .with_max_tokens(Some(16_000));
+/// assert_eq!(route.selector(), "openai/gpt-5.6");
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FallbackRoute {
+    selector:         String,
+    reasoning_effort: Option<ReasoningEffort>,
+    speed:            Option<Speed>,
+    max_tokens:       Option<i64>,
+}
+
+impl FallbackRoute {
+    /// A route to `selector`, with every control at the provider's default.
+    pub fn new(selector: impl Into<String>) -> Self {
+        Self {
+            selector:         selector.into(),
+            reasoning_effort: None,
+            speed:            None,
+            max_tokens:       None,
+        }
+    }
+
+    /// Sets how hard the model on this route is asked to think.
+    #[must_use]
+    pub const fn with_reasoning_effort(mut self, effort: Option<ReasoningEffort>) -> Self {
+        self.reasoning_effort = effort;
+        self
+    }
+
+    /// Sets which latency or cost tier this route asks for.
+    #[must_use]
+    pub const fn with_speed(mut self, speed: Option<Speed>) -> Self {
+        self.speed = speed;
+        self
+    }
+
+    /// Sets the most tokens the model on this route may produce per turn.
+    #[must_use]
+    pub const fn with_max_tokens(mut self, max_tokens: Option<i64>) -> Self {
+        self.max_tokens = max_tokens;
+        self
+    }
+
+    /// The `provider/model` selector the client resolves.
+    #[must_use]
+    pub fn selector(&self) -> &str {
+        &self.selector
+    }
+
+    /// How hard the model on this route is asked to think.
+    #[must_use]
+    pub const fn reasoning_effort(&self) -> Option<ReasoningEffort> {
+        self.reasoning_effort
+    }
+
+    /// Which latency or cost tier this route asks for.
+    #[must_use]
+    pub const fn speed(&self) -> Option<Speed> {
+        self.speed
+    }
+
+    /// The most tokens the model on this route may produce per turn.
+    #[must_use]
+    pub const fn max_tokens(&self) -> Option<i64> {
+        self.max_tokens
+    }
+}
+
+/// The routes an agent has left to fail over to, and what it rebuilds itself
+/// from when it does.
+struct FallbackChain {
+    routes: Vec<FallbackRoute>,
+    /// How many routes have been taken. The next candidate is `routes[taken]`.
+    taken:  usize,
+    /// The builder the agent was built from, so a replacement runtime binds
+    /// the same environment, tools, sink, and middleware.
+    recipe: CodingRuntimeBuilder,
+}
+
+impl FallbackChain {
+    fn next_route(&mut self) -> Option<FallbackRoute> {
+        let route = self.routes.get(self.taken)?.clone();
+        self.taken += 1;
+        Some(route)
+    }
+
+    fn remaining(&self) -> &[FallbackRoute] {
+        &self.routes[self.taken.min(self.routes.len())..]
+    }
+}
+
+/// What one prompt accumulated across every route it ran on.
+#[derive(Default)]
+struct RouteTotals {
+    usage:             TokenUsage,
+    cost_usd_micros:   Option<u64>,
+    timing:            PromptTiming,
+    files_touched:     Vec<String>,
+    last_file_touched: Option<String>,
+}
+
+impl RouteTotals {
+    /// Adds what `runtime`'s last prompt spent and touched.
+    fn absorb(&mut self, runtime: &CodingRuntime) {
+        self.usage = self.usage.saturating_add(runtime.last_prompt_usage());
+        if let Some(cost) = runtime.last_prompt_cost_usd_micros() {
+            self.cost_usd_micros = Some(self.cost_usd_micros.unwrap_or(0).saturating_add(cost));
+        }
+        let timing = runtime.last_prompt_timing();
+        self.timing.inference = self.timing.inference.saturating_add(timing.inference);
+        self.timing.tool = self.timing.tool.saturating_add(timing.tool);
+        let (touched, last) = runtime.last_prompt_files();
+        for path in touched {
+            if !self.files_touched.contains(&path) {
+                self.files_touched.push(path);
+            }
+        }
+        if last.is_some() {
+            self.last_file_touched = last;
+        }
+    }
+}
 
 /// Why a coding agent is being shut down.
 ///
@@ -263,13 +404,24 @@ impl CodingAgentExport {
 #[must_use = "inspect the prompt result even when only recording accounting"]
 pub struct PromptReport {
     /// The final output or the original typed failure.
-    pub result:          Result<PromptOutput, Error>,
+    pub result:            Result<PromptOutput, Error>,
     /// Observed tokens used by this invocation.
-    pub usage:           TokenUsage,
+    pub usage:             TokenUsage,
     /// Known cost in USD micros, or `None` if no cost was reported.
-    pub cost_usd_micros: Option<u64>,
+    pub cost_usd_micros:   Option<u64>,
     /// Time spent in inference and tool execution, including failed work.
-    pub timing:          PromptTiming,
+    pub timing:            PromptTiming,
+    /// Every file this prompt wrote or edited, sorted, each once: this
+    /// session's successful `write_file`, `edit_file`, and `apply_patch`
+    /// calls and those of the children it ran. A patch's paths come from the
+    /// parsed patch; a moved file is recorded at its destination. Deletions
+    /// are not recorded.
+    pub files_touched:     Vec<String>,
+    /// The path written or edited most recently, when any was.
+    pub last_file_touched: Option<String>,
+    /// The `provider/model` the prompt ended on. After a failover this is the
+    /// fallback route, not the route the prompt started on.
+    pub route:             String,
 }
 
 /// The final output of a successful prompt.
@@ -422,16 +574,43 @@ enum ResumeSource {
 /// Builds an initialized [`CodingAgent`].
 #[must_use = "a builder does nothing until `build().await` is called"]
 pub struct CodingAgentBuilder {
-    inner:  CodingRuntimeBuilder,
-    resume: Option<ResumeSource>,
+    inner:           CodingRuntimeBuilder,
+    resume:          Option<ResumeSource>,
+    fallback_routes: Vec<FallbackRoute>,
 }
 
 impl CodingAgentBuilder {
     fn new(client: Client, environment: Arc<dyn Environment>) -> Self {
         Self {
-            inner:  CodingRuntime::builder(client).environment(environment),
-            resume: None,
+            inner:           CodingRuntime::builder(client).environment(environment),
+            resume:          None,
+            fallback_routes: Vec::new(),
         }
+    }
+
+    /// Names the routes a prompt continues on when its model fails, in order.
+    ///
+    /// When a prompt ends with a model error the client would not retry on the
+    /// same route and another route might not share — the error's
+    /// [`failover_eligible`](lithos_llm::types::Error::failover_eligible) — the
+    /// agent takes its own record, closes its session, resumes the record on
+    /// the next route with [`ResumeMode::UseModel`] and that route's controls,
+    /// requeues the steering and follow-ups the failed session still held, and
+    /// continues the prompt as
+    /// [`continue_prompt`](CodingAgent::continue_prompt) would: on the
+    /// history as it stands, so no tool effect repeats. The stream carries
+    /// [`RouteFailover`](CodingEvent::RouteFailover) from the new route,
+    /// and the report names the route the prompt ended on.
+    ///
+    /// The list is the whole plan, fixed here: a route's own fallbacks, if the
+    /// application knows of any, are not consulted. A route that cannot be
+    /// built ends the prompt with [`Error::FallbackRoute`]. Once the list is
+    /// spent, a model error ends the prompt as it would without one. A prompt
+    /// that was cancelled never moves. Children built by this agent run on its
+    /// current route and do not fail over on their own.
+    pub fn fallback_routes(mut self, routes: impl IntoIterator<Item = FallbackRoute>) -> Self {
+        self.fallback_routes = routes.into_iter().collect();
+        self
     }
 
     /// Names the model through the client's catalog.
@@ -608,6 +787,17 @@ impl CodingAgentBuilder {
         if self.resume.is_some() && self.inner.has_model() {
             return Err(CodingAgentBuildError::ModelConflictsWithResume);
         }
+        // Cloned before the build consumes the builder, so a replacement
+        // runtime is built from exactly what this one was.
+        // Boxed: the recipe is a whole builder, and an agent lives inside its
+        // application's futures.
+        let fallback = (!self.fallback_routes.is_empty()).then(|| {
+            Box::new(FallbackChain {
+                routes: self.fallback_routes,
+                taken:  0,
+                recipe: self.inner.clone(),
+            })
+        });
         let inner = match self.resume {
             Some(ResumeSource::Record(record, mode)) => {
                 let mut inner = CodingRuntime::from_record(*record, &mode, self.inner)?;
@@ -641,7 +831,21 @@ impl CodingAgentBuilder {
             }
         };
         let control = CodingControl::new(&inner);
-        Ok(CodingAgent { inner, control })
+        // The live channel is captured while its pump runs: a session that
+        // closes itself on a credential failure has joined its pump before
+        // the failover can look, and every replacement publishes here so a
+        // subscriber taken now keeps receiving.
+        let fallback = fallback.map(|mut chain| {
+            if let Some(published) = inner.published_sender() {
+                chain.recipe = chain.recipe.continue_publishing_on(published);
+            }
+            chain
+        });
+        Ok(CodingAgent {
+            inner,
+            control,
+            fallback,
+        })
     }
 }
 
@@ -651,6 +855,15 @@ impl CodingAgentBuilder {
 /// Whether a prompt is running and whether the agent is closed are read from
 /// the session's own control rather than tracked again here.
 struct CodingControl {
+    /// The runtime the handle reaches. Replaced when a failover rebuilds the
+    /// runtime, so a handle taken before the prompt keeps working after it.
+    target: RwLock<ControlTarget>,
+}
+
+/// One runtime's control surface: cheap handles, every one of them shared with
+/// the runtime they came from.
+#[derive(Clone)]
+struct ControlTarget {
     session:          AgentControlHandle,
     cancel:           CancellationToken,
     interrupt_reason: InterruptReasonHandle,
@@ -740,12 +953,33 @@ impl From<Vec<ContentPart>> for CodingInput {
 impl CodingControl {
     fn new(session: &CodingRuntime) -> Arc<Self> {
         Arc::new(Self {
+            target: RwLock::new(ControlTarget::of(session)),
+        })
+    }
+
+    /// Points every handle at `session` from now on.
+    fn retarget(&self, session: &CodingRuntime) {
+        *self.target.write().unwrap_or_else(PoisonError::into_inner) = ControlTarget::of(session);
+    }
+
+    /// The runtime the handle reaches right now.
+    fn target(&self) -> ControlTarget {
+        self.target
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+impl ControlTarget {
+    fn of(session: &CodingRuntime) -> Self {
+        Self {
             session:          session.control_handle(),
             cancel:           session.cancel_token(),
             interrupt_reason: session.interrupt_reason_handle(),
             state:            session.state_machine(),
             compaction:       session.compaction_control(),
-        })
+        }
     }
 }
 
@@ -1004,7 +1238,7 @@ impl CodingAgentControlHandle {
             return SteeringOutcome::Closed;
         }
         let message = message.into();
-        SteeringOutcome::from_queue(self.control.session.enqueue_steering_bounded(
+        SteeringOutcome::from_queue(self.control.target().session.enqueue_steering_bounded(
             steering_message(message.content, message.actor),
             Self::STEERING_QUEUE_CAPACITY,
         ))
@@ -1022,7 +1256,7 @@ impl CodingAgentControlHandle {
             return SteeringOutcome::Closed;
         }
         let message = message.into();
-        SteeringOutcome::from_queue(self.control.session.steer_bounded(
+        SteeringOutcome::from_queue(self.control.target().session.steer_bounded(
             steering_message(message.content, message.actor),
             Self::STEERING_QUEUE_CAPACITY,
         ))
@@ -1041,7 +1275,7 @@ impl CodingAgentControlHandle {
         if !self.is_running() || self.is_closed() {
             return false;
         }
-        self.control.session.interrupt()
+        self.control.target().session.interrupt()
     }
 
     /// Holds natural completion open while an external steering source is
@@ -1054,7 +1288,7 @@ impl CodingAgentControlHandle {
     /// supported replacement for reaching into the drain, park, and generation
     /// protocol directly.
     pub fn hold_open_for_steering(&self) -> SteeringLease {
-        SteeringLease::acquire(&self.control.session)
+        SteeringLease::acquire(&self.control.target().session)
     }
 
     /// Queues input to run as its own user turn once the current prompt
@@ -1068,7 +1302,7 @@ impl CodingAgentControlHandle {
             return SteeringOutcome::Closed;
         }
         let message = message.into();
-        SteeringOutcome::from_queue(self.control.session.follow_up_bounded(
+        SteeringOutcome::from_queue(self.control.target().session.follow_up_bounded(
             input_message(message.content, InputSource::FollowUp),
             Self::FOLLOW_UP_QUEUE_CAPACITY,
         ))
@@ -1079,12 +1313,11 @@ impl CodingAgentControlHandle {
     /// The loop unwinds through its cancellation checkpoints and keeps tool
     /// calls paired with results. Returns whether a prompt was running.
     pub fn abort(&self) -> bool {
-        if self.is_closed() || !self.control.session.abort() {
+        let target = self.control.target();
+        if self.is_closed() || !target.session.abort() {
             return false;
         }
-        self.control
-            .interrupt_reason
-            .record(InterruptReason::Cancelled);
+        target.interrupt_reason.record(InterruptReason::Cancelled);
         true
     }
 
@@ -1094,14 +1327,13 @@ impl CodingAgentControlHandle {
     /// [`CodingAgent`] must still call [`CodingAgent::shutdown`] to publish the
     /// terminal event and join owned tasks.
     pub fn close(&self) -> bool {
-        if !self.control.session.close() {
+        let target = self.control.target();
+        if !target.session.close() {
             return false;
         }
-        self.control
-            .interrupt_reason
-            .record(InterruptReason::Cancelled);
-        self.control.state.transition(CodingAgentState::Closed);
-        self.control.cancel.cancel();
+        target.interrupt_reason.record(InterruptReason::Cancelled);
+        target.state.transition(CodingAgentState::Closed);
+        target.cancel.cancel();
         true
     }
 
@@ -1111,14 +1343,15 @@ impl CodingAgentControlHandle {
     /// Cancelling manual compaction ends that operation with
     /// [`Error::Interrupted`] and leaves the agent reusable.
     pub fn cancel_compaction(&self) -> bool {
-        self.control.compaction.cancel()
+        self.control.target().compaction.cancel()
     }
 
     /// Waits until no prompt or compaction is running.
     pub async fn wait_for_idle(&self) {
         loop {
-            self.control.session.wait_for_idle().await;
-            self.control.compaction.wait_for_idle().await;
+            let target = self.control.target();
+            target.session.wait_for_idle().await;
+            target.compaction.wait_for_idle().await;
             if !self.is_running() && !self.is_compacting() {
                 return;
             }
@@ -1128,25 +1361,26 @@ impl CodingAgentControlHandle {
     /// Whether a prompt is running.
     #[must_use]
     pub fn is_running(&self) -> bool {
-        self.control.session.is_running()
+        self.control.target().session.is_running()
     }
 
     /// Whether the agent is permanently closed.
     #[must_use]
     pub fn is_closed(&self) -> bool {
-        self.control.session.is_closed() || self.control.cancel.is_cancelled()
+        let target = self.control.target();
+        target.session.is_closed() || target.cancel.is_cancelled()
     }
 
     /// Whether conversation history is being compacted.
     #[must_use]
     pub fn is_compacting(&self) -> bool {
-        self.control.compaction.is_active()
+        self.control.target().compaction.is_active()
     }
 
     /// A read-only view of the agent's state and queued input.
     #[must_use]
     pub fn snapshot(&self) -> ControlSnapshot {
-        let snapshot = self.control.session.snapshot();
+        let snapshot = self.control.target().session.snapshot();
         ControlSnapshot {
             running:            snapshot.is_running(),
             closed:             self.is_closed(),
@@ -1160,7 +1394,7 @@ impl CodingAgentControlHandle {
     /// Clones the input currently waiting in both queues.
     #[must_use]
     pub fn pending_input(&self) -> PendingInput {
-        PendingInput::from_agent(self.control.session.pending_input())
+        PendingInput::from_agent(self.control.target().session.pending_input())
     }
 
     /// Removes and returns the input currently waiting in both queues.
@@ -1169,7 +1403,7 @@ impl CodingAgentControlHandle {
     /// the prompt parked at its next boundary. Abort the prompt first when the
     /// application is restoring queued input to an editor.
     pub fn take_pending_input(&self) -> PendingInput {
-        PendingInput::from_agent(self.control.session.take_pending_input())
+        PendingInput::from_agent(self.control.target().session.take_pending_input())
     }
 }
 
@@ -1190,8 +1424,10 @@ impl fmt::Debug for CodingAgentControlHandle {
 /// those coding-specific facilities are not needed.
 #[must_use = "call `shutdown` to stop the agent and join what it owns"]
 pub struct CodingAgent {
-    inner:   CodingRuntime,
-    control: Arc<CodingControl>,
+    inner:    CodingRuntime,
+    control:  Arc<CodingControl>,
+    /// The routes left to fail over to, when the builder named any.
+    fallback: Option<Box<FallbackChain>>,
 }
 
 impl CodingAgent {
@@ -1402,25 +1638,163 @@ impl CodingAgent {
         cancel: Option<&CancellationToken>,
     ) -> PromptReport {
         let result = self.inner.prompt_with_cancellation(input, cancel).await;
-        self.report(result)
+        self.finish_prompt(result, cancel).await
     }
 
     async fn continue_inner(&mut self, cancel: Option<&CancellationToken>) -> PromptReport {
         let result = self.inner.continue_prompt(cancel).await;
-        self.report(result)
+        self.finish_prompt(result, cancel).await
     }
 
-    /// The report of a prompt that ended with `result`.
-    fn report(&self, result: Result<Option<String>, Error>) -> PromptReport {
+    /// Ends a prompt that came back with `result`, following the fallback
+    /// routes while the result is a model failure they can absorb.
+    ///
+    /// Accounting spans every route the prompt ran on: what the failed
+    /// session spent is in the report beside what the one that answered
+    /// spent.
+    async fn finish_prompt(
+        &mut self,
+        mut result: Result<Option<String>, Error>,
+        cancel: Option<&CancellationToken>,
+    ) -> PromptReport {
+        let mut totals = RouteTotals::default();
+        loop {
+            totals.absorb(&self.inner);
+            let Err(error) = &result else {
+                break;
+            };
+            let Some(route) = self.route_to_fail_over_to(error, cancel) else {
+                break;
+            };
+            let attempt = self
+                .fallback
+                .as_ref()
+                .map_or(0, |chain| u32::try_from(chain.taken).unwrap_or(u32::MAX));
+            match self.fail_over(&route, attempt, error).await {
+                Ok(()) => result = self.inner.continue_prompt(cancel).await,
+                Err(build_error) => {
+                    result = Err(build_error);
+                    break;
+                }
+            }
+        }
+        self.report(result, totals)
+    }
+
+    /// The next fallback route, when `error` is a model failure worth moving
+    /// for and the prompt was not cancelled.
+    fn route_to_fail_over_to(
+        &mut self,
+        error: &Error,
+        cancel: Option<&CancellationToken>,
+    ) -> Option<FallbackRoute> {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return None;
+        }
+        if !error.llm_source().is_some_and(LlmError::failover_eligible) {
+            return None;
+        }
+        self.fallback.as_mut()?.next_route()
+    }
+
+    /// Moves the conversation to `route`: closes the failed session, resumes
+    /// its record on the route with the route's controls, points every control
+    /// handle at the replacement, and requeues the input the failed session
+    /// still held.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::FallbackRoute`] when the route cannot be built or
+    /// initialized. The failed session is closed either way.
+    async fn fail_over(
+        &mut self,
+        route: &FallbackRoute,
+        attempt: u32,
+        error: &Error,
+    ) -> Result<(), Error> {
+        let from = self.inner.route();
+        let failed_error = ErrorData::from(error);
+        // Taken before the session closes: the queues belong to the prompt,
+        // not to the runtime that happened to hold them.
+        let pending = self.control.target().session.take_pending_input();
+        let mut record = self.inner.to_record();
+        let _ = self.inner.shutdown(ShutdownReason::Error).await;
+        // The close is in the stream now; the replacement numbers past it.
+        record.advance_event_cursor(self.inner.committed_event_seq());
+
+        let recipe = self
+            .fallback
+            .as_ref()
+            .expect("a route was taken from the chain")
+            .recipe
+            .clone()
+            .with_route_controls(route.reasoning_effort, route.speed, route.max_tokens);
+        let unavailable = |source: CodingAgentBuildError| Error::FallbackRoute {
+            route:  route.selector.clone(),
+            source: Box::new(source),
+        };
+        let mut inner = CodingRuntime::from_record(
+            record,
+            &ResumeMode::UseModel(route.selector.clone()),
+            recipe,
+        )
+        .map_err(unavailable)?;
+        if let Err(source) = inner.initialize().await {
+            let _ = inner.shutdown(ShutdownReason::Error).await;
+            return Err(unavailable(CodingAgentBuildError::Initialization {
+                source: Box::new(source),
+            }));
+        }
+        inner.emit(CodingEvent::RouteFailover {
+            from,
+            to: inner.route(),
+            attempt,
+            error: failed_error,
+        });
+        self.inner = inner;
+        self.control.retarget(&self.inner);
+        let handle = self.inner.control_handle();
+        let (steering, follow_ups) = pending.into_parts();
+        for message in steering {
+            handle.enqueue_steering_bounded(
+                message,
+                CodingAgentControlHandle::STEERING_QUEUE_CAPACITY,
+            );
+        }
+        for message in follow_ups {
+            handle.follow_up_bounded(message, CodingAgentControlHandle::FOLLOW_UP_QUEUE_CAPACITY);
+        }
+        Ok(())
+    }
+
+    /// The report of a prompt that ended with `result` having spent `totals`.
+    fn report(&self, result: Result<Option<String>, Error>, totals: RouteTotals) -> PromptReport {
+        let mut files_touched = totals.files_touched;
+        files_touched.sort();
         PromptReport {
-            result:          result.map(|text| PromptOutput {
+            result: result.map(|text| PromptOutput {
                 text,
                 final_message: self.inner.final_assistant_message(),
             }),
-            usage:           self.inner.last_prompt_usage(),
-            cost_usd_micros: self.inner.last_prompt_cost_usd_micros(),
-            timing:          self.inner.last_prompt_timing(),
+            usage: totals.usage,
+            cost_usd_micros: totals.cost_usd_micros,
+            timing: totals.timing,
+            files_touched,
+            last_file_touched: totals.last_file_touched,
+            route: self.inner.route(),
         }
+    }
+
+    /// The fallback routes this agent has not moved to yet, in order.
+    ///
+    /// Empty when the builder named none or every one has been taken. A
+    /// successor built from this agent's [`export`](Self::export) starts with
+    /// no routes of its own; hand it these to keep the plan going.
+    #[must_use]
+    pub fn remaining_fallback_routes(&self) -> &[FallbackRoute] {
+        self.fallback
+            .as_deref()
+            .map_or(&[], FallbackChain::remaining)
     }
 
     /// Watches events published after this call.
@@ -1611,7 +1985,11 @@ impl CodingAgent {
     /// If this future is dropped, call `shutdown` again to finish cleanup.
     /// The terminal event is emitted once.
     pub async fn shutdown(&mut self, reason: ShutdownReason) -> Result<bool, Error> {
-        self.inner.shutdown(reason).await
+        let result = self.inner.shutdown(reason).await;
+        // The chain's hold on the live channel ends with the agent, so a
+        // subscriber sees the stream end as it would without fallback routes.
+        self.fallback = None;
+        result
     }
 }
 
