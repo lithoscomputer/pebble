@@ -659,6 +659,8 @@ async fn a_server_launched_in_the_environment_is_reached_through_its_port_and_st
         port,
         env: BTreeMap::from([("PEBBLE_MCP_TEST_SENTINEL".to_owned(), "inside".to_owned())]),
         protocol: McpHttpProtocol::StreamableHttp,
+
+        path: Some("/mcp".to_owned()),
     })
     .with_startup_timeout(Duration::from_secs(15));
     let (client, _provider) = client_from(ScriptedProvider::new(vec![
@@ -731,6 +733,8 @@ async fn an_environment_server_that_never_listens_fails_within_its_startup_timeo
         port,
         env: BTreeMap::new(),
         protocol: McpHttpProtocol::StreamableHttp,
+
+        path: None,
     })
     .with_startup_timeout(Duration::from_secs(2));
     let (client, _provider) = client_from(ScriptedProvider::new(vec![ScriptedCall::response(

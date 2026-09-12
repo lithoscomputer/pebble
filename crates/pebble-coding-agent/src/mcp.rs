@@ -150,6 +150,10 @@ pub enum McpPlacement {
         env:      BTreeMap<String, String>,
         /// Which HTTP transport the server speaks.
         protocol: McpHttpProtocol,
+        /// The path the server speaks at, appended to the route to its port:
+        /// `/sse` for a server that serves its event stream there, `/mcp` for
+        /// one that serves streamable HTTP there. Absent reaches the root.
+        path:     Option<String>,
     },
 }
 

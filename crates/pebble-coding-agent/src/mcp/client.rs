@@ -311,6 +311,7 @@ impl Connection {
                 port,
                 env,
                 protocol,
+                path,
             } => {
                 let process =
                     launch_in_environment(environment, &server.name, command, env).await?;
@@ -336,6 +337,14 @@ impl Connection {
                         }
                     },
                     None => (format!("http://127.0.0.1:{port}"), BTreeMap::new()),
+                };
+                let url = match path {
+                    Some(path) => format!(
+                        "{}/{}",
+                        url.trim_end_matches('/'),
+                        path.trim_start_matches('/')
+                    ),
+                    None => url,
                 };
                 let deadline = began + startup;
                 if let Err(error) = probe_until_ready(&url, &headers, deadline).await {
