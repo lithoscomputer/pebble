@@ -566,6 +566,101 @@ async fn a_streamable_http_server_is_reached_with_its_headers() {
         .expect("the agent shuts down");
 }
 
+#[tokio::test]
+async fn a_streamable_http_server_that_starts_listening_late_is_waited_for() {
+    let port = free_port().await;
+    let router = Router::new()
+        .route("/mcp", post(streamable))
+        .with_state(HttpEcho::default());
+    // The server binds its port only after the agent has started waiting for
+    // it, as one an application spawns just before building the agent does.
+    tokio::spawn(async move {
+        sleep(Duration::from_millis(500)).await;
+        let listener = TcpListener::bind(("127.0.0.1", port))
+            .await
+            .expect("the port is free");
+        axum::serve(listener, router)
+            .await
+            .expect("the server runs");
+    });
+    let server = McpServer::new("late", McpPlacement::Http {
+        url:      format!("http://127.0.0.1:{port}/mcp"),
+        headers:  BTreeMap::new(),
+        protocol: McpHttpProtocol::StreamableHttp,
+    })
+    .with_startup_timeout(Duration::from_secs(5));
+    let (mut agent, mut events) = agent_with(
+        vec![
+            ScriptedCall::response(tool_call_response(
+                "mcp__late__echo",
+                "call_1",
+                json!({"message": "waited"}),
+            )),
+            ScriptedCall::response(text_response("done")),
+        ],
+        vec![server],
+    )
+    .await;
+
+    let published = drained(&mut events);
+    assert_eq!(ready_events(&published).len(), 1, "{published:?}");
+    let startups = startup_events(&published);
+    assert!(
+        startups[0].1 >= 300,
+        "the start waited for the server to listen: {startups:?}"
+    );
+    let report = agent.prompt("echo").await;
+    assert!(report.result.is_ok(), "{report:?}");
+    let completions = tool_completions(&drained(&mut events));
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].1, json!("echo: waited"));
+    agent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the agent shuts down");
+}
+
+#[tokio::test]
+async fn an_http_server_nothing_listens_for_fails_after_its_startup_timeout() {
+    let port = free_port().await;
+    let server = McpServer::new("absent", McpPlacement::Http {
+        url:      format!("http://127.0.0.1:{port}/mcp"),
+        headers:  BTreeMap::new(),
+        protocol: McpHttpProtocol::StreamableHttp,
+    })
+    .with_startup_timeout(Duration::from_secs(1));
+    let started = Instant::now();
+    let (mut agent, mut events) =
+        agent_with(vec![ScriptedCall::response(text_response("alone"))], vec![
+            server,
+        ])
+        .await;
+    let waited = started.elapsed();
+
+    assert!(
+        waited >= Duration::from_secs(1),
+        "the server is waited for until the startup timeout, not failed at once: {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(10),
+        "the startup timeout bounds the wait: {waited:?}"
+    );
+    let published = drained(&mut events);
+    let failed = failed_events(&published);
+    assert_eq!(failed.len(), 1, "{published:?}");
+    assert_eq!(failed[0].0, "absent");
+    assert_eq!(
+        failed[0].1,
+        "the server did not complete the MCP handshake within 1s"
+    );
+    assert!(ready_events(&published).is_empty());
+    assert!(startup_events(&published)[0].1 >= 1_000, "{published:?}");
+    agent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the agent shuts down");
+}
+
 // --- SSE ----------------------------------------------------------------------
 
 /// The older transport: the stream names the endpoint, posts get answers on

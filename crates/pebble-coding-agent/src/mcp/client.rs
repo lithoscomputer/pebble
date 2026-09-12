@@ -309,7 +309,23 @@ impl Connection {
                 url,
                 headers,
                 protocol,
-            } => connect_http(*protocol, url, headers, info, &cancel, startup).await?,
+            } => {
+                // The server gets the startup timeout to start answering, as
+                // an environment-hosted one does: an application often spawns
+                // it just before building the agent.
+                let deadline = began + startup;
+                if let Err(error) = probe_until_ready(url, headers, deadline).await {
+                    return Err(match error {
+                        ProbeError::Build(reason) => StartError::Unsupported(reason),
+                        ProbeError::Deadline => StartError::HandshakeTimeout {
+                            timeout: startup,
+                            tail:    String::new(),
+                        },
+                    });
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                connect_http(*protocol, url, headers, info, &cancel, remaining).await?
+            }
             McpPlacement::Environment {
                 command,
                 port,

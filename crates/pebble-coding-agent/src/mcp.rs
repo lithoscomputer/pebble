@@ -12,7 +12,9 @@
 //! - [`McpPlacement::Stdio`]: a child process of the application, never of the
 //!   sandbox.
 //! - [`McpPlacement::Http`]: a server reached over HTTP, by the streamable HTTP
-//!   transport or the older SSE one.
+//!   transport or the older SSE one. The server gets the startup timeout to
+//!   start answering, so one the application spawns just before building the
+//!   agent is waited for rather than failed on the first refused connection.
 //! - [`McpPlacement::Environment`]: a server launched through
 //!   [`Environment::exec`] and reached over HTTP through the environment's
 //!   route to its port. The route is sandbox-driver's [`PreviewUrls`] facet,
@@ -78,7 +80,8 @@ impl McpServer {
     }
 
     /// Sets how long the server gets to complete the MCP handshake and list
-    /// its tools, launch included.
+    /// its tools, launch included. A server reached over HTTP gets the same
+    /// time to start answering at its URL.
     #[must_use]
     pub const fn with_startup_timeout(mut self, timeout: Duration) -> Self {
         self.startup_timeout = timeout;
@@ -134,7 +137,8 @@ pub enum McpPlacement {
         /// Whether the child sees only `env`, not the application's variables.
         clear_env:   bool,
     },
-    /// A server reached over HTTP from the application.
+    /// A server reached over HTTP from the application. It gets the startup
+    /// timeout to start answering at `url` before the handshake is tried.
     Http {
         /// The endpoint URL.
         url:      String,
