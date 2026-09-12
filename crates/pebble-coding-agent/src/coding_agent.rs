@@ -31,7 +31,7 @@ use crate::human_input::HumanInputProvider;
 #[cfg(feature = "mcp")]
 use crate::mcp::{McpServer, McpServers, PreviewUrls};
 use crate::prompt_transform::SystemPromptTransform;
-use crate::record::SessionRecord;
+use crate::record::{SessionRecord, StoredMessage};
 use crate::redact::Redactor;
 use crate::runtime::{
     CodingRuntime, CodingRuntimeBuilder, InterruptReasonHandle, StateMachine, SteeringLease,
@@ -42,8 +42,9 @@ use crate::subagent::SubagentOptions;
 use crate::tool::{RegisteredTool, ToolEnvProvider, ToolRegistrationError};
 use crate::types::{
     Actor, AgentProfileKind, CodingAgentEvent, CodingAgentState, CodingEvent,
-    ContextWindowSnapshot, InputContent, InputSource, McpServerStatus, MemoryFileSummary, Message,
-    PermissionLevel, SkillSummary, TokenUsage, ToolSummary,
+    ContextWindowSnapshot, FailoverContinuation, FailoverStop, InputContent, InputSource,
+    McpServerStatus, MemoryFileSummary, Message, PermissionLevel, SkillSummary, TokenUsage,
+    ToolSummary,
 };
 
 /// A route a prompt continues on when its model fails for a reason another
@@ -151,6 +152,48 @@ impl FallbackChain {
     fn remaining(&self) -> &[FallbackRoute] {
         &self.routes[self.taken.min(self.routes.len())..]
     }
+
+    /// How many routes have been taken, as the events count attempts.
+    fn attempt(&self) -> u32 {
+        u32::try_from(self.taken).unwrap_or(u32::MAX)
+    }
+
+    /// Where the plan stands for the runtime on the route taken last.
+    fn outlook(&self) -> FailoverOutlook {
+        FailoverOutlook {
+            attempt:     self.attempt(),
+            routes_left: self.remaining().len(),
+        }
+    }
+}
+
+/// Where an agent's fallback plan stands, as told to the runtime it applies
+/// to: how many routes the prompt has moved through to reach it and how many
+/// are left. A runtime with an outlook publishes
+/// [`RouteFailoverStopped`](CodingEvent::RouteFailoverStopped) when a model
+/// failure ends its prompt without a move; the agent's own decision,
+/// [`CodingAgent::route_to_fail_over_to`], reads the same facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FailoverOutlook {
+    /// How many fallback routes the prompt had moved through: `0` on the
+    /// route it started on.
+    pub(crate) attempt:     u32,
+    /// How many routes are left to move to.
+    pub(crate) routes_left: usize,
+}
+
+impl FailoverOutlook {
+    /// Why `error` ends the prompt on its route, when it does: a model failure
+    /// that does not qualify for failover, or one that does with no route left.
+    /// `None` for a failure the agent moves on, and for one that is not the
+    /// model's, which fallback routes never absorb.
+    pub(crate) fn stop_for(self, error: &Error) -> Option<FailoverStop> {
+        let failure = error.llm_source()?;
+        if !failure.failover_eligible() {
+            return Some(FailoverStop::Ineligible);
+        }
+        (self.routes_left == 0).then_some(FailoverStop::Exhausted)
+    }
 }
 
 /// What one prompt accumulated across every route it ran on.
@@ -162,11 +205,17 @@ struct RouteTotals {
     files_touched:     Vec<String>,
     last_file_touched: Option<String>,
     compactions:       Vec<CompactionAccount>,
+    /// The assistant turns and tool results the prompt committed, on every
+    /// route so far.
+    committed_turns:   u64,
 }
 
 impl RouteTotals {
     /// Adds what `runtime`'s last prompt spent, compacted, and touched.
     fn absorb(&mut self, runtime: &CodingRuntime) {
+        self.committed_turns = self
+            .committed_turns
+            .saturating_add(runtime.last_prompt_committed_turns());
         self.usage = self.usage.saturating_add(runtime.last_prompt_usage());
         if let Some(cost) = runtime.last_prompt_cost_usd_micros() {
             self.cost_usd_micros = Some(self.cost_usd_micros.unwrap_or(0).saturating_add(cost));
@@ -185,6 +234,38 @@ impl RouteTotals {
             self.last_file_touched = last;
         }
     }
+}
+
+/// How the route a failover resumes `record` on will carry the prompt on.
+///
+/// Read from what the model will be asked on: the record's last turn that is
+/// not injected steering or system text. Tool results, or an assistant turn,
+/// mean the turn continues from there, whichever route committed them and
+/// even when the prompt itself began from a record left mid-turn. A user
+/// turn is the prompt asked again, unless the prompt has already committed
+/// output on some route, in which case it is a follow-up the conversation
+/// continues past.
+fn continuation_of(record: &SessionRecord, committed_output: bool) -> FailoverContinuation {
+    if committed_output {
+        return FailoverContinuation::ContinueTurn;
+    }
+    let unanswered = record.messages.iter().rev().find(|message| {
+        !matches!(
+            message,
+            StoredMessage::Steering { .. } | StoredMessage::System { .. }
+        )
+    });
+    match unanswered {
+        Some(StoredMessage::ToolResults { .. } | StoredMessage::Assistant { .. }) => {
+            FailoverContinuation::ContinueTurn
+        }
+        _ => FailoverContinuation::ReplayPrompt,
+    }
+}
+
+/// A duration in whole milliseconds, as the events carry time.
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Why a coding agent is being shut down.
@@ -886,7 +967,7 @@ impl CodingAgentBuilder {
                 recipe: self.inner.clone(),
             })
         });
-        let inner = match Self::build_runtime(self.resume, self.inner).await {
+        let mut inner = match Self::build_runtime(self.resume, self.inner).await {
             Ok(inner) => inner,
             Err(error) => {
                 // The servers were started for an agent that will not exist:
@@ -899,6 +980,9 @@ impl CodingAgentBuilder {
                 return Err(error);
             }
         };
+        if let Some(chain) = &fallback {
+            inner.set_failover_outlook(Some(chain.outlook()));
+        }
         let control = CodingControl::new(&inner);
         // The live channel is captured while its pump runs: a session that
         // closes itself on a credential failure has joined its pump before
@@ -1779,11 +1863,8 @@ impl CodingAgent {
             let Some(route) = self.route_to_fail_over_to(error, cancel) else {
                 break;
             };
-            let attempt = self
-                .fallback
-                .as_ref()
-                .map_or(0, |chain| u32::try_from(chain.taken).unwrap_or(u32::MAX));
-            match self.fail_over(&route, attempt, error).await {
+            let committed_output = totals.committed_turns > 0;
+            match self.fail_over(&route, error, committed_output).await {
                 Ok(()) => result = self.inner.continue_prompt(cancel).await,
                 Err(build_error) => {
                     result = Err(build_error);
@@ -1796,6 +1877,9 @@ impl CodingAgent {
 
     /// The next fallback route, when `error` is a model failure worth moving
     /// for and the prompt was not cancelled.
+    ///
+    /// The runtime reads the same facts through its [`FailoverOutlook`] to
+    /// say, before the prompt ends, when there is no move to make.
     fn route_to_fail_over_to(
         &mut self,
         error: &Error,
@@ -1815,6 +1899,10 @@ impl CodingAgent {
     /// handle at the replacement, and requeues the input the failed session
     /// still held.
     ///
+    /// `committed_output` says whether the prompt has committed an assistant
+    /// turn or a tool result on any route so far; with the record it decides
+    /// how the failover is described.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::FallbackRoute`] when the route cannot be built or
@@ -1822,26 +1910,36 @@ impl CodingAgent {
     async fn fail_over(
         &mut self,
         route: &FallbackRoute,
-        attempt: u32,
         error: &Error,
+        committed_output: bool,
     ) -> Result<(), Error> {
         let from = self.inner.route();
         let failed_error = ErrorData::from(error);
+        // The failed route's account of this prompt, read before its session
+        // closes.
+        let usage = self.inner.last_prompt_usage();
+        let cost_usd_micros = self.inner.last_prompt_cost_usd_micros();
+        let timing = self.inner.last_prompt_timing();
         // Taken before the session closes: the queues belong to the prompt,
         // not to the runtime that happened to hold them.
         let pending = self.control.target().session.take_pending_input();
         let mut record = self.inner.to_record();
+        let continuation = continuation_of(&record, committed_output);
         let _ = self.inner.shutdown(ShutdownReason::Error).await;
         // The close is in the stream now; the replacement numbers past it.
         record.advance_event_cursor(self.inner.committed_event_seq());
 
-        let recipe = self
+        let chain = self
             .fallback
             .as_ref()
-            .expect("a route was taken from the chain")
-            .recipe
-            .clone()
-            .with_route_controls(route.reasoning_effort, route.speed, route.max_tokens);
+            .expect("a route was taken from the chain");
+        let attempt = chain.attempt();
+        let outlook = chain.outlook();
+        let recipe = chain.recipe.clone().with_route_controls(
+            route.reasoning_effort,
+            route.speed,
+            route.max_tokens,
+        );
         let unavailable = |source: CodingAgentBuildError| Error::FallbackRoute {
             route:  route.selector.clone(),
             source: Box::new(source),
@@ -1858,11 +1956,17 @@ impl CodingAgent {
                 source: Box::new(source),
             }));
         }
+        inner.set_failover_outlook(Some(outlook));
         inner.emit(CodingEvent::RouteFailover {
             from,
             to: inner.route(),
             attempt,
             error: failed_error,
+            usage,
+            cost_usd_micros,
+            inference_ms: millis(timing.inference),
+            tool_ms: millis(timing.tool),
+            continuation,
         });
         self.inner = inner;
         self.control.retarget(&self.inner);

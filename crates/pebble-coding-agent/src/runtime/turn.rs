@@ -198,6 +198,7 @@ impl ConversationState {
         }
         let written = self.file_tracker.record_from_tool_calls(calls, results);
         self.files.record(written);
+        self.totals.committed_turns += 1;
         self.push(Message::ToolResults {
             results:   results.to_vec(),
             timestamp: SystemTime::now(),
@@ -258,6 +259,7 @@ impl ConversationState {
         if let Some(reminder) = self.pending_task_reminder.take() {
             self.push(reminder);
         }
+        self.totals.committed_turns += 1;
         self.push(message);
     }
 

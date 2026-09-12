@@ -947,6 +947,77 @@ pub struct McpToolSummary {
     pub original_name: String,
 }
 
+/// How a prompt carries on after a failover, read from the record the new
+/// route resumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FailoverContinuation {
+    /// Nothing this prompt committed is in the conversation: no assistant
+    /// turn and no tool result, on the failed route or on any route before
+    /// it. The new route is asked the prompt again.
+    ReplayPrompt,
+    /// The conversation holds assistant output or tool results this prompt
+    /// committed, so the new route continues the turn from where it stood:
+    /// the model is asked on the tool results, or on the follow-up, that the
+    /// failed call left unanswered.
+    ContinueTurn,
+}
+
+impl FailoverContinuation {
+    /// The wire spelling of this continuation.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ReplayPrompt => "replay_prompt",
+            Self::ContinueTurn => "continue_turn",
+        }
+    }
+}
+
+impl fmt::Display for FailoverContinuation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The continuation of a `RouteFailover` recorded before the member existed.
+/// Pebble then described every failover as continuing the conversation as it
+/// stood.
+const fn continuation_before_it_was_recorded() -> FailoverContinuation {
+    FailoverContinuation::ContinueTurn
+}
+
+/// Why a model failure ends a prompt on its route when fallback routes were
+/// named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FailoverStop {
+    /// The failure does not qualify for failover: it follows the request, so
+    /// another route would fail the same way.
+    Ineligible,
+    /// Every named route has been taken.
+    Exhausted,
+}
+
+impl FailoverStop {
+    /// The wire spelling of this reason.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ineligible => "ineligible",
+            Self::Exhausted => "exhausted",
+        }
+    }
+}
+
+impl fmt::Display for FailoverStop {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Something a session did, as seen by an observer.
 ///
 /// The serialized form is externally tagged: `{"ToolCallStarted": {…}}` for
@@ -1180,15 +1251,63 @@ pub enum CodingEvent {
     ///
     /// The conversation continued as it stood: no tool effect was repeated.
     /// Published by the session on its new route, after
-    /// [`SessionStarted`](Self::SessionStarted) reports that route.
+    /// [`SessionStarted`](Self::SessionStarted) reports that route. The
+    /// accounting members describe the route that failed: what this prompt
+    /// spent there since it began, or since the previous failover.
+    ///
+    /// A prompt with routes A → B → C that fails on A and on B and succeeds
+    /// on C publishes `RouteFailover` (A → B), `RouteFailover` (B → C), and
+    /// then the usual [`ProcessingEnd`](Self::ProcessingEnd), with a report
+    /// that names C. A prompt that fails on all three publishes the same two
+    /// `RouteFailover`s, then
+    /// [`RouteFailoverStopped`](Self::RouteFailoverStopped) for C with
+    /// [`FailoverStop::Exhausted`], and ends with the error.
     RouteFailover {
         /// The `provider/model` that failed.
-        from:    String,
+        from:            String,
         /// The `provider/model` the prompt continues on.
-        to:      String,
+        to:              String,
         /// How many routes the prompt has moved through, this one included.
-        attempt: u32,
+        attempt:         u32,
         /// The failure that ended the previous route.
+        error:           ErrorData,
+        /// The tokens this prompt used on the failed route: its committed
+        /// responses and the summary call of each compaction it performed
+        /// there. A call that failed before it answered adds nothing.
+        #[serde(default)]
+        usage:           TokenUsage,
+        /// What the same work cost in USD micros, where the catalog or the
+        /// provider priced it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd_micros: Option<u64>,
+        /// Time this prompt spent waiting on the failed route's model, in
+        /// milliseconds, the failed call included.
+        #[serde(default)]
+        inference_ms:    u64,
+        /// Time this prompt spent running tools on the failed route, in
+        /// milliseconds.
+        #[serde(default)]
+        tool_ms:         u64,
+        /// How the new route carries the prompt on.
+        #[serde(default = "continuation_before_it_was_recorded")]
+        continuation:    FailoverContinuation,
+    },
+    /// The prompt's model failed and it stays on its route, although
+    /// fallback routes were named: the failure does not qualify for one, or
+    /// every route has been taken. Published by the session on the route
+    /// that failed, after the [`Error`](Self::Error) that reports the
+    /// failure and before the prompt ends; the prompt ends with that error.
+    /// Without fallback routes a model failure ends the prompt with nothing
+    /// to say about routes, and a cancelled prompt publishes nothing here.
+    RouteFailoverStopped {
+        /// The `provider/model` the prompt ends on.
+        route:   String,
+        /// How many fallback routes the prompt had moved through: `0` on the
+        /// route it started on.
+        attempt: u32,
+        /// Why the prompt stays here.
+        reason:  FailoverStop,
+        /// The failure that ends the prompt.
         error:   ErrorData,
     },
     /// Steering was injected into the conversation.
@@ -1575,6 +1694,11 @@ impl CodingEvent {
                 to,
                 attempt,
                 error,
+                usage,
+                cost_usd_micros,
+                inference_ms,
+                tool_ms,
+                continuation,
             } => {
                 warn!(
                     session_id,
@@ -1582,7 +1706,27 @@ impl CodingEvent {
                     to = to.as_str(),
                     attempt,
                     error = error.message.as_str(),
+                    tokens = usage.total(),
+                    cost_usd_micros,
+                    inference_ms,
+                    tool_ms,
+                    continuation = continuation.as_str(),
                     "Route failover"
+                );
+            }
+            Self::RouteFailoverStopped {
+                route,
+                attempt,
+                reason,
+                error,
+            } => {
+                warn!(
+                    session_id,
+                    route = route.as_str(),
+                    attempt,
+                    reason = reason.as_str(),
+                    error = error.message.as_str(),
+                    "Route failover stopped"
                 );
             }
             Self::SteeringInjected { text, .. } => {

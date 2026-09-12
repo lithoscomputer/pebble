@@ -37,7 +37,7 @@ pub(crate) use self::control::{actor_from_attribution, input_message, steering_m
 pub use self::retry::RetryEventObserver;
 use self::turn::{CodingAgentBridge, ConversationState};
 pub(crate) use crate::coding_agent::{
-    CodingAgentBuildError, CodingInput, PromptTiming, ResumeMode, ShutdownReason,
+    CodingAgentBuildError, CodingInput, FailoverOutlook, PromptTiming, ResumeMode, ShutdownReason,
 };
 use crate::compaction::{
     CompactionAccount, CompactionControl, CompactionOptions, CompactionOutcome, CompactionReason,
@@ -112,6 +112,10 @@ struct PromptTotals {
     cost_usd_micros: Option<u64>,
     /// The compactions this prompt completed, in order.
     compactions:     Vec<CompactionAccount>,
+    /// The assistant turns and tool results this prompt committed to the
+    /// history: what a failover leaves in the conversation for the next
+    /// route to continue from.
+    committed_turns: u64,
 }
 
 /// The `agent` namespace of a catalog entry.
@@ -665,6 +669,7 @@ impl CodingRuntimeBuilder {
             compaction_policy: self.compaction_policy,
             coding_agent: None,
             coding_bridge: None,
+            failover_outlook: None,
         };
 
         // Wired here rather than by the application: a supervisor with no
@@ -902,6 +907,10 @@ pub(crate) struct CodingRuntime {
     coding_agent:      Option<Agent>,
     /// Coding state and durable projection shared with `coding_agent`.
     coding_bridge:     Option<Arc<CodingAgentBridge>>,
+    /// The agent's fallback plan as it stands for this runtime, when the
+    /// agent has one, so a model failure that will not move the prompt can
+    /// be reported before the prompt ends.
+    failover_outlook:  Option<FailoverOutlook>,
 }
 
 impl fmt::Debug for CodingRuntime {
@@ -1524,6 +1533,42 @@ impl CodingRuntime {
         self.conversation().totals.compactions.clone()
     }
 
+    /// How many assistant turns and tool results the last prompt committed
+    /// to the history on this runtime.
+    pub(crate) fn last_prompt_committed_turns(&self) -> u64 {
+        self.conversation().totals.committed_turns
+    }
+
+    /// Tells this runtime where the agent's fallback plan stands, or that
+    /// there is none. With a plan, a prompt whose model fails without moving
+    /// publishes [`RouteFailoverStopped`](CodingEvent::RouteFailoverStopped)
+    /// before it ends.
+    pub(crate) fn set_failover_outlook(&mut self, outlook: Option<FailoverOutlook>) {
+        self.failover_outlook = outlook;
+    }
+
+    /// Publishes that `error` ends the prompt on this route although the
+    /// agent's plan named fallback routes, when that is so. Nothing is said
+    /// without a plan, for a failure that is not the model's, for one the
+    /// agent will move on, or when the caller cancelled.
+    fn report_failover_stopped(&self, error: &Error, cancel: Option<&CancellationToken>) {
+        if cancel.is_some_and(CancellationToken::is_cancelled) {
+            return;
+        }
+        let Some(outlook) = self.failover_outlook else {
+            return;
+        };
+        let Some(reason) = outlook.stop_for(error) else {
+            return;
+        };
+        self.emit(CodingEvent::RouteFailoverStopped {
+            route: self.route(),
+            attempt: outlook.attempt,
+            reason,
+            error: ErrorData::from(error),
+        });
+    }
+
     /// The broadcast channel this session's live subscribers are on, for a
     /// replacement that should keep them.
     pub(crate) fn published_sender(&self) -> Option<broadcast::Sender<CodingAgentEvent>> {
@@ -1841,6 +1886,11 @@ impl CodingRuntime {
             PromptStart::Continue => self.continue_input(&prompt_cancel).await,
         };
         self.conversation().finish_prompt_timing();
+        // Said here, while the stream is open and before a session that
+        // closes itself on the failure publishes its end.
+        if let Err(error) = &result {
+            self.report_failover_stopped(error, cancel);
+        }
 
         if let Some(link) = caller_link {
             link.stop().await;

@@ -189,6 +189,25 @@ impl Renderer {
                 error.message
             )),
             CodingEvent::LoopDetected => print_err("[loop] the agent is repeating itself"),
+            CodingEvent::RouteFailover {
+                from,
+                to,
+                attempt,
+                error,
+                ..
+            } => print_err(&format!(
+                "[failover] {from} -> {to} (attempt {attempt}): {}",
+                error.message
+            )),
+            CodingEvent::RouteFailoverStopped {
+                route,
+                reason,
+                error,
+                ..
+            } => print_err(&format!(
+                "[failover] stopped on {route}, {reason}: {}",
+                error.message
+            )),
             CodingEvent::CompactionCompleted {
                 original_turn_count,
                 preserved_turn_count,

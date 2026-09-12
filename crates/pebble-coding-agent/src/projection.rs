@@ -250,6 +250,9 @@ impl SessionProjection {
                     model:    model.clone(),
                 };
             }
+            // The failed route's usage on the event is what that route's
+            // `AssistantMessage`s already folded in, so the report and this
+            // projection agree without counting it again.
             CodingEvent::RouteFailover { to, .. } if is_root => {
                 if let Some((provider, model)) = to.split_once('/') {
                     self.route = RouteProjection {
