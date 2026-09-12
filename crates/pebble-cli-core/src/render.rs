@@ -1,9 +1,9 @@
 //! Rendering the event stream to standard error.
 
-use std::collections::BTreeMap;
 use std::io::{self, Write as _};
 
 use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent};
+use pebble_coding_agent::projection::SessionProjection;
 use pebble_coding_agent::{CodingAgent, PromptReport};
 use serde_json::Value;
 use tokio::sync::broadcast;
@@ -44,13 +44,15 @@ pub struct Renderer {
 }
 
 /// What the stream said, kept for the closing report.
+///
+/// The facts are the [`SessionProjection`]'s, the one fold every embedder
+/// reads a session through, so this summary and an application's view of the
+/// same stream agree. The one thing added is what this reader missed of the
+/// stream, which is the reader's own and not the session's.
 #[derive(Debug, Default)]
 pub struct Summary {
-    tools:    BTreeMap<String, usize>,
-    failures: usize,
-    turns:    usize,
-    retries:  usize,
-    dropped:  u64,
+    projection: SessionProjection,
+    dropped:    u64,
 }
 
 impl Renderer {
@@ -98,7 +100,7 @@ impl Renderer {
     }
 
     fn render(&mut self, event: &CodingAgentEvent) {
-        self.summary.observe(&event.event);
+        self.summary.projection.apply(event);
         match self.style {
             Style::Json => match serde_json::to_string(event) {
                 Ok(line) => match self.json_to {
@@ -244,22 +246,10 @@ impl Renderer {
 }
 
 impl Summary {
-    fn observe(&mut self, event: &CodingEvent) {
-        match event {
-            CodingEvent::AssistantMessage { .. } => self.turns += 1,
-            CodingEvent::ToolCallCompleted {
-                tool_name,
-                is_error,
-                ..
-            } => {
-                *self.tools.entry(tool_name.clone()).or_default() += 1;
-                if *is_error {
-                    self.failures += 1;
-                }
-            }
-            CodingEvent::LlmRetry { .. } => self.retries += 1,
-            _ => {}
-        }
+    /// The fold the report reads its facts from.
+    #[must_use]
+    pub fn projection(&self) -> &SessionProjection {
+        &self.projection
     }
 
     /// Prints what the prompt used, after the answer.
@@ -267,24 +257,46 @@ impl Summary {
         if style != Style::Text {
             return;
         }
-        let calls: usize = self.tools.values().sum();
-        let named = self
+        print_err("");
+        for line in self.lines(outcome) {
+            print_err(&line);
+        }
+    }
+
+    /// The report's lines, in order.
+    ///
+    /// Turns are the root session's, as the projection keeps them; what the
+    /// children did is on the `subagents` line. Tools and retries are the
+    /// tree's. Tokens and cost are the report's rather than the projection's
+    /// because the report bills a compaction's summary call to the prompt and
+    /// no event carries that call's usage.
+    fn lines(&self, outcome: &PromptReport) -> Vec<String> {
+        let projection = &self.projection;
+        let mut lines = vec![format!("turns:  {}", projection.messages)];
+
+        let calls: u64 = projection.tools.values().map(|tool| tool.calls).sum();
+        let failed: u64 = projection.tools.values().map(|tool| tool.errors).sum();
+        let open: u64 = projection.tools.values().map(|tool| tool.open).sum();
+        let unfinished = if open > 0 {
+            format!(", {open} unfinished")
+        } else {
+            String::new()
+        };
+        lines.push(format!(
+            "tools:  {calls} call(s), {failed} failed{unfinished}"
+        ));
+        let named = projection
             .tools
             .iter()
-            .map(|(name, count)| format!("{name} x{count}"))
+            .map(|(name, tool)| format!("{name} x{}", tool.calls))
             .collect::<Vec<_>>()
             .join(", ");
-        let usage = outcome.usage;
-        print_err("");
-        print_err(&format!("turns:  {}", self.turns));
-        print_err(&format!(
-            "tools:  {calls} call(s), {} failed",
-            self.failures
-        ));
         if !named.is_empty() {
-            print_err(&format!("        {named}"));
+            lines.push(format!("        {named}"));
         }
-        print_err(&format!(
+
+        let usage = outcome.usage;
+        lines.push(format!(
             "tokens: {} in, {} out, {} reasoning, {} cached ({} total)",
             usage.input,
             usage.output,
@@ -292,19 +304,35 @@ impl Summary {
             usage.cache_read + usage.cache_write,
             usage.total()
         ));
-        match outcome.cost_usd_micros {
-            Some(cost) => print_err(&format!("cost:   {}", dollars(cost))),
-            None => print_err("cost:   not reported for this model"),
+        lines.push(match outcome.cost_usd_micros {
+            Some(cost) => format!("cost:   {}", dollars(cost)),
+            None => "cost:   not reported for this model".to_owned(),
+        });
+
+        let spawned = projection.subagent_counts.spawned;
+        if spawned > 0 || !projection.descendants.is_empty() {
+            let (usage, cost) = projection.descendant_usage();
+            let turns: u64 = projection
+                .descendants
+                .values()
+                .map(|account| account.messages)
+                .sum();
+            let cost = cost.map_or_else(String::new, |cost| format!(", {}", dollars(cost)));
+            lines.push(format!(
+                "subagents: {spawned} spawned, {turns} turn(s), {} tokens{cost}",
+                usage.total()
+            ));
         }
-        if self.retries > 0 {
-            print_err(&format!("retries: {}", self.retries));
+        if projection.retries > 0 {
+            lines.push(format!("retries: {}", projection.retries));
         }
         if self.dropped > 0 {
-            print_err(&format!(
+            lines.push(format!(
                 "dropped: {} event(s) this reader missed",
                 self.dropped
             ));
         }
+        lines
     }
 }
 
@@ -339,5 +367,200 @@ pub fn report_mcp_servers(agent: &CodingAgent, style: Style) {
             )),
             Some(error) => print_err(&format!("[mcp] {} failed: {error}", status.server)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::SystemTime;
+
+    use pebble_coding_agent::events::{
+        ErrorData, ErrorKind, InputSource, LlmRetryPhase, TokenUsage,
+    };
+    use pebble_coding_agent::{PromptOutput, PromptTiming};
+    use serde_json::json;
+
+    use super::*;
+
+    fn root(event: CodingEvent) -> CodingAgentEvent {
+        CodingAgentEvent::new("ses_root", event, SystemTime::UNIX_EPOCH)
+    }
+
+    fn child(event: CodingEvent) -> CodingAgentEvent {
+        CodingAgentEvent::new("ses_child", event, SystemTime::UNIX_EPOCH)
+            .with_parent_session_id("ses_root")
+    }
+
+    fn message(input: u64, output: u64, cost: Option<u64>) -> CodingEvent {
+        CodingEvent::AssistantMessage {
+            text:            "ok".into(),
+            model:           "model".into(),
+            usage:           TokenUsage {
+                input,
+                output,
+                ..TokenUsage::default()
+            },
+            cost_usd_micros: cost,
+            cost_source:     None,
+            tool_call_count: 0,
+            context_window:  None,
+            reasoning:       None,
+        }
+    }
+
+    fn tool_started(tool_name: &str, tool_call_id: &str) -> CodingEvent {
+        CodingEvent::ToolCallStarted {
+            tool_name:    tool_name.into(),
+            tool_call_id: tool_call_id.into(),
+            arguments:    json!({"path": "/w/a.txt"}),
+        }
+    }
+
+    fn tool_completed(tool_name: &str, tool_call_id: &str, is_error: bool) -> CodingEvent {
+        CodingEvent::ToolCallCompleted {
+            tool_name: tool_name.into(),
+            tool_call_id: tool_call_id.into(),
+            output: json!("done"),
+            metadata: pebble_agent::ToolOutputMetadata::default(),
+            is_error,
+            error_kind: None,
+            output_bytes_observed: 0,
+            output_bytes_retained: 0,
+            output_bytes_omitted: 0,
+        }
+    }
+
+    fn retry() -> CodingEvent {
+        CodingEvent::LlmRetry {
+            provider:   "test".into(),
+            model:      "model".into(),
+            attempt:    0,
+            delay_secs: 0.1,
+            error:      ErrorData::new(ErrorKind::Llm, "slow down"),
+            phase:      LlmRetryPhase::Open,
+        }
+    }
+
+    /// One prompt as the stream tells it: the root answers twice with a retry
+    /// before the first, a child answers once and fails a tool call, and two
+    /// of the root's tool calls succeed.
+    fn scripted_prompt() -> Vec<CodingAgentEvent> {
+        vec![
+            root(CodingEvent::UserInput {
+                text:    "go".into(),
+                content: None,
+                source:  InputSource::Prompt,
+            }),
+            root(tool_started("read_file", "r1")),
+            root(tool_completed("read_file", "r1", false)),
+            root(retry()),
+            root(message(10, 5, Some(100))),
+            root(CodingEvent::SubAgentSpawned {
+                agent_id:   "a1".into(),
+                depth:      1,
+                task:       "look".into(),
+                generation: 1,
+            }),
+            child(tool_started("read_file", "r2")),
+            child(tool_completed("read_file", "r2", true)),
+            child(message(7, 3, Some(400))),
+            root(CodingEvent::SubAgentCompleted {
+                agent_id:   "a1".into(),
+                depth:      1,
+                generation: 1,
+                success:    true,
+                turns_used: 1,
+            }),
+            root(tool_started("edit_file", "e1")),
+            root(tool_completed("edit_file", "e1", false)),
+            root(message(20, 5, Some(200))),
+            root(CodingEvent::ProcessingEnd),
+            root(CodingEvent::SessionEnded),
+        ]
+    }
+
+    fn report_of(projection: &SessionProjection) -> PromptReport {
+        PromptReport {
+            result:            Ok(PromptOutput {
+                text:          Some("done".into()),
+                final_message: None,
+            }),
+            usage:             projection.usage,
+            cost_usd_micros:   projection.cost_usd_micros,
+            timing:            PromptTiming::default(),
+            files_touched:     Vec::new(),
+            last_file_touched: None,
+            route:             "test/model".into(),
+            compactions:       Vec::new(),
+        }
+    }
+
+    async fn summarize(events: &[CodingAgentEvent], capacity: usize) -> Summary {
+        let (sender, receiver) = broadcast::channel(capacity);
+        for event in events {
+            sender
+                .send(event.clone())
+                .expect("the renderer holds the receiver");
+        }
+        Renderer::new(Style::Quiet).run(receiver).await
+    }
+
+    #[tokio::test]
+    async fn the_summary_is_the_projection_of_the_stream() {
+        let events = scripted_prompt();
+        let summary = summarize(&events, events.len()).await;
+
+        let mut projection = SessionProjection::new();
+        projection.apply_all(&events);
+        assert_eq!(summary.projection(), &projection);
+        assert_eq!(projection.messages, 2, "the root's turns");
+        assert_eq!(projection.retries, 1);
+        assert_eq!(projection.descendants["ses_child"].messages, 1);
+
+        assert_eq!(summary.lines(&report_of(&projection)), [
+            "turns:  2",
+            "tools:  3 call(s), 1 failed",
+            "        edit_file x1, read_file x2",
+            "tokens: 30 in, 10 out, 0 reasoning, 0 cached (40 total)",
+            "cost:   $0.0003",
+            "subagents: 1 spawned, 1 turn(s), 10 tokens, $0.0004",
+            "retries: 1",
+        ]);
+    }
+
+    #[tokio::test]
+    async fn a_prompt_without_children_or_retries_says_nothing_of_them() {
+        let events = [
+            root(CodingEvent::UserInput {
+                text:    "go".into(),
+                content: None,
+                source:  InputSource::Prompt,
+            }),
+            root(message(10, 5, None)),
+            root(CodingEvent::ProcessingEnd),
+            root(CodingEvent::SessionEnded),
+        ];
+        let summary = summarize(&events, events.len()).await;
+        assert_eq!(summary.lines(&report_of(summary.projection())), [
+            "turns:  1",
+            "tools:  0 call(s), 0 failed",
+            "tokens: 10 in, 5 out, 0 reasoning, 0 cached (15 total)",
+            "cost:   not reported for this model",
+        ]);
+    }
+
+    #[tokio::test]
+    async fn a_lagging_reader_reports_what_it_missed() {
+        let events = scripted_prompt();
+        // A channel too small for the stream: the reader is told how many
+        // events it lost, and the summary says so, on top of what it folded.
+        let capacity = 2;
+        let summary = summarize(&events, capacity).await;
+        let dropped = u64::try_from(events.len() - capacity).expect("a small count");
+        let lines = summary.lines(&report_of(summary.projection()));
+        assert_eq!(
+            lines.last().map(String::as_str),
+            Some(format!("dropped: {dropped} event(s) this reader missed").as_str())
+        );
     }
 }

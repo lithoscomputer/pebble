@@ -158,6 +158,9 @@ pub struct PromptDelta {
     pub context_window:    Option<ContextWindowSnapshot>,
     /// Tool calls started, across the tree.
     pub tool_calls:        u64,
+    /// Model calls retried after a failed attempt, across the tree.
+    #[serde(default)]
+    pub retries:           u64,
     /// What each descendant spent during the prompt, by session id.
     pub descendants:       BTreeMap<String, DescendantAccount>,
     /// Child lifecycle events during the prompt.
@@ -204,6 +207,10 @@ pub struct SessionProjection {
     pub context_window:    Option<ContextWindowSnapshot>,
     /// Every tool called anywhere in the tree, by the name the model used.
     pub tools:             BTreeMap<String, ToolActivity>,
+    /// Model calls retried after a failed attempt, across the tree: every
+    /// `LlmRetry`, whichever session's call was replayed.
+    #[serde(default)]
+    pub retries:           u64,
     /// Every MCP server the root configured, by name.
     pub mcp_servers:       BTreeMap<String, McpServerProjection>,
     pub skills:            SkillsProjection,
@@ -308,6 +315,11 @@ impl SessionProjection {
                         account.messages += 1;
                     }
                 }
+            }
+            // A child's retries count for the tree, as its tool calls do.
+            CodingEvent::LlmRetry { .. } => {
+                self.retries += 1;
+                self.prompt.retries += 1;
             }
             CodingEvent::ToolCallStarted {
                 tool_name,
@@ -576,7 +588,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::types::{TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoStatus};
+    use crate::error::ErrorKind;
+    use crate::types::{
+        LlmRetryPhase, TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoStatus,
+    };
 
     fn root(event: CodingEvent) -> CodingAgentEvent {
         CodingAgentEvent::new("ses_root".to_owned(), event, SystemTime::UNIX_EPOCH)
@@ -645,6 +660,43 @@ mod tests {
         }));
         assert!(projection.prompt.descendants.is_empty());
         assert_eq!(projection.descendants.len(), 1, "the lifetime map keeps it");
+    }
+
+    fn retry() -> CodingEvent {
+        CodingEvent::LlmRetry {
+            provider:   "test".into(),
+            model:      "model".into(),
+            attempt:    0,
+            delay_secs: 0.1,
+            error:      ErrorData::new(ErrorKind::Llm, "slow down"),
+            phase:      LlmRetryPhase::Open,
+        }
+    }
+
+    #[test]
+    fn retries_count_across_the_tree_and_restart_with_the_prompt() {
+        let mut projection = SessionProjection::new();
+        projection.apply(&root(CodingEvent::UserInput {
+            text:    "go".into(),
+            content: None,
+            source:  InputSource::Prompt,
+        }));
+        projection.apply(&root(retry()));
+        projection.apply(&child(retry()));
+        assert_eq!(projection.retries, 2, "a child's retry counts for the tree");
+        assert_eq!(projection.prompt.retries, 2);
+
+        projection.apply(&root(CodingEvent::ProcessingEnd));
+        projection.apply(&root(CodingEvent::UserInput {
+            text:    "again".into(),
+            content: None,
+            source:  InputSource::Prompt,
+        }));
+        assert_eq!(
+            projection.prompt.retries, 0,
+            "a new prompt starts from nothing"
+        );
+        assert_eq!(projection.retries, 2, "the lifetime count keeps counting");
     }
 
     #[test]
