@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 
 use super::capture::capture_collected_stream;
+use super::support::{ExecFailure, classify_exec_error};
 use super::{
     DirEntry, EnvResult, Environment, EnvironmentError, EnvironmentErrorKind, ExecOutcome,
     ExecOutputStream, ExecRequest, ExecResult, GrepOptions,
@@ -243,7 +244,7 @@ impl Environment for MockEnvironment {
 
         if let Some(error) = &self.exec_error {
             return Err(EnvironmentError::new(
-                EnvironmentErrorKind::Spawn,
+                classify_exec_error(ExecFailure::Start),
                 error.clone(),
             ));
         }
