@@ -108,6 +108,18 @@ fn failed_events(published: &[CodingEvent]) -> Vec<(String, String)> {
         .collect()
 }
 
+fn disconnected_events(published: &[CodingEvent]) -> Vec<(String, String)> {
+    published
+        .iter()
+        .filter_map(|event| match event {
+            CodingEvent::McpServerDisconnected { server, error } => {
+                Some((server.clone(), error.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn tool_completions(published: &[CodingEvent]) -> Vec<(String, Value, bool)> {
     published
         .iter()
@@ -288,6 +300,69 @@ async fn an_error_result_and_a_slow_call_reach_the_model_as_tool_errors() {
             .contains("did not answer within"),
         "{:?}",
         completions[0].1
+    );
+    agent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the agent shuts down");
+}
+
+#[tokio::test]
+async fn a_server_that_dies_mid_call_is_reported_disconnected_once_and_later_calls_fail() {
+    let server = stdio_echo_server("echo").with_tool_timeout(Duration::from_secs(5));
+    let (mut agent, mut events) = agent_with(
+        vec![
+            ScriptedCall::response(tool_call_response(
+                "mcp__echo__echo",
+                "dies",
+                json!({"message": "__exit__"}),
+            )),
+            ScriptedCall::response(tool_call_response(
+                "mcp__echo__echo",
+                "after",
+                json!({"message": "still there?"}),
+            )),
+            ScriptedCall::response(tool_call_response(
+                "mcp__echo__echo",
+                "again",
+                json!({"message": "and now?"}),
+            )),
+            ScriptedCall::response(text_response("gone")),
+        ],
+        vec![server],
+    )
+    .await;
+    assert_eq!(ready_events(&drained(&mut events)).len(), 1);
+
+    let report = agent.prompt("poke").await;
+
+    assert!(report.result.is_ok(), "{report:?}");
+    let published = drained(&mut events);
+    let disconnected = disconnected_events(&published);
+    assert_eq!(disconnected.len(), 1, "reported once: {published:?}");
+    assert_eq!(disconnected[0].0, "echo");
+    assert!(!disconnected[0].1.is_empty(), "the close has a reason");
+    let completions = tool_completions(&published);
+    assert_eq!(completions.len(), 3, "{published:?}");
+    assert!(
+        completions.iter().all(|(_, _, is_error)| *is_error),
+        "every call after the death fails: {completions:?}"
+    );
+    for (_, output, _) in &completions[1..] {
+        assert!(
+            output.to_string().contains("connection is closed"),
+            "{output:?}"
+        );
+    }
+    let first_disconnect = published
+        .iter()
+        .position(|event| matches!(event, CodingEvent::McpServerDisconnected { .. }));
+    let first_completion = published
+        .iter()
+        .position(|event| matches!(event, CodingEvent::ToolCallCompleted { .. }));
+    assert!(
+        first_disconnect < first_completion,
+        "the disconnect is on the stream before the call that saw it completes: {published:?}"
     );
     agent
         .shutdown(ShutdownReason::Completed)

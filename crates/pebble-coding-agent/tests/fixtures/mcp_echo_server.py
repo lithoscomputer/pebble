@@ -64,6 +64,10 @@ def handle_request(req):
                 milliseconds = int(msg[len("__sleep_ms:") : -len("__")])
                 time.sleep(milliseconds / 1000)
                 msg = f"slept {milliseconds}ms"
+            elif msg == "__exit__":
+                # The server dies mid-call: no reply, the pipe closes.
+                sys.stdout.flush()
+                os._exit(0)
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,

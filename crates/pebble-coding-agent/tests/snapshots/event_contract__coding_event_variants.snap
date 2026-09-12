@@ -183,6 +183,12 @@ expression: render(&every_variant())
     }
   },
   {
+    "McpServerDisconnected": {
+      "server": "github",
+      "error": "transport closed"
+    }
+  },
+  {
     "RouteFailover": {
       "from": "anthropic/claude-sonnet-5",
       "to": "openai/gpt-5.6",

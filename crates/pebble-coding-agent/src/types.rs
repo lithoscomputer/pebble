@@ -1155,6 +1155,15 @@ pub enum CodingEvent {
         /// Why it did not start.
         error:  String,
     },
+    /// An MCP server's connection closed during the session; every later call
+    /// to its tools fails until the session ends. Published once per server,
+    /// by the session whose tool call first observed the close.
+    McpServerDisconnected {
+        /// The server's configured name.
+        server: String,
+        /// What closed it, as the client observed it.
+        error:  String,
+    },
     /// The prompt moved to a fallback route after its model failed.
     ///
     /// The conversation continued as it stood: no tool effect was repeated.
@@ -1529,6 +1538,14 @@ impl CodingEvent {
                     server = server.as_str(),
                     error = error.as_str(),
                     "MCP server failed"
+                );
+            }
+            Self::McpServerDisconnected { server, error } => {
+                warn!(
+                    session_id,
+                    server = server.as_str(),
+                    error = error.as_str(),
+                    "MCP server disconnected"
                 );
             }
             Self::RouteFailover {

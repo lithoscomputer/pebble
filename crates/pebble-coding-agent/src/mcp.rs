@@ -30,7 +30,11 @@
 //! started, each reported as [`McpServerReady`](CodingEvent::McpServerReady).
 //! A tool result the server marks `isError` reaches the model as the tool's
 //! error text; a transport failure, a timeout, or a cancellation reaches it as
-//! a failed call with a reason.
+//! a failed call with a reason. A server whose connection closes during the
+//! session is reported once as
+//! [`McpServerDisconnected`](CodingEvent::McpServerDisconnected), by the call
+//! that first observed the close; every later call to its tools fails until
+//! the session ends.
 
 mod client;
 mod sse;
@@ -354,10 +358,19 @@ fn registered_tool(
         let server_name = server_name.clone();
         let original = original.clone();
         Box::pin(async move {
-            match connection
+            let outcome = connection
                 .call(&original, arguments, context.cancel())
-                .await
-            {
+                .await;
+            // The close is reported by the call that first observed it, on
+            // the stream of whichever session made that call; the flag on the
+            // connection keeps it to one report for the connection's life.
+            if let Some(error) = connection.unreported_disconnect() {
+                context.emit_coding_event(CodingEvent::McpServerDisconnected {
+                    server: server_name.clone(),
+                    error:  error.to_owned(),
+                });
+            }
+            match outcome {
                 CallOutcome::Ok(text) => Ok(text),
                 CallOutcome::ToolError(text) => Err(ToolError::execution(text)),
                 CallOutcome::Failed(message) => Err(ToolError::unavailable(format!(

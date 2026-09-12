@@ -193,6 +193,10 @@ fn every_variant() -> Vec<CodingEvent> {
             server: "filesystem".into(),
             error:  "could not launch `npx`: No such file or directory".into(),
         },
+        CodingEvent::McpServerDisconnected {
+            server: "github".into(),
+            error:  "transport closed".into(),
+        },
         CodingEvent::RouteFailover {
             from:    "anthropic/claude-sonnet-5".into(),
             to:      "openai/gpt-5.6".into(),

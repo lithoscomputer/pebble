@@ -87,11 +87,14 @@ pub struct SubagentCounts {
 /// One MCP server the session configured, and whether it has been called.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerProjection {
-    pub tools:   Vec<McpToolSummary>,
+    pub tools:        Vec<McpToolSummary>,
     /// Why it did not start, when it did not.
-    pub error:   Option<String>,
+    pub error:        Option<String>,
     /// Whether any of its tools has been called.
-    pub invoked: bool,
+    pub invoked:      bool,
+    /// What closed its connection during the session, when it closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disconnected: Option<String>,
 }
 
 /// A skill the session activated.
@@ -360,6 +363,12 @@ impl SessionProjection {
                 let projection = self.mcp_servers.entry(server.clone()).or_default();
                 projection.tools.clear();
                 projection.error = Some(error.clone());
+            }
+            // Reported by whichever session's call first observed the close,
+            // so this arm is not limited to the root.
+            CodingEvent::McpServerDisconnected { server, error } => {
+                let projection = self.mcp_servers.entry(server.clone()).or_default();
+                projection.disconnected = Some(error.clone());
             }
             CodingEvent::SkillsDiscovered { skills, .. } if is_root => {
                 self.skills.available.clone_from(skills);
@@ -746,6 +755,17 @@ mod tests {
             projection.mcp_servers["broken"].error.as_deref(),
             Some("could not launch")
         );
+        assert_eq!(projection.mcp_servers["my-server"].disconnected, None);
+        // A child's call may be the one that sees the connection close.
+        projection.apply(&child(CodingEvent::McpServerDisconnected {
+            server: "my-server".into(),
+            error:  "transport closed".into(),
+        }));
+        assert_eq!(
+            projection.mcp_servers["my-server"].disconnected.as_deref(),
+            Some("transport closed")
+        );
+        assert_eq!(projection.mcp_servers["my-server"].error, None);
 
         projection.apply(&root(CodingEvent::SkillsDiscovered {
             profile:     "anthropic".into(),

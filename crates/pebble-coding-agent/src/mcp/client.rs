@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, PoisonError};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use reqwest::header::{CONNECTION, HeaderMap, HeaderName, HeaderValue};
@@ -213,14 +213,18 @@ impl Cleanup {
 
 /// The live connection to one server.
 pub(super) struct Connection {
-    peer:         Peer<RoleClient>,
-    service:      Mutex<Option<RunningService<RoleClient, ClientInfo>>>,
-    tool_timeout: Duration,
+    peer:                Peer<RoleClient>,
+    service:             Mutex<Option<RunningService<RoleClient, ClientInfo>>>,
+    tool_timeout:        Duration,
     /// The process an environment-hosted server runs in.
-    process:      Option<EnvironmentProcess>,
+    process:             Option<EnvironmentProcess>,
     /// The route to an environment-hosted server's port.
-    route:        Option<Route>,
-    disconnected: AtomicBool,
+    route:               Option<Route>,
+    /// What closed the connection, set once by the first call that observed
+    /// the close; every later call fails without reaching the server.
+    disconnect:          OnceLock<String>,
+    /// Whether the close has been handed out for reporting.
+    disconnect_reported: AtomicBool,
 }
 
 /// The protocol handshake, or the way it did not happen.
@@ -432,7 +436,8 @@ impl Connection {
                 tool_timeout,
                 process: cleanup.process,
                 route: cleanup.route,
-                disconnected: AtomicBool::new(false),
+                disconnect: OnceLock::new(),
+                disconnect_reported: AtomicBool::new(false),
             },
             tools,
         ))
@@ -447,7 +452,7 @@ impl Connection {
         arguments: Value,
         cancel: &CancellationToken,
     ) -> CallOutcome {
-        if self.disconnected.load(Ordering::Acquire) {
+        if self.disconnect.get().is_some() {
             return CallOutcome::Failed("the server's connection is closed".into());
         }
         let arguments: Option<Map<String, Value>> = match arguments {
@@ -497,9 +502,22 @@ impl Connection {
             error,
             ServiceError::TransportClosed | ServiceError::TransportSend(_)
         ) {
-            self.disconnected.store(true, Ordering::Release);
+            // Only the first close is kept: it is the one that closed the
+            // connection, and the one the session is told about.
+            let _ = self.disconnect.set(error.to_string());
         }
         CallOutcome::Failed(error.to_string())
+    }
+
+    /// What closed the connection, handed out once: `Some` to exactly one
+    /// caller after the close was observed, `None` before it and to every
+    /// caller after that one. The caller reports it on the session's stream.
+    pub(super) fn unreported_disconnect(&self) -> Option<&str> {
+        let error = self.disconnect.get()?;
+        if self.disconnect_reported.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        Some(error)
     }
 
     /// Ends the session, stops the owned process, and releases the route to

@@ -118,7 +118,9 @@ with `ToolSource::Mcp`, so middleware, history, output policy, cancellation
 and events treat it as any other tool. Each server's outcome is on the stream
 as `McpServerReady` or `McpServerFailed`, and a server that fails is skipped.
 A result the server marks `isError` is the tool's error text; a transport
-failure, a timeout or a cancellation is a failed call with a reason. The
+failure, a timeout or a cancellation is a failed call with a reason. A server
+whose connection closes during the session is reported once as
+`McpServerDisconnected`, and every later call to its tools fails. The
 servers close when the agent shuts down. See `pebble_coding_agent::mcp`.
 
 `CodingAgentBuilder::fallback_routes` names the routes a prompt continues on
