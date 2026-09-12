@@ -1409,10 +1409,12 @@ name = "pebble-coding-agent"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "futures-util",
  "insta",
  "lithos-llm",
  "pebble-agent",
+ "reqwest",
  "rustix",
  "serde",
  "serde_json",
@@ -1648,6 +1650,7 @@ dependencies = [
  "rustls-platform-verifier",
  "serde",
  "serde_json",
+ "serde_urlencoded",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",

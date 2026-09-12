@@ -67,6 +67,7 @@ run = [
   "cargo check --locked -p pebble-agent --lib --no-default-features",
   "cargo check --locked -p pebble-coding-agent --lib --no-default-features",
   "cargo check --locked -p pebble-coding-agent --lib --no-default-features --features test-util",
+  "cargo check --locked -p pebble-coding-agent --lib --no-default-features --features search-providers",
 ]
 
 [tasks."check:actions"]

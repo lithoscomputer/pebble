@@ -30,7 +30,7 @@ use crate::history::History;
 use crate::human_input::HumanInputProvider;
 use crate::profile::{AgentProfile, EnvContext};
 use crate::redact::Redactor;
-use crate::search::SearchProvider;
+use crate::search::seam::SearchProvider;
 use crate::skills::{Skill, format_skills_prompt_section};
 use crate::subagent::{ChildObserver, SubagentLimits, SubagentOptions};
 use crate::test_support::{

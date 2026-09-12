@@ -58,7 +58,7 @@ use crate::profiles::{FileEditToolKind, ProfileDeps};
 use crate::prompt_transform::{SystemPromptContext, SystemPromptTransform};
 use crate::record::{SESSION_RECORD_FORMAT_VERSION, SessionRecord};
 use crate::redact::{NoRedaction, Redactor};
-use crate::search::SearchProvider;
+use crate::search::seam::SearchProvider;
 use crate::skills::{Skill, SkillExpansion, discover_skills};
 use crate::subagent::{
     ChildDeps, ChildIdentity, ChildObserver, OpenSessions, SubagentEventCallback, SubagentOptions,

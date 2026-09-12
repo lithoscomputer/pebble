@@ -62,7 +62,7 @@ use crate::policy::{CompactionPolicy, ContextPolicy};
 use crate::profile::AgentProfile;
 use crate::redact::Redactor;
 use crate::runtime::{CodingAgentBuildError, CodingRuntime, ShutdownReason};
-use crate::search::SearchProvider;
+use crate::search::seam::SearchProvider;
 use crate::tool::{RegisteredTool, ToolEnvProvider, ToolError};
 use crate::types::{
     CodingAgentState, CodingEvent, INITIAL_SUBAGENT_GENERATION, InputSource, ToolErrorKind,

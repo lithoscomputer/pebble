@@ -346,15 +346,28 @@ the parent. Applications use `agent.session()` to read it.
 
 For a custom policy or approval flow, install `PermissionMiddleware` directly. `CodingAgentOptions::with_recorded_permission_level` records metadata only; it does not enforce permissions. Add a `ToolApprovalService` with `PermissionMiddleware::with_approval` when calls that are not auto-approved should remain visible and ask for approval. Without an approval service, those tools are hidden and direct attempts are denied.
 
-Optional seams follow the same rule. Pebble ships no implementation and
-advertises no tool without one: an `extensions::HumanInputProvider` (no
-provider, no question tool), an `extensions::SearchProvider` (no provider, no
-`web_search`), an `extensions::Redactor` for process output and failed tool
+Optional seams follow the same rule. Pebble installs no implementation by
+default and advertises no tool without one: an `extensions::HumanInputProvider`
+(no provider, no question tool), an `extensions::SearchProvider` (no provider,
+no `web_search`), an `extensions::Redactor` for process output and failed tool
 call messages, and a
 `subagents::SubagentOptions` for subagents. A child is given a task, not the
 project briefing: it loads no memory files and discovers no skills unless the
 options ask for them with `with_inherited_memory` and `with_inherited_skills`,
 which give a child the parent's configured memory files and skill directories.
+
+**Search providers.** Search is the one seam pebble ships implementations
+for, because the engines behind it are public HTTP APIs that every embedder
+would otherwise write the same way. With the `search-providers` feature, off
+by default, `pebble_coding_agent::search::providers::Brave` and
+`search::providers::Venice` implement `SearchProvider` over the Brave Search
+API and Venice's search endpoint. Each is built with `new(api_key, client)`
+from an API key and a `reqwest::Client` the application owns, so proxies, TLS,
+and timeouts stay the application's; `search::providers::default_client()`
+builds a client for an application with none. Which engine a session gets,
+from whichever key the application holds, is still the application's decision,
+made by handing the provider to `CodingAgentBuilder::search_provider`. Without
+the feature pebble depends on no HTTP client of its own.
 
 ## Native embedding extensions
 

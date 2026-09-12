@@ -9,12 +9,23 @@ description = "Coding-agent library built on pebble-agent"
 [features]
 # Test doubles (`pebble_coding_agent::test_support`) for embedding applications.
 test-util = []
+# `pebble_coding_agent::search::providers`: Brave and Venice web search over
+# their public HTTP APIs, for an application that would rather not write them.
+search-providers = ["dep:reqwest"]
 
 [dependencies]
 async-trait.workspace = true
 futures-util.workspace = true
 lithos-llm = { workspace = true, features = ["runtime"] }
 pebble-agent = { path = "../pebble-agent" }
+# The search providers' transport. lithos-llm already builds this version with
+# these features and more for its own runtime, so it adds nothing to the
+# lockfile; the application's client is what a provider is given.
+reqwest = { version = "0.13.4", default-features = false, features = [
+  "json",
+  "query",
+  "rustls",
+], optional = true }
 serde.workspace = true
 serde_json.workspace = true
 # Deterministic todo identities: a whole-list tool identifies an item by its
@@ -50,11 +61,16 @@ lithos-llm = { workspace = true, features = [
   "openai-compatible",
   "environment-credentials",
 ] }
+# The search providers are tested against a fake engine served in the test
+# process, the way the CLI cases are answered by twin-openai. Already in the
+# lockfile for those cases.
+axum = "0.8"
 insta = { version = "1.48.0", features = ["json"] }
 # `start_paused` test runtimes, so a test that waits out a retry delay does not
-# actually wait, and the multi-threaded runtime the example's `#[tokio::main]`
-# asks for. Adds no package to the lockfile: tokio is already a dependency.
-tokio = { version = "1.49.0", features = ["rt-multi-thread", "test-util"] }
+# actually wait, the multi-threaded runtime the example's `#[tokio::main]`
+# asks for, and the listener the fake search engine binds. Adds no package to
+# the lockfile: tokio is already a dependency.
+tokio = { version = "1.49.0", features = ["net", "rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true
