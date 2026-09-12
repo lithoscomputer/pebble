@@ -861,19 +861,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
-name = "globset"
-version = "0.4.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07c34a9410465b45bd9787443bc7370f37735bad04b0f0cd57ff1a3186c98988"
-dependencies = [
- "aho-corasick",
- "bstr",
- "log",
- "regex-automata",
- "regex-syntax",
-]
-
-[[package]]
 name = "hashbrown"
 version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1553,7 +1540,6 @@ dependencies = [
  "reqwest",
  "rmcp",
  "rustix",
- "sandbox-driver",
  "serde",
  "serde_json",
  "sha2",
@@ -1978,23 +1964,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "sandbox-driver"
-version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver?rev=a92c0db6b6a122ca9b6df75de6615544f53c0d47#a92c0db6b6a122ca9b6df75de6615544f53c0d47"
-dependencies = [
- "async-trait",
- "globset",
- "humantime",
- "rand",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
 ]
 
 [[package]]

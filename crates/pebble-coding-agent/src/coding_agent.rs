@@ -29,7 +29,7 @@ use crate::extensions::{CompactionPolicy, ContextPolicy};
 use crate::history::History;
 use crate::human_input::HumanInputProvider;
 #[cfg(feature = "mcp")]
-use crate::mcp::{McpServer, McpServers, PreviewUrls};
+use crate::mcp::{McpServer, McpServers, PortRoutes};
 use crate::prompt_transform::SystemPromptTransform;
 use crate::record::{SessionRecord, StoredMessage};
 use crate::redact::Redactor;
@@ -683,7 +683,7 @@ pub struct CodingAgentBuilder {
     #[cfg(feature = "mcp")]
     mcp_servers:     Vec<McpServer>,
     #[cfg(feature = "mcp")]
-    port_routes:     Option<Arc<dyn PreviewUrls>>,
+    port_routes:     Option<Arc<dyn PortRoutes>>,
 }
 
 impl CodingAgentBuilder {
@@ -724,13 +724,18 @@ impl CodingAgentBuilder {
     /// environment, for servers placed in the environment
     /// ([`McpPlacement::Environment`](crate::mcp::McpPlacement::Environment)).
     ///
-    /// This is sandbox-driver's [`PreviewUrls`] facet, which a sandbox that
-    /// forwards ports provides, headers included. Without one, an
+    /// The application implements [`PortRoutes`] over its sandbox — fabro
+    /// over its run sandbox's preview-URL facet, petri over its execution
+    /// environment's `preview_url` — answering with the URL and headers that
+    /// reach a port from where the application runs. Without one, an
     /// environment-hosted server is reached on the loopback address. Pebble
-    /// releases every route it opened when the server fails to start and
-    /// when the agent shuts down.
+    /// asks for the route once per server and releases every route it opened,
+    /// when the server fails to start and when the agent shuts down; a route
+    /// the application reports as
+    /// [`Unsupported`](crate::mcp::PortRouteError::Unsupported) fails the
+    /// server as having no route to its port.
     #[cfg(feature = "mcp")]
-    pub fn port_routes(mut self, routes: Arc<dyn PreviewUrls>) -> Self {
+    pub fn port_routes(mut self, routes: Arc<dyn PortRoutes>) -> Self {
         self.port_routes = Some(routes);
         self
     }
