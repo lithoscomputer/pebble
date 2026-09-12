@@ -99,14 +99,23 @@ impl SessionRecord {
         self.format_version == SESSION_RECORD_FORMAT_VERSION
     }
 
-    /// Advances the event cursor to include events already held by the sink.
+    /// Resumes this record past a durable log whose head is `log_head`: the
+    /// cursor moves up to the head, never back, so the resumed session's first
+    /// event is numbered above every event the log already holds.
     ///
-    /// Use this before resume when the event log and this record were not saved
-    /// in one transaction. A crash can leave the log ahead of the record; the
-    /// next event must start above both. This method never moves the cursor
-    /// backwards.
+    /// This is the rule for a record and an event log that were not saved in
+    /// one transaction: a crash between the log's last write and the record's
+    /// leaves the log ahead, and a resume that numbered from the record would
+    /// reuse a sequence number the log has. Call it with the log's last
+    /// sequence before [`CodingAgent::resume`](crate::CodingAgent::resume).
+    pub fn resume_after(&mut self, log_head: u64) {
+        self.last_event_seq = self.last_event_seq.max(log_head);
+    }
+
+    /// Advances the event cursor to include events already held by the sink:
+    /// [`resume_after`](Self::resume_after) under its older name.
     pub fn advance_event_cursor(&mut self, committed_seq: u64) {
-        self.last_event_seq = self.last_event_seq.max(committed_seq);
+        self.resume_after(committed_seq);
     }
 
     /// The exact route the session last ran on, as a `provider/model` selector

@@ -829,6 +829,9 @@ pub enum SkippedSkillReason {
     /// The file was read but is not a skill: its frontmatter is missing,
     /// unterminated, or names no skill.
     Malformed,
+    /// A directory the application required a skill discovery to search
+    /// does not exist.
+    MissingDirectory,
 }
 
 /// How a skill was activated.
@@ -870,6 +873,18 @@ pub enum AgentProfileKind {
 }
 
 impl AgentProfileKind {
+    /// The instruction files this harness reads, in load order: the shared
+    /// `AGENTS.md` first, then the vendor's own name where it has one.
+    #[must_use]
+    pub const fn memory_filenames(self) -> &'static [&'static str] {
+        match self {
+            Self::Anthropic | Self::Claude5 => &["AGENTS.md", "CLAUDE.md"],
+            Self::OpenAi | Self::Gpt56 | Self::Gpt6 => &["AGENTS.md", ".codex/instructions.md"],
+            Self::Gemini => &["AGENTS.md", "GEMINI.md"],
+            Self::Kimi => &["AGENTS.md"],
+        }
+    }
+
     /// Every profile pebble ships.
     ///
     /// A slice rather than an array, so a profile added later does not change

@@ -2081,6 +2081,26 @@ impl CodingAgent {
         }
     }
 
+    /// Closes the agent and hands back what a successor continues from.
+    ///
+    /// The export is taken after the close, so its event cursor is past every
+    /// event this agent committed, the close included, and a successor built
+    /// with [`resume_from_export`](Self::resume_from_export) numbers its
+    /// events above them on the same stream. This replaces taking an
+    /// [`export`](Self::export) before [`shutdown`](Self::shutdown) and
+    /// advancing its cursor by hand afterwards.
+    ///
+    /// # Errors
+    ///
+    /// As [`shutdown`](Self::shutdown). The agent is closed either way.
+    pub async fn export_for_reuse(
+        &mut self,
+        reason: ShutdownReason,
+    ) -> Result<CodingAgentExport, Error> {
+        self.shutdown(reason).await?;
+        Ok(self.export())
+    }
+
     /// Closes the agent and joins its owned tasks.
     ///
     /// If this future is dropped, call `shutdown` again to finish cleanup.

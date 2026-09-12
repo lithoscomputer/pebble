@@ -75,7 +75,7 @@ use crate::types::{
     MemoryFileSummary, Message, PermissionLevel, SkillSummary, TokenUsage, ToolSummary,
     rfc3339_millis,
 };
-use crate::{SessionId, SessionScope};
+use crate::{SessionId, SessionScope, discovery};
 
 /// The catalog metadata namespace every agent runtime reads.
 const METADATA_NAMESPACE: &str = "agent";
@@ -690,10 +690,20 @@ fn child_options(parent: &CodingAgentOptions, subagents: &SubagentOptions) -> Co
         } else {
             Vec::new()
         },
+        memory_discovery: if subagents.inherits_memory() {
+            parent.memory_discovery.clone()
+        } else {
+            None
+        },
         skill_dirs: if subagents.inherits_skills() {
             parent.skill_dirs.clone()
         } else {
             Vec::new()
+        },
+        skill_discovery: if subagents.inherits_skills() {
+            parent.skill_discovery.clone()
+        } else {
+            None
         },
         ..parent.clone()
     }
@@ -1118,13 +1128,66 @@ impl CodingRuntime {
             return Err(Error::Interrupted(InterruptReason::Cancelled));
         }
 
-        let profile = self.profile.profile_kind().as_str().to_owned();
+        let profile_kind = self.profile.profile_kind();
+        let profile = profile_kind.as_str().to_owned();
+
+        // The conventions the application named, resolved to paths: one git
+        // probe serves both when either asks for the root.
+        let needs_git_root = matches!(
+            self.config
+                .memory_discovery
+                .as_ref()
+                .map(discovery::MemoryDiscovery::root),
+            Some(discovery::MemoryRoot::GitRoot)
+        ) || self
+            .config
+            .skill_discovery
+            .as_ref()
+            .is_some_and(discovery::SkillDiscovery::needs_git_root);
+        let git_root = if needs_git_root {
+            discovery::git_root(self.env.as_ref(), &cancel).await?
+        } else {
+            None
+        };
+        let mut memory_files = match &self.config.memory_discovery {
+            Some(memory) => match memory.root() {
+                discovery::MemoryRoot::GitRoot => discovery::MemoryDiscovery::candidates(
+                    profile_kind,
+                    git_root.as_deref(),
+                    self.env.working_directory(),
+                ),
+                _ => {
+                    memory
+                        .resolve(self.env.as_ref(), profile_kind, &cancel)
+                        .await?
+                }
+            },
+            None => Vec::new(),
+        };
+        for path in &self.config.memory_files {
+            if !memory_files.contains(path) {
+                memory_files.push(path.clone());
+            }
+        }
+        let mut skill_dirs = self.config.skill_dirs.clone();
+        let mut skill_skipped = Vec::new();
+        if let Some(skills) = &self.config.skill_discovery {
+            let resolved = skills
+                .resolve(self.env.as_ref(), git_root.as_deref(), &cancel)
+                .await?;
+            for dir in resolved.dirs {
+                if !skill_dirs.contains(&dir) {
+                    skill_dirs.push(dir);
+                }
+            }
+            skill_skipped = resolved.skipped;
+        }
 
         // Independent reads of the environment, overlapped; the events they
         // feed stay in their documented order below.
         let (memory, skills) = tokio::join!(
-            ProjectMemory::load(self.env.as_ref(), &self.config.memory_files, &cancel),
-            discover_skills(self.env.as_ref(), &self.config.skill_dirs, &cancel),
+            ProjectMemory::load(self.env.as_ref(), &memory_files, &cancel),
+            discover_skills(self.env.as_ref(), &skill_dirs, &cancel),
         );
 
         let memory = memory?;
@@ -1142,16 +1205,17 @@ impl CodingRuntime {
 
         let discovered = skills?;
         Arc::make_mut(&mut self.resources).skills = discovered.skills;
+        skill_skipped.extend(discovered.skipped);
         self.emit(CodingEvent::SkillsDiscovered {
             profile,
-            source_dirs: self.config.skill_dirs.clone(),
+            source_dirs: skill_dirs,
             skills: self
                 .resources
                 .skills
                 .iter()
                 .map(Skill::to_summary)
                 .collect(),
-            skipped: discovered.skipped,
+            skipped: skill_skipped,
         });
         // The one tool that cannot be built by the builder: what it loads is
         // discovered here, and a session that discovered no skills advertises

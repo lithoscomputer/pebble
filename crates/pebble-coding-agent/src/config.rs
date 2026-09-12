@@ -12,6 +12,7 @@ use lithos_llm::middleware::RetryPolicy;
 use lithos_llm::types::{ReasoningEffort, Speed};
 use pebble_agent::AgentConfig;
 
+use crate::discovery::{MemoryDiscovery, SkillDiscovery};
 use crate::truncation::{
     DEFAULT_TOOL_OUTPUT_RETENTION_BYTES, DEFAULT_TOOL_OUTPUT_SERIALIZED_BYTES,
 };
@@ -138,11 +139,18 @@ pub struct CodingAgentOptions {
     /// Empty loads nothing: pebble looks in no conventional location and
     /// guesses no filename.
     pub(crate) memory_files: Vec<String>,
+    /// Where the profile's own instruction files are looked for, when the
+    /// application names the convention rather than the paths. Discovered
+    /// paths are loaded before [`memory_files`](Self::memory_files).
+    pub(crate) memory_discovery: Option<MemoryDiscovery>,
     /// Directories searched for skills.
     ///
     /// Explicit, like [`memory_files`](Self::memory_files); empty discovers no
     /// skills.
     pub(crate) skill_dirs: Vec<String>,
+    /// Directories resolved and checked by pebble, searched after
+    /// [`skill_dirs`](Self::skill_dirs).
+    pub(crate) skill_discovery: Option<SkillDiscovery>,
     /// The permission level the session started under, for an application that
     /// installs matching middleware and wants the level recorded beside it.
     pub(crate) permission_level: Option<PermissionLevel>,
@@ -210,7 +218,9 @@ impl fmt::Debug for CodingAgentOptions {
             .field("git_root", &self.git_root)
             .field("user_instructions", &self.user_instructions)
             .field("memory_files", &self.memory_files)
+            .field("memory_discovery", &self.memory_discovery)
             .field("skill_dirs", &self.skill_dirs)
+            .field("skill_discovery", &self.skill_discovery)
             .field("permission_level", &self.permission_level)
             .field("enable_context_compaction", &self.enable_context_compaction)
             .field(
@@ -241,7 +251,9 @@ impl Default for CodingAgentOptions {
             git_root: None,
             user_instructions: None,
             memory_files: Vec::new(),
+            memory_discovery: None,
             skill_dirs: Vec::new(),
+            skill_discovery: None,
             permission_level: None,
             enable_context_compaction: true,
             compaction_threshold_percent: 80,
@@ -365,6 +377,24 @@ impl CodingAgentOptions {
     #[must_use]
     pub fn with_memory_files(mut self, files: impl IntoIterator<Item = String>) -> Self {
         self.memory_files = files.into_iter().collect();
+        self
+    }
+
+    /// Names where the profile's own instruction files are looked for, so an
+    /// application states the convention (the git root down to the working
+    /// directory, say) and pebble finds the files. Discovered paths are loaded
+    /// before the explicit [`with_memory_files`](Self::with_memory_files).
+    #[must_use]
+    pub fn with_memory_discovery(mut self, discovery: MemoryDiscovery) -> Self {
+        self.memory_discovery = Some(discovery);
+        self
+    }
+
+    /// Names the directories pebble resolves and checks for skills, searched
+    /// after the explicit [`with_skill_dirs`](Self::with_skill_dirs).
+    #[must_use]
+    pub fn with_skill_discovery(mut self, discovery: SkillDiscovery) -> Self {
+        self.skill_discovery = Some(discovery);
         self
     }
 

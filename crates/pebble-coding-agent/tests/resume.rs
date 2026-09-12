@@ -711,3 +711,75 @@ async fn an_export_continues_in_memory_without_initializing_again() {
         "a warm successor keeps the stable stream identity"
     );
 }
+
+// --- Reuse bookkeeping ---
+
+#[tokio::test]
+async fn export_for_reuse_numbers_the_successor_past_the_close() {
+    let log = Arc::new(SequenceLog::default());
+    let (client, _) = scripted_client(vec![
+        ScriptedCall::response(text_response("first")),
+        ScriptedCall::response(text_response("second")),
+    ]);
+    let mut agent = CodingAgent::builder(client.clone(), environment())
+        .model("test/model")
+        .event_sink(Arc::clone(&log) as Arc<dyn EventSink>)
+        .build()
+        .await
+        .expect("the agent builds");
+    agent
+        .prompt("one")
+        .await
+        .result
+        .expect("the first prompt succeeds");
+
+    let export = agent
+        .export_for_reuse(ShutdownReason::Completed)
+        .await
+        .expect("the agent closes and exports");
+    let close_seq = *log.seqs().last().expect("the close was logged");
+    assert_eq!(
+        export.record().last_event_seq,
+        close_seq,
+        "the export's cursor is at the close the log holds"
+    );
+
+    let mut successor = CodingAgent::resume_from_export(client, environment(), export)
+        .event_sink(Arc::clone(&log) as Arc<dyn EventSink>)
+        .build()
+        .await
+        .expect("the successor builds");
+    successor
+        .prompt("two")
+        .await
+        .result
+        .expect("the second prompt succeeds");
+    successor
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the successor shuts down");
+
+    let seqs = log.seqs();
+    assert!(
+        seqs.windows(2).all(|pair| pair[0] < pair[1]),
+        "one stream, strictly increasing: {seqs:?}"
+    );
+    let streams = log.stream_ids();
+    assert!(
+        streams.iter().all(|stream| stream == &streams[0]),
+        "both agents publish on the session's one stream"
+    );
+}
+
+#[test]
+fn resume_after_moves_the_cursor_up_and_never_back() {
+    let mut record = SessionRecord::new(SessionScope::root(SessionId::new("ses_cursor")));
+    record.last_event_seq = 5;
+    record.resume_after(9);
+    assert_eq!(record.last_event_seq, 9, "a log ahead of the record wins");
+    record.resume_after(3);
+    assert_eq!(
+        record.last_event_seq, 9,
+        "a log behind the record changes nothing"
+    );
+}

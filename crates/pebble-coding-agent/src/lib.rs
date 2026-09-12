@@ -24,6 +24,7 @@ mod coding_agent;
 mod compaction;
 mod config;
 mod context_window;
+mod discovery;
 pub mod environment;
 mod error;
 mod event;
@@ -79,6 +80,9 @@ pub use self::compaction::{
     CompactionOptions, CompactionOutcome, CompactionReason, CompactionResult,
 };
 pub use self::config::{CodingAgentOptions, CodingAgentOptionsError};
+pub use self::discovery::{
+    MemoryDiscovery, MemoryRoot, ResolvedSkillDirs, SkillDiscovery, SkillSearch, SkillSearchBase,
+};
 pub use self::error::{CompactionError, Error, InterruptReason, Result, TaskKind};
 pub use self::memory::{MemoryDocument, ProjectMemory};
 pub use self::runtime::SteeringLease;

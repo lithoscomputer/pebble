@@ -133,6 +133,26 @@ the prompt with `Error::FallbackRoute`, and once the list is spent a model
 error ends the prompt as it would without one. `remaining_fallback_routes`
 says what is left, for a successor built from an export.
 
+`CodingAgentOptions::with_memory_discovery` and `with_skill_discovery` name
+a convention instead of a list. `MemoryDiscovery::from_git_root()` reads the
+profile's own instruction files (`AgentProfileKind::memory_filenames`:
+`AGENTS.md` and `CLAUDE.md` for the Claude harnesses, `AGENTS.md` and
+`.codex/instructions.md` for the Codex ones, `AGENTS.md` and `GEMINI.md` for
+Gemini, `AGENTS.md` alone for Kimi) in every directory from the repository
+root down to the working directory, root first; `from_root` and
+`working_directory` are the other two starts. `SkillDiscovery` lists the
+directories to search in precedence order, anchored at the working directory
+or the git root, and a directory the application `require`s is reported as
+`MissingDirectory` on `SkillsDiscovered` when it is not there. Pebble does the
+git probe, the walk, and the checks through the `Environment`; explicit
+`with_memory_files` and `with_skill_dirs` still work and come first.
+
+`CodingAgent::export_for_reuse(reason)` closes the agent and returns the
+export a successor continues from, its cursor already past the close, so an
+application no longer takes an export, shuts down, and advances the cursor by
+hand. `SessionRecord::resume_after(log_head)` is the rule for a record and an
+event log saved separately: the cursor moves up to the log's head, never back.
+
 The crate root contains the normal coding-agent path and the environment
 contract. The environment a session acts through is in
 `pebble_coding_agent::environment`. Durable event types are in
