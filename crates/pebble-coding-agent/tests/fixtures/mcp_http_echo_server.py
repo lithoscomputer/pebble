@@ -7,6 +7,7 @@ tool: echo(message) -> message. Usage: mcp_http_echo_server.py <port>
 """
 import json
 import os
+import socketserver
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -106,9 +107,20 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
+class Server(HTTPServer):
+    def server_bind(self):
+        # HTTPServer.server_bind resolves the bound address to a fully
+        # qualified host name, a reverse DNS lookup that can stall for many
+        # seconds on macOS, hosted CI runners included, and push the start
+        # past the agent's startup timeout. The name only feeds headers this
+        # server never sends, so bind without it.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 def main():
     port = int(sys.argv[1])
-    server = HTTPServer(("127.0.0.1", port), Handler)
+    server = Server(("127.0.0.1", port), Handler)
     server.serve_forever()
 
 
