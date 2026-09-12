@@ -13,11 +13,12 @@
 //! Tool permissions are ordinary `pebble-agent` middleware, with the coding
 //! policies and approval service contracts also in [`tools`].
 //! Durable state is in [`state`]. Optional application services — human input,
-//! search, redaction, the prompt transform — are in [`extensions`], and
-//! subagent configuration is in [`subagents`]. [`ProjectMemory`] is the loader
-//! an agent reads its memory files with, for an application that gives the
-//! same instructions to a model call of its own. The runtime underneath is
-//! not public.
+//! search, redaction, the prompt transform — are in [`extensions`], the search
+//! providers pebble ships are in [`search`] behind the `search-providers`
+//! feature, and subagent configuration is in [`subagents`]. [`ProjectMemory`]
+//! is the loader an agent reads its memory files with, for an application
+//! that gives the same instructions to a model call of its own. The runtime
+//! underneath is not public.
 
 mod char_boundary;
 mod coding_agent;
@@ -44,7 +45,7 @@ mod prompt_transform;
 mod record;
 mod redact;
 mod runtime;
-mod search;
+pub mod search;
 mod skills;
 pub mod state;
 mod subagent;

@@ -12,12 +12,25 @@ test-util = []
 # MCP servers as tool sources (`pebble_coding_agent::mcp`): the `rmcp` client
 # over stdio and HTTP, and the route to a server launched in the environment.
 mcp = ["dep:rmcp", "dep:reqwest", "dep:sandbox-driver", "dep:sse-stream", "dep:url"]
+# `pebble_coding_agent::search::providers`: Brave and Venice web search over
+# their public HTTP APIs, for an application that would rather not write them.
+search-providers = ["dep:reqwest"]
 
 [dependencies]
 async-trait.workspace = true
 futures-util.workspace = true
 lithos-llm = { workspace = true, features = ["runtime"] }
 pebble-agent = { path = "../pebble-agent" }
+# The HTTP transport the search providers and the MCP client share. lithos-llm
+# already builds this version with these features and more for its own runtime,
+# so it adds nothing to the lockfile; a search provider is given the
+# application's client, and the MCP client builds its own.
+reqwest = { version = "0.13.4", default-features = false, features = [
+  "json",
+  "query",
+  "rustls",
+  "stream",
+], optional = true }
 serde.workspace = true
 serde_json.workspace = true
 # Deterministic todo identities: a whole-list tool identifies an item by its
@@ -47,7 +60,6 @@ rmcp = { version = "=1.7.0", default-features = false, features = [
   "transport-child-process",
   "transport-streamable-http-client-reqwest",
 ], optional = true }
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"], optional = true }
 sse-stream = { version = "0.2", optional = true }
 url = { version = "2.5", optional = true }
 # The route from the embedding application to a port inside its sandbox:
@@ -71,14 +83,16 @@ lithos-llm = { workspace = true, features = [
   "openai-compatible",
   "environment-credentials",
 ] }
-insta = { version = "1.48.0", features = ["json"] }
-# A fake MCP server over HTTP for the transport tests. Already in the lockfile
-# through lithos-llm's own tests.
+# The search providers are tested against a fake engine, and the MCP HTTP
+# transports against a fake server, both served in the test process. Already
+# in the lockfile through lithos-llm's own tests.
 axum = "0.8"
+insta = { version = "1.48.0", features = ["json"] }
 # `start_paused` test runtimes, so a test that waits out a retry delay does not
-# actually wait, and the multi-threaded runtime the example's `#[tokio::main]`
-# asks for. Adds no package to the lockfile: tokio is already a dependency.
-tokio = { version = "1.49.0", features = ["rt-multi-thread", "test-util"] }
+# actually wait, the multi-threaded runtime the example's `#[tokio::main]`
+# asks for, and the listener the fake search engine binds. Adds no package to
+# the lockfile: tokio is already a dependency.
+tokio = { version = "1.49.0", features = ["net", "rt-multi-thread", "test-util"] }
 
 [lints]
 workspace = true

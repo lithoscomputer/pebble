@@ -18,7 +18,7 @@ use lithos_llm::types::Role;
 use super::super::testing::TestProfile;
 use super::*;
 use crate::human_input::{Answer, HumanInputError, HumanInputProvider, Question};
-use crate::search::{SearchError, SearchProvider, SearchRequest, SearchResult};
+use crate::search::seam::{SearchError, SearchProvider, SearchRequest, SearchResult};
 use crate::subagent::{ChildObserver, SubagentOptions};
 use crate::test_support::{
     MockEnvironment, ScriptedProvider, TEST_CATALOG, message_text, scripted_client,

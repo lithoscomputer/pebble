@@ -26,7 +26,7 @@ use crate::config::{CodingAgentOptions, NativeToolOptions};
 use crate::environment::Environment;
 use crate::event::{EventOptions, EventPump, EventSink, EventSinkError};
 use crate::redact::{NoRedaction, Redactor};
-use crate::search::SearchProvider;
+use crate::search::seam::SearchProvider;
 use crate::tools::{
     WebFetchSummarizer, make_edit_file_tool, make_glob_tool, make_grep_tool, make_read_file_tool,
     make_shell_tool_with_options, make_web_fetch_tool, make_web_search_tool, make_write_file_tool,

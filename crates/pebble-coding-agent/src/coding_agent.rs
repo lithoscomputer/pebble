@@ -37,7 +37,7 @@ use crate::runtime::{
     CodingRuntime, CodingRuntimeBuilder, InterruptReasonHandle, StateMachine, SteeringLease,
     WarmState, actor_from_attribution, input_message, steering_message,
 };
-use crate::search::SearchProvider;
+use crate::search::seam::SearchProvider;
 use crate::subagent::SubagentOptions;
 use crate::tool::{RegisteredTool, ToolEnvProvider, ToolRegistrationError};
 use crate::types::{
