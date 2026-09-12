@@ -482,6 +482,17 @@ impl<K: Ord + Clone> SteeringBus<K> {
         interruption
     }
 
+    /// Interrupts one attached session. Returns whether it had a round to
+    /// stop.
+    pub fn interrupt_at(&self, key: &K, session_id: &str) -> Result<bool, TargetError> {
+        let attached = self.attached.read().unwrap_or_else(PoisonError::into_inner);
+        let entry = attached
+            .get(key)
+            .filter(|entry| entry.session_id == session_id)
+            .ok_or(TargetError::NotAttached)?;
+        Ok(entry.session.interrupt())
+    }
+
     /// Steers one attached session. The caller reads the outcome: a paired
     /// human's message that evicted an older steer may not count as
     /// accepted to them.
@@ -845,6 +856,14 @@ mod tests {
         );
         assert_eq!(a.texts(), ["just you"]);
         assert!(b.texts().is_empty());
+
+        assert_eq!(bus.interrupt_at(&"b", "session-b"), Ok(true));
+        assert_eq!(
+            bus.interrupt_at(&"b", "session-a"),
+            Err(TargetError::NotAttached)
+        );
+        assert_eq!(a.interrupts(), 0);
+        assert_eq!(b.interrupts(), 1);
     }
 
     #[test]
