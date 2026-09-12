@@ -12,9 +12,19 @@ use crate::event::OutputCaptureStats;
 /// A byte buffer that keeps an equal-sized stable head and rolling tail.
 ///
 /// Bytes past the cap are discarded from the middle: the head stops growing
-/// once it fills half the cap, and the tail keeps the newest bytes.
+/// once it fills half the cap, and the tail keeps the newest bytes. This is the
+/// capture behind [`ExecOutcome`](super::ExecOutcome): [`LocalEnvironment`]
+/// drains each pipe into one, and an [`Environment`] implementation over
+/// another machine does the same with the chunks its driver hands it —
+/// [`push`](Self::push) every chunk, whatever the cap, so the process is
+/// always drained; hand each chunk to the request's `output_sink` first, so
+/// the sink sees the bytes uncapped; then [`into_text`](Self::into_text) or
+/// [`into_parts`](Self::into_parts) for the retained output and its counts.
+///
+/// [`Environment`]: super::Environment
+/// [`LocalEnvironment`]: super::LocalEnvironment
 #[derive(Debug)]
-pub(crate) struct OutputCaptureBuffer {
+pub struct OutputCaptureBuffer {
     max_bytes:      Option<usize>,
     head:           Vec<u8>,
     tail:           VecDeque<u8>,
@@ -23,7 +33,13 @@ pub(crate) struct OutputCaptureBuffer {
 
 impl OutputCaptureBuffer {
     /// A buffer bounded to `max_bytes`, or unbounded when it is `None`.
-    pub(crate) const fn new(max_bytes: Option<usize>) -> Self {
+    ///
+    /// `max_bytes` is
+    /// [`ExecRequest::output_bytes_cap`](super::ExecRequest::output_bytes_cap)
+    /// as the caller set it. A cap of zero keeps nothing and still counts what
+    /// was drained.
+    #[must_use]
+    pub const fn new(max_bytes: Option<usize>) -> Self {
         Self {
             max_bytes,
             head: Vec::new(),
@@ -33,7 +49,10 @@ impl OutputCaptureBuffer {
     }
 
     /// Records `bytes`, keeping what fits.
-    pub(crate) fn push(&mut self, bytes: &[u8]) {
+    ///
+    /// Every byte counts as observed. Chunks may cut a UTF-8 sequence
+    /// anywhere; the buffer works in bytes and decodes only at the end.
+    pub fn push(&mut self, bytes: &[u8]) {
         self.observed_bytes = self.observed_bytes.saturating_add(bytes.len());
         let Some(max_bytes) = self.max_bytes else {
             self.head.extend_from_slice(bytes);
@@ -63,7 +82,12 @@ impl OutputCaptureBuffer {
     }
 
     /// What the buffer has seen and kept so far.
-    pub(crate) fn stats(&self) -> OutputCaptureStats {
+    ///
+    /// The same numbers
+    /// [`support::capture_stats`](super::support::capture_stats)
+    /// computes for this many observed bytes under this cap.
+    #[must_use]
+    pub fn stats(&self) -> OutputCaptureStats {
         let retained_bytes = self.head.len().saturating_add(self.tail.len());
         OutputCaptureStats {
             observed_bytes: self.observed_bytes,
@@ -72,8 +96,9 @@ impl OutputCaptureBuffer {
         }
     }
 
-    /// The retained bytes and their counts.
-    pub(crate) fn into_parts(self) -> (Vec<u8>, OutputCaptureStats) {
+    /// The retained bytes, head then tail, and their counts.
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<u8>, OutputCaptureStats) {
         let stats = self.stats();
         let Self {
             head: mut bytes,
@@ -84,6 +109,19 @@ impl OutputCaptureBuffer {
         bytes.extend_from_slice(front);
         bytes.extend_from_slice(back);
         (bytes, stats)
+    }
+
+    /// The retained bytes as text, and their counts.
+    ///
+    /// This is the shape [`ExecResult::stdout`](super::ExecResult::stdout) and
+    /// [`ExecResult::stderr`](super::ExecResult::stderr) take. Bytes that are
+    /// not UTF-8 — a binary stream, or a sequence the cap cut through where the
+    /// head meets the tail — become replacement characters; the counts are
+    /// still in bytes as the process wrote them.
+    #[must_use]
+    pub fn into_text(self) -> (String, OutputCaptureStats) {
+        let (bytes, stats) = self.into_parts();
+        (String::from_utf8_lossy(&bytes).into_owned(), stats)
     }
 }
 
@@ -102,8 +140,8 @@ pub(crate) fn capture_collected_stream(
         Some(cap) if text.len() > cap => {
             let mut buffer = OutputCaptureBuffer::new(Some(cap));
             buffer.push(text.as_bytes());
-            let (bytes, stats) = buffer.into_parts();
-            *text = String::from_utf8_lossy(&bytes).into_owned();
+            let (bounded, stats) = buffer.into_text();
+            *text = bounded;
             stats
         }
         _ => OutputCaptureStats::complete(text.len()),

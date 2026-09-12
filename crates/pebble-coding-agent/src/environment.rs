@@ -14,12 +14,19 @@
 //! of the contract rather than implementation detail:
 //! [`format_lines_numbered`] is the exact `read_file` rendering, and
 //! [`ExecRequest::command`] is Bash source (see [`Environment::exec`]).
+//!
+//! [`support`] holds the pieces of the contract an implementation over another
+//! machine would otherwise write by hand — the glob grammar, the listing
+//! order, bounded output capture and its accounting, and the error kind a
+//! failed command reports — as the one implementation [`LocalEnvironment`]
+//! uses too.
 
 mod capture;
 mod glob;
 mod local;
 #[cfg(any(test, feature = "test-util"))]
 pub(crate) mod mock;
+pub mod support;
 
 use std::collections::HashMap;
 use std::error::Error as StdError;

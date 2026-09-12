@@ -316,6 +316,15 @@ the trait over that instead, and nothing else in the crate changes.
 `pebble_coding_agent::test_support::MockEnvironment` stands in for a machine in tests,
 behind the `test-util` feature.
 
+An implementation over another machine does not write pebble's rules again.
+`pebble_coding_agent::environment::support` holds the pieces of the contract
+an adapter would otherwise hand-write: `validate_glob` refuses the patterns
+pebble refuses, in pebble's words; `tree_order` sorts a listing the way
+`list_directory` promises; `OutputCaptureBuffer` and `capture_stats` keep and
+count bounded process output; and `classify_exec_error` names the error kind a
+command that failed to run reports. `LocalEnvironment` uses the same helpers,
+so an adapter built on them passes the `EnvironmentContract` checks they cover.
+
 **Somewhere for the events to go, if they matter.**
 `CodingAgent::subscribe` hands out a bounded broadcast receiver, which is
 lossy for a reader that falls behind: right for a terminal, wrong for a ledger.
@@ -411,7 +420,10 @@ the omitted bytes. Truncation does not make a successful tool call fail.
 Retaining complete tool output is an explicit anti-goal: Pebble does not store
 full output or provide a retrieval tool for discarded bytes. Environment
 adapters must continue draining process output after the capture limit is
-reached, while retaining only the bounded preview and byte counts.
+reached, while retaining only the bounded preview and byte counts;
+`environment::support::OutputCaptureBuffer` is that capture, and
+`environment::support::capture_stats` the counts for a driver that bounds
+output itself.
 
 **Context and compaction policy.** Install `extensions::ContextPolicy` with
 `CodingAgentBuilder::context_policy` to prepare the messages for each model
