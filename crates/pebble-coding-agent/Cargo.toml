@@ -66,7 +66,7 @@ url = { version = "2.5", optional = true }
 # sandbox-driver's `PreviewUrls` facet, which both embedders' sandboxes
 # already provide. Pinned to the revision fabro pins, because a trait object
 # only crosses the boundary when both sides name the same crate version.
-sandbox-driver = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "23062b6ad62ff4665cbbcb7dce037ec9c4c34318", optional = true }
+sandbox-driver = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "a92c0db6b6a122ca9b6df75de6615544f53c0d47", optional = true }
 
 # Signalling a command's process group without writing unsafe code.
 [target.'cfg(unix)'.dependencies]
