@@ -850,15 +850,58 @@ async fn a_server_launched_in_the_environment_is_reached_through_its_port_and_st
         .expect("the agent shuts down");
 
     // The server is stopped with the agent: its port frees up.
-    let mut freed = false;
+    assert!(
+        port_frees_up(port).await,
+        "the server released port {port} after shutdown"
+    );
+    let _ = fs::remove_dir_all(&work);
+}
+
+/// Whether `port` becomes bindable within a few seconds.
+async fn port_frees_up(port: u16) -> bool {
     for _ in 0..50 {
         if TcpListener::bind(("127.0.0.1", port)).await.is_ok() {
-            freed = true;
-            break;
+            return true;
         }
         sleep(Duration::from_millis(100)).await;
     }
-    assert!(freed, "the server released port {port} after shutdown");
+    false
+}
+
+#[tokio::test]
+async fn a_build_that_fails_after_the_servers_started_stops_them() {
+    let work = tempdir();
+    let environment: Arc<dyn Environment> = Arc::new(LocalEnvironment::new(&work));
+    let port = free_port().await;
+    let server = McpServer::new("inside", McpPlacement::Environment {
+        command: vec![
+            "python3".to_owned(),
+            fixture("mcp_http_echo_server.py").display().to_string(),
+            port.to_string(),
+        ],
+        port,
+        env: BTreeMap::new(),
+        protocol: McpHttpProtocol::StreamableHttp,
+        path: Some("/mcp".to_owned()),
+    })
+    .with_startup_timeout(Duration::from_secs(15));
+    let (client, _provider) = client_from(ScriptedProvider::new(Vec::new()));
+
+    // The servers start before the runtime is built, and the runtime is
+    // built against a model the client does not know.
+    let built = CodingAgent::builder(client, Arc::clone(&environment))
+        .model("test/no-such-model")
+        .options(CodingAgentOptions::default().with_loop_detection(false))
+        .mcp_servers([server])
+        .build()
+        .await;
+
+    assert!(built.is_err(), "the unknown model fails the build");
+    drop(built);
+    assert!(
+        port_frees_up(port).await,
+        "the server launched for the failed build released port {port}"
+    );
     let _ = fs::remove_dir_all(&work);
 }
 
