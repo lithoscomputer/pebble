@@ -12,16 +12,20 @@ use std::sync::Arc;
 use lithos_llm::types::{ErrorKind as LlmErrorKind, Message as LlmMessage, ReasoningEffort, Role};
 use pebble_coding_agent::environment::Environment;
 use pebble_coding_agent::events::{
-    CodingAgentEvent, CodingAgentState, CodingEvent, PermissionLevel,
+    CodingAgentEvent, CodingAgentState, CodingEvent, FailoverContinuation, FailoverStop,
+    PermissionLevel, TokenUsage,
 };
 use pebble_coding_agent::state::Message;
 use pebble_coding_agent::test_support::{
     MockEnvironment, ScriptedCall, ScriptedFailure, ScriptedProvider, client_from, text_response,
-    tool_call_response,
+    tool_call_response, with_cost,
 };
-use pebble_coding_agent::{CodingAgent, CodingAgentOptions, Error, FallbackRoute, ShutdownReason};
+use pebble_coding_agent::{
+    CodingAgent, CodingAgentOptions, Error, FallbackRoute, ResumeMode, ShutdownReason,
+};
 use serde_json::json;
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 
 /// The route every test starts on.
 const PRIMARY: &str = "test/model";
@@ -63,6 +67,22 @@ fn count(published: &[CodingAgentEvent], wanted: impl Fn(&CodingEvent) -> bool) 
         .count()
 }
 
+/// The failovers in `published`, in order.
+fn failovers(published: &[CodingAgentEvent]) -> Vec<&CodingAgentEvent> {
+    published
+        .iter()
+        .filter(|event| matches!(event.event, CodingEvent::RouteFailover { .. }))
+        .collect()
+}
+
+/// The failover stops in `published`, in order.
+fn stops(published: &[CodingAgentEvent]) -> Vec<&CodingAgentEvent> {
+    published
+        .iter()
+        .filter(|event| matches!(event.event, CodingEvent::RouteFailoverStopped { .. }))
+        .collect()
+}
+
 /// An agent on [`PRIMARY`] whose one script serves every route in the test
 /// catalog, with `routes` to fall over to, working in a mock environment the
 /// test keeps a handle on.
@@ -87,10 +107,13 @@ async fn agent_with(
 async fn a_failover_eligible_error_moves_the_conversation_to_the_next_route() {
     let (mut agent, provider, environment) = agent_with(
         vec![
-            ScriptedCall::response(tool_call_response(
-                "write_file",
-                "call_1",
-                json!({"file_path": "/home/test/once.txt", "content": "written once"}),
+            ScriptedCall::response(with_cost(
+                tool_call_response(
+                    "write_file",
+                    "call_1",
+                    json!({"file_path": "/home/test/once.txt", "content": "written once"}),
+                ),
+                7,
             )),
             credentials_rejected(),
             ScriptedCall::response(text_response("recovered on the fallback")),
@@ -160,16 +183,17 @@ async fn a_failover_eligible_error_moves_the_conversation_to_the_next_route() {
     // The stream: the failed session ends, the fallback starts and reports
     // the move, all on the session's one stream with no number reused.
     let published = drained(&mut events);
-    let failovers: Vec<&CodingAgentEvent> = published
-        .iter()
-        .filter(|event| matches!(event.event, CodingEvent::RouteFailover { .. }))
-        .collect();
+    let failovers = failovers(&published);
     assert_eq!(failovers.len(), 1, "{published:?}");
     let CodingEvent::RouteFailover {
         from,
         to,
         attempt,
         error,
+        usage,
+        cost_usd_micros,
+        continuation,
+        ..
     } = &failovers[0].event
     else {
         unreachable!()
@@ -178,6 +202,19 @@ async fn a_failover_eligible_error_moves_the_conversation_to_the_next_route() {
     assert_eq!(to, FALLBACK);
     assert_eq!(*attempt, 1);
     assert!(error.message.contains("primary key revoked"), "{error:?}");
+    // The failed route answered once before it failed: that answer is what
+    // it spent, and what the next route continues from.
+    assert_eq!(
+        usage.input, 10,
+        "the tool-call response's tokens: {usage:?}"
+    );
+    assert_eq!(usage.output, 5);
+    assert_eq!(*cost_usd_micros, Some(7));
+    assert_eq!(*continuation, FailoverContinuation::ContinueTurn);
+    assert!(
+        stops(&published).is_empty(),
+        "a prompt that moved has nothing to say about stopping: {published:?}"
+    );
     // The subscription was taken after the first route had started, so the
     // one start it sees is the fallback's, on its own route.
     let started: Vec<&CodingAgentEvent> = published
@@ -254,6 +291,7 @@ async fn queued_follow_ups_move_with_the_conversation() {
     )
     .await;
     agent.queue_follow_up("then this");
+    let mut events = agent.subscribe();
 
     let report = agent.prompt("first").await;
 
@@ -263,6 +301,25 @@ async fn queued_follow_ups_move_with_the_conversation() {
         "the follow-up the failed session held ran on the new route"
     );
     assert_eq!(provider.call_count(), 3);
+    // The first call failed before any token was spent, so the new route is
+    // asked the prompt again and the failed route accounts for nothing.
+    let published = drained(&mut events);
+    let failovers = failovers(&published);
+    assert_eq!(failovers.len(), 1, "{published:?}");
+    let CodingEvent::RouteFailover {
+        usage,
+        cost_usd_micros,
+        tool_ms,
+        continuation,
+        ..
+    } = &failovers[0].event
+    else {
+        unreachable!()
+    };
+    assert_eq!(*usage, TokenUsage::default(), "{usage:?}");
+    assert_eq!(*cost_usd_micros, None);
+    assert_eq!(*tool_ms, 0, "no tool ran on the failed route");
+    assert_eq!(*continuation, FailoverContinuation::ReplayPrompt);
     let follow_ups = agent
         .history()
         .turns()
@@ -282,6 +339,7 @@ async fn queued_follow_ups_move_with_the_conversation() {
 async fn an_ineligible_error_ends_the_prompt_on_its_route() {
     let (mut agent, provider, _environment) =
         agent_with(vec![bad_request()], vec![FallbackRoute::new(FALLBACK)]).await;
+    let mut events = agent.subscribe();
 
     let report = agent.prompt("work").await;
 
@@ -292,6 +350,40 @@ async fn an_ineligible_error_ends_the_prompt_on_its_route() {
         agent.remaining_fallback_routes().len(),
         1,
         "the route is still there for a failure that deserves it"
+    );
+    // The stream says why the routes were not used.
+    let published = drained(&mut events);
+    assert!(failovers(&published).is_empty(), "{published:?}");
+    let stops = stops(&published);
+    assert_eq!(stops.len(), 1, "{published:?}");
+    let CodingEvent::RouteFailoverStopped {
+        route,
+        attempt,
+        reason,
+        error,
+    } = &stops[0].event
+    else {
+        unreachable!()
+    };
+    assert_eq!(route, PRIMARY);
+    assert_eq!(*attempt, 0, "the prompt never left its first route");
+    assert_eq!(*reason, FailoverStop::Ineligible);
+    assert!(error.message.contains("malformed tool schema"), "{error:?}");
+    let reported = published
+        .iter()
+        .position(|event| matches!(event.event, CodingEvent::Error { .. }))
+        .expect("the failure is reported");
+    let ended = published
+        .iter()
+        .position(|event| matches!(event.event, CodingEvent::ProcessingEnd))
+        .expect("the prompt ends");
+    let stopped = published
+        .iter()
+        .position(|event| matches!(event.event, CodingEvent::RouteFailoverStopped { .. }))
+        .expect("the stop is reported");
+    assert!(
+        reported < stopped && stopped < ended,
+        "the stop follows the failure and precedes the prompt's end: {published:?}"
     );
     agent
         .shutdown(ShutdownReason::Completed)
@@ -313,12 +405,33 @@ async fn a_spent_chain_reports_the_last_routes_error() {
     assert!(matches!(report.result, Err(Error::Llm(_))), "{report:?}");
     assert_eq!(report.route, FALLBACK, "the prompt ended on the last route");
     assert_eq!(provider.call_count(), 2);
-    assert_eq!(
-        count(&drained(&mut events), |event| matches!(
-            event,
-            CodingEvent::RouteFailover { .. }
-        )),
-        1
+    let published = drained(&mut events);
+    assert_eq!(failovers(&published).len(), 1, "{published:?}");
+    // The last route's failure is reported as the end of the plan, on that
+    // route, before the session it closed says it ended.
+    let stops = stops(&published);
+    assert_eq!(stops.len(), 1, "{published:?}");
+    let CodingEvent::RouteFailoverStopped {
+        route,
+        attempt,
+        reason,
+        error,
+    } = &stops[0].event
+    else {
+        unreachable!()
+    };
+    assert_eq!(route, FALLBACK);
+    assert_eq!(*attempt, 1);
+    assert_eq!(*reason, FailoverStop::Exhausted);
+    assert!(error.message.contains("primary key revoked"), "{error:?}");
+    let last_end = published
+        .iter()
+        .rev()
+        .find(|event| matches!(event.event, CodingEvent::SessionEnded))
+        .expect("the credential failure closed the last session");
+    assert!(
+        stops[0].seq < last_end.seq,
+        "the stop is on the stream before the session ends: {published:?}"
     );
     assert!(agent.remaining_fallback_routes().is_empty());
     agent
@@ -386,12 +499,152 @@ async fn a_route_carries_its_own_request_controls() {
 async fn without_routes_a_model_error_ends_the_prompt() {
     let (mut agent, provider, _environment) =
         agent_with(vec![credentials_rejected()], vec![]).await;
+    let mut events = agent.subscribe();
 
     let report = agent.prompt("work").await;
 
     assert!(matches!(report.result, Err(Error::Llm(_))), "{report:?}");
     assert_eq!(provider.call_count(), 1);
     assert!(agent.remaining_fallback_routes().is_empty());
+    let published = drained(&mut events);
+    assert!(
+        failovers(&published).is_empty() && stops(&published).is_empty(),
+        "with no plan there is nothing to say about routes: {published:?}"
+    );
+    agent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the agent shuts down");
+}
+
+#[tokio::test]
+async fn a_cancelled_prompt_neither_moves_nor_reports_a_stop() {
+    let (mut agent, provider, _environment) =
+        agent_with(vec![ScriptedCall::PendingOpen], vec![FallbackRoute::new(
+            FALLBACK,
+        )])
+        .await;
+    let mut events = agent.subscribe();
+    let cancel = CancellationToken::new();
+    let canceller = {
+        let cancel = cancel.clone();
+        let provider = Arc::clone(&provider);
+        tokio::spawn(async move {
+            provider.wait_for_call().await;
+            cancel.cancel();
+        })
+    };
+
+    let report = agent.prompt_with_cancellation("work", &cancel).await;
+
+    canceller.await.expect("the canceller finishes");
+    assert!(
+        matches!(report.result, Err(Error::Interrupted(_))),
+        "{report:?}"
+    );
+    assert_eq!(report.route, PRIMARY);
+    assert_eq!(
+        agent.remaining_fallback_routes().len(),
+        1,
+        "a cancelled prompt never moves"
+    );
+    let published = drained(&mut events);
+    assert!(
+        failovers(&published).is_empty() && stops(&published).is_empty(),
+        "a cancellation says nothing about routes: {published:?}"
+    );
+    agent
+        .shutdown(ShutdownReason::Cancelled)
+        .await
+        .expect("the agent shuts down");
+}
+
+#[tokio::test]
+async fn a_prompt_resumed_mid_turn_continues_the_turn_on_the_new_route() {
+    // A session whose model failed right after a tool round, stored as it
+    // stood: the record ends with the tool's result.
+    let (mut stored, _provider, _environment) = agent_with(
+        vec![
+            ScriptedCall::response(tool_call_response(
+                "write_file",
+                "call_1",
+                json!({"file_path": "/home/test/once.txt", "content": "written once"}),
+            )),
+            credentials_rejected(),
+        ],
+        vec![],
+    )
+    .await;
+    let failed = stored.prompt("write the file").await;
+    assert!(matches!(failed.result, Err(Error::Llm(_))), "{failed:?}");
+    let record = stored.to_record();
+    assert!(
+        matches!(
+            stored.history().turns().last(),
+            Some(Message::ToolResults { .. })
+        ),
+        "{:?}",
+        stored.history().turns()
+    );
+    stored
+        .shutdown(ShutdownReason::Error)
+        .await
+        .expect("the stored agent shuts down");
+
+    // Resumed on its recorded route, which fails again before it answers.
+    let (client, provider) = client_from(ScriptedProvider::new(vec![
+        credentials_rejected(),
+        ScriptedCall::response(text_response("finished on the fallback")),
+    ]));
+    let environment = Arc::new(MockEnvironment::linux());
+    let mut agent = CodingAgent::resume(
+        client,
+        environment as Arc<dyn Environment>,
+        record,
+        ResumeMode::RecordedModel,
+    )
+    .permission_level(PermissionLevel::Full)
+    .options(CodingAgentOptions::default().with_loop_detection(false))
+    .fallback_routes(vec![FallbackRoute::new(FALLBACK)])
+    .build()
+    .await
+    .expect("the record resumes");
+    let mut events = agent.subscribe();
+
+    let report = agent.continue_prompt().await;
+
+    let output = report.result.as_ref().expect("the fallback answers");
+    assert_eq!(output.text.as_deref(), Some("finished on the fallback"));
+    assert_eq!(report.route, FALLBACK);
+    assert_eq!(provider.call_count(), 2);
+    let published = drained(&mut events);
+    let failovers = failovers(&published);
+    assert_eq!(failovers.len(), 1, "{published:?}");
+    let CodingEvent::RouteFailover {
+        usage,
+        continuation,
+        ..
+    } = &failovers[0].event
+    else {
+        unreachable!()
+    };
+    assert_eq!(
+        *usage,
+        TokenUsage::default(),
+        "the resumed route spent nothing before it failed: {usage:?}"
+    );
+    assert_eq!(
+        *continuation,
+        FailoverContinuation::ContinueTurn,
+        "the record ends mid-turn, so the new route continues the turn even \
+         though the failed route committed nothing"
+    );
+    let requests = provider.requests();
+    assert_eq!(
+        requests[1].messages().last().map(LlmMessage::role),
+        Some(Role::Tool),
+        "the fallback was asked on the tool result the record held"
+    );
     agent
         .shutdown(ShutdownReason::Completed)
         .await

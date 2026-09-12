@@ -20,11 +20,11 @@ use pebble_coding_agent::events::{
     Actor, AgentProfileKind, CodingAgentEvent, CodingEvent, CommandTermination, CompactionReason,
     ContextWindowBreakdownItem, ContextWindowCategory, ContextWindowCountMethod,
     ContextWindowSnapshot, ContextWindowStaleness, ContextWindowWarning, CostSource, ErrorData,
-    ErrorKind, EventSinkError, ExecOutputTail, InputContent, InputSource, LlmOutputKind,
-    LlmRetryPhase, McpToolSummary, MemoryFileSummary, PermissionLevel, ReasoningOutput,
-    SkillActivationSource, SkillSummary, SkippedSkill, SkippedSkillReason, TodoCreatedProps,
-    TodoDeletedProps, TodoListKind, TodoStatus, TodoUpdatedProps, TokenUsage, ToolCategory,
-    ToolErrorKind, ToolSource, ToolSummary,
+    ErrorKind, EventSinkError, ExecOutputTail, FailoverContinuation, FailoverStop, InputContent,
+    InputSource, LlmOutputKind, LlmRetryPhase, McpToolSummary, MemoryFileSummary, PermissionLevel,
+    ReasoningOutput, SkillActivationSource, SkillSummary, SkippedSkill, SkippedSkillReason,
+    TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoStatus, TodoUpdatedProps, TokenUsage,
+    ToolCategory, ToolErrorKind, ToolSource, ToolSummary,
 };
 use pebble_coding_agent::{Error, InterruptReason};
 use serde::Serialize;
@@ -200,9 +200,20 @@ fn every_variant() -> Vec<CodingEvent> {
             error:  "transport closed".into(),
         },
         CodingEvent::RouteFailover {
-            from:    "anthropic/claude-sonnet-5".into(),
-            to:      "openai/gpt-5.6".into(),
+            from:            "anthropic/claude-sonnet-5".into(),
+            to:              "openai/gpt-5.6".into(),
+            attempt:         1,
+            error:           ErrorData::from(&rate_limited()),
+            usage:           usage(),
+            cost_usd_micros: Some(4_200),
+            inference_ms:    1_850,
+            tool_ms:         320,
+            continuation:    FailoverContinuation::ContinueTurn,
+        },
+        CodingEvent::RouteFailoverStopped {
+            route:   "openai/gpt-5.6".into(),
             attempt: 1,
+            reason:  FailoverStop::Exhausted,
             error:   ErrorData::from(&rate_limited()),
         },
         CodingEvent::SteeringInjected {

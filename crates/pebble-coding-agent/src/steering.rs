@@ -16,6 +16,12 @@
 //! dropped, and the application records those in its own vocabulary and
 //! order.
 //!
+//! A message travels in one of two modes. A steer reaches the session at
+//! its next round boundary, inside the answer in progress; a follow-up waits
+//! and runs as a new user turn once the current answer is reached. The bus
+//! remembers the mode of every message it buffers, so text that arrived before
+//! a session attached is delivered the way its sender meant.
+//!
 //! Sessions implement [`SteerableSession`]. Pebble's own
 //! [`CodingAgentControlHandle`] does; a session on another backend
 //! implements it with an adapter.
@@ -58,11 +64,23 @@ pub trait SteerableSession: Send + Sync {
     fn hold_open(&self) -> Option<SessionHold> {
         None
     }
+
+    /// Queues `message` to run as a new user turn once the current answer is
+    /// reached, rather than inside it. A session that can queue a new turn
+    /// should override this; the default steers, which is the nearest thing
+    /// a session with one queue can do.
+    fn follow_up(&self, message: SteeringMessage) -> SteeringOutcome {
+        self.steer(message)
+    }
 }
 
 impl SteerableSession for CodingAgentControlHandle {
     fn steer(&self, message: SteeringMessage) -> SteeringOutcome {
         self.queue_steering(message)
+    }
+
+    fn follow_up(&self, message: SteeringMessage) -> SteeringOutcome {
+        self.queue_follow_up(message)
     }
 
     fn interrupt(&self) -> bool {
@@ -112,6 +130,25 @@ pub struct Attachment<K> {
     pub session_id: String,
 }
 
+/// How a message reaches a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum DeliveryMode {
+    /// At the session's next round boundary, inside the answer in progress:
+    /// [`SteerableSession::steer`].
+    Steer,
+    /// As a new user turn once the current answer is reached:
+    /// [`SteerableSession::follow_up`].
+    FollowUp,
+}
+
+/// A message waiting on the bus for the next attachment, with the mode its
+/// sender chose.
+struct Pending {
+    mode:    DeliveryMode,
+    message: SteeringMessage,
+}
+
 /// Why a steer was dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -122,7 +159,7 @@ pub enum DropReason {
     Ended,
 }
 
-/// Steering the agent will never see.
+/// Steering, or a follow-up, the agent will never see.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DroppedSteer<K> {
     pub reason:     DropReason,
@@ -134,7 +171,7 @@ pub struct DroppedSteer<K> {
     pub attachment: Option<Attachment<K>>,
 }
 
-/// What one steer did.
+/// What one steer or follow-up did.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Delivery<K> {
     /// The sessions that queued the message.
@@ -213,7 +250,7 @@ struct Attached {
 /// The bus. `K` names a session's place: a stage, a node, a slot.
 pub struct SteeringBus<K> {
     attached:         RwLock<BTreeMap<K, Attached>>,
-    pending:          Mutex<VecDeque<SteeringMessage>>,
+    pending:          Mutex<VecDeque<Pending>>,
     pending_capacity: usize,
 }
 
@@ -235,7 +272,7 @@ impl<K> Default for SteeringBus<K> {
 }
 
 impl<K> SteeringBus<K> {
-    /// How many steers wait on the bus with no session attached before the
+    /// How many messages wait on the bus with no session attached before the
     /// oldest is dropped.
     pub const DEFAULT_PENDING_CAPACITY: usize = 32;
 
@@ -245,7 +282,7 @@ impl<K> SteeringBus<K> {
         Self::with_pending_capacity(Self::DEFAULT_PENDING_CAPACITY)
     }
 
-    /// A bus whose buffer holds `capacity` steers.
+    /// A bus whose buffer holds `capacity` messages.
     #[must_use]
     pub fn with_pending_capacity(capacity: usize) -> Self {
         Self {
@@ -255,7 +292,8 @@ impl<K> SteeringBus<K> {
         }
     }
 
-    /// How many steers wait for the next attachment.
+    /// How many messages, steers and follow-ups alike, wait for the next
+    /// attachment.
     #[must_use]
     pub fn pending_len(&self) -> usize {
         self.pending
@@ -273,7 +311,7 @@ impl<K> SteeringBus<K> {
             .len()
     }
 
-    /// Drops every buffered steer, as at the end of a run. Returns what was
+    /// Drops every buffered message, as at the end of a run. Returns what was
     /// dropped, if anything was.
     pub fn drain_pending(&self) -> Option<DroppedSteer<K>> {
         let count = {
@@ -294,7 +332,7 @@ impl<K> SteeringBus<K> {
 impl<K: Ord + Clone> SteeringBus<K> {
     /// Attaches `session` at `key`. Re-attaching the same session replaces
     /// its handle; a different session is refused while the first holds the
-    /// key. Buffered steers stay on the bus until
+    /// key. Buffered messages stay on the bus until
     /// [`drain_pending_into`](Self::drain_pending_into), so the application
     /// can record the attachment first.
     pub fn attach(
@@ -327,14 +365,17 @@ impl<K: Ord + Clone> SteeringBus<K> {
         }
     }
 
-    /// Moves every buffered steer into the session attached at `key`, in
-    /// order. Nothing moves when no session is attached there.
+    /// Moves every buffered message into the session attached at `key`, in
+    /// order, each the way its sender chose: a steer through
+    /// [`steer`](SteerableSession::steer), a follow-up through
+    /// [`follow_up`](SteerableSession::follow_up). Nothing moves when no
+    /// session is attached there.
     pub fn drain_pending_into(&self, key: &K) -> Delivery<K> {
         let attached = self.attached.read().unwrap_or_else(PoisonError::into_inner);
         let Some(entry) = attached.get(key) else {
             return Delivery::none();
         };
-        let pending: Vec<SteeringMessage> = {
+        let pending: Vec<Pending> = {
             let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
             pending.drain(..).collect()
         };
@@ -343,8 +384,14 @@ impl<K: Ord + Clone> SteeringBus<K> {
             session_id: entry.session_id.clone(),
         };
         let mut delivery = Delivery::none();
-        for message in pending {
-            Self::push(entry.session.as_ref(), message, &attachment, &mut delivery);
+        for Pending { mode, message } in pending {
+            Self::push(
+                entry.session.as_ref(),
+                mode,
+                message,
+                &attachment,
+                &mut delivery,
+            );
         }
         delivery
     }
@@ -411,6 +458,19 @@ impl<K: Ord + Clone> SteeringBus<K> {
     /// Steers every attached session, or buffers the message when none is
     /// attached.
     pub fn steer(&self, message: SteeringMessage) -> Delivery<K> {
+        self.deliver(DeliveryMode::Steer, message)
+    }
+
+    /// Queues `message` as a follow-up on every attached session, to run as
+    /// a new user turn once each reaches its current answer, or buffers it
+    /// as a follow-up when none is attached.
+    pub fn follow_up(&self, message: SteeringMessage) -> Delivery<K> {
+        self.deliver(DeliveryMode::FollowUp, message)
+    }
+
+    /// Delivers `message` in `mode` to every attached session, or buffers it
+    /// with its mode when none is attached.
+    fn deliver(&self, mode: DeliveryMode, message: SteeringMessage) -> Delivery<K> {
         let attached = self.attached.read().unwrap_or_else(PoisonError::into_inner);
         let mut delivery = Delivery::none();
         if attached.is_empty() {
@@ -421,11 +481,11 @@ impl<K: Ord + Clone> SteeringBus<K> {
                 delivery.dropped.push(DroppedSteer {
                     reason:     DropReason::QueueFull,
                     count:      1,
-                    actor:      evicted.actor().cloned(),
+                    actor:      evicted.message.actor().cloned(),
                     attachment: None,
                 });
             }
-            pending.push_back(message);
+            pending.push_back(Pending { mode, message });
             delivery.buffered = true;
             return delivery;
         }
@@ -436,6 +496,7 @@ impl<K: Ord + Clone> SteeringBus<K> {
             };
             Self::push(
                 entry.session.as_ref(),
+                mode,
                 message.clone(),
                 &attachment,
                 &mut delivery,
@@ -510,6 +571,23 @@ impl<K: Ord + Clone> SteeringBus<K> {
         Ok(entry.session.steer(message))
     }
 
+    /// Queues `message` as a follow-up on one attached session, to run as a
+    /// new user turn once its current answer is reached. The caller reads the
+    /// outcome as for [`send_to`](Self::send_to).
+    pub fn follow_up_to(
+        &self,
+        key: &K,
+        session_id: &str,
+        message: SteeringMessage,
+    ) -> Result<SteeringOutcome, TargetError> {
+        let attached = self.attached.read().unwrap_or_else(PoisonError::into_inner);
+        let entry = attached
+            .get(key)
+            .filter(|entry| entry.session_id == session_id)
+            .ok_or(TargetError::NotAttached)?;
+        Ok(entry.session.follow_up(message))
+    }
+
     /// Holds the session at `key` open: while held, a prompt that reaches a
     /// plain answer parks instead of completing. The hold lasts until
     /// [`release_hold`](Self::release_hold) or the session detaches.
@@ -554,11 +632,15 @@ impl<K: Ord + Clone> SteeringBus<K> {
 
     fn push(
         session: &dyn SteerableSession,
+        mode: DeliveryMode,
         message: SteeringMessage,
         attachment: &Attachment<K>,
         delivery: &mut Delivery<K>,
     ) {
-        let outcome = session.steer(message);
+        let outcome = match mode {
+            DeliveryMode::Steer => session.steer(message),
+            DeliveryMode::FollowUp => session.follow_up(message),
+        };
         if outcome.is_accepted() {
             delivery.delivered.push(attachment.clone());
         }
@@ -587,9 +669,11 @@ mod tests {
 
     use super::*;
 
-    /// A session with a bounded queue, standing in for a live agent.
+    /// A session with a bounded steering queue and a follow-up queue,
+    /// standing in for a live agent.
     struct FakeSession {
         queue:       Mutex<VecDeque<SteeringMessage>>,
+        follow_ups:  Mutex<Vec<SteeringMessage>>,
         capacity:    usize,
         interrupted: AtomicUsize,
         holds:       Arc<AtomicUsize>,
@@ -607,6 +691,7 @@ mod tests {
         fn with_capacity(capacity: usize) -> Arc<Self> {
             Arc::new(Self {
                 queue: Mutex::new(VecDeque::new()),
+                follow_ups: Mutex::new(Vec::new()),
                 capacity,
                 interrupted: AtomicUsize::new(0),
                 holds: Arc::new(AtomicUsize::new(0)),
@@ -621,6 +706,15 @@ mod tests {
             self.queue
                 .lock()
                 .expect("queue lock")
+                .iter()
+                .map(|message| message.text().to_owned())
+                .collect()
+        }
+
+        fn follow_up_texts(&self) -> Vec<String> {
+            self.follow_ups
+                .lock()
+                .expect("follow-up lock")
                 .iter()
                 .map(|message| message.text().to_owned())
                 .collect()
@@ -662,6 +756,56 @@ mod tests {
         fn hold_open(&self) -> Option<SessionHold> {
             self.holds.fetch_add(1, Ordering::SeqCst);
             Some(SessionHold::new(FakeHold(Arc::clone(&self.holds))))
+        }
+
+        fn follow_up(&self, message: SteeringMessage) -> SteeringOutcome {
+            self.follow_ups
+                .lock()
+                .expect("follow-up lock")
+                .push(message);
+            SteeringOutcome::Accepted
+        }
+    }
+
+    /// A session with one queue and no idea of a follow-up, like an adapter
+    /// written before the mode existed.
+    struct SteerOnly {
+        queue: Mutex<Vec<SteeringMessage>>,
+    }
+
+    impl SteerOnly {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                queue: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn texts(&self) -> Vec<String> {
+            self.queue
+                .lock()
+                .expect("queue lock")
+                .iter()
+                .map(|message| message.text().to_owned())
+                .collect()
+        }
+    }
+
+    impl SteerableSession for SteerOnly {
+        fn steer(&self, message: SteeringMessage) -> SteeringOutcome {
+            self.queue.lock().expect("queue lock").push(message);
+            SteeringOutcome::Accepted
+        }
+
+        fn interrupt(&self) -> bool {
+            false
+        }
+
+        fn steer_now(&self, message: SteeringMessage) -> SteeringOutcome {
+            self.steer(message)
+        }
+
+        fn has_pending_steering(&self) -> bool {
+            !self.queue.lock().expect("queue lock").is_empty()
         }
     }
 
@@ -921,5 +1065,108 @@ mod tests {
             bus.hold_open(&"a", "session-a"),
             Err(TargetError::Unsupported)
         );
+    }
+
+    #[test]
+    fn a_follow_up_with_nothing_attached_is_delivered_as_a_follow_up_on_attach() {
+        let bus = bus();
+        let delivery = bus.follow_up(steer("later"));
+        assert!(delivery.buffered);
+        assert!(delivery.delivered.is_empty());
+        assert_eq!(bus.pending_len(), 1);
+
+        let session = FakeSession::new();
+        bus.attach("agent", "session-a", session.clone())
+            .expect("attaches");
+        let delivery = bus.drain_pending_into(&"agent");
+
+        assert_eq!(session.follow_up_texts(), ["later"]);
+        assert!(session.texts().is_empty(), "a follow-up is not a steer");
+        assert_eq!(delivery.delivered.len(), 1);
+        assert_eq!(bus.pending_len(), 0);
+    }
+
+    #[test]
+    fn a_follow_up_to_an_attached_session_reaches_follow_up_and_a_steer_reaches_steer() {
+        let bus = bus();
+        let session = FakeSession::new();
+        bus.attach("a", "session-a", session.clone())
+            .expect("attaches");
+
+        let follow_up = bus.follow_up(steer("after the answer"));
+        let steered = bus.steer(steer("right now"));
+
+        assert_eq!(session.follow_up_texts(), ["after the answer"]);
+        assert_eq!(session.texts(), ["right now"]);
+        assert_eq!(follow_up.delivered.len(), 1);
+        assert!(!follow_up.buffered);
+        assert_eq!(steered.delivered.len(), 1);
+
+        assert_eq!(
+            bus.follow_up_to(&"a", "session-a", steer("just you, later")),
+            Ok(SteeringOutcome::Accepted)
+        );
+        assert_eq!(
+            bus.follow_up_to(&"a", "session-b", steer("stale")),
+            Err(TargetError::NotAttached)
+        );
+        assert_eq!(session.follow_up_texts(), [
+            "after the answer",
+            "just you, later"
+        ]);
+        assert_eq!(session.texts(), ["right now"]);
+    }
+
+    #[test]
+    fn a_session_without_a_follow_up_queue_receives_follow_ups_as_steers() {
+        let bus = bus();
+        bus.follow_up(steer("buffered"));
+        let session = SteerOnly::new();
+        bus.attach("a", "session-a", session.clone())
+            .expect("attaches");
+
+        bus.drain_pending_into(&"a");
+        bus.follow_up(steer("live"));
+        assert_eq!(
+            bus.follow_up_to(&"a", "session-a", steer("targeted")),
+            Ok(SteeringOutcome::Accepted)
+        );
+
+        assert_eq!(session.texts(), ["buffered", "live", "targeted"]);
+    }
+
+    #[test]
+    fn mixed_pending_messages_keep_their_order_and_their_modes() {
+        let bus = bus();
+        bus.steer(steer("s1"));
+        bus.follow_up(steer("f1"));
+        bus.steer(steer("s2"));
+        bus.follow_up(steer("f2"));
+        assert_eq!(bus.pending_len(), 4);
+
+        // The buffer's capacity counts both modes, and the oldest goes first.
+        let small: SteeringBus<&str> = SteeringBus::with_pending_capacity(2);
+        small.follow_up(steer("old").with_actor(Actor::System));
+        small.steer(steer("kept"));
+        let delivery = small.follow_up(steer("newest"));
+        assert_eq!(delivery.dropped, [DroppedSteer {
+            reason:     DropReason::QueueFull,
+            count:      1,
+            actor:      Some(Actor::System),
+            attachment: None,
+        }]);
+
+        let session = FakeSession::new();
+        bus.attach("a", "session-a", session.clone())
+            .expect("attaches");
+        let delivery = bus.drain_pending_into(&"a");
+
+        assert_eq!(delivery.delivered.len(), 4);
+        assert_eq!(session.texts(), ["s1", "s2"]);
+        assert_eq!(session.follow_up_texts(), ["f1", "f2"]);
+        assert_eq!(bus.pending_len(), 0);
+
+        let drained = small.drain_pending().expect("two were dropped");
+        assert_eq!(drained.count, 2, "a follow-up and a steer, both unread");
     }
 }
