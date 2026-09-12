@@ -354,12 +354,12 @@ impl SessionProjection {
                     }
                 }
             }
-            CodingEvent::McpServerReady { server, tools } if is_root => {
+            CodingEvent::McpServerReady { server, tools, .. } if is_root => {
                 let projection = self.mcp_servers.entry(server.clone()).or_default();
                 projection.tools.clone_from(tools);
                 projection.error = None;
             }
-            CodingEvent::McpServerFailed { server, error } if is_root => {
+            CodingEvent::McpServerFailed { server, error, .. } if is_root => {
                 let projection = self.mcp_servers.entry(server.clone()).or_default();
                 projection.tools.clear();
                 projection.error = Some(error.clone());
@@ -734,15 +734,17 @@ mod tests {
     fn mcp_servers_skills_todos_and_subagents_fold() {
         let mut projection = SessionProjection::new();
         projection.apply(&root(CodingEvent::McpServerReady {
-            server: "my-server".into(),
-            tools:  vec![McpToolSummary {
+            server:     "my-server".into(),
+            tools:      vec![McpToolSummary {
                 name:          "mcp__my_server__echo".into(),
                 original_name: "echo".into(),
             }],
+            startup_ms: 120,
         }));
         projection.apply(&root(CodingEvent::McpServerFailed {
-            server: "broken".into(),
-            error:  "could not launch".into(),
+            server:     "broken".into(),
+            error:      "could not launch".into(),
+            startup_ms: 3,
         }));
         projection.apply(&root(CodingEvent::ToolCallStarted {
             tool_name:    "mcp__my_server__echo".into(),

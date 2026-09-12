@@ -926,12 +926,16 @@ impl fmt::Display for AgentProfileKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct McpServerStatus {
     /// The server's configured name.
-    pub server: String,
+    pub server:     String,
     /// The tools it advertised, sorted by registered name; empty when it
     /// failed.
-    pub tools:  Vec<McpToolSummary>,
+    pub tools:      Vec<McpToolSummary>,
     /// Why it did not start, when it did not.
-    pub error:  Option<String>,
+    pub error:      Option<String>,
+    /// How long the server took from launch to its outcome, in milliseconds:
+    /// to its tools being listed, or to the failure.
+    #[serde(default)]
+    pub startup_ms: u64,
 }
 
 /// One tool an MCP server advertised, as the registry named it.
@@ -1143,17 +1147,25 @@ pub enum CodingEvent {
     /// registered, each under `mcp__{server}__{tool}`.
     McpServerReady {
         /// The server's configured name.
-        server: String,
+        server:     String,
         /// The tools it advertised, sorted by registered name.
-        tools:  Vec<McpToolSummary>,
+        tools:      Vec<McpToolSummary>,
+        /// How long the server took from launch to its tools being listed,
+        /// in milliseconds.
+        #[serde(default)]
+        startup_ms: u64,
     },
     /// An MCP server the application configured did not start; the session
     /// runs without its tools.
     McpServerFailed {
         /// The server's configured name.
-        server: String,
+        server:     String,
         /// Why it did not start.
-        error:  String,
+        error:      String,
+        /// How long the server took from launch to the failure, in
+        /// milliseconds.
+        #[serde(default)]
+        startup_ms: u64,
     },
     /// An MCP server's connection closed during the session; every later call
     /// to its tools fails until the session ends. Published once per server,
@@ -1524,19 +1536,29 @@ impl CodingEvent {
             Self::ToolRoundsExhausted { limit } => {
                 warn!(session_id, limit, "Tool round budget exhausted");
             }
-            Self::McpServerReady { server, tools } => {
+            Self::McpServerReady {
+                server,
+                tools,
+                startup_ms,
+            } => {
                 info!(
                     session_id,
                     server = server.as_str(),
                     tools = tools.len(),
+                    startup_ms,
                     "MCP server ready"
                 );
             }
-            Self::McpServerFailed { server, error } => {
+            Self::McpServerFailed {
+                server,
+                error,
+                startup_ms,
+            } => {
                 warn!(
                     session_id,
                     server = server.as_str(),
                     error = error.as_str(),
+                    startup_ms,
                     "MCP server failed"
                 );
             }

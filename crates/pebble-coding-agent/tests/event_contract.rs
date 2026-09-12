@@ -183,15 +183,17 @@ fn every_variant() -> Vec<CodingEvent> {
         CodingEvent::LoopDetected,
         CodingEvent::ToolRoundsExhausted { limit: 3 },
         CodingEvent::McpServerReady {
-            server: "github".into(),
-            tools:  vec![McpToolSummary {
+            server:     "github".into(),
+            tools:      vec![McpToolSummary {
                 name:          "mcp__github__list_issues".into(),
                 original_name: "list_issues".into(),
             }],
+            startup_ms: 842,
         },
         CodingEvent::McpServerFailed {
-            server: "filesystem".into(),
-            error:  "could not launch `npx`: No such file or directory".into(),
+            server:     "filesystem".into(),
+            error:      "could not launch `npx`: No such file or directory".into(),
+            startup_ms: 4,
         },
         CodingEvent::McpServerDisconnected {
             server: "github".into(),

@@ -42,7 +42,7 @@ mod sse;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use client::{CallOutcome, Connection, DiscoveredTool};
 use lithos_llm::types::ToolDefinition;
@@ -210,43 +210,72 @@ fn sanitize_name(name: &str) -> String {
 #[derive(Clone, Debug)]
 pub(crate) enum McpServerOutcome {
     Ready {
-        server: String,
-        tools:  Vec<McpToolSummary>,
+        server:  String,
+        tools:   Vec<McpToolSummary>,
+        /// From launch to the tools being listed.
+        startup: Duration,
     },
     Failed {
-        server: String,
-        error:  String,
+        server:  String,
+        error:   String,
+        /// From launch to the failure.
+        startup: Duration,
     },
 }
 
 impl McpServerOutcome {
     pub(crate) fn to_status(&self) -> McpServerStatus {
         match self {
-            Self::Ready { server, tools } => McpServerStatus {
-                server: server.clone(),
-                tools:  tools.clone(),
-                error:  None,
+            Self::Ready {
+                server,
+                tools,
+                startup,
+            } => McpServerStatus {
+                server:     server.clone(),
+                tools:      tools.clone(),
+                error:      None,
+                startup_ms: whole_millis(*startup),
             },
-            Self::Failed { server, error } => McpServerStatus {
-                server: server.clone(),
-                tools:  Vec::new(),
-                error:  Some(error.clone()),
+            Self::Failed {
+                server,
+                error,
+                startup,
+            } => McpServerStatus {
+                server:     server.clone(),
+                tools:      Vec::new(),
+                error:      Some(error.clone()),
+                startup_ms: whole_millis(*startup),
             },
         }
     }
 
     pub(crate) fn to_event(&self) -> CodingEvent {
         match self {
-            Self::Ready { server, tools } => CodingEvent::McpServerReady {
-                server: server.clone(),
-                tools:  tools.clone(),
+            Self::Ready {
+                server,
+                tools,
+                startup,
+            } => CodingEvent::McpServerReady {
+                server:     server.clone(),
+                tools:      tools.clone(),
+                startup_ms: whole_millis(*startup),
             },
-            Self::Failed { server, error } => CodingEvent::McpServerFailed {
-                server: server.clone(),
-                error:  error.clone(),
+            Self::Failed {
+                server,
+                error,
+                startup,
+            } => CodingEvent::McpServerFailed {
+                server:     server.clone(),
+                error:      error.clone(),
+                startup_ms: whole_millis(*startup),
             },
         }
     }
+}
+
+/// `duration` in whole milliseconds, saturating.
+fn whole_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// One agent's MCP servers: started, their tools registered, and closed with
@@ -271,9 +300,12 @@ impl McpServers {
             outcomes:    Vec::with_capacity(servers.len()),
         };
         for server in servers {
+            let launched = Instant::now();
             // Boxed: the start future carries the readiness probe and the
             // route, and would otherwise weigh on every future above it.
-            match Box::pin(Connection::start(server, environment, routes)).await {
+            let started_in = Box::pin(Connection::start(server, environment, routes)).await;
+            let startup = launched.elapsed();
+            match started_in {
                 Ok((connection, tools)) => {
                     let connection = Arc::new(connection);
                     let mut summaries: Vec<McpToolSummary> = tools
@@ -289,19 +321,31 @@ impl McpServers {
                             .tools
                             .push(registered_tool(&connection, server, tool));
                     }
-                    tracing::info!(server = %server.name, tools = summaries.len(), "MCP server ready");
+                    tracing::info!(
+                        server = %server.name,
+                        tools = summaries.len(),
+                        startup_ms = whole_millis(startup),
+                        "MCP server ready"
+                    );
                     started.outcomes.push(McpServerOutcome::Ready {
                         server: server.name.clone(),
-                        tools:  summaries,
+                        tools: summaries,
+                        startup,
                     });
                     started.connections.push((server.name.clone(), connection));
                 }
                 Err(error) => {
                     let error = error.to_string();
-                    tracing::error!(server = %server.name, error = %error, "MCP server failed to start");
+                    tracing::error!(
+                        server = %server.name,
+                        error = %error,
+                        startup_ms = whole_millis(startup),
+                        "MCP server failed to start"
+                    );
                     started.outcomes.push(McpServerOutcome::Failed {
                         server: server.name.clone(),
                         error,
+                        startup,
                     });
                 }
             }

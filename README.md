@@ -116,7 +116,9 @@ facet handed over with `port_routes`. The servers start while the agent is
 built; every tool they advertise is registered under `mcp__{server}__{tool}`
 with `ToolSource::Mcp`, so middleware, history, output policy, cancellation
 and events treat it as any other tool. Each server's outcome is on the stream
-as `McpServerReady` or `McpServerFailed`, and a server that fails is skipped.
+as `McpServerReady` or `McpServerFailed`, each carrying how long the server
+took to reach that outcome in `startup_ms`, and a server that fails is
+skipped.
 A result the server marks `isError` is the tool's error text; a transport
 failure, a timeout or a cancellation is a failed call with a reason. A server
 whose connection closes during the session is reported once as

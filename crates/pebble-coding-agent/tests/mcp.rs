@@ -92,7 +92,9 @@ fn ready_events(published: &[CodingEvent]) -> Vec<(String, Vec<McpToolSummary>)>
     published
         .iter()
         .filter_map(|event| match event {
-            CodingEvent::McpServerReady { server, tools } => Some((server.clone(), tools.clone())),
+            CodingEvent::McpServerReady { server, tools, .. } => {
+                Some((server.clone(), tools.clone()))
+            }
             _ => None,
         })
         .collect()
@@ -102,7 +104,25 @@ fn failed_events(published: &[CodingEvent]) -> Vec<(String, String)> {
     published
         .iter()
         .filter_map(|event| match event {
-            CodingEvent::McpServerFailed { server, error } => Some((server.clone(), error.clone())),
+            CodingEvent::McpServerFailed { server, error, .. } => {
+                Some((server.clone(), error.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// The startup time each server's outcome event reported, by name.
+fn startup_events(published: &[CodingEvent]) -> Vec<(String, u64)> {
+    published
+        .iter()
+        .filter_map(|event| match event {
+            CodingEvent::McpServerReady {
+                server, startup_ms, ..
+            }
+            | CodingEvent::McpServerFailed {
+                server, startup_ms, ..
+            } => Some((server.clone(), *startup_ms)),
             _ => None,
         })
         .collect()
@@ -154,14 +174,19 @@ async fn a_stdio_servers_tools_reach_the_model_and_its_call_comes_back() {
 
     // Ready before the first prompt, tools registered with their source, and
     // the outcome on the snapshot for a view that starts now.
-    assert_eq!(agent.snapshot().mcp_servers(), [McpServerStatus {
-        server: "echo".to_owned(),
-        tools:  vec![McpToolSummary {
-            name:          "mcp__echo__echo".to_owned(),
-            original_name: "echo".to_owned(),
-        }],
-        error:  None,
+    let statuses: Vec<McpServerStatus> = agent.snapshot().mcp_servers().to_vec();
+    assert_eq!(statuses.len(), 1, "{statuses:?}");
+    let status = &statuses[0];
+    assert_eq!(status.server, "echo");
+    assert_eq!(status.tools, [McpToolSummary {
+        name:          "mcp__echo__echo".to_owned(),
+        original_name: "echo".to_owned(),
     }]);
+    assert_eq!(status.error, None);
+    assert!(
+        status.startup_ms > 0,
+        "launching a process and listing its tools takes time: {status:?}"
+    );
     let published = drained(&mut events);
     assert_eq!(
         ready_events(&published),
@@ -170,6 +195,11 @@ async fn a_stdio_servers_tools_reach_the_model_and_its_call_comes_back() {
             original_name: "echo".to_owned(),
         }])],
         "{published:?}"
+    );
+    assert_eq!(
+        startup_events(&published),
+        [("echo".to_owned(), status.startup_ms)],
+        "the event and the snapshot report the same startup time"
     );
     let tool = agent
         .snapshot()
@@ -850,7 +880,8 @@ async fn an_environment_server_that_never_listens_fails_within_its_startup_timeo
     );
     let mut events = agent.subscribe();
     agent.flush_events().await.expect("events flush");
-    let failed = failed_events(&drained(&mut events));
+    let published = drained(&mut events);
+    let failed = failed_events(&published);
     assert_eq!(failed.len(), 1);
     assert_eq!(failed[0].0, "silent");
     assert!(
@@ -858,6 +889,17 @@ async fn an_environment_server_that_never_listens_fails_within_its_startup_timeo
         "{}",
         failed[0].1
     );
+    // The failure came from the startup timeout, so it took at least that
+    // long, and the snapshot says the same.
+    let startups = startup_events(&published);
+    assert_eq!(startups.len(), 1, "{published:?}");
+    assert!(
+        startups[0].1 >= 2_000,
+        "the failure waited out the startup timeout: {startups:?}"
+    );
+    let statuses = agent.snapshot().mcp_servers().to_vec();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].startup_ms, startups[0].1);
     agent
         .shutdown(ShutdownReason::Completed)
         .await
