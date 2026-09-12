@@ -33,6 +33,8 @@ mod file_tracker;
 mod history;
 mod human_input;
 mod loop_detection;
+#[cfg(feature = "mcp")]
+pub mod mcp;
 mod memory;
 mod policy;
 mod profile;

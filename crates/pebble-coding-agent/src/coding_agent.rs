@@ -26,6 +26,8 @@ use crate::event::{EventCapacity, EventSink, EventSinkTimeout};
 use crate::extensions::{CompactionPolicy, ContextPolicy};
 use crate::history::History;
 use crate::human_input::HumanInputProvider;
+#[cfg(feature = "mcp")]
+use crate::mcp::{McpServer, McpServers, PreviewUrls};
 use crate::prompt_transform::SystemPromptTransform;
 use crate::record::SessionRecord;
 use crate::redact::Redactor;
@@ -577,15 +579,59 @@ pub struct CodingAgentBuilder {
     inner:           CodingRuntimeBuilder,
     resume:          Option<ResumeSource>,
     fallback_routes: Vec<FallbackRoute>,
+    #[cfg(feature = "mcp")]
+    mcp_servers:     Vec<McpServer>,
+    #[cfg(feature = "mcp")]
+    port_routes:     Option<Arc<dyn PreviewUrls>>,
 }
 
 impl CodingAgentBuilder {
     fn new(client: Client, environment: Arc<dyn Environment>) -> Self {
         Self {
-            inner:           CodingRuntime::builder(client).environment(environment),
-            resume:          None,
+            inner: CodingRuntime::builder(client).environment(environment),
+            resume: None,
             fallback_routes: Vec::new(),
+            #[cfg(feature = "mcp")]
+            mcp_servers: Vec::new(),
+            #[cfg(feature = "mcp")]
+            port_routes: None,
         }
+    }
+
+    /// Names the MCP servers whose tools the agent gets, in the order they
+    /// start.
+    ///
+    /// The servers start while the agent is built, before its first prompt,
+    /// and every tool they advertise is registered under
+    /// `mcp__{server}__{tool}` with
+    /// [`ToolSource::Mcp`](crate::tools::ToolSource::Mcp) as its source.
+    /// Each server's outcome is on the stream once the agent
+    /// is up: [`McpServerReady`](CodingEvent::McpServerReady) with its tools,
+    /// or [`McpServerFailed`](CodingEvent::McpServerFailed) with the reason,
+    /// after which the agent runs without that server's tools. The servers
+    /// close when the agent [shuts down](CodingAgent::shutdown), after its
+    /// last tool call. A successor built from this agent's
+    /// [`export`](CodingAgent::export) starts servers of its own; give it the
+    /// same list and its tools keep their names.
+    #[cfg(feature = "mcp")]
+    pub fn mcp_servers(mut self, servers: impl IntoIterator<Item = McpServer>) -> Self {
+        self.mcp_servers = servers.into_iter().collect();
+        self
+    }
+
+    /// Names the route from the application to a port inside its
+    /// environment, for servers placed in the environment
+    /// ([`McpPlacement::Environment`](crate::mcp::McpPlacement::Environment)).
+    ///
+    /// This is sandbox-driver's [`PreviewUrls`] facet, which a sandbox that
+    /// forwards ports provides, headers included. Without one, an
+    /// environment-hosted server is reached on the loopback address. Pebble
+    /// releases every route it opened when the server fails to start and
+    /// when the agent shuts down.
+    #[cfg(feature = "mcp")]
+    pub fn port_routes(mut self, routes: Arc<dyn PreviewUrls>) -> Self {
+        self.port_routes = Some(routes);
+        self
     }
 
     /// Names the routes a prompt continues on when its model fails, in order.
@@ -783,10 +829,26 @@ impl CodingAgentBuilder {
     /// Returns an error when required configuration is absent, model metadata
     /// does not select a supported coding profile, or resource initialization
     /// fails.
-    pub async fn build(self) -> Result<CodingAgent, CodingAgentBuildError> {
+    pub async fn build(mut self) -> Result<CodingAgent, CodingAgentBuildError> {
         if self.resume.is_some() && self.inner.has_model() {
             return Err(CodingAgentBuildError::ModelConflictsWithResume);
         }
+        // The servers start first, so their tools are in the registry every
+        // runtime built from here — the first and any failover replacement —
+        // is given.
+        #[cfg(feature = "mcp")]
+        let mcp = if self.mcp_servers.is_empty() {
+            None
+        } else {
+            let environment = self
+                .inner
+                .environment_ref()
+                .ok_or(CodingAgentBuildError::MissingEnvironment)?;
+            let servers =
+                McpServers::start(&self.mcp_servers, environment, self.port_routes.as_ref()).await;
+            self.inner = self.inner.tools(servers.tools());
+            Some(servers)
+        };
         // Cloned before the build consumes the builder, so a replacement
         // runtime is built from exactly what this one was.
         // Boxed: the recipe is a whole builder, and an agent lives inside its
@@ -841,10 +903,19 @@ impl CodingAgentBuilder {
             }
             chain
         });
+        // What became of each server, now that there is a stream to say it on.
+        #[cfg(feature = "mcp")]
+        if let Some(servers) = &mcp {
+            for outcome in servers.outcomes() {
+                inner.emit(outcome.to_event());
+            }
+        }
         Ok(CodingAgent {
             inner,
             control,
             fallback,
+            #[cfg(feature = "mcp")]
+            mcp,
         })
     }
 }
@@ -1428,6 +1499,9 @@ pub struct CodingAgent {
     control:  Arc<CodingControl>,
     /// The routes left to fail over to, when the builder named any.
     fallback: Option<Box<FallbackChain>>,
+    /// The MCP servers this agent started, closed after it.
+    #[cfg(feature = "mcp")]
+    mcp:      Option<McpServers>,
 }
 
 impl CodingAgent {
@@ -1989,6 +2063,11 @@ impl CodingAgent {
         // The chain's hold on the live channel ends with the agent, so a
         // subscriber sees the stream end as it would without fallback routes.
         self.fallback = None;
+        // The servers outlive the agent's last tool call and nothing else.
+        #[cfg(feature = "mcp")]
+        if let Some(mut servers) = self.mcp.take() {
+            servers.shutdown().await;
+        }
         result
     }
 }

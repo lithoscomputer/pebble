@@ -225,6 +225,11 @@ impl CodingRuntimeBuilder {
     }
 
     /// Whether a model has been named on this builder.
+    /// The environment the session will act through, once named.
+    pub(crate) const fn environment_ref(&self) -> Option<&Arc<dyn Environment>> {
+        self.environment.as_ref()
+    }
+
     pub(crate) const fn has_model(&self) -> bool {
         self.model.is_some()
     }

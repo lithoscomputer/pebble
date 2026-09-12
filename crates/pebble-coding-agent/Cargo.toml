@@ -9,6 +9,9 @@ description = "Coding-agent library built on pebble-agent"
 [features]
 # Test doubles (`pebble_coding_agent::test_support`) for embedding applications.
 test-util = []
+# MCP servers as tool sources (`pebble_coding_agent::mcp`): the `rmcp` client
+# over stdio and HTTP, and the route to a server launched in the environment.
+mcp = ["dep:rmcp", "dep:reqwest", "dep:sandbox-driver", "dep:sse-stream", "dep:url"]
 
 [dependencies]
 async-trait.workspace = true
@@ -34,6 +37,24 @@ tokio = { workspace = true, features = [
 tokio-util.workspace = true
 tracing.workspace = true
 uuid = { version = "1.18.1", features = ["v4"] }
+# The MCP client and its HTTP transports. rmcp 1.7 targets the reqwest line
+# lithos-llm locks (0.13); the `reqwest` feature selects rustls as lithos-llm
+# does. `sse-stream` and `url` back the legacy SSE transport, which rmcp no
+# longer ships as a client.
+rmcp = { version = "=1.7.0", default-features = false, features = [
+  "client",
+  "reqwest",
+  "transport-child-process",
+  "transport-streamable-http-client-reqwest",
+], optional = true }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls", "stream"], optional = true }
+sse-stream = { version = "0.2", optional = true }
+url = { version = "2.5", optional = true }
+# The route from the embedding application to a port inside its sandbox:
+# sandbox-driver's `PreviewUrls` facet, which both embedders' sandboxes
+# already provide. Pinned to the revision fabro pins, because a trait object
+# only crosses the boundary when both sides name the same crate version.
+sandbox-driver = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "23062b6ad62ff4665cbbcb7dce037ec9c4c34318", optional = true }
 
 # Signalling a command's process group without writing unsafe code.
 [target.'cfg(unix)'.dependencies]
@@ -51,6 +72,9 @@ lithos-llm = { workspace = true, features = [
   "environment-credentials",
 ] }
 insta = { version = "1.48.0", features = ["json"] }
+# A fake MCP server over HTTP for the transport tests. Already in the lockfile
+# through lithos-llm's own tests.
+axum = "0.8"
 # `start_paused` test runtimes, so a test that waits out a retry delay does not
 # actually wait, and the multi-threaded runtime the example's `#[tokio::main]`
 # asks for. Adds no package to the lockfile: tokio is already a dependency.

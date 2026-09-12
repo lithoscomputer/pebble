@@ -102,6 +102,20 @@ through `ResumeMode::UseModel`, is asked again on the history as it stands and
 repeats no tool effect. A history that ends with the model's own answer has
 nothing to continue, and the report says so.
 
+`CodingAgentBuilder::mcp_servers`, behind the `mcp` feature, names the MCP
+servers whose tools the agent gets: a child process spoken to over its
+standard streams, a server reached over HTTP (streamable HTTP or the older
+SSE transport), or a server launched in the environment and reached through
+the environment's route to its port, which is sandbox-driver's `PreviewUrls`
+facet handed over with `port_routes`. The servers start while the agent is
+built; every tool they advertise is registered under `mcp__{server}__{tool}`
+with `ToolSource::Mcp`, so middleware, history, output policy, cancellation
+and events treat it as any other tool. Each server's outcome is on the stream
+as `McpServerReady` or `McpServerFailed`, and a server that fails is skipped.
+A result the server marks `isError` is the tool's error text; a transport
+failure, a timeout or a cancellation is a failed call with a reason. The
+servers close when the agent shuts down. See `pebble_coding_agent::mcp`.
+
 `CodingAgentBuilder::fallback_routes` names the routes a prompt continues on
 when its model fails for a reason another route might not share (lithos-llm's
 `failover_eligible`: authentication, access, not-found and quota failures,

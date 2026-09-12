@@ -905,6 +905,15 @@ impl fmt::Display for AgentProfileKind {
     }
 }
 
+/// One tool an MCP server advertised, as the registry named it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpToolSummary {
+    /// The name the model calls: `mcp__{server}__{tool}`.
+    pub name:          String,
+    /// The server's own name for the tool.
+    pub original_name: String,
+}
+
 /// Something a session did, as seen by an observer.
 ///
 /// The serialized form is externally tagged: `{"ToolCallStarted": {…}}` for
@@ -1100,6 +1109,22 @@ pub enum CodingEvent {
     ToolRoundsExhausted {
         /// The configured limit, which is also how many rounds ran.
         limit: usize,
+    },
+    /// An MCP server the application configured started and its tools are
+    /// registered, each under `mcp__{server}__{tool}`.
+    McpServerReady {
+        /// The server's configured name.
+        server: String,
+        /// The tools it advertised, sorted by registered name.
+        tools:  Vec<McpToolSummary>,
+    },
+    /// An MCP server the application configured did not start; the session
+    /// runs without its tools.
+    McpServerFailed {
+        /// The server's configured name.
+        server: String,
+        /// Why it did not start.
+        error:  String,
     },
     /// The prompt moved to a fallback route after its model failed.
     ///
@@ -1460,6 +1485,22 @@ impl CodingEvent {
             Self::LoopDetected => warn!(session_id, "Loop detected"),
             Self::ToolRoundsExhausted { limit } => {
                 warn!(session_id, limit, "Tool round budget exhausted");
+            }
+            Self::McpServerReady { server, tools } => {
+                info!(
+                    session_id,
+                    server = server.as_str(),
+                    tools = tools.len(),
+                    "MCP server ready"
+                );
+            }
+            Self::McpServerFailed { server, error } => {
+                warn!(
+                    session_id,
+                    server = server.as_str(),
+                    error = error.as_str(),
+                    "MCP server failed"
+                );
             }
             Self::RouteFailover {
                 from,
