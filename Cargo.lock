@@ -1494,6 +1494,32 @@ dependencies = [
  "axum",
  "base64",
  "clap",
+ "futures-util",
+ "lithos-llm",
+ "pebble-agent",
+ "pebble-cli-core",
+ "pebble-coding-agent",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "trycmd",
+ "twin-openai",
+ "unicode-width 0.2.2",
+ "uuid",
+ "vte",
+]
+
+[[package]]
+name = "pebble-cli-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "clap",
  "crossterm",
  "fs2",
  "futures-util",
@@ -1509,12 +1535,9 @@ dependencies = [
  "termimad",
  "tokio",
  "tokio-util",
- "trycmd",
- "twin-openai",
  "unicode-segmentation",
  "unicode-width 0.2.2",
  "uuid",
- "vte",
 ]
 
 [[package]]

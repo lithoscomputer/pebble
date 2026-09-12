@@ -287,6 +287,17 @@ lets the agent spawn children for independent work. The command is the
 smallest application pebble ships, and its source is a worked example of what
 an embedding application supplies.
 
+The command line is a library first. `pebble-cli-core` holds the `exec`
+session (`session::run_prompt`: the events rendered as they happen, the answer
+on standard output, the summary after it, the agent shut down for the reason
+the prompt ended with), its `render::Renderer` and closing `Summary`, the
+`approval::TerminalApproval` prompt for tools the permission level does not
+allow outright, and the interactive session, credential store, and settings
+whole. The `pebble` binary is an argument parser over it. Another program that
+builds its own agent, with its own client, environment, tools, and settings,
+runs it through the same session and renderer instead of writing them again;
+fabro's `fabro exec` does.
+
 ## What an application has to supply
 
 **A client, with retry middleware.** Pebble takes a built `lithos_llm::Client`

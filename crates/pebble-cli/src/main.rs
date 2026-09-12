@@ -5,21 +5,14 @@
 //! the tools the model asks for, the final answer out. Events are rendered to
 //! standard error as they happen, the answer goes to standard output, and the
 //! exit status says how the prompt ended.
+//!
+//! Everything but the argument parser lives in `pebble-cli-core`, so another
+//! program can run the same sessions with its own front end.
 
 use std::process::ExitCode;
 
-mod application;
-mod auth;
-mod credentials;
-mod exec;
-mod interactive;
-mod render;
-mod resources;
-mod secret_input;
-mod settings;
-mod storage;
-
 use clap::Parser;
+use pebble_cli_core::{auth, exec, interactive};
 
 #[derive(Debug, Parser)]
 #[command(

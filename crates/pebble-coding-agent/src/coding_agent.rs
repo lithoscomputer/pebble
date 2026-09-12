@@ -849,7 +849,13 @@ impl CodingAgentBuilder {
     /// Returns an error when required configuration is absent, model metadata
     /// does not select a supported coding profile, or resource initialization
     /// fails.
-    pub async fn build(mut self) -> Result<CodingAgent, CodingAgentBuildError> {
+    pub async fn build(
+        #[cfg_attr(
+            not(feature = "mcp"),
+            expect(unused_mut, reason = "only the MCP servers add tools to the builder")
+        )]
+        mut self,
+    ) -> Result<CodingAgent, CodingAgentBuildError> {
         if self.resume.is_some() && self.inner.has_model() {
             return Err(CodingAgentBuildError::ModelConflictsWithResume);
         }

@@ -10,11 +10,11 @@ use lithos_llm::middleware::RetryPolicy;
 
 use crate::application::Application;
 use crate::credentials::accepts_api_key;
-use crate::exec::print_err;
 use crate::secret_input;
+use crate::terminal::print_err;
 
 #[derive(Debug, Args)]
-pub(crate) struct AuthArgs {
+pub struct AuthArgs {
     #[command(subcommand)]
     command: Command,
 }
@@ -35,7 +35,7 @@ enum Command {
     Status { provider: Option<String> },
 }
 
-pub(crate) async fn run(args: AuthArgs) -> ExitCode {
+pub async fn run(args: AuthArgs) -> ExitCode {
     match execute(args).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::application::{Application, DEFAULT_MODEL, PermissionArg, model_route};
 use crate::credentials::AuthStore;
-use crate::exec::print_err;
+use crate::terminal::print_err;
 
 mod attachments;
 mod branch;
@@ -57,7 +57,7 @@ use transcript::{Output, Transcript};
 use worker::{Command, Worker};
 
 #[derive(Debug, Default, Args)]
-pub(crate) struct InteractiveArgs {
+pub struct InteractiveArgs {
     /// An optional first prompt for the interactive session.
     #[arg(value_name = "PROMPT")]
     prompt:           Option<String>,
@@ -96,7 +96,7 @@ pub(crate) struct InteractiveArgs {
     instructions:     Option<String>,
 }
 
-pub(crate) async fn run(args: InteractiveArgs) -> ExitCode {
+pub async fn run(args: InteractiveArgs) -> ExitCode {
     match Box::pin(start(args)).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
