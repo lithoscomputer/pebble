@@ -294,6 +294,12 @@ pub struct SessionProjection {
     /// What the prompt in progress, or the last one, did.
     pub prompt:            PromptDelta,
     /// Writes and edits started and not yet completed, by tool call id.
+    ///
+    /// In-flight bookkeeping, not a fact about the session: it is filled
+    /// between a write's `ToolCallStarted` and its `ToolCallCompleted` and
+    /// empty otherwise, so it is serialized only when a value is taken
+    /// mid-write and a value stored between prompts has no such member.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pending_writes:        BTreeMap<String, Vec<String>>,
 }
 
@@ -1175,6 +1181,42 @@ mod tests {
         assert_eq!(projection.subagent_counts.spawned, 2);
         assert_eq!(projection.subagents.len(), 2);
         assert_eq!(projection.subagents[1].depth, 2);
+    }
+
+    #[test]
+    fn in_flight_writes_are_serialized_only_mid_write() {
+        let mut projection = SessionProjection::new();
+        projection.apply(&root(CodingEvent::ToolCallStarted {
+            tool_name:    "write_file".into(),
+            tool_call_id: "w1".into(),
+            arguments:    json!({"file_path": "/w/b.txt", "content": "x"}),
+        }));
+        let mid_write = serde_json::to_value(&projection).expect("serializes");
+        assert_eq!(
+            mid_write["pending_writes"]["w1"],
+            json!(["/w/b.txt"]),
+            "a value taken mid-write carries the open write"
+        );
+        let resumed: SessionProjection = serde_json::from_value(mid_write).expect("parses");
+        assert_eq!(resumed, projection);
+
+        projection.apply(&root(CodingEvent::ToolCallCompleted {
+            tool_name:             "write_file".into(),
+            tool_call_id:          "w1".into(),
+            output:                json!("done"),
+            metadata:              pebble_agent::ToolOutputMetadata::default(),
+            is_error:              false,
+            error_kind:            None,
+            output_bytes_observed: 0,
+            output_bytes_retained: 0,
+            output_bytes_omitted:  0,
+        }));
+        let settled = serde_json::to_value(&projection).expect("serializes");
+        assert!(
+            settled.get("pending_writes").is_none(),
+            "nothing in flight, nothing on the wire: {settled}"
+        );
+        assert_eq!(projection.files_touched, ["/w/b.txt"]);
     }
 
     #[test]
