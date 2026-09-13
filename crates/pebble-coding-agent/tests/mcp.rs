@@ -6,7 +6,8 @@
 //! with the agent. These tests drive every placement: a child process over
 //! its standard streams, a server over streamable HTTP and over the older SSE
 //! transport, and a server launched in the environment and reached through
-//! its port.
+//! its port, on the loopback address and through the route the application
+//! supplies.
 
 #![cfg(feature = "mcp")]
 
@@ -14,10 +15,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use std::{env, fs, process};
 
+use async_trait::async_trait;
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Query, State};
@@ -30,7 +32,10 @@ use pebble_coding_agent::events::{
     CodingAgentEvent, CodingEvent, McpServerStatus, McpToolSummary, PermissionLevel, ToolErrorKind,
     ToolSource,
 };
-use pebble_coding_agent::mcp::{McpHttpProtocol, McpPlacement, McpServer, qualified_tool_name};
+use pebble_coding_agent::mcp::{
+    McpHttpProtocol, McpPlacement, McpServer, PortRoute, PortRouteError, PortRoutes,
+    qualified_tool_name,
+};
 use pebble_coding_agent::test_support::{
     MockEnvironment, ScriptedCall, ScriptedProvider, client_from, text_response, tool_call_response,
 };
@@ -878,6 +883,55 @@ async fn free_port() -> u16 {
         .port()
 }
 
+/// An application's [`PortRoutes`]: every port routes to one address, or to
+/// nowhere, and every call is recorded.
+struct RecordingRoutes {
+    target:   Option<PortRoute>,
+    routed:   StdMutex<Vec<u16>>,
+    released: StdMutex<Vec<u16>>,
+}
+
+impl RecordingRoutes {
+    /// Routes every port to `route`.
+    fn to(route: PortRoute) -> Arc<Self> {
+        Arc::new(Self {
+            target:   Some(route),
+            routed:   StdMutex::new(Vec::new()),
+            released: StdMutex::new(Vec::new()),
+        })
+    }
+
+    /// An environment that routes to none of its ports.
+    fn unsupported() -> Arc<Self> {
+        Arc::new(Self {
+            target:   None,
+            routed:   StdMutex::new(Vec::new()),
+            released: StdMutex::new(Vec::new()),
+        })
+    }
+
+    fn routed(&self) -> Vec<u16> {
+        self.routed.lock().expect("not poisoned").clone()
+    }
+
+    fn released(&self) -> Vec<u16> {
+        self.released.lock().expect("not poisoned").clone()
+    }
+}
+
+#[async_trait]
+impl PortRoutes for RecordingRoutes {
+    async fn route(&self, port: u16) -> Result<PortRoute, PortRouteError> {
+        self.routed.lock().expect("not poisoned").push(port);
+        self.target.clone().ok_or(PortRouteError::Unsupported)
+    }
+
+    async fn release(&self, port: u16) -> Result<(), PortRouteError> {
+        self.released.lock().expect("not poisoned").push(port);
+        Ok(())
+    }
+}
+
 #[tokio::test]
 async fn a_server_launched_in_the_environment_is_reached_through_its_port_and_stopped_with_the_agent()
  {
@@ -964,10 +1018,11 @@ async fn port_frees_up(port: u16) -> bool {
 }
 
 #[tokio::test]
-async fn a_build_that_fails_after_the_servers_started_stops_them() {
+async fn a_build_that_fails_after_the_servers_started_stops_them_and_releases_their_routes() {
     let work = tempdir();
     let environment: Arc<dyn Environment> = Arc::new(LocalEnvironment::new(&work));
     let port = free_port().await;
+    let routes = RecordingRoutes::to(PortRoute::new(format!("http://127.0.0.1:{port}")));
     let server = McpServer::new("inside", McpPlacement::Environment {
         command: vec![
             "python3".to_owned(),
@@ -988,6 +1043,7 @@ async fn a_build_that_fails_after_the_servers_started_stops_them() {
         .model("test/no-such-model")
         .options(CodingAgentOptions::default().with_loop_detection(false))
         .mcp_servers([server])
+        .port_routes(Arc::clone(&routes) as Arc<dyn PortRoutes>)
         .build()
         .await;
 
@@ -996,6 +1052,184 @@ async fn a_build_that_fails_after_the_servers_started_stops_them() {
     assert!(
         port_frees_up(port).await,
         "the server launched for the failed build released port {port}"
+    );
+    assert_eq!(
+        routes.routed(),
+        [port],
+        "the route was opened for the server"
+    );
+    assert_eq!(
+        routes.released(),
+        [port],
+        "the route was released once with the failed build"
+    );
+    let _ = fs::remove_dir_all(&work);
+}
+
+#[tokio::test]
+async fn an_environment_server_is_reached_through_the_applications_route_which_is_released_once() {
+    // The application's route leads to this fake, which insists on the
+    // route's header; the process launched in the environment stands in for
+    // a server listening on a port the application alone can reach.
+    let state = HttpEcho::default();
+    let addr = serve(
+        Router::new()
+            .route("/mcp", post(streamable))
+            .with_state(state.clone()),
+    )
+    .await;
+    let routes = RecordingRoutes::to(PortRoute {
+        url:     format!("http://{addr}"),
+        headers: BTreeMap::from([("x-test-token".to_owned(), "secret".to_owned())]),
+    });
+    let work = tempdir();
+    let environment: Arc<dyn Environment> = Arc::new(LocalEnvironment::new(&work));
+    let port = free_port().await;
+    let server = McpServer::new("inside", McpPlacement::Environment {
+        command: vec!["sleep".to_owned(), "30".to_owned()],
+        port,
+        env: BTreeMap::new(),
+        protocol: McpHttpProtocol::StreamableHttp,
+        path: Some("/mcp".to_owned()),
+    })
+    .with_startup_timeout(Duration::from_secs(5));
+    let (client, _provider) = client_from(ScriptedProvider::new(vec![
+        ScriptedCall::response(tool_call_response(
+            "mcp__inside__echo",
+            "call_1",
+            json!({"message": "through the route"}),
+        )),
+        ScriptedCall::response(text_response("done")),
+    ]));
+    let mut agent = CodingAgent::builder(client, Arc::clone(&environment))
+        .model("test/model")
+        .permission_level(PermissionLevel::Full)
+        .options(CodingAgentOptions::default().with_loop_detection(false))
+        .mcp_servers([server])
+        .port_routes(Arc::clone(&routes) as Arc<dyn PortRoutes>)
+        .build()
+        .await
+        .expect("the coding agent builds");
+    let mut events = agent.subscribe();
+    agent.flush_events().await.expect("events flush");
+
+    let published = drained(&mut events);
+    assert_eq!(
+        ready_events(&published),
+        [("inside".to_owned(), vec![McpToolSummary {
+            name:          qualified_tool_name("inside", "echo"),
+            original_name: "echo".to_owned(),
+        }])],
+        "{published:?}"
+    );
+    assert_eq!(
+        routes.routed(),
+        [port],
+        "the route was asked for the server's port"
+    );
+    assert!(
+        routes.released().is_empty(),
+        "the route stays open while the agent lives"
+    );
+    let report = agent.prompt("echo").await;
+    assert!(report.result.is_ok(), "{report:?}");
+    let completions = tool_completions(&drained(&mut events));
+    assert_eq!(completions.len(), 1);
+    assert_eq!(completions[0].1, json!("echo: through the route"));
+    {
+        let seen = state.seen_token.lock().await;
+        assert!(!seen.is_empty());
+        assert!(
+            seen.iter().all(|token| token.as_deref() == Some("secret")),
+            "every request carried the route's header: {seen:?}"
+        );
+    }
+
+    agent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the agent shuts down");
+
+    assert_eq!(
+        routes.released(),
+        [port],
+        "the route was released exactly once, at shutdown"
+    );
+    let _ = fs::remove_dir_all(&work);
+}
+
+#[tokio::test]
+async fn an_environment_server_without_a_route_to_its_port_fails_to_start_and_is_stopped() {
+    let routes = RecordingRoutes::unsupported();
+    let work = tempdir();
+    let environment: Arc<dyn Environment> = Arc::new(LocalEnvironment::new(&work));
+    let port = free_port().await;
+    let server = McpServer::new("inside", McpPlacement::Environment {
+        command: vec![
+            "python3".to_owned(),
+            fixture("mcp_http_echo_server.py").display().to_string(),
+            port.to_string(),
+        ],
+        port,
+        env: BTreeMap::new(),
+        protocol: McpHttpProtocol::StreamableHttp,
+        path: Some("/mcp".to_owned()),
+    })
+    .with_startup_timeout(Duration::from_secs(15));
+    let (client, _provider) = client_from(ScriptedProvider::new(vec![ScriptedCall::response(
+        text_response("alone"),
+    )]));
+    let mut agent = CodingAgent::builder(client, Arc::clone(&environment))
+        .model("test/model")
+        .options(CodingAgentOptions::default().with_loop_detection(false))
+        .mcp_servers([server])
+        .port_routes(Arc::clone(&routes) as Arc<dyn PortRoutes>)
+        .build()
+        .await
+        .expect("the coding agent builds");
+    let mut events = agent.subscribe();
+    agent.flush_events().await.expect("events flush");
+
+    let published = drained(&mut events);
+    let expected = format!(
+        "no route to port {port} in the environment: the environment does not route to its ports"
+    );
+    assert_eq!(
+        failed_events(&published),
+        [("inside".to_owned(), expected.clone())],
+        "{published:?}"
+    );
+    assert!(ready_events(&published).is_empty());
+    let statuses = agent.snapshot().mcp_servers().to_vec();
+    assert_eq!(statuses.len(), 1);
+    assert_eq!(statuses[0].error.as_deref(), Some(expected.as_str()));
+    assert_eq!(routes.routed(), [port], "the route was asked for");
+    assert!(
+        routes.released().is_empty(),
+        "a route that never opened is not released"
+    );
+    // The server was launched before the route was asked for, so the failed
+    // start stops it.
+    assert!(
+        port_frees_up(port).await,
+        "the server launched for the failed start released port {port}"
+    );
+    let report = agent.prompt("go on").await;
+    assert_eq!(
+        report
+            .result
+            .expect("the agent runs without the server")
+            .text
+            .as_deref(),
+        Some("alone")
+    );
+    agent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the agent shuts down");
+    assert!(
+        routes.released().is_empty(),
+        "shutdown releases only routes that were opened"
     );
     let _ = fs::remove_dir_all(&work);
 }

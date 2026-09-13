@@ -111,8 +111,9 @@ nothing to continue, and the report says so.
 servers whose tools the agent gets: a child process spoken to over its
 standard streams, a server reached over HTTP (streamable HTTP or the older
 SSE transport), or a server launched in the environment and reached through
-the environment's route to its port, which is sandbox-driver's `PreviewUrls`
-facet handed over with `port_routes`. The servers start while the agent is
+the environment's route to its port: a `PortRoutes` the application implements
+over its own sandbox and hands over with `port_routes`, so pebble shares no
+sandbox crate with the application. The servers start while the agent is
 built; every tool they advertise is registered under `mcp__{server}__{tool}`
 with `ToolSource::Mcp`, so middleware, history, output policy, cancellation
 and events treat it as any other tool. Each server's outcome is on the stream
