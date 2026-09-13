@@ -103,6 +103,11 @@ pub struct McpServerProjection {
     /// What closed its connection during the session, when it closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disconnected: Option<String>,
+    /// How long it took from launch to its outcome, in milliseconds: to its
+    /// tools being listed, or to the failure. `None` until either event has
+    /// been seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_ms:   Option<u64>,
 }
 
 /// A skill the session activated.
@@ -495,15 +500,25 @@ impl SessionProjection {
                     }
                 }
             }
-            CodingEvent::McpServerReady { server, tools, .. } if is_root => {
+            CodingEvent::McpServerReady {
+                server,
+                tools,
+                startup_ms,
+            } if is_root => {
                 let projection = self.mcp_servers.entry(server.clone()).or_default();
                 projection.tools.clone_from(tools);
                 projection.error = None;
+                projection.startup_ms = Some(*startup_ms);
             }
-            CodingEvent::McpServerFailed { server, error, .. } if is_root => {
+            CodingEvent::McpServerFailed {
+                server,
+                error,
+                startup_ms,
+            } if is_root => {
                 let projection = self.mcp_servers.entry(server.clone()).or_default();
                 projection.tools.clear();
                 projection.error = Some(error.clone());
+                projection.startup_ms = Some(*startup_ms);
             }
             // Reported by whichever session's call first observed the close,
             // so this arm is not limited to the root.
@@ -1151,6 +1166,8 @@ mod tests {
         }));
         assert!(projection.mcp_servers["my-server"].invoked);
         assert!(!projection.mcp_servers["broken"].invoked);
+        assert_eq!(projection.mcp_servers["my-server"].startup_ms, Some(120));
+        assert_eq!(projection.mcp_servers["broken"].startup_ms, Some(3));
         assert_eq!(
             projection.mcp_servers["broken"].error.as_deref(),
             Some("could not launch")
