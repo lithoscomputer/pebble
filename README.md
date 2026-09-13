@@ -158,10 +158,12 @@ git probe, the walk, and the checks through the `Environment`; explicit
 
 `pebble_coding_agent::projection::SessionProjection` folds one session
 tree's events into what a view or an accountant needs: the root's token
-counts and provider-reported cost, each descendant's, the context window,
-which tools ran and how often they failed, how many model calls were retried,
-the MCP servers and whether they were called, skills, todo lists, the
-children and how they ended, compactions, and the files touched. It is
+counts and provider-reported cost, each descendant's and the model it ran,
+the context window, which tools ran and how often they failed, how many model
+calls were retried, the route and every failover that moved it, the MCP
+servers and whether they were called, skills, todo lists, the children and
+how they ended, compactions with their summary calls' usage, and the files
+touched. It is
 serializable, so a view resumes from a stored value, and it keeps a
 `PromptDelta` for the prompt in progress, because a retained session spans
 stages: the root's spend, each descendant's, the child lifecycle counts,

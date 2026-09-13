@@ -258,6 +258,16 @@ async fn a_failover_eligible_error_moves_the_conversation_to_the_next_route() {
     assert_eq!(report.cost_usd_micros, Some(7));
     assert!(projection.prompt.descendants.is_empty());
     assert_eq!(projection.route.model.as_deref(), Some("vision"));
+    // The move is in the fold as the stream told it, and nothing says the
+    // prompt stopped.
+    assert_eq!(projection.failovers.len(), 1, "{:?}", projection.failovers);
+    assert_eq!(projection.failovers[0].from, PRIMARY);
+    assert_eq!(projection.failovers[0].to, FALLBACK);
+    assert_eq!(projection.failovers[0].attempt, 1);
+    assert_eq!(projection.failovers[0].usage, *usage);
+    assert_eq!(projection.failovers[0].cost_usd_micros, Some(7));
+    assert_eq!(projection.prompt.failovers, 1);
+    assert!(projection.failover_stopped.is_none());
     let mut seqs: Vec<u64> = published.iter().map(|event| event.seq).collect();
     seqs.sort_unstable();
     let before = seqs.len();
@@ -384,6 +394,15 @@ async fn an_ineligible_error_ends_the_prompt_on_its_route() {
     assert_eq!(*attempt, 0, "the prompt never left its first route");
     assert_eq!(*reason, FailoverStop::Ineligible);
     assert!(error.message.contains("malformed tool schema"), "{error:?}");
+    let mut projection = SessionProjection::new();
+    projection.apply_all(&published);
+    let stopped = projection
+        .failover_stopped
+        .as_ref()
+        .expect("the fold keeps why the prompt stayed");
+    assert_eq!(stopped.route, PRIMARY);
+    assert_eq!(stopped.reason, FailoverStop::Ineligible);
+    assert!(projection.failovers.is_empty());
     let reported = published
         .iter()
         .position(|event| matches!(event.event, CodingEvent::Error { .. }))
@@ -439,6 +458,18 @@ async fn a_spent_chain_reports_the_last_routes_error() {
     assert_eq!(*attempt, 1);
     assert_eq!(*reason, FailoverStop::Exhausted);
     assert!(error.message.contains("primary key revoked"), "{error:?}");
+    let mut projection = SessionProjection::new();
+    projection.apply_all(&published);
+    assert_eq!(projection.failovers.len(), 1);
+    assert_eq!(projection.prompt.failovers, 1);
+    let stopped = projection
+        .failover_stopped
+        .as_ref()
+        .expect("the fold keeps why the prompt stayed");
+    assert_eq!(stopped.route, FALLBACK);
+    assert_eq!(stopped.attempt, 1);
+    assert_eq!(stopped.reason, FailoverStop::Exhausted);
+    assert!(stopped.error.message.contains("primary key revoked"));
     let last_end = published
         .iter()
         .rev()

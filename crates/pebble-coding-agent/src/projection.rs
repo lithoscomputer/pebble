@@ -23,8 +23,9 @@ use crate::compaction::CompactionReason;
 use crate::error::ErrorData;
 use crate::file_tracker;
 use crate::types::{
-    CodingAgentEvent, CodingEvent, ContextWindowSnapshot, InputSource, McpToolSummary,
-    SkillActivationSource, SkillSummary, TodoListProjection, TodoProjection, TokenUsage,
+    CodingAgentEvent, CodingEvent, ContextWindowSnapshot, FailoverContinuation, FailoverStop,
+    InputSource, McpToolSummary, SkillActivationSource, SkillSummary, TodoListProjection,
+    TodoProjection, TokenUsage,
 };
 
 /// Where a session stands, as its events tell it.
@@ -151,6 +152,48 @@ pub struct CompactionProjection {
     pub cost_usd_micros:        Option<u64>,
 }
 
+/// One move the root session made to a fallback route, as the stream reported
+/// it from the route it moved to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteFailoverProjection {
+    /// The `provider/model` that failed.
+    pub from:            String,
+    /// The `provider/model` the prompt continued on.
+    pub to:              String,
+    /// How many routes the prompt had moved through, this one included.
+    pub attempt:         u32,
+    /// The failure that ended the previous route.
+    pub error:           ErrorData,
+    /// What the prompt spent on the failed route. Already in the session's
+    /// and the prompt's totals through that route's committed answers, so a
+    /// breakdown of them and not an addition.
+    pub usage:           TokenUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd_micros: Option<u64>,
+    /// Time the prompt spent waiting on the failed route's model, in
+    /// milliseconds.
+    pub inference_ms:    u64,
+    /// Time the prompt spent running tools on the failed route, in
+    /// milliseconds.
+    pub tool_ms:         u64,
+    /// How the new route carried the prompt on.
+    pub continuation:    FailoverContinuation,
+}
+
+/// Why a prompt stayed on its route and ended there although fallback routes
+/// were named.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailoverStopProjection {
+    /// The `provider/model` the prompt ended on.
+    pub route:   String,
+    /// How many fallback routes the prompt had moved through: `0` on the
+    /// route it started on.
+    pub attempt: u32,
+    pub reason:  FailoverStop,
+    /// The failure that ended the prompt.
+    pub error:   ErrorData,
+}
+
 /// What the prompt in progress, or the last one, did: reset when a prompt
 /// starts, complete once [`completed`](Self::completed) is set.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -169,6 +212,9 @@ pub struct PromptDelta {
     /// Model calls retried after a failed attempt, across the tree.
     #[serde(default)]
     pub retries:           u64,
+    /// Moves the root made to a fallback route during the prompt.
+    #[serde(default)]
+    pub failovers:         u32,
     /// What each descendant spent during the prompt, by session id.
     pub descendants:       BTreeMap<String, DescendantAccount>,
     /// Child lifecycle events during the prompt.
@@ -230,6 +276,15 @@ pub struct SessionProjection {
     pub subagents:         Vec<SubagentProjection>,
     /// The root session's compactions, in order.
     pub compactions:       Vec<CompactionProjection>,
+    /// Every move the root made to a fallback route over the session's life,
+    /// in order.
+    #[serde(default)]
+    pub failovers:         Vec<RouteFailoverProjection>,
+    /// Why the prompt in progress, or the last one, stayed on its route and
+    /// ended there although routes were named, when it did. Cleared when a
+    /// prompt starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failover_stopped:  Option<FailoverStopProjection>,
     /// Files written or edited over the session's life, across the tree,
     /// sorted.
     pub files_touched:     Vec<String>,
@@ -268,19 +323,55 @@ impl SessionProjection {
             // The failed route's usage on the event is what that route's
             // `AssistantMessage`s already folded in, so the report and this
             // projection agree without counting it again.
-            CodingEvent::RouteFailover { to, .. } if is_root => {
+            CodingEvent::RouteFailover {
+                from,
+                to,
+                attempt,
+                error,
+                usage,
+                cost_usd_micros,
+                inference_ms,
+                tool_ms,
+                continuation,
+            } if is_root => {
                 if let Some((provider, model)) = to.split_once('/') {
                     self.route = RouteProjection {
                         provider: Some(provider.to_owned()),
                         model:    Some(model.to_owned()),
                     };
                 }
+                self.prompt.failovers += 1;
+                self.failovers.push(RouteFailoverProjection {
+                    from:            from.clone(),
+                    to:              to.clone(),
+                    attempt:         *attempt,
+                    error:           error.clone(),
+                    usage:           *usage,
+                    cost_usd_micros: *cost_usd_micros,
+                    inference_ms:    *inference_ms,
+                    tool_ms:         *tool_ms,
+                    continuation:    *continuation,
+                });
+            }
+            CodingEvent::RouteFailoverStopped {
+                route,
+                attempt,
+                reason,
+                error,
+            } if is_root => {
+                self.failover_stopped = Some(FailoverStopProjection {
+                    route:   route.clone(),
+                    attempt: *attempt,
+                    reason:  *reason,
+                    error:   error.clone(),
+                });
             }
             CodingEvent::SessionEnded if is_root => self.activity = SessionActivity::Ended,
             CodingEvent::UserInput { source, .. } if is_root => {
                 if *source == InputSource::Prompt {
                     self.prompts += 1;
                     self.prompt = PromptDelta::default();
+                    self.failover_stopped = None;
                 }
                 self.activity = SessionActivity::Running;
             }
@@ -780,6 +871,92 @@ mod tests {
             "a new prompt starts from nothing"
         );
         assert_eq!(projection.retries, 2, "the lifetime count keeps counting");
+    }
+
+    fn failover(from: &str, to: &str, attempt: u32) -> CodingEvent {
+        CodingEvent::RouteFailover {
+            from: from.into(),
+            to: to.into(),
+            attempt,
+            error: ErrorData::new(ErrorKind::Llm, "key revoked"),
+            usage: TokenUsage {
+                input: 10,
+                ..TokenUsage::default()
+            },
+            cost_usd_micros: Some(7),
+            inference_ms: 120,
+            tool_ms: 30,
+            continuation: FailoverContinuation::ContinueTurn,
+        }
+    }
+
+    #[test]
+    fn failovers_are_kept_in_order_and_a_stop_lasts_one_prompt() {
+        let mut projection = SessionProjection::new();
+        projection.apply(&root(CodingEvent::SessionStarted {
+            provider: Some("a".into()),
+            model:    Some("one".into()),
+        }));
+        projection.apply(&root(CodingEvent::UserInput {
+            text:    "go".into(),
+            content: None,
+            source:  InputSource::Prompt,
+        }));
+        projection.apply(&root(message(10, Some(7))));
+        projection.apply(&root(failover("a/one", "b/two", 1)));
+        projection.apply(&root(failover("b/two", "c/three", 2)));
+        projection.apply(&root(CodingEvent::RouteFailoverStopped {
+            route:   "c/three".into(),
+            attempt: 2,
+            reason:  FailoverStop::Exhausted,
+            error:   ErrorData::new(ErrorKind::Llm, "key revoked"),
+        }));
+        projection.apply(&child(failover("x/y", "z/w", 9)));
+
+        assert_eq!(projection.failovers.len(), 2, "a child's move is its own");
+        assert_eq!(projection.failovers[0].from, "a/one");
+        assert_eq!(projection.failovers[0].to, "b/two");
+        assert_eq!(projection.failovers[0].attempt, 1);
+        assert_eq!(projection.failovers[0].usage.input, 10);
+        assert_eq!(projection.failovers[0].cost_usd_micros, Some(7));
+        assert_eq!(projection.failovers[0].inference_ms, 120);
+        assert_eq!(projection.failovers[0].tool_ms, 30);
+        assert_eq!(
+            projection.failovers[0].continuation,
+            FailoverContinuation::ContinueTurn
+        );
+        assert_eq!(projection.failovers[1].attempt, 2);
+        assert_eq!(projection.prompt.failovers, 2);
+        assert_eq!(projection.route.provider.as_deref(), Some("c"));
+        assert_eq!(projection.route.model.as_deref(), Some("three"));
+        assert_eq!(
+            projection.usage.input, 10,
+            "the failed route's spend on the event is not counted again"
+        );
+        assert_eq!(projection.cost_usd_micros, Some(7));
+        let stopped = projection
+            .failover_stopped
+            .as_ref()
+            .expect("the stop is kept");
+        assert_eq!(stopped.route, "c/three");
+        assert_eq!(stopped.attempt, 2);
+        assert_eq!(stopped.reason, FailoverStop::Exhausted);
+        assert_eq!(stopped.error.message, "key revoked");
+
+        projection.apply(&root(CodingEvent::UserInput {
+            text:    "again".into(),
+            content: None,
+            source:  InputSource::Prompt,
+        }));
+        assert_eq!(
+            projection.prompt.failovers, 0,
+            "the prompt's count restarts"
+        );
+        assert!(
+            projection.failover_stopped.is_none(),
+            "a stop is the prompt's, not the session's"
+        );
+        assert_eq!(projection.failovers.len(), 2, "the history keeps its moves");
     }
 
     #[test]
