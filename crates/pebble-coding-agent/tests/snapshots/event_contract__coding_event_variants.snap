@@ -267,7 +267,15 @@ expression: render(&every_variant())
       "original_turn_count": 64,
       "preserved_turn_count": 12,
       "summary_token_estimate": 900,
-      "tracked_file_count": 7
+      "tracked_file_count": 7,
+      "usage": {
+        "input": 1200,
+        "output": 340,
+        "reasoning": 96,
+        "cache_read": 800,
+        "cache_write": 64
+      },
+      "cost_usd_micros": 1900
     }
   },
   {
@@ -276,6 +284,13 @@ expression: render(&every_variant())
       "error": {
         "kind": "compaction",
         "message": "summary request failed"
+      },
+      "usage": {
+        "input": 1200,
+        "output": 340,
+        "reasoning": 96,
+        "cache_read": 800,
+        "cache_write": 64
       }
     }
   },

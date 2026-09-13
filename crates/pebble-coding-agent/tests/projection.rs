@@ -9,13 +9,16 @@ use std::mem;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use pebble_coding_agent::events::{CodingAgentEvent, EventSink, EventSinkError, PermissionLevel};
+use lithos_llm::types::TokenCounts;
+use pebble_coding_agent::events::{
+    CodingAgentEvent, EventSink, EventSinkError, PermissionLevel, TokenUsage,
+};
 use pebble_coding_agent::projection::{SessionActivity, SessionProjection};
 use pebble_coding_agent::test_support::{
-    MockEnvironment, ScriptedCall, ScriptedProvider, client_from, multi_tool_call_response,
-    text_response,
+    MockEnvironment, ScriptedCall, ScriptedCompletion, ScriptedProvider, client_from,
+    multi_tool_call_response, text_response, with_cost, with_usage,
 };
-use pebble_coding_agent::{CodingAgent, CodingAgentOptions, ShutdownReason};
+use pebble_coding_agent::{CodingAgent, CodingAgentOptions, PromptReport, ShutdownReason};
 use serde_json::{Value, json};
 
 fn write(path: &str) -> (&'static str, &str, Value) {
@@ -116,4 +119,88 @@ async fn the_projection_agrees_with_the_prompt_report_live_and_resumed() {
         .expect("the agent shuts down");
     resumed.apply_all(&sink.drain());
     assert_eq!(resumed.activity, SessionActivity::Ended);
+}
+
+/// An input long enough to fill the 100-token window of `test/small`.
+fn large_input() -> String {
+    "x".repeat(400)
+}
+
+/// The summary call's answer, with the usage and cost the provider reports
+/// for it.
+fn priced_summary(usage: TokenCounts, usd_micros: u64) -> ScriptedCompletion {
+    ScriptedCompletion::response(with_cost(
+        with_usage(
+            text_response("Here is the summary of the conversation so far."),
+            usage,
+        ),
+        usd_micros,
+    ))
+}
+
+/// The property every embedder's accounting rests on: the report bills the
+/// root session's prompt and the fold's `PromptDelta` bills the same, so the
+/// tree's spend is the report's plus `descendant_usage()`, which the report
+/// keeps out and the fold keeps beside.
+fn assert_agrees_with_the_report(projection: &SessionProjection, report: &PromptReport) {
+    assert_eq!(
+        projection.prompt.usage, report.usage,
+        "the delta spends what the report spends"
+    );
+    assert_eq!(projection.prompt.cost_usd_micros, report.cost_usd_micros);
+}
+
+#[tokio::test]
+async fn the_projection_bills_a_compaction_as_the_report_does() {
+    let summary_usage = TokenCounts {
+        input: 70,
+        output: 12,
+        ..TokenCounts::default()
+    };
+    // The one response reports tokens of its own, enough to put the window
+    // over the threshold, so the totals are the response plus the summary
+    // call, and a fold that missed either would show it.
+    let (client, _provider) = client_from(
+        ScriptedProvider::new(vec![ScriptedCall::response(with_cost(
+            with_usage(text_response("OK"), TokenCounts {
+                input: 90,
+                output: 5,
+                ..TokenCounts::default()
+            }),
+            3,
+        ))])
+        .completing(vec![priced_summary(summary_usage, 5)]),
+    );
+    let sink = Arc::new(RecordingSink::default());
+    let mut agent = CodingAgent::builder(client, Arc::new(MockEnvironment::linux()))
+        .model("test/small")
+        .options(CodingAgentOptions::default().with_compaction_preserve_turns(1))
+        .event_sink(sink.clone())
+        .build()
+        .await
+        .expect("the coding agent builds");
+
+    let report = agent.prompt(&large_input()).await;
+
+    assert!(report.result.is_ok(), "{report:?}");
+    let mut live = SessionProjection::new();
+    live.apply_all(&sink.drain());
+    let [account] = report.compactions.as_slice() else {
+        panic!("one compaction is on the report: {report:?}");
+    };
+    let [compaction] = live.prompt.compactions.as_slice() else {
+        panic!("one compaction is in the fold: {live:?}");
+    };
+    assert_eq!(compaction.usage, account.usage);
+    assert_eq!(compaction.usage, TokenUsage::from(summary_usage));
+    assert_eq!(compaction.cost_usd_micros, Some(5));
+    assert_eq!(report.usage.input, 160, "the response and the summary call");
+    assert_eq!(report.cost_usd_micros, Some(8));
+    assert_agrees_with_the_report(&live, &report);
+    assert_eq!(live.usage, report.usage);
+    assert_eq!(live.compactions, live.prompt.compactions);
+    agent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the agent shuts down");
 }

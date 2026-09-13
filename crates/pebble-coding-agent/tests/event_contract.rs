@@ -236,10 +236,14 @@ fn every_variant() -> Vec<CodingEvent> {
             summary_token_estimate: 900,
             tracked_file_count:     7,
             reason:                 CompactionReason::Threshold,
+            usage:                  usage(),
+            cost_usd_micros:        Some(1_900),
         },
         CodingEvent::CompactionFailed {
-            reason: CompactionReason::Manual,
-            error:  ErrorData::new(ErrorKind::Compaction, "summary request failed"),
+            reason:          CompactionReason::Manual,
+            error:           ErrorData::new(ErrorKind::Compaction, "summary request failed"),
+            usage:           Some(usage()),
+            cost_usd_micros: None,
         },
         CodingEvent::CompactionCancelled {
             reason: CompactionReason::Manual,

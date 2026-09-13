@@ -23,8 +23,9 @@ use crate::compaction::CompactionReason;
 use crate::error::ErrorData;
 use crate::file_tracker;
 use crate::types::{
-    CodingAgentEvent, CodingEvent, ContextWindowSnapshot, InputSource, McpToolSummary,
-    SkillActivationSource, SkillSummary, TodoListProjection, TodoProjection, TokenUsage,
+    CodingAgentEvent, CodingEvent, ContextWindowSnapshot, FailoverContinuation, FailoverStop,
+    InputSource, McpToolSummary, SkillActivationSource, SkillSummary, TodoListProjection,
+    TodoProjection, TokenUsage,
 };
 
 /// Where a session stands, as its events tell it.
@@ -55,6 +56,13 @@ pub struct RouteProjection {
 pub struct DescendantAccount {
     /// The session that spawned it.
     pub parent:          String,
+    /// The route it runs on, as its `SessionStarted` reported it, so an
+    /// application prices its tokens at its own model. When the start was
+    /// not seen, the model of its first answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider:        Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model:           Option<String>,
     pub usage:           TokenUsage,
     pub cost_usd_micros: Option<u64>,
     /// Committed assistant messages.
@@ -95,6 +103,11 @@ pub struct McpServerProjection {
     /// What closed its connection during the session, when it closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disconnected: Option<String>,
+    /// How long it took from launch to its outcome, in milliseconds: to its
+    /// tools being listed, or to the failure. `None` until either event has
+    /// been seen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_ms:   Option<u64>,
 }
 
 /// A skill the session activated.
@@ -141,6 +154,56 @@ pub struct CompactionProjection {
     pub preserved_turn_count:   usize,
     pub summary_token_estimate: usize,
     pub tracked_file_count:     usize,
+    /// The summary call's tokens: a breakdown of the session's and the
+    /// prompt's usage, which already include them.
+    #[serde(default)]
+    pub usage:                  TokenUsage,
+    /// The summary call's provider-reported cost, included in the totals the
+    /// same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd_micros:        Option<u64>,
+}
+
+/// One move the root session made to a fallback route, as the stream reported
+/// it from the route it moved to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteFailoverProjection {
+    /// The `provider/model` that failed.
+    pub from:            String,
+    /// The `provider/model` the prompt continued on.
+    pub to:              String,
+    /// How many routes the prompt had moved through, this one included.
+    pub attempt:         u32,
+    /// The failure that ended the previous route.
+    pub error:           ErrorData,
+    /// What the prompt spent on the failed route. Already in the session's
+    /// and the prompt's totals through that route's committed answers, so a
+    /// breakdown of them and not an addition.
+    pub usage:           TokenUsage,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd_micros: Option<u64>,
+    /// Time the prompt spent waiting on the failed route's model, in
+    /// milliseconds.
+    pub inference_ms:    u64,
+    /// Time the prompt spent running tools on the failed route, in
+    /// milliseconds.
+    pub tool_ms:         u64,
+    /// How the new route carried the prompt on.
+    pub continuation:    FailoverContinuation,
+}
+
+/// Why a prompt stayed on its route and ended there although fallback routes
+/// were named.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FailoverStopProjection {
+    /// The `provider/model` the prompt ended on.
+    pub route:   String,
+    /// How many fallback routes the prompt had moved through: `0` on the
+    /// route it started on.
+    pub attempt: u32,
+    pub reason:  FailoverStop,
+    /// The failure that ended the prompt.
+    pub error:   ErrorData,
 }
 
 /// What the prompt in progress, or the last one, did: reset when a prompt
@@ -158,6 +221,12 @@ pub struct PromptDelta {
     pub context_window:    Option<ContextWindowSnapshot>,
     /// Tool calls started, across the tree.
     pub tool_calls:        u64,
+    /// Model calls retried after a failed attempt, across the tree.
+    #[serde(default)]
+    pub retries:           u64,
+    /// Moves the root made to a fallback route during the prompt.
+    #[serde(default)]
+    pub failovers:         u32,
     /// What each descendant spent during the prompt, by session id.
     pub descendants:       BTreeMap<String, DescendantAccount>,
     /// Child lifecycle events during the prompt.
@@ -204,6 +273,10 @@ pub struct SessionProjection {
     pub context_window:    Option<ContextWindowSnapshot>,
     /// Every tool called anywhere in the tree, by the name the model used.
     pub tools:             BTreeMap<String, ToolActivity>,
+    /// Model calls retried after a failed attempt, across the tree: every
+    /// `LlmRetry`, whichever session's call was replayed.
+    #[serde(default)]
+    pub retries:           u64,
     /// Every MCP server the root configured, by name.
     pub mcp_servers:       BTreeMap<String, McpServerProjection>,
     pub skills:            SkillsProjection,
@@ -215,6 +288,15 @@ pub struct SessionProjection {
     pub subagents:         Vec<SubagentProjection>,
     /// The root session's compactions, in order.
     pub compactions:       Vec<CompactionProjection>,
+    /// Every move the root made to a fallback route over the session's life,
+    /// in order.
+    #[serde(default)]
+    pub failovers:         Vec<RouteFailoverProjection>,
+    /// Why the prompt in progress, or the last one, stayed on its route and
+    /// ended there although routes were named, when it did. Cleared when a
+    /// prompt starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failover_stopped:  Option<FailoverStopProjection>,
     /// Files written or edited over the session's life, across the tree,
     /// sorted.
     pub files_touched:     Vec<String>,
@@ -224,6 +306,12 @@ pub struct SessionProjection {
     /// What the prompt in progress, or the last one, did.
     pub prompt:            PromptDelta,
     /// Writes and edits started and not yet completed, by tool call id.
+    ///
+    /// In-flight bookkeeping, not a fact about the session: it is filled
+    /// between a write's `ToolCallStarted` and its `ToolCallCompleted` and
+    /// empty otherwise, so it is serialized only when a value is taken
+    /// mid-write and a value stored between prompts has no such member.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pending_writes:        BTreeMap<String, Vec<String>>,
 }
 
@@ -244,28 +332,74 @@ impl SessionProjection {
             self.root_session_id = Some(event.session_id.clone());
         }
         match &event.event {
-            CodingEvent::SessionStarted { provider, model } if is_root => {
-                self.route = RouteProjection {
-                    provider: provider.clone(),
-                    model:    model.clone(),
-                };
+            CodingEvent::SessionStarted { provider, model } => {
+                if is_root {
+                    self.route = RouteProjection {
+                        provider: provider.clone(),
+                        model:    model.clone(),
+                    };
+                } else if let Some(parent) = &event.parent_session_id {
+                    for account in [
+                        descendant(&mut self.descendants, &event.session_id, parent),
+                        descendant(&mut self.prompt.descendants, &event.session_id, parent),
+                    ] {
+                        account.provider.clone_from(provider);
+                        account.model.clone_from(model);
+                    }
+                }
             }
             // The failed route's usage on the event is what that route's
             // `AssistantMessage`s already folded in, so the report and this
             // projection agree without counting it again.
-            CodingEvent::RouteFailover { to, .. } if is_root => {
+            CodingEvent::RouteFailover {
+                from,
+                to,
+                attempt,
+                error,
+                usage,
+                cost_usd_micros,
+                inference_ms,
+                tool_ms,
+                continuation,
+            } if is_root => {
                 if let Some((provider, model)) = to.split_once('/') {
                     self.route = RouteProjection {
                         provider: Some(provider.to_owned()),
                         model:    Some(model.to_owned()),
                     };
                 }
+                self.prompt.failovers += 1;
+                self.failovers.push(RouteFailoverProjection {
+                    from:            from.clone(),
+                    to:              to.clone(),
+                    attempt:         *attempt,
+                    error:           error.clone(),
+                    usage:           *usage,
+                    cost_usd_micros: *cost_usd_micros,
+                    inference_ms:    *inference_ms,
+                    tool_ms:         *tool_ms,
+                    continuation:    *continuation,
+                });
+            }
+            CodingEvent::RouteFailoverStopped {
+                route,
+                attempt,
+                reason,
+                error,
+            } if is_root => {
+                self.failover_stopped = Some(FailoverStopProjection {
+                    route:   route.clone(),
+                    attempt: *attempt,
+                    reason:  *reason,
+                    error:   error.clone(),
+                });
             }
             CodingEvent::SessionEnded if is_root => self.activity = SessionActivity::Ended,
             CodingEvent::UserInput { source, .. } if is_root => {
                 if *source == InputSource::Prompt {
                     self.prompts += 1;
                     self.prompt = PromptDelta::default();
+                    self.failover_stopped = None;
                 }
                 self.activity = SessionActivity::Running;
             }
@@ -282,6 +416,7 @@ impl SessionProjection {
                 self.activity = SessionActivity::Running;
             }
             CodingEvent::AssistantMessage {
+                model,
                 usage,
                 cost_usd_micros,
                 context_window,
@@ -306,8 +441,16 @@ impl SessionProjection {
                         account.usage = account.usage.saturating_add(*usage);
                         add_cost(&mut account.cost_usd_micros, *cost_usd_micros);
                         account.messages += 1;
+                        // The start names the route; an answer seen without
+                        // one still says which model to price it at.
+                        account.model.get_or_insert_with(|| model.clone());
                     }
                 }
+            }
+            // A child's retries count for the tree, as its tool calls do.
+            CodingEvent::LlmRetry { .. } => {
+                self.retries += 1;
+                self.prompt.retries += 1;
             }
             CodingEvent::ToolCallStarted {
                 tool_name,
@@ -357,15 +500,25 @@ impl SessionProjection {
                     }
                 }
             }
-            CodingEvent::McpServerReady { server, tools, .. } if is_root => {
+            CodingEvent::McpServerReady {
+                server,
+                tools,
+                startup_ms,
+            } if is_root => {
                 let projection = self.mcp_servers.entry(server.clone()).or_default();
                 projection.tools.clone_from(tools);
                 projection.error = None;
+                projection.startup_ms = Some(*startup_ms);
             }
-            CodingEvent::McpServerFailed { server, error, .. } if is_root => {
+            CodingEvent::McpServerFailed {
+                server,
+                error,
+                startup_ms,
+            } if is_root => {
                 let projection = self.mcp_servers.entry(server.clone()).or_default();
                 projection.tools.clear();
                 projection.error = Some(error.clone());
+                projection.startup_ms = Some(*startup_ms);
             }
             // Reported by whichever session's call first observed the close,
             // so this arm is not limited to the root.
@@ -465,27 +618,44 @@ impl SessionProjection {
                 self.prompt.subagents.closed += 1;
                 self.set_subagent_status(agent_id, SubagentStatus::Closed);
             }
+            // The summary call is billed to the session that compacted, as
+            // its report bills it. A failed compaction is not: the report
+            // leaves it out, so the fold does too, and `CompactionFailed`
+            // falls through below.
             CodingEvent::CompactionCompleted {
                 original_turn_count,
                 preserved_turn_count,
                 summary_token_estimate,
                 tracked_file_count,
                 reason,
+                usage,
+                cost_usd_micros,
             } => {
                 if is_root {
+                    self.usage = self.usage.saturating_add(*usage);
+                    add_cost(&mut self.cost_usd_micros, *cost_usd_micros);
+                    self.prompt.usage = self.prompt.usage.saturating_add(*usage);
+                    add_cost(&mut self.prompt.cost_usd_micros, *cost_usd_micros);
                     let compaction = CompactionProjection {
                         reason:                 *reason,
                         original_turn_count:    *original_turn_count,
                         preserved_turn_count:   *preserved_turn_count,
                         summary_token_estimate: *summary_token_estimate,
                         tracked_file_count:     *tracked_file_count,
+                        usage:                  *usage,
+                        cost_usd_micros:        *cost_usd_micros,
                     };
                     self.prompt.compactions.push(compaction.clone());
                     self.compactions.push(compaction);
                 } else if let Some(parent) = &event.parent_session_id {
-                    descendant(&mut self.descendants, &event.session_id, parent).compactions += 1;
-                    descendant(&mut self.prompt.descendants, &event.session_id, parent)
-                        .compactions += 1;
+                    for account in [
+                        descendant(&mut self.descendants, &event.session_id, parent),
+                        descendant(&mut self.prompt.descendants, &event.session_id, parent),
+                    ] {
+                        account.usage = account.usage.saturating_add(*usage);
+                        add_cost(&mut account.cost_usd_micros, *cost_usd_micros);
+                        account.compactions += 1;
+                    }
                 }
             }
             _ => {}
@@ -576,7 +746,10 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::types::{TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoStatus};
+    use crate::error::ErrorKind;
+    use crate::types::{
+        LlmRetryPhase, TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoStatus,
+    };
 
     fn root(event: CodingEvent) -> CodingAgentEvent {
         CodingAgentEvent::new("ses_root".to_owned(), event, SystemTime::UNIX_EPOCH)
@@ -645,6 +818,243 @@ mod tests {
         }));
         assert!(projection.prompt.descendants.is_empty());
         assert_eq!(projection.descendants.len(), 1, "the lifetime map keeps it");
+    }
+
+    fn compaction(input: u64, cost: Option<u64>) -> CodingEvent {
+        CodingEvent::CompactionCompleted {
+            original_turn_count:    6,
+            preserved_turn_count:   2,
+            summary_token_estimate: 40,
+            tracked_file_count:     1,
+            reason:                 CompactionReason::Threshold,
+            usage:                  TokenUsage {
+                input,
+                ..TokenUsage::default()
+            },
+            cost_usd_micros:        cost,
+        }
+    }
+
+    #[test]
+    fn a_compactions_summary_call_is_billed_where_the_report_bills_it() {
+        let mut projection = SessionProjection::new();
+        projection.apply(&root(CodingEvent::UserInput {
+            text:    "go".into(),
+            content: None,
+            source:  InputSource::Prompt,
+        }));
+        projection.apply(&root(message(10, Some(5))));
+        projection.apply(&root(compaction(30, Some(2))));
+        projection.apply(&child(compaction(4, None)));
+        projection.apply(&root(CodingEvent::CompactionFailed {
+            reason:          CompactionReason::Manual,
+            error:           ErrorData::new(ErrorKind::Compaction, "empty summary"),
+            usage:           Some(TokenUsage {
+                input: 100,
+                ..TokenUsage::default()
+            }),
+            cost_usd_micros: Some(50),
+        }));
+
+        assert_eq!(
+            projection.usage.input, 40,
+            "the summary call is in the total"
+        );
+        assert_eq!(projection.cost_usd_micros, Some(7));
+        assert_eq!(projection.prompt.usage.input, 40);
+        assert_eq!(projection.prompt.cost_usd_micros, Some(7));
+        assert_eq!(projection.messages, 1, "a compaction is not a turn");
+        assert_eq!(projection.compactions[0].usage.input, 30);
+        assert_eq!(projection.compactions[0].cost_usd_micros, Some(2));
+        assert_eq!(projection.prompt.compactions, projection.compactions);
+        assert_eq!(
+            projection.descendants["ses_child"].usage.input, 4,
+            "a child's compaction is the child's spend"
+        );
+        assert_eq!(projection.descendants["ses_child"].compactions, 1);
+        assert_eq!(
+            projection.usage.input, 40,
+            "a failed compaction is not billed, as the report does not bill it"
+        );
+    }
+
+    fn retry() -> CodingEvent {
+        CodingEvent::LlmRetry {
+            provider:   "test".into(),
+            model:      "model".into(),
+            attempt:    0,
+            delay_secs: 0.1,
+            error:      ErrorData::new(ErrorKind::Llm, "slow down"),
+            phase:      LlmRetryPhase::Open,
+        }
+    }
+
+    #[test]
+    fn a_descendant_is_priced_at_its_own_model() {
+        let mut projection = SessionProjection::new();
+        projection.apply(&root(CodingEvent::SessionStarted {
+            provider: Some("test".into()),
+            model:    Some("big".into()),
+        }));
+        projection.apply(&root(CodingEvent::UserInput {
+            text:    "go".into(),
+            content: None,
+            source:  InputSource::Prompt,
+        }));
+        projection.apply(&child(CodingEvent::SessionStarted {
+            provider: Some("test".into()),
+            model:    Some("small".into()),
+        }));
+        projection.apply(&child(message(7, None)));
+        // A grandchild whose start this fold never saw: its answer's model
+        // stands in.
+        let grandchild = CodingAgentEvent::new(
+            "ses_grandchild".to_owned(),
+            CodingEvent::AssistantMessage {
+                text:            "ok".into(),
+                model:           "tiny".into(),
+                usage:           TokenUsage::default(),
+                cost_usd_micros: None,
+                cost_source:     None,
+                tool_call_count: 0,
+                context_window:  None,
+                reasoning:       None,
+            },
+            SystemTime::UNIX_EPOCH,
+        )
+        .with_parent_session_id("ses_child".to_owned());
+        projection.apply(&grandchild);
+
+        assert_eq!(projection.route.model.as_deref(), Some("big"));
+        let child_account = &projection.descendants["ses_child"];
+        assert_eq!(child_account.provider.as_deref(), Some("test"));
+        assert_eq!(
+            child_account.model.as_deref(),
+            Some("small"),
+            "the start's route wins over the answer's model"
+        );
+        assert_eq!(child_account.usage.input, 7);
+        assert_eq!(
+            projection.prompt.descendants["ses_child"].model.as_deref(),
+            Some("small"),
+            "the prompt's account names the model too"
+        );
+        let grandchild_account = &projection.descendants["ses_grandchild"];
+        assert_eq!(grandchild_account.parent, "ses_child");
+        assert_eq!(grandchild_account.provider, None);
+        assert_eq!(grandchild_account.model.as_deref(), Some("tiny"));
+    }
+
+    #[test]
+    fn retries_count_across_the_tree_and_restart_with_the_prompt() {
+        let mut projection = SessionProjection::new();
+        projection.apply(&root(CodingEvent::UserInput {
+            text:    "go".into(),
+            content: None,
+            source:  InputSource::Prompt,
+        }));
+        projection.apply(&root(retry()));
+        projection.apply(&child(retry()));
+        assert_eq!(projection.retries, 2, "a child's retry counts for the tree");
+        assert_eq!(projection.prompt.retries, 2);
+
+        projection.apply(&root(CodingEvent::ProcessingEnd));
+        projection.apply(&root(CodingEvent::UserInput {
+            text:    "again".into(),
+            content: None,
+            source:  InputSource::Prompt,
+        }));
+        assert_eq!(
+            projection.prompt.retries, 0,
+            "a new prompt starts from nothing"
+        );
+        assert_eq!(projection.retries, 2, "the lifetime count keeps counting");
+    }
+
+    fn failover(from: &str, to: &str, attempt: u32) -> CodingEvent {
+        CodingEvent::RouteFailover {
+            from: from.into(),
+            to: to.into(),
+            attempt,
+            error: ErrorData::new(ErrorKind::Llm, "key revoked"),
+            usage: TokenUsage {
+                input: 10,
+                ..TokenUsage::default()
+            },
+            cost_usd_micros: Some(7),
+            inference_ms: 120,
+            tool_ms: 30,
+            continuation: FailoverContinuation::ContinueTurn,
+        }
+    }
+
+    #[test]
+    fn failovers_are_kept_in_order_and_a_stop_lasts_one_prompt() {
+        let mut projection = SessionProjection::new();
+        projection.apply(&root(CodingEvent::SessionStarted {
+            provider: Some("a".into()),
+            model:    Some("one".into()),
+        }));
+        projection.apply(&root(CodingEvent::UserInput {
+            text:    "go".into(),
+            content: None,
+            source:  InputSource::Prompt,
+        }));
+        projection.apply(&root(message(10, Some(7))));
+        projection.apply(&root(failover("a/one", "b/two", 1)));
+        projection.apply(&root(failover("b/two", "c/three", 2)));
+        projection.apply(&root(CodingEvent::RouteFailoverStopped {
+            route:   "c/three".into(),
+            attempt: 2,
+            reason:  FailoverStop::Exhausted,
+            error:   ErrorData::new(ErrorKind::Llm, "key revoked"),
+        }));
+        projection.apply(&child(failover("x/y", "z/w", 9)));
+
+        assert_eq!(projection.failovers.len(), 2, "a child's move is its own");
+        assert_eq!(projection.failovers[0].from, "a/one");
+        assert_eq!(projection.failovers[0].to, "b/two");
+        assert_eq!(projection.failovers[0].attempt, 1);
+        assert_eq!(projection.failovers[0].usage.input, 10);
+        assert_eq!(projection.failovers[0].cost_usd_micros, Some(7));
+        assert_eq!(projection.failovers[0].inference_ms, 120);
+        assert_eq!(projection.failovers[0].tool_ms, 30);
+        assert_eq!(
+            projection.failovers[0].continuation,
+            FailoverContinuation::ContinueTurn
+        );
+        assert_eq!(projection.failovers[1].attempt, 2);
+        assert_eq!(projection.prompt.failovers, 2);
+        assert_eq!(projection.route.provider.as_deref(), Some("c"));
+        assert_eq!(projection.route.model.as_deref(), Some("three"));
+        assert_eq!(
+            projection.usage.input, 10,
+            "the failed route's spend on the event is not counted again"
+        );
+        assert_eq!(projection.cost_usd_micros, Some(7));
+        let stopped = projection
+            .failover_stopped
+            .as_ref()
+            .expect("the stop is kept");
+        assert_eq!(stopped.route, "c/three");
+        assert_eq!(stopped.attempt, 2);
+        assert_eq!(stopped.reason, FailoverStop::Exhausted);
+        assert_eq!(stopped.error.message, "key revoked");
+
+        projection.apply(&root(CodingEvent::UserInput {
+            text:    "again".into(),
+            content: None,
+            source:  InputSource::Prompt,
+        }));
+        assert_eq!(
+            projection.prompt.failovers, 0,
+            "the prompt's count restarts"
+        );
+        assert!(
+            projection.failover_stopped.is_none(),
+            "a stop is the prompt's, not the session's"
+        );
+        assert_eq!(projection.failovers.len(), 2, "the history keeps its moves");
     }
 
     #[test]
@@ -756,6 +1166,8 @@ mod tests {
         }));
         assert!(projection.mcp_servers["my-server"].invoked);
         assert!(!projection.mcp_servers["broken"].invoked);
+        assert_eq!(projection.mcp_servers["my-server"].startup_ms, Some(120));
+        assert_eq!(projection.mcp_servers["broken"].startup_ms, Some(3));
         assert_eq!(
             projection.mcp_servers["broken"].error.as_deref(),
             Some("could not launch")
@@ -863,6 +1275,42 @@ mod tests {
         assert_eq!(projection.subagent_counts.spawned, 2);
         assert_eq!(projection.subagents.len(), 2);
         assert_eq!(projection.subagents[1].depth, 2);
+    }
+
+    #[test]
+    fn in_flight_writes_are_serialized_only_mid_write() {
+        let mut projection = SessionProjection::new();
+        projection.apply(&root(CodingEvent::ToolCallStarted {
+            tool_name:    "write_file".into(),
+            tool_call_id: "w1".into(),
+            arguments:    json!({"file_path": "/w/b.txt", "content": "x"}),
+        }));
+        let mid_write = serde_json::to_value(&projection).expect("serializes");
+        assert_eq!(
+            mid_write["pending_writes"]["w1"],
+            json!(["/w/b.txt"]),
+            "a value taken mid-write carries the open write"
+        );
+        let resumed: SessionProjection = serde_json::from_value(mid_write).expect("parses");
+        assert_eq!(resumed, projection);
+
+        projection.apply(&root(CodingEvent::ToolCallCompleted {
+            tool_name:             "write_file".into(),
+            tool_call_id:          "w1".into(),
+            output:                json!("done"),
+            metadata:              pebble_agent::ToolOutputMetadata::default(),
+            is_error:              false,
+            error_kind:            None,
+            output_bytes_observed: 0,
+            output_bytes_retained: 0,
+            output_bytes_omitted:  0,
+        }));
+        let settled = serde_json::to_value(&projection).expect("serializes");
+        assert!(
+            settled.get("pending_writes").is_none(),
+            "nothing in flight, nothing on the wire: {settled}"
+        );
+        assert_eq!(projection.files_touched, ["/w/b.txt"]);
     }
 
     #[test]

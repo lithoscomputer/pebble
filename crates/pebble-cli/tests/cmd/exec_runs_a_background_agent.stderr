@@ -9,8 +9,9 @@ Farming it out.
 The background agent found two items.
 [turn] 15 tokens, 0 tool call(s)
 
-turns:  4
+turns:  3
 tools:  1 call(s), 0 failed
         Agent x1
 tokens: 30 in, 15 out, 0 reasoning, 0 cached (45 total)
 cost:   $0.0002
+subagents: 1 spawned, 1 turn(s), 15 tokens, $0.0001

@@ -548,7 +548,7 @@ pub(crate) async fn compact_context(
         Ok(request) => request,
         Err(source) => {
             let error = Error::from(source);
-            emit_compaction_failure(emitter, session_id, request.reason, &error);
+            emit_compaction_failure(emitter, session_id, request.reason, &error, None);
             return Err(error);
         }
     };
@@ -601,7 +601,7 @@ pub(crate) async fn compact_context(
                 Err(source) => {
                     drop_guard.finished = true;
                     let error = Error::from(source);
-                    emit_compaction_failure(emitter, session_id, request.reason, &error);
+                    emit_compaction_failure(emitter, session_id, request.reason, &error, None);
                     return Err(error);
                 }
             }
@@ -619,13 +619,12 @@ pub(crate) async fn compact_context(
     // `compact_from` discards the summarized turns for good, so an empty
     // summary is refused before history is touched. Trimming first stops a
     // whitespace-only response from passing as a summary.
-    let response_text = response.text;
-    let summary = response_text.trim();
+    let summary = response.text.trim();
     if summary.is_empty() {
         let error = Error::from(CompactionError::EmptySummary {
             summarized_turn_count: preserve_start,
         });
-        emit_compaction_failure(emitter, session_id, request.reason, &error);
+        emit_compaction_failure(emitter, session_id, request.reason, &error, Some(&response));
         return Err(error);
     }
 
@@ -662,6 +661,8 @@ pub(crate) async fn compact_context(
         summary_token_estimate,
         tracked_file_count: file_tracker.file_count(),
         reason: request.reason,
+        usage: result.usage(),
+        cost_usd_micros: result.cost_usd_micros(),
     });
 
     Ok(CompactionOutcome::Compacted(result))
@@ -689,15 +690,21 @@ impl Drop for CompactionDropGuard<'_> {
     }
 }
 
+/// Reports a compaction that left history as it was. `answered` is the
+/// summary the model gave when the failure came after the call, so its cost
+/// is on the stream even though nothing was compacted.
 fn emit_compaction_failure(
     emitter: &Emitter,
     session_id: &str,
     reason: CompactionReason,
     error: &Error,
+    answered: Option<&CompactionSummary>,
 ) {
     emitter.emit(session_id.to_owned(), CodingEvent::CompactionFailed {
         reason,
         error: ErrorData::from(error),
+        usage: answered.map(|summary| summary.usage),
+        cost_usd_micros: answered.and_then(|summary| summary.cost_usd_micros),
     });
 }
 

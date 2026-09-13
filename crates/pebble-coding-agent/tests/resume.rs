@@ -17,8 +17,11 @@ use lithos_llm::client::ClientBuild;
 use lithos_llm::types::{ErrorKind as LlmErrorKind, Message as LlmMessage, Request, Role};
 use pebble_agent::{AgentError, SessionId, SessionScope};
 use pebble_coding_agent::environment::Environment;
-use pebble_coding_agent::events::{CodingAgentEvent, CodingAgentState, EventSink, EventSinkError};
+use pebble_coding_agent::events::{
+    CodingAgentEvent, CodingAgentState, CodingEvent, EventSink, EventSinkError, SkillSummary,
+};
 use pebble_coding_agent::extensions::{Answer, HumanInputError, HumanInputProvider, Question};
+use pebble_coding_agent::projection::SessionProjection;
 use pebble_coding_agent::state::{
     Message, SESSION_RECORD_FORMAT_VERSION, SessionRecord, StoredMessage,
 };
@@ -122,6 +125,42 @@ impl EventSink for SequenceLog {
             .push((event.stream_id().to_owned(), event.seq));
         Ok(())
     }
+}
+
+/// A sink that keeps every event, from `SessionStarted` on.
+#[derive(Default)]
+struct RecordingSink(Mutex<Vec<CodingAgentEvent>>);
+
+impl RecordingSink {
+    fn recorded(&self) -> Vec<CodingAgentEvent> {
+        self.0.lock().expect("the sink lock is held").clone()
+    }
+}
+
+#[async_trait]
+impl EventSink for RecordingSink {
+    async fn record(&self, event: &CodingAgentEvent) -> Result<(), EventSinkError> {
+        self.0
+            .lock()
+            .expect("the sink lock is held")
+            .push(event.clone());
+        Ok(())
+    }
+}
+
+/// What a `SkillsDiscovered` on `events` said, less what was skipped.
+fn skills_announced(
+    events: &[CodingAgentEvent],
+) -> Option<(String, Vec<String>, Vec<SkillSummary>)> {
+    events.iter().find_map(|event| match &event.event {
+        CodingEvent::SkillsDiscovered {
+            profile,
+            source_dirs,
+            skills,
+            ..
+        } => Some((profile.clone(), source_dirs.clone(), skills.clone())),
+        _ => None,
+    })
 }
 
 /// Someone to ask, who is never asked anything here.
@@ -710,6 +749,166 @@ async fn an_export_continues_in_memory_without_initializing_again() {
         log.stream_ids().iter().all(|stream_id| stream_id == &id),
         "a warm successor keeps the stable stream identity"
     );
+}
+
+#[tokio::test]
+async fn a_warm_successor_announces_its_skills_again() {
+    // A view that starts with the successor folds only its events. The skills
+    // came with the warm state, and the stream says so again, as the
+    // predecessor said it, so that view lists them too.
+    let (client, _) = scripted_client(vec![ScriptedCall::response(text_response("one"))]);
+    let first_sink = Arc::new(RecordingSink::default());
+    let mut first = CodingAgent::builder(client, environment_with_a_skill())
+        .model("test/model")
+        .options(CodingAgentOptions::default().with_skill_dirs(["/skills".to_owned()]))
+        .event_sink(Arc::clone(&first_sink) as Arc<dyn EventSink>)
+        .build()
+        .await
+        .expect("the first agent builds");
+    first
+        .prompt("first")
+        .await
+        .result
+        .expect("the first prompt succeeds");
+    let export = first
+        .export_for_reuse(ShutdownReason::Completed)
+        .await
+        .expect("the first agent closes and exports");
+    let discovered =
+        skills_announced(&first_sink.recorded()).expect("the first agent discovered its skills");
+    assert_eq!(discovered.1, ["/skills"]);
+    assert_eq!(discovered.2.len(), 1);
+
+    let (client, _) = scripted_client(vec![ScriptedCall::response(text_response("two"))]);
+    let sink = Arc::new(RecordingSink::default());
+    let mut second = CodingAgent::resume_from_export(client, environment(), export)
+        .event_sink(Arc::clone(&sink) as Arc<dyn EventSink>)
+        .build()
+        .await
+        .expect("the export resumes");
+    // The barrier makes everything the build queued visible to the sink.
+    second.flush_events().await.expect("events flush");
+
+    let recorded = sink.recorded();
+    let started = recorded
+        .iter()
+        .position(|event| matches!(event.event, CodingEvent::SessionStarted { .. }))
+        .expect("the successor starts");
+    let announced = recorded
+        .iter()
+        .position(|event| matches!(event.event, CodingEvent::SkillsDiscovered { .. }))
+        .expect("the successor announces its skills");
+    assert!(
+        started < announced,
+        "the start comes first, as on a fresh session: {recorded:?}"
+    );
+    assert_eq!(
+        skills_announced(&recorded),
+        Some(discovered),
+        "the successor says what its predecessor said: the same profile, \
+         directories, and skills"
+    );
+    assert!(
+        recorded.iter().all(|event| !matches!(
+            event.event,
+            CodingEvent::SkillsDiscovered { ref skipped, .. } if !skipped.is_empty()
+        )),
+        "nothing was read again, so nothing was skipped"
+    );
+    let mut projection = SessionProjection::new();
+    projection.apply_all(&recorded);
+    assert_eq!(projection.route.model.as_deref(), Some("model"));
+    assert_eq!(projection.skills.available, [SkillSummary {
+        name:        "commit".to_owned(),
+        description: "Make a commit".to_owned(),
+    }]);
+
+    second
+        .prompt("second")
+        .await
+        .result
+        .expect("the successor's prompt succeeds");
+    second
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the successor shuts down");
+}
+
+/// The servers a successor's builder names are started and announced by the
+/// build, with their own startup times, as a fresh agent's are; nothing
+/// re-announces the predecessor's, which closed with it.
+#[cfg(feature = "mcp")]
+#[tokio::test]
+async fn a_warm_successors_view_lists_its_servers_and_skills() {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use pebble_coding_agent::events::McpToolSummary;
+    use pebble_coding_agent::mcp::{McpPlacement, McpServer};
+
+    fn echo_server() -> McpServer {
+        McpServer::new("echo", McpPlacement::Stdio {
+            command:     vec![
+                "python3".to_owned(),
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/mcp_echo_server.py")
+                    .display()
+                    .to_string(),
+            ],
+            env:         BTreeMap::new(),
+            current_dir: None,
+            clear_env:   false,
+        })
+    }
+
+    let (client, _) = scripted_client(vec![ScriptedCall::response(text_response("one"))]);
+    let mut first = CodingAgent::builder(client, environment_with_a_skill())
+        .model("test/model")
+        .options(CodingAgentOptions::default().with_skill_dirs(["/skills".to_owned()]))
+        .mcp_servers(vec![echo_server()])
+        .build()
+        .await
+        .expect("the first agent builds");
+    first
+        .prompt("first")
+        .await
+        .result
+        .expect("the first prompt succeeds");
+    let export = first
+        .export_for_reuse(ShutdownReason::Completed)
+        .await
+        .expect("the first agent closes and exports");
+
+    let (client, _) = scripted_client(vec![ScriptedCall::response(text_response("two"))]);
+    let sink = Arc::new(RecordingSink::default());
+    let mut second = CodingAgent::resume_from_export(client, environment(), export)
+        .mcp_servers(vec![echo_server()])
+        .event_sink(Arc::clone(&sink) as Arc<dyn EventSink>)
+        .build()
+        .await
+        .expect("the export resumes");
+    // The server outcomes were queued as the agent was built; the barrier
+    // makes them visible to the sink.
+    second.flush_events().await.expect("events flush");
+
+    let mut projection = SessionProjection::new();
+    projection.apply_all(&sink.recorded());
+    let echo = &projection.mcp_servers["echo"];
+    assert_eq!(echo.tools, [McpToolSummary {
+        name:          "mcp__echo__echo".to_owned(),
+        original_name: "echo".to_owned(),
+    }]);
+    assert_eq!(echo.error, None);
+    assert!(
+        echo.startup_ms.is_some_and(|millis| millis > 0),
+        "the successor's server was launched, not re-announced: {echo:?}"
+    );
+    assert_eq!(projection.skills.available.len(), 1);
+
+    second
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the successor shuts down");
 }
 
 // --- Reuse bookkeeping ---

@@ -33,6 +33,7 @@ use super::*;
 use crate::SessionId;
 use crate::event::{EventSink, EventSinkError};
 use crate::human_input::{Answer, HumanInputError, HumanInputProvider, Question};
+use crate::projection::SessionProjection;
 use crate::subagent::{
     ChildObserver, SubagentLimits, SubagentResult, SubagentStatus, SubagentSupervisor,
 };
@@ -115,6 +116,23 @@ fn person_probe(seen: Arc<Mutex<Vec<bool>>>) -> RegisteredTool {
     .with_source(ToolSource::Native)
 }
 
+/// Everything `events` holds, folded. A reader that lagged has lost events
+/// and cannot fold them, so that is a failure here.
+fn projected(events: &mut broadcast::Receiver<CodingAgentEvent>) -> SessionProjection {
+    let mut projection = SessionProjection::new();
+    loop {
+        match events.try_recv() {
+            Ok(event) => projection.apply(&event),
+            Err(broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed) => {
+                return projection;
+            }
+            Err(broadcast::error::TryRecvError::Lagged(dropped)) => {
+                panic!("the reader lagged {dropped} events behind the stream");
+            }
+        }
+    }
+}
+
 /// A parent whose one round calls `wait` on a child that never finishes.
 ///
 /// Answers with the session, its supervisor, and the token the child watches,
@@ -178,6 +196,7 @@ async fn background_agent_notifications_are_batched_into_one_parent_turn() {
         .subagent_supervisor()
         .expect("the test session was given a factory")
         .clone();
+    let mut events = parent.subscribe();
 
     // Both results are ready before the parent reaches a boundary, one child at
     // a time so each takes the script entry meant for it.
@@ -224,6 +243,55 @@ async fn background_agent_notifications_are_batched_into_one_parent_turn() {
     assert!(notification.contains(&second));
     assert!(notification.contains("first result"));
     assert!(notification.contains("second result"));
+
+    // The fold agrees with the accounting the report carries: the prompt's
+    // usage is the root's two answers, and the children's answers are kept
+    // beside it, each under its own session and model.
+    let projection = projected(&mut events);
+    assert_eq!(
+        projection.prompt.usage,
+        parent.last_prompt_usage(),
+        "the delta spends what the report spends: the root's own answers"
+    );
+    assert_eq!(
+        projection.prompt.cost_usd_micros,
+        parent.last_prompt_cost_usd_micros()
+    );
+    assert_eq!(projection.prompt.messages, 2);
+    let (descendants, _) = projection.descendant_usage();
+    assert_eq!(
+        descendants.total(),
+        30,
+        "two children answered once each: {:?}",
+        projection.descendants
+    );
+    assert!(
+        projection.prompt.descendants.is_empty(),
+        "the children answered before the prompt began"
+    );
+    // The accounts are by session id; the spawn's agent id names the row.
+    assert_eq!(
+        projection.descendants.len(),
+        2,
+        "{:?}",
+        projection.descendants
+    );
+    for account in projection.descendants.values() {
+        assert_eq!(account.parent, parent.id());
+        assert_eq!(account.messages, 1);
+        assert_eq!(account.provider.as_deref(), Some("test"));
+        assert_eq!(
+            account.model.as_deref(),
+            Some("model"),
+            "each child is priced at the model its own start named"
+        );
+    }
+    let rows: Vec<&str> = projection
+        .subagents
+        .iter()
+        .map(|row| row.agent_id.as_str())
+        .collect();
+    assert_eq!(rows, [first.as_str(), second.as_str()]);
 
     parent
         .shutdown(ShutdownReason::Completed)

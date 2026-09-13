@@ -1339,6 +1339,10 @@ pub enum CodingEvent {
         reason:              CompactionReason,
     },
     /// Compaction of conversation history finished.
+    ///
+    /// The summary call's tokens and cost are on the event, so a view folding
+    /// the stream bills the prompt what its report bills it: the report's
+    /// totals include every compaction the prompt performed.
     CompactionCompleted {
         /// Turns in history before compaction.
         original_turn_count:    usize,
@@ -1351,13 +1355,32 @@ pub enum CodingEvent {
         /// Why this compaction ran.
         #[serde(default, skip_serializing_if = "is_threshold_reason")]
         reason:                 CompactionReason,
+        /// The tokens the summary call used, as the provider reported them.
+        /// Absent from streams recorded before it existed, which read back as
+        /// nothing used.
+        #[serde(default)]
+        usage:                  TokenUsage,
+        /// What the summary call cost in USD micros, where the catalog or the
+        /// provider priced it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd_micros:        Option<u64>,
     },
     /// Compaction ended without changing history.
     CompactionFailed {
         /// Why this compaction ran.
-        reason: CompactionReason,
+        reason:          CompactionReason,
         /// The failure projected for transport.
-        error:  ErrorData,
+        error:           ErrorData,
+        /// The tokens the summary call used before the compaction failed,
+        /// when it answered: a summary that came back empty was still paid
+        /// for. `None` when the call itself failed or was never made. The
+        /// prompt's report does not bill a failed compaction, so a view that
+        /// agrees with the report leaves this out of its totals.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage:           Option<TokenUsage>,
+        /// What that call cost in USD micros, when it answered and was priced.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd_micros: Option<u64>,
     },
     /// Compaction was cancelled before it changed history.
     CompactionCancelled {
@@ -1754,6 +1777,8 @@ impl CodingEvent {
                 summary_token_estimate,
                 tracked_file_count,
                 reason,
+                usage,
+                cost_usd_micros,
             } => {
                 info!(
                     session_id,
@@ -1762,14 +1787,23 @@ impl CodingEvent {
                     summary_token_estimate,
                     tracked_file_count,
                     reason = ?reason,
+                    tokens = usage.total(),
+                    cost_usd_micros,
                     "Context compaction completed"
                 );
             }
-            Self::CompactionFailed { reason, error } => {
+            Self::CompactionFailed {
+                reason,
+                error,
+                usage,
+                cost_usd_micros,
+            } => {
                 warn!(
                     session_id,
                     reason = ?reason,
                     error = error.message.as_str(),
+                    tokens = usage.map(TokenUsage::total),
+                    cost_usd_micros,
                     "Context compaction failed"
                 );
             }
@@ -2838,10 +2872,14 @@ mod tests {
                 summary_token_estimate: 500,
                 tracked_file_count:     3,
                 reason:                 CompactionReason::Threshold,
+                usage:                  TokenUsage::default(),
+                cost_usd_micros:        None,
             },
             CodingEvent::CompactionFailed {
-                reason: CompactionReason::Manual,
-                error:  ErrorData::new(ErrorKind::Compaction, "summary failed"),
+                reason:          CompactionReason::Manual,
+                error:           ErrorData::new(ErrorKind::Compaction, "summary failed"),
+                usage:           None,
+                cost_usd_micros: None,
             },
             CodingEvent::CompactionCancelled {
                 reason: CompactionReason::Manual,
