@@ -93,6 +93,7 @@ pub(crate) struct WarmState {
     pub(crate) record: SessionRecord,
     pub(crate) system_prompt: String,
     pub(crate) skills: Vec<Skill>,
+    pub(crate) skill_dirs: Vec<String>,
     pub(crate) memory_summaries: Vec<MemoryFileSummary>,
     pub(crate) memory_tokens: u64,
     pub(crate) skills_tokens: u64,
@@ -631,6 +632,7 @@ impl CodingRuntimeBuilder {
             resources: Arc::new(PromptResources {
                 registry,
                 skills: Vec::new(),
+                skill_dirs: Vec::new(),
                 system_prompt: String::new(),
                 memory_tokens: 0,
                 skills_tokens: 0,
@@ -850,6 +852,9 @@ struct SessionModel {
 struct PromptResources {
     registry:      ToolRegistry,
     skills:        Vec<Skill>,
+    /// The directories the skills were discovered in, as
+    /// [`SkillsDiscovered`](CodingEvent::SkillsDiscovered) reported them.
+    skill_dirs:    Vec<String>,
     system_prompt: String,
     memory_tokens: u64,
     skills_tokens: u64,
@@ -1043,6 +1048,7 @@ impl CodingRuntime {
             )?;
         }
         Arc::make_mut(&mut session.resources).skills = state.skills;
+        Arc::make_mut(&mut session.resources).skill_dirs = state.skill_dirs;
         session.memory_summaries = state.memory_summaries;
         Arc::make_mut(&mut session.resources).system_prompt = state.system_prompt;
         Arc::make_mut(&mut session.resources).memory_tokens = state.memory_tokens;
@@ -1058,13 +1064,25 @@ impl CodingRuntime {
 
     /// Opens the event stream of a session built from warm state.
     ///
-    /// Publishes [`SessionStarted`](CodingEvent::SessionStarted) and nothing
-    /// else: no memory was loaded and no skills were discovered, because the
-    /// warm state already carried what they produce.
+    /// Publishes [`SessionStarted`](CodingEvent::SessionStarted) and then
+    /// [`SkillsDiscovered`](CodingEvent::SkillsDiscovered) with the skills the
+    /// warm state carried, so a view that folds only the successor's events
+    /// still lists them. Nothing was read for it: the directories are the
+    /// ones the predecessor searched and nothing is reported skipped. No
+    /// memory is loaded and no memory event is published, because the warm
+    /// state carries what loading produced. The MCP servers the successor's
+    /// builder names are started and announced by the build, as a fresh
+    /// agent's are.
     pub(crate) async fn start_from_warm_state(&mut self) -> Result<()> {
         self.emit(CodingEvent::SessionStarted {
             provider: Some(self.model_context.provider.clone()),
             model:    Some(self.model_context.model.clone()),
+        });
+        self.emit(CodingEvent::SkillsDiscovered {
+            profile:     self.profile.profile_kind().as_str().to_owned(),
+            source_dirs: self.resources.skill_dirs.clone(),
+            skills:      self.skill_summaries(),
+            skipped:     Vec::new(),
         });
         self.flush_events().await.map(|_| ())
     }
@@ -1079,6 +1097,7 @@ impl CodingRuntime {
             record,
             system_prompt: self.resources.system_prompt.clone(),
             skills: self.resources.skills.clone(),
+            skill_dirs: self.resources.skill_dirs.clone(),
             memory_summaries: self.memory_summaries.clone(),
             memory_tokens: self.resources.memory_tokens,
             skills_tokens: self.resources.skills_tokens,
@@ -1220,6 +1239,9 @@ impl CodingRuntime {
 
         let discovered = skills?;
         Arc::make_mut(&mut self.resources).skills = discovered.skills;
+        Arc::make_mut(&mut self.resources)
+            .skill_dirs
+            .clone_from(&skill_dirs);
         skill_skipped.extend(discovered.skipped);
         self.emit(CodingEvent::SkillsDiscovered {
             profile,
