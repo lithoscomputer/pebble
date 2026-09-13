@@ -279,6 +279,12 @@ async fn background_agent_notifications_are_batched_into_one_parent_turn() {
     for account in projection.descendants.values() {
         assert_eq!(account.parent, parent.id());
         assert_eq!(account.messages, 1);
+        assert_eq!(account.provider.as_deref(), Some("test"));
+        assert_eq!(
+            account.model.as_deref(),
+            Some("model"),
+            "each child is priced at the model its own start named"
+        );
     }
     let rows: Vec<&str> = projection
         .subagents

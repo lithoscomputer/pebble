@@ -56,6 +56,13 @@ pub struct RouteProjection {
 pub struct DescendantAccount {
     /// The session that spawned it.
     pub parent:          String,
+    /// The route it runs on, as its `SessionStarted` reported it, so an
+    /// application prices its tokens at its own model. When the start was
+    /// not seen, the model of its first answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider:        Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model:           Option<String>,
     pub usage:           TokenUsage,
     pub cost_usd_micros: Option<u64>,
     /// Committed assistant messages.
@@ -320,11 +327,21 @@ impl SessionProjection {
             self.root_session_id = Some(event.session_id.clone());
         }
         match &event.event {
-            CodingEvent::SessionStarted { provider, model } if is_root => {
-                self.route = RouteProjection {
-                    provider: provider.clone(),
-                    model:    model.clone(),
-                };
+            CodingEvent::SessionStarted { provider, model } => {
+                if is_root {
+                    self.route = RouteProjection {
+                        provider: provider.clone(),
+                        model:    model.clone(),
+                    };
+                } else if let Some(parent) = &event.parent_session_id {
+                    for account in [
+                        descendant(&mut self.descendants, &event.session_id, parent),
+                        descendant(&mut self.prompt.descendants, &event.session_id, parent),
+                    ] {
+                        account.provider.clone_from(provider);
+                        account.model.clone_from(model);
+                    }
+                }
             }
             // The failed route's usage on the event is what that route's
             // `AssistantMessage`s already folded in, so the report and this
@@ -394,6 +411,7 @@ impl SessionProjection {
                 self.activity = SessionActivity::Running;
             }
             CodingEvent::AssistantMessage {
+                model,
                 usage,
                 cost_usd_micros,
                 context_window,
@@ -418,6 +436,9 @@ impl SessionProjection {
                         account.usage = account.usage.saturating_add(*usage);
                         add_cost(&mut account.cost_usd_micros, *cost_usd_micros);
                         account.messages += 1;
+                        // The start names the route; an answer seen without
+                        // one still says which model to price it at.
+                        account.model.get_or_insert_with(|| model.clone());
                     }
                 }
             }
@@ -851,6 +872,62 @@ mod tests {
             error:      ErrorData::new(ErrorKind::Llm, "slow down"),
             phase:      LlmRetryPhase::Open,
         }
+    }
+
+    #[test]
+    fn a_descendant_is_priced_at_its_own_model() {
+        let mut projection = SessionProjection::new();
+        projection.apply(&root(CodingEvent::SessionStarted {
+            provider: Some("test".into()),
+            model:    Some("big".into()),
+        }));
+        projection.apply(&root(CodingEvent::UserInput {
+            text:    "go".into(),
+            content: None,
+            source:  InputSource::Prompt,
+        }));
+        projection.apply(&child(CodingEvent::SessionStarted {
+            provider: Some("test".into()),
+            model:    Some("small".into()),
+        }));
+        projection.apply(&child(message(7, None)));
+        // A grandchild whose start this fold never saw: its answer's model
+        // stands in.
+        let grandchild = CodingAgentEvent::new(
+            "ses_grandchild".to_owned(),
+            CodingEvent::AssistantMessage {
+                text:            "ok".into(),
+                model:           "tiny".into(),
+                usage:           TokenUsage::default(),
+                cost_usd_micros: None,
+                cost_source:     None,
+                tool_call_count: 0,
+                context_window:  None,
+                reasoning:       None,
+            },
+            SystemTime::UNIX_EPOCH,
+        )
+        .with_parent_session_id("ses_child".to_owned());
+        projection.apply(&grandchild);
+
+        assert_eq!(projection.route.model.as_deref(), Some("big"));
+        let child_account = &projection.descendants["ses_child"];
+        assert_eq!(child_account.provider.as_deref(), Some("test"));
+        assert_eq!(
+            child_account.model.as_deref(),
+            Some("small"),
+            "the start's route wins over the answer's model"
+        );
+        assert_eq!(child_account.usage.input, 7);
+        assert_eq!(
+            projection.prompt.descendants["ses_child"].model.as_deref(),
+            Some("small"),
+            "the prompt's account names the model too"
+        );
+        let grandchild_account = &projection.descendants["ses_grandchild"];
+        assert_eq!(grandchild_account.parent, "ses_child");
+        assert_eq!(grandchild_account.provider, None);
+        assert_eq!(grandchild_account.model.as_deref(), Some("tiny"));
     }
 
     #[test]
