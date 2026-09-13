@@ -2,9 +2,9 @@
 
 use std::io::{self, Write as _};
 
+use pebble_coding_agent::CodingAgent;
 use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent};
 use pebble_coding_agent::projection::SessionProjection;
-use pebble_coding_agent::{CodingAgent, PromptReport};
 use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
@@ -253,24 +253,24 @@ impl Summary {
     }
 
     /// Prints what the prompt used, after the answer.
-    pub fn report(&self, outcome: &PromptReport, style: Style) {
+    pub fn report(&self, style: Style) {
         if style != Style::Text {
             return;
         }
         print_err("");
-        for line in self.lines(outcome) {
+        for line in self.lines() {
             print_err(&line);
         }
     }
 
     /// The report's lines, in order.
     ///
-    /// Turns are the root session's, as the projection keeps them; what the
-    /// children did is on the `subagents` line. Tools and retries are the
-    /// tree's. Tokens and cost are the report's rather than the projection's
-    /// because the report bills a compaction's summary call to the prompt and
-    /// no event carries that call's usage.
-    fn lines(&self, outcome: &PromptReport) -> Vec<String> {
+    /// Turns, tokens, and cost are the root session's, as the projection
+    /// keeps them, and agree with the prompt's report: a compaction's summary
+    /// call is on the stream with its usage, so the fold bills it as the
+    /// report does. What the children did is on the `subagents` line. Tools
+    /// and retries are the tree's.
+    fn lines(&self) -> Vec<String> {
         let projection = &self.projection;
         let mut lines = vec![format!("turns:  {}", projection.messages)];
 
@@ -295,7 +295,7 @@ impl Summary {
             lines.push(format!("        {named}"));
         }
 
-        let usage = outcome.usage;
+        let usage = projection.usage;
         lines.push(format!(
             "tokens: {} in, {} out, {} reasoning, {} cached ({} total)",
             usage.input,
@@ -304,7 +304,7 @@ impl Summary {
             usage.cache_read + usage.cache_write,
             usage.total()
         ));
-        lines.push(match outcome.cost_usd_micros {
+        lines.push(match projection.cost_usd_micros {
             Some(cost) => format!("cost:   {}", dollars(cost)),
             None => "cost:   not reported for this model".to_owned(),
         });
@@ -375,9 +375,8 @@ mod tests {
     use std::time::SystemTime;
 
     use pebble_coding_agent::events::{
-        ErrorData, ErrorKind, InputSource, LlmRetryPhase, TokenUsage,
+        CompactionReason, ErrorData, ErrorKind, InputSource, LlmRetryPhase, TokenUsage,
     };
-    use pebble_coding_agent::{PromptOutput, PromptTiming};
     use serde_json::json;
 
     use super::*;
@@ -479,22 +478,6 @@ mod tests {
         ]
     }
 
-    fn report_of(projection: &SessionProjection) -> PromptReport {
-        PromptReport {
-            result:            Ok(PromptOutput {
-                text:          Some("done".into()),
-                final_message: None,
-            }),
-            usage:             projection.usage,
-            cost_usd_micros:   projection.cost_usd_micros,
-            timing:            PromptTiming::default(),
-            files_touched:     Vec::new(),
-            last_file_touched: None,
-            route:             "test/model".into(),
-            compactions:       Vec::new(),
-        }
-    }
-
     async fn summarize(events: &[CodingAgentEvent], capacity: usize) -> Summary {
         let (sender, receiver) = broadcast::channel(capacity);
         for event in events {
@@ -517,7 +500,7 @@ mod tests {
         assert_eq!(projection.retries, 1);
         assert_eq!(projection.descendants["ses_child"].messages, 1);
 
-        assert_eq!(summary.lines(&report_of(&projection)), [
+        assert_eq!(summary.lines(), [
             "turns:  2",
             "tools:  3 call(s), 1 failed",
             "        edit_file x1, read_file x2",
@@ -541,11 +524,45 @@ mod tests {
             root(CodingEvent::SessionEnded),
         ];
         let summary = summarize(&events, events.len()).await;
-        assert_eq!(summary.lines(&report_of(summary.projection())), [
+        assert_eq!(summary.lines(), [
             "turns:  1",
             "tools:  0 call(s), 0 failed",
             "tokens: 10 in, 5 out, 0 reasoning, 0 cached (15 total)",
             "cost:   not reported for this model",
+        ]);
+    }
+
+    #[tokio::test]
+    async fn a_compactions_summary_call_is_on_the_tokens_line() {
+        let events = [
+            root(CodingEvent::UserInput {
+                text:    "go".into(),
+                content: None,
+                source:  InputSource::Prompt,
+            }),
+            root(message(10, 5, Some(100))),
+            root(CodingEvent::CompactionCompleted {
+                original_turn_count:    4,
+                preserved_turn_count:   1,
+                summary_token_estimate: 20,
+                tracked_file_count:     0,
+                reason:                 CompactionReason::Threshold,
+                usage:                  TokenUsage {
+                    input: 30,
+                    output: 2,
+                    ..TokenUsage::default()
+                },
+                cost_usd_micros:        Some(200),
+            }),
+            root(CodingEvent::ProcessingEnd),
+            root(CodingEvent::SessionEnded),
+        ];
+        let summary = summarize(&events, events.len()).await;
+        assert_eq!(summary.lines(), [
+            "turns:  1",
+            "tools:  0 call(s), 0 failed",
+            "tokens: 40 in, 7 out, 0 reasoning, 0 cached (47 total)",
+            "cost:   $0.0003",
         ]);
     }
 
@@ -557,7 +574,7 @@ mod tests {
         let capacity = 2;
         let summary = summarize(&events, capacity).await;
         let dropped = u64::try_from(events.len() - capacity).expect("a small count");
-        let lines = summary.lines(&report_of(summary.projection()));
+        let lines = summary.lines();
         assert_eq!(
             lines.last().map(String::as_str),
             Some(format!("dropped: {dropped} event(s) this reader missed").as_str())

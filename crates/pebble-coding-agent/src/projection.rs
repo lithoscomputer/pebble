@@ -141,6 +141,14 @@ pub struct CompactionProjection {
     pub preserved_turn_count:   usize,
     pub summary_token_estimate: usize,
     pub tracked_file_count:     usize,
+    /// The summary call's tokens: a breakdown of the session's and the
+    /// prompt's usage, which already include them.
+    #[serde(default)]
+    pub usage:                  TokenUsage,
+    /// The summary call's provider-reported cost, included in the totals the
+    /// same way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd_micros:        Option<u64>,
 }
 
 /// What the prompt in progress, or the last one, did: reset when a prompt
@@ -477,27 +485,44 @@ impl SessionProjection {
                 self.prompt.subagents.closed += 1;
                 self.set_subagent_status(agent_id, SubagentStatus::Closed);
             }
+            // The summary call is billed to the session that compacted, as
+            // its report bills it. A failed compaction is not: the report
+            // leaves it out, so the fold does too, and `CompactionFailed`
+            // falls through below.
             CodingEvent::CompactionCompleted {
                 original_turn_count,
                 preserved_turn_count,
                 summary_token_estimate,
                 tracked_file_count,
                 reason,
+                usage,
+                cost_usd_micros,
             } => {
                 if is_root {
+                    self.usage = self.usage.saturating_add(*usage);
+                    add_cost(&mut self.cost_usd_micros, *cost_usd_micros);
+                    self.prompt.usage = self.prompt.usage.saturating_add(*usage);
+                    add_cost(&mut self.prompt.cost_usd_micros, *cost_usd_micros);
                     let compaction = CompactionProjection {
                         reason:                 *reason,
                         original_turn_count:    *original_turn_count,
                         preserved_turn_count:   *preserved_turn_count,
                         summary_token_estimate: *summary_token_estimate,
                         tracked_file_count:     *tracked_file_count,
+                        usage:                  *usage,
+                        cost_usd_micros:        *cost_usd_micros,
                     };
                     self.prompt.compactions.push(compaction.clone());
                     self.compactions.push(compaction);
                 } else if let Some(parent) = &event.parent_session_id {
-                    descendant(&mut self.descendants, &event.session_id, parent).compactions += 1;
-                    descendant(&mut self.prompt.descendants, &event.session_id, parent)
-                        .compactions += 1;
+                    for account in [
+                        descendant(&mut self.descendants, &event.session_id, parent),
+                        descendant(&mut self.prompt.descendants, &event.session_id, parent),
+                    ] {
+                        account.usage = account.usage.saturating_add(*usage);
+                        add_cost(&mut account.cost_usd_micros, *cost_usd_micros);
+                        account.compactions += 1;
+                    }
                 }
             }
             _ => {}
@@ -660,6 +685,64 @@ mod tests {
         }));
         assert!(projection.prompt.descendants.is_empty());
         assert_eq!(projection.descendants.len(), 1, "the lifetime map keeps it");
+    }
+
+    fn compaction(input: u64, cost: Option<u64>) -> CodingEvent {
+        CodingEvent::CompactionCompleted {
+            original_turn_count:    6,
+            preserved_turn_count:   2,
+            summary_token_estimate: 40,
+            tracked_file_count:     1,
+            reason:                 CompactionReason::Threshold,
+            usage:                  TokenUsage {
+                input,
+                ..TokenUsage::default()
+            },
+            cost_usd_micros:        cost,
+        }
+    }
+
+    #[test]
+    fn a_compactions_summary_call_is_billed_where_the_report_bills_it() {
+        let mut projection = SessionProjection::new();
+        projection.apply(&root(CodingEvent::UserInput {
+            text:    "go".into(),
+            content: None,
+            source:  InputSource::Prompt,
+        }));
+        projection.apply(&root(message(10, Some(5))));
+        projection.apply(&root(compaction(30, Some(2))));
+        projection.apply(&child(compaction(4, None)));
+        projection.apply(&root(CodingEvent::CompactionFailed {
+            reason:          CompactionReason::Manual,
+            error:           ErrorData::new(ErrorKind::Compaction, "empty summary"),
+            usage:           Some(TokenUsage {
+                input: 100,
+                ..TokenUsage::default()
+            }),
+            cost_usd_micros: Some(50),
+        }));
+
+        assert_eq!(
+            projection.usage.input, 40,
+            "the summary call is in the total"
+        );
+        assert_eq!(projection.cost_usd_micros, Some(7));
+        assert_eq!(projection.prompt.usage.input, 40);
+        assert_eq!(projection.prompt.cost_usd_micros, Some(7));
+        assert_eq!(projection.messages, 1, "a compaction is not a turn");
+        assert_eq!(projection.compactions[0].usage.input, 30);
+        assert_eq!(projection.compactions[0].cost_usd_micros, Some(2));
+        assert_eq!(projection.prompt.compactions, projection.compactions);
+        assert_eq!(
+            projection.descendants["ses_child"].usage.input, 4,
+            "a child's compaction is the child's spend"
+        );
+        assert_eq!(projection.descendants["ses_child"].compactions, 1);
+        assert_eq!(
+            projection.usage.input, 40,
+            "a failed compaction is not billed, as the report does not bill it"
+        );
     }
 
     fn retry() -> CodingEvent {

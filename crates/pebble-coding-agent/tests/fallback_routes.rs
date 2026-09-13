@@ -15,6 +15,7 @@ use pebble_coding_agent::events::{
     CodingAgentEvent, CodingAgentState, CodingEvent, FailoverContinuation, FailoverStop,
     PermissionLevel, TokenUsage,
 };
+use pebble_coding_agent::projection::SessionProjection;
 use pebble_coding_agent::state::Message;
 use pebble_coding_agent::test_support::{
     MockEnvironment, ScriptedCall, ScriptedFailure, ScriptedProvider, client_from, text_response,
@@ -243,6 +244,20 @@ async fn a_failover_eligible_error_moves_the_conversation_to_the_next_route() {
         started[0].seq < failovers[0].seq,
         "the failover is reported from the route it moved to"
     );
+    // A view folding the stream agrees with the report across both routes:
+    // the failed route's spend is on the event and in the fold once, through
+    // the answer that route committed.
+    let mut projection = SessionProjection::new();
+    projection.apply_all(&published);
+    assert_eq!(
+        projection.prompt.usage, report.usage,
+        "the fold spends what the report spends, on both routes"
+    );
+    assert_eq!(projection.prompt.cost_usd_micros, report.cost_usd_micros);
+    assert_eq!(report.usage.input, 20, "one answer on each route");
+    assert_eq!(report.cost_usd_micros, Some(7));
+    assert!(projection.prompt.descendants.is_empty());
+    assert_eq!(projection.route.model.as_deref(), Some("vision"));
     let mut seqs: Vec<u64> = published.iter().map(|event| event.seq).collect();
     seqs.sort_unstable();
     let before = seqs.len();

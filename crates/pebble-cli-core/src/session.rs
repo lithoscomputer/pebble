@@ -73,7 +73,7 @@ pub async fn run_prompt(
     {
         write_answer(outcome)?;
     }
-    summary.report(&report, options.style);
+    summary.report(options.style);
     if report.result.is_ok() {
         shutdown.context("shutting the agent down")?;
     }
