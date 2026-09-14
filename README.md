@@ -279,6 +279,7 @@ pebble exec "add a --dry-run flag to bin/deploy"
 pebble exec --model gpt-5.6 --cwd ../service --permission full "run the tests and fix what fails"
 echo "summarize what this repository does" | pebble exec --quiet
 pebble exec --json "..."   # one JSON event per line on standard error
+pebble exec --verbose "..." # tool arguments and results, and the model's reasoning
 ```
 
 The permission flag chooses what the agent may do without asking:
@@ -291,17 +292,21 @@ then `claude-sonnet-5`, and never opens a setup prompt.
 `PEBBLE_<PROVIDER>_BASE_URL`, such as `PEBBLE_OPENAI_BASE_URL` or
 `PEBBLE_MOONSHOT_BASE_URL`, points a built-in provider at a compatible
 endpoint instead: a proxy, a self-hosted model, or a test double. `--subagents`
-lets the agent spawn children for independent work. The command is the
-smallest application pebble ships, and its source is a worked example of what
-an embedding application supplies.
+lets the agent spawn children for independent work. `--tool-results` prints
+each tool call's arguments in full and what the call answered;
+`--transcript` prints the reasoning behind each turn when the model reports
+it, and the text of a turn that did not stream; `--verbose` is both. The
+command is the smallest application pebble ships, and its source is a worked
+example of what an embedding application supplies.
 
 The command line is a library first. `pebble-cli-core` holds the `exec`
 session (`session::run_prompt`: the events rendered as they happen, the answer
 on standard output, the summary after it, the agent shut down for the reason
-the prompt ended with), its `render::Renderer` and closing `Summary`, the
-`approval::TerminalApproval` prompt for tools the permission level does not
-allow outright, and the interactive session, credential store, and settings
-whole. The `pebble` binary is an argument parser over it. Another program that
+the prompt ended with, and `session::run_prompt_with` for a front end with a
+verbose mode), its `render::Renderer` with its `RenderOptions` and closing
+`Summary`, the `approval::TerminalApproval` prompt for tools the permission
+level does not allow outright, and the interactive session, credential store,
+and settings whole. The `pebble` binary is an argument parser over it. Another program that
 builds its own agent, with its own client, environment, tools, and settings,
 runs it through the same session and renderer instead of writing them again;
 fabro's `fabro exec` does.

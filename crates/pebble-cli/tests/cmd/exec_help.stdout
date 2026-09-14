@@ -37,6 +37,15 @@ Options:
   -q, --quiet
           Write nothing to standard error but errors
 
+      --tool-results
+          Print each tool call's arguments and its result in full
+
+      --transcript
+          Print the reasoning behind each turn, when the model reports it
+
+      --verbose
+          Print everything: implies --tool-results and --transcript
+
       --subagents
           Let the agent spawn subagents for independent work
 

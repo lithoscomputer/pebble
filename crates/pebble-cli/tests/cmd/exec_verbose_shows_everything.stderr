@@ -1,0 +1,22 @@
+[ask] kimi-k3
+Reading.
+[reasoning]
+  The notes come first.
+[turn] 15 tokens, 1 tool call(s)
+[tool] Read
+  {
+    "path": "notes.txt"
+  }
+[result] Read
+  1 | colour
+[ask] kimi-k3
+The notes say colour.
+[reasoning]
+  One word, British spelling.
+[turn] 15 tokens, 0 tool call(s)
+
+turns:  2
+tools:  1 call(s), 0 failed
+        Read x1
+tokens: 20 in, 10 out, 0 reasoning, 0 cached (30 total)
+cost:   $0.0002

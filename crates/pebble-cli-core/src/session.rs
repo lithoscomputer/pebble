@@ -15,7 +15,7 @@ use pebble_coding_agent::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::render::{JsonStream, Renderer, Style};
+use crate::render::{JsonStream, RenderOptions, Renderer, Style};
 
 /// How the prompt is shown and where its answer goes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,15 +45,32 @@ impl Default for SessionOptions {
 /// says how the prompt ended; an error here is the harness's own: the
 /// renderer could not be joined, the answer could not be written, or the
 /// agent did not shut down cleanly after answering.
+///
+/// The events are rendered with the default [`RenderOptions`];
+/// [`run_prompt_with`] takes the options as well.
 pub async fn run_prompt(
-    mut agent: CodingAgent,
+    agent: CodingAgent,
     input: impl Into<CodingInput>,
     cancel: &CancellationToken,
     options: SessionOptions,
 ) -> Result<PromptReport> {
+    run_prompt_with(agent, input, cancel, options, RenderOptions::default()).await
+}
+
+/// [`run_prompt`], with `render` saying what more the readable lines carry:
+/// each tool call's arguments and result, the model's reasoning, and the
+/// text of a turn that did not stream.
+pub async fn run_prompt_with(
+    mut agent: CodingAgent,
+    input: impl Into<CodingInput>,
+    cancel: &CancellationToken,
+    options: SessionOptions,
+    render: RenderOptions,
+) -> Result<PromptReport> {
     let renderer = tokio::spawn(
         Renderer::new(options.style)
             .json_to(options.json_to)
+            .options(render)
             .run(agent.subscribe()),
     );
 
