@@ -38,9 +38,8 @@ use crate::subagent::SubagentSupervisor;
 use crate::task_reminder::maybe_task_reminder;
 use crate::tool::{CodingToolService, NativeTool, canonical_tool_name};
 use crate::types::{
-    CodingAgentState, CodingEvent, ContextWindowSnapshot, ContextWindowStaleness, CostSource,
-    InputContent, InputSource, LlmOutputKind, LlmRetryPhase, Message, SkillActivationSource,
-    TokenUsage,
+    CodingAgentState, CodingEvent, ContextWindowSnapshot, ContextWindowStaleness, InputContent,
+    InputSource, LlmOutputKind, LlmRetryPhase, Message, SkillActivationSource, TokenCounts,
 };
 use crate::{SessionId, SessionScope};
 
@@ -220,7 +219,7 @@ impl ConversationState {
 
     fn record_response_usage(
         &mut self,
-        usage: TokenUsage,
+        usage: TokenCounts,
         cost: Option<u64>,
     ) -> Option<ContextWindowSnapshot> {
         let context_window = self
@@ -236,7 +235,7 @@ impl ConversationState {
         context_window
     }
 
-    fn accumulate_usage(&mut self, usage: TokenUsage, cost: Option<u64>) {
+    fn accumulate_usage(&mut self, usage: TokenCounts, cost: Option<u64>) {
         self.totals.usage = self.totals.usage.saturating_add(usage);
         if let Some(cost) = cost {
             self.totals.cost_usd_micros = Some(
@@ -571,7 +570,7 @@ impl CodingAgentBridge {
         let tool_calls = tool_calls_of(response);
         let reasoning = response.reasoning();
         let provider_parts = provider_parts_of(response);
-        let usage = TokenUsage::from(response.usage);
+        let usage = response.usage;
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let context_window =
             state.record_response_usage(usage, response.cost.map(|cost| cost.usd_micros));
@@ -606,7 +605,7 @@ impl CodingAgentBridge {
             },
             usage,
             cost_usd_micros: response.cost.map(|cost| cost.usd_micros),
-            cost_source: response.cost.map(|cost| CostSource::from(cost.source)),
+            cost_source: response.cost.map(|cost| cost.source),
             tool_call_count: tool_calls.len(),
             context_window,
             reasoning,

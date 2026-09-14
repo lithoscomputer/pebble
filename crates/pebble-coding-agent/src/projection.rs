@@ -25,7 +25,7 @@ use crate::file_tracker;
 use crate::types::{
     CodingAgentEvent, CodingEvent, ContextWindowSnapshot, FailoverContinuation, FailoverStop,
     InputSource, McpToolSummary, SkillActivationSource, SkillSummary, TodoListProjection,
-    TodoProjection, TokenUsage,
+    TodoProjection, TokenCounts,
 };
 
 /// Where a session stands, as its events tell it.
@@ -63,7 +63,7 @@ pub struct DescendantAccount {
     pub provider:        Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model:           Option<String>,
-    pub usage:           TokenUsage,
+    pub usage:           TokenCounts,
     pub cost_usd_micros: Option<u64>,
     /// Committed assistant messages.
     pub messages:        u64,
@@ -157,7 +157,7 @@ pub struct CompactionProjection {
     /// The summary call's tokens: a breakdown of the session's and the
     /// prompt's usage, which already include them.
     #[serde(default)]
-    pub usage:                  TokenUsage,
+    pub usage:                  TokenCounts,
     /// The summary call's provider-reported cost, included in the totals the
     /// same way.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -179,7 +179,7 @@ pub struct RouteFailoverProjection {
     /// What the prompt spent on the failed route. Already in the session's
     /// and the prompt's totals through that route's committed answers, so a
     /// breakdown of them and not an addition.
-    pub usage:           TokenUsage,
+    pub usage:           TokenCounts,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_usd_micros: Option<u64>,
     /// Time the prompt spent waiting on the failed route's model, in
@@ -213,7 +213,7 @@ pub struct PromptDelta {
     /// Whether the prompt reached its end.
     pub completed:         bool,
     /// The root session's usage over the prompt.
-    pub usage:             TokenUsage,
+    pub usage:             TokenCounts,
     pub cost_usd_micros:   Option<u64>,
     /// Committed assistant messages.
     pub messages:          u64,
@@ -241,7 +241,7 @@ pub struct PromptDelta {
 impl PromptDelta {
     /// What every descendant spent during the prompt, summed.
     #[must_use]
-    pub fn descendant_usage(&self) -> (TokenUsage, Option<u64>) {
+    pub fn descendant_usage(&self) -> (TokenCounts, Option<u64>) {
         sum_accounts(self.descendants.values())
     }
 
@@ -264,7 +264,7 @@ pub struct SessionProjection {
     pub route:             RouteProjection,
     pub activity:          SessionActivity,
     /// The root session's lifetime usage.
-    pub usage:             TokenUsage,
+    pub usage:             TokenCounts,
     pub cost_usd_micros:   Option<u64>,
     pub messages:          u64,
     /// Every descendant session, by id.
@@ -671,7 +671,7 @@ impl SessionProjection {
 
     /// What every descendant spent over the session's life, summed.
     #[must_use]
-    pub fn descendant_usage(&self) -> (TokenUsage, Option<u64>) {
+    pub fn descendant_usage(&self) -> (TokenCounts, Option<u64>) {
         sum_accounts(self.descendants.values())
     }
 
@@ -703,8 +703,8 @@ fn descendant<'a>(
 
 fn sum_accounts<'a>(
     accounts: impl Iterator<Item = &'a DescendantAccount>,
-) -> (TokenUsage, Option<u64>) {
-    let mut usage = TokenUsage::default();
+) -> (TokenCounts, Option<u64>) {
+    let mut usage = TokenCounts::default();
     let mut cost = None;
     for account in accounts {
         usage = usage.saturating_add(account.usage);
@@ -764,9 +764,9 @@ mod tests {
         CodingEvent::AssistantMessage {
             text:            "ok".into(),
             model:           "model".into(),
-            usage:           TokenUsage {
+            usage:           TokenCounts {
                 input,
-                ..TokenUsage::default()
+                ..TokenCounts::default()
             },
             cost_usd_micros: cost,
             cost_source:     None,
@@ -827,9 +827,9 @@ mod tests {
             summary_token_estimate: 40,
             tracked_file_count:     1,
             reason:                 CompactionReason::Threshold,
-            usage:                  TokenUsage {
+            usage:                  TokenCounts {
                 input,
-                ..TokenUsage::default()
+                ..TokenCounts::default()
             },
             cost_usd_micros:        cost,
         }
@@ -849,9 +849,9 @@ mod tests {
         projection.apply(&root(CodingEvent::CompactionFailed {
             reason:          CompactionReason::Manual,
             error:           ErrorData::new(ErrorKind::Compaction, "empty summary"),
-            usage:           Some(TokenUsage {
+            usage:           Some(TokenCounts {
                 input: 100,
-                ..TokenUsage::default()
+                ..TokenCounts::default()
             }),
             cost_usd_micros: Some(50),
         }));
@@ -913,7 +913,7 @@ mod tests {
             CodingEvent::AssistantMessage {
                 text:            "ok".into(),
                 model:           "tiny".into(),
-                usage:           TokenUsage::default(),
+                usage:           TokenCounts::default(),
                 cost_usd_micros: None,
                 cost_source:     None,
                 tool_call_count: 0,
@@ -977,9 +977,9 @@ mod tests {
             to: to.into(),
             attempt,
             error: ErrorData::new(ErrorKind::Llm, "key revoked"),
-            usage: TokenUsage {
+            usage: TokenCounts {
                 input: 10,
-                ..TokenUsage::default()
+                ..TokenCounts::default()
             },
             cost_usd_micros: Some(7),
             inference_ms: 120,

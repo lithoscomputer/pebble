@@ -375,7 +375,7 @@ mod tests {
     use std::time::SystemTime;
 
     use pebble_coding_agent::events::{
-        CompactionReason, ErrorData, ErrorKind, InputSource, LlmRetryPhase, TokenUsage,
+        CompactionReason, ErrorData, ErrorKind, InputSource, LlmRetryPhase, TokenCounts,
     };
     use serde_json::json;
 
@@ -394,10 +394,10 @@ mod tests {
         CodingEvent::AssistantMessage {
             text:            "ok".into(),
             model:           "model".into(),
-            usage:           TokenUsage {
+            usage:           TokenCounts {
                 input,
                 output,
-                ..TokenUsage::default()
+                ..TokenCounts::default()
             },
             cost_usd_micros: cost,
             cost_source:     None,
@@ -547,10 +547,10 @@ mod tests {
                 summary_token_estimate: 20,
                 tracked_file_count:     0,
                 reason:                 CompactionReason::Threshold,
-                usage:                  TokenUsage {
+                usage:                  TokenCounts {
                     input: 30,
                     output: 2,
-                    ..TokenUsage::default()
+                    ..TokenCounts::default()
                 },
                 cost_usd_micros:        Some(200),
             }),

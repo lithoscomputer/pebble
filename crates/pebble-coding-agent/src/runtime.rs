@@ -72,7 +72,7 @@ use crate::tools::skill::make_use_skill_tool_for_vocabulary;
 use crate::tools::{WebFetchSummarizer, make_question_tool, make_web_search_tool};
 use crate::types::{
     AgentProfileKind, CodingAgentEvent, CodingAgentState, CodingEvent, ContextWindowSnapshot,
-    MemoryFileSummary, Message, PermissionLevel, SkillSummary, TokenUsage, ToolSummary,
+    MemoryFileSummary, Message, PermissionLevel, SkillSummary, TokenCounts, ToolSummary,
     rfc3339_millis,
 };
 use crate::{SessionId, SessionScope, discovery};
@@ -109,7 +109,7 @@ pub(crate) struct WarmState {
 #[derive(Clone, Debug, Default)]
 struct PromptTotals {
     timing:          PromptTiming,
-    usage:           TokenUsage,
+    usage:           TokenCounts,
     cost_usd_micros: Option<u64>,
     /// The compactions this prompt completed, in order.
     compactions:     Vec<CompactionAccount>,
@@ -1533,7 +1533,7 @@ impl CodingRuntime {
     }
 
     /// What the last prompt cost in tokens, summed over every response.
-    pub(crate) fn last_prompt_usage(&self) -> TokenUsage {
+    pub(crate) fn last_prompt_usage(&self) -> TokenCounts {
         self.conversation().totals.usage
     }
 

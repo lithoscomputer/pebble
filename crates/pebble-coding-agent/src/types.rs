@@ -30,7 +30,7 @@ pub use self::context_window::{
     ContextWindowBreakdownItem, ContextWindowCategory, ContextWindowCountMethod,
     ContextWindowSnapshot, ContextWindowStaleness, ContextWindowWarning,
 };
-pub use self::llm::{CostSource, LlmOutputKind, LlmRetryPhase, TokenUsage};
+pub use self::llm::{Cost, CostSource, LlmOutputKind, LlmRetryPhase, TokenCounts, Usage};
 pub use self::process::{CommandTermination, ExecOutputTail, ExecOutputTailTrace};
 pub use self::todo::{
     TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoListProjection, TodoProjection,
@@ -482,7 +482,7 @@ pub enum Message {
         /// blocks with their signatures, and opaque provider items.
         provider_parts: Vec<ContentPart>,
         /// The token accounting the provider reported for this turn.
-        usage:          TokenUsage,
+        usage:          TokenCounts,
         /// The provider's identifier for the response.
         response_id:    String,
         /// When the turn was committed.
@@ -521,7 +521,7 @@ pub enum Message {
         /// Whether Pebble truncated the generated summary.
         summary_truncated:       bool,
         /// Usage from the summarization call.
-        usage:                   TokenUsage,
+        usage:                   TokenCounts,
         /// Cost of the summarization call in USD micros.
         cost_usd_micros:         Option<u64>,
         /// When the summary was recorded.
@@ -1085,7 +1085,7 @@ pub enum CodingEvent {
         /// The catalog identifier of the model that answered.
         model:           String,
         /// The token accounting the provider reported.
-        usage:           TokenUsage,
+        usage:           TokenCounts,
         /// The cost of this response, in USD micros.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cost_usd_micros: Option<u64>,
@@ -1275,7 +1275,7 @@ pub enum CodingEvent {
         /// responses and the summary call of each compaction it performed
         /// there. A call that failed before it answered adds nothing.
         #[serde(default)]
-        usage:           TokenUsage,
+        usage:           TokenCounts,
         /// What the same work cost in USD micros, where the catalog or the
         /// provider priced it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1359,7 +1359,7 @@ pub enum CodingEvent {
         /// Absent from streams recorded before it existed, which read back as
         /// nothing used.
         #[serde(default)]
-        usage:                  TokenUsage,
+        usage:                  TokenCounts,
         /// What the summary call cost in USD micros, where the catalog or the
         /// provider priced it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1377,7 +1377,7 @@ pub enum CodingEvent {
         /// prompt's report does not bill a failed compaction, so a view that
         /// agrees with the report leaves this out of its totals.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        usage:           Option<TokenUsage>,
+        usage:           Option<TokenCounts>,
         /// What that call cost in USD micros, when it answered and was priced.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cost_usd_micros: Option<u64>,
@@ -1802,7 +1802,7 @@ impl CodingEvent {
                     session_id,
                     reason = ?reason,
                     error = error.message.as_str(),
-                    tokens = usage.map(TokenUsage::total),
+                    tokens = usage.map(TokenCounts::total),
                     cost_usd_micros,
                     "Context compaction failed"
                 );
@@ -2244,7 +2244,7 @@ mod tests {
             content:        "on it".into(),
             tool_calls:     vec![ToolCall::function("call_1", "shell", json!({"cmd": "ls"}))],
             provider_parts: vec![ContentPart::opaque("openai.reasoning", json!({"id": "r"}))],
-            usage:          TokenUsage::default(),
+            usage:          TokenCounts::default(),
             response_id:    "resp_1".into(),
             timestamp:      moment(),
         };
@@ -2264,7 +2264,7 @@ mod tests {
             content:        String::new(),
             tool_calls:     vec![ToolCall::function("call_1", "shell", json!({}))],
             provider_parts: Vec::new(),
-            usage:          TokenUsage::default(),
+            usage:          TokenCounts::default(),
             response_id:    "resp_1".into(),
             timestamp:      moment(),
         };
@@ -2342,7 +2342,7 @@ mod tests {
             content:        String::new(),
             tool_calls:     Vec::new(),
             provider_parts: vec![redacted, readable],
-            usage:          TokenUsage::default(),
+            usage:          TokenCounts::default(),
             response_id:    "resp_1".into(),
             timestamp:      moment(),
         };
@@ -2504,7 +2504,7 @@ mod tests {
         let event = CodingEvent::AssistantMessage {
             text:            "hello".into(),
             model:           "claude-sonnet-5".into(),
-            usage:           TokenUsage {
+            usage:           TokenCounts {
                 input:       100,
                 output:      50,
                 reasoning:   20,
@@ -2872,7 +2872,7 @@ mod tests {
                 summary_token_estimate: 500,
                 tracked_file_count:     3,
                 reason:                 CompactionReason::Threshold,
-                usage:                  TokenUsage::default(),
+                usage:                  TokenCounts::default(),
                 cost_usd_micros:        None,
             },
             CodingEvent::CompactionFailed {

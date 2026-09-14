@@ -427,7 +427,7 @@ fn append_tail(destination: &mut String, delta: &str) {
 mod tests {
     use std::time::SystemTime;
 
-    use pebble_coding_agent::events::TokenUsage;
+    use pebble_coding_agent::events::TokenCounts;
 
     use super::*;
 
@@ -451,7 +451,7 @@ mod tests {
             &event(2, CodingEvent::AssistantMessage {
                 text:            "Hello\n\nWorld".into(),
                 model:           "model".into(),
-                usage:           TokenUsage::default(),
+                usage:           TokenCounts::default(),
                 cost_usd_micros: None,
                 cost_source:     None,
                 tool_call_count: 0,

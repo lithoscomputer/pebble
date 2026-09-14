@@ -34,7 +34,7 @@ use crate::history::{APPROX_CHARS_PER_TOKEN, History};
 use crate::policy::{CompactionPolicy, CompactionPreparation, CompactionSummary};
 use crate::profile::ModelFacts;
 use crate::tool::result_text;
-use crate::types::{CodingEvent, Message, TokenUsage};
+use crate::types::{CodingEvent, Message, TokenCounts};
 
 /// The output budget for the summary text itself.
 const SUMMARY_MAX_TOKENS: u32 = 4_096;
@@ -129,7 +129,7 @@ pub struct CompactionResult {
     summary_token_estimate:  usize,
     tracked_file_count:      usize,
     summary_truncated:       bool,
-    usage:                   TokenUsage,
+    usage:                   TokenCounts,
     cost_usd_micros:         Option<u64>,
 }
 
@@ -184,7 +184,7 @@ impl CompactionResult {
 
     /// Provider-reported token usage for the summarization call.
     #[must_use]
-    pub const fn usage(&self) -> TokenUsage {
+    pub const fn usage(&self) -> TokenCounts {
         self.usage
     }
 
@@ -220,7 +220,7 @@ impl CompactionResult {
             summary_token_estimate: 0,
             tracked_file_count: 0,
             summary_truncated: false,
-            usage: TokenUsage::default(),
+            usage: TokenCounts::default(),
             cost_usd_micros: None,
         }
     }
@@ -249,7 +249,7 @@ pub struct CompactionAccount {
     /// Whether Pebble truncated the generated summary to its visible budget.
     pub summary_truncated:       bool,
     /// Provider-reported token usage for the summarization call.
-    pub usage:                   TokenUsage,
+    pub usage:                   TokenCounts,
     /// Provider-reported or catalog-derived cost of the summarization call in
     /// USD micros, when it was priced.
     pub cost_usd_micros:         Option<u64>,
@@ -581,7 +581,7 @@ pub(crate) async fn compact_context(
                 .map_err(CompactionError::Llm)?;
             Ok(CompactionSummary {
                 text:            response.text(),
-                usage:           TokenUsage::from(response.usage),
+                usage:           response.usage,
                 cost_usd_micros: response.cost.map(|cost| cost.usd_micros),
             })
         }
@@ -998,7 +998,7 @@ mod tests {
         ScriptedCompletion, ScriptedFailure, ScriptedProvider, client_from, message_text,
         test_catalog, text_response,
     };
-    use crate::types::{CodingAgentEvent, TokenUsage};
+    use crate::types::{CodingAgentEvent, TokenCounts};
 
     static NEVER_CANCEL: LazyLock<CancellationToken> = LazyLock::new(CancellationToken::new);
 
@@ -1032,7 +1032,7 @@ mod tests {
         }
     }
 
-    fn assistant(content: &str, usage: TokenUsage) -> Message {
+    fn assistant(content: &str, usage: TokenCounts) -> Message {
         Message::Assistant {
             content: content.to_owned(),
             tool_calls: Vec::new(),
@@ -1189,7 +1189,7 @@ mod tests {
                     json!({ "path": "foo.rs" }),
                 )],
                 provider_parts: Vec::new(),
-                usage:          TokenUsage::default(),
+                usage:          TokenCounts::default(),
                 response_id:    "resp_1".to_owned(),
                 timestamp:      now(),
             },
@@ -1231,7 +1231,7 @@ mod tests {
             content:        String::new(),
             tool_calls:     vec![ToolCall::function("c1", "write_file", arguments.clone())],
             provider_parts: Vec::new(),
-            usage:          TokenUsage::default(),
+            usage:          TokenCounts::default(),
             response_id:    "resp_1".to_owned(),
             timestamp:      now(),
         }]);
@@ -1276,7 +1276,7 @@ mod tests {
                     json!({ "path": "foo.rs" }),
                 )],
                 provider_parts: Vec::new(),
-                usage:          TokenUsage::default(),
+                usage:          TokenCounts::default(),
                 response_id:    "resp_1".to_owned(),
                 timestamp:      now(),
             },
@@ -1294,9 +1294,9 @@ mod tests {
     fn reported_usage_anchors_the_estimate_and_later_turns_are_added() {
         let history = history_from(vec![
             user(&"ignored before the baseline".repeat(100)),
-            assistant("baseline response", TokenUsage {
+            assistant("baseline response", TokenCounts {
                 input: 50,
-                ..TokenUsage::default()
+                ..TokenCounts::default()
             }),
             tool_results("call_1", "1234"),
             user(&"u".repeat(16)),
@@ -1318,7 +1318,7 @@ mod tests {
 
     #[test]
     fn every_reported_bucket_counts_toward_the_baseline() {
-        let history = history_from(vec![assistant("short", TokenUsage {
+        let history = history_from(vec![assistant("short", TokenCounts {
             input:       10,
             output:      20,
             reasoning:   30,
@@ -1338,14 +1338,14 @@ mod tests {
     #[test]
     fn the_latest_reported_usage_wins() {
         let history = history_from(vec![
-            assistant("older response", TokenUsage {
+            assistant("older response", TokenCounts {
                 input: 1_000,
-                ..TokenUsage::default()
+                ..TokenCounts::default()
             }),
             user(&"ignored before the latest baseline".repeat(100)),
-            assistant("latest response", TokenUsage {
+            assistant("latest response", TokenCounts {
                 input: 20,
-                ..TokenUsage::default()
+                ..TokenCounts::default()
             }),
             user(&"u".repeat(8)),
         ]);
@@ -1561,7 +1561,7 @@ mod tests {
             content:        "working on it".to_owned(),
             tool_calls:     vec![ToolCall::function("call_1", "shell", json!({}))],
             provider_parts: Vec::new(),
-            usage:          TokenUsage::default(),
+            usage:          TokenCounts::default(),
             response_id:    "resp_1".to_owned(),
             timestamp:      now(),
         }]);

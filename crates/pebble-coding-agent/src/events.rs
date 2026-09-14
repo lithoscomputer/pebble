@@ -19,11 +19,11 @@ pub use crate::runtime::RetryEventObserver;
 pub use crate::types::{
     Actor, AgentProfileKind, CodingAgentEvent, CodingAgentState, CodingEvent, CommandTermination,
     ContextWindowBreakdownItem, ContextWindowCategory, ContextWindowCountMethod,
-    ContextWindowSnapshot, ContextWindowStaleness, ContextWindowWarning, CostSource,
+    ContextWindowSnapshot, ContextWindowStaleness, ContextWindowWarning, Cost, CostSource,
     ExecOutputTail, ExecOutputTailTrace, FailoverContinuation, FailoverStop,
     INITIAL_SUBAGENT_GENERATION, InputContent, InputSource, LlmOutputKind, LlmRetryPhase,
     McpServerStatus, McpToolSummary, MemoryFileSummary, PermissionLevel, SkillActivationSource,
     SkillSummary, SkippedSkill, SkippedSkillReason, TodoCreatedProps, TodoDeletedProps,
-    TodoListKind, TodoListProjection, TodoProjection, TodoStatus, TodoUpdatedProps, TokenUsage,
-    ToolCategory, ToolErrorKind, ToolSource, ToolSummary,
+    TodoListKind, TodoListProjection, TodoProjection, TodoStatus, TodoUpdatedProps, TokenCounts,
+    ToolCategory, ToolErrorKind, ToolSource, ToolSummary, Usage,
 };

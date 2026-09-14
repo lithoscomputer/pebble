@@ -37,7 +37,7 @@ use lithos_llm::client::ClientBuild;
 use lithos_llm::credentials::ConventionalCredentials;
 use lithos_llm::middleware::{RetryMiddleware, RetryPolicy};
 use pebble_coding_agent::environment::LocalEnvironment;
-use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent, RetryEventObserver, TokenUsage};
+use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent, RetryEventObserver, TokenCounts};
 use pebble_coding_agent::{
     CodingAgent, CodingAgentControlHandle, CodingAgentOptions, PromptReport, ShutdownReason,
 };
@@ -324,7 +324,7 @@ async fn wait_until(
 /// wants a session total keeps its own.
 #[derive(Debug, Default)]
 struct Totals {
-    usage:           TokenUsage,
+    usage:           TokenCounts,
     cost_usd_micros: u64,
     priced:          bool,
     prompts:         usize,

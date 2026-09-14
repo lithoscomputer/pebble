@@ -43,7 +43,7 @@ use crate::tool::{RegisteredTool, ToolEnvProvider, ToolRegistrationError};
 use crate::types::{
     Actor, AgentProfileKind, CodingAgentEvent, CodingAgentState, CodingEvent,
     ContextWindowSnapshot, FailoverContinuation, FailoverStop, InputContent, InputSource,
-    McpServerStatus, MemoryFileSummary, Message, PermissionLevel, SkillSummary, TokenUsage,
+    McpServerStatus, MemoryFileSummary, Message, PermissionLevel, SkillSummary, TokenCounts,
     ToolSummary,
 };
 
@@ -199,7 +199,7 @@ impl FailoverOutlook {
 /// What one prompt accumulated across every route it ran on.
 #[derive(Default)]
 struct RouteTotals {
-    usage:             TokenUsage,
+    usage:             TokenCounts,
     cost_usd_micros:   Option<u64>,
     timing:            PromptTiming,
     files_touched:     Vec<String>,
@@ -494,7 +494,7 @@ pub struct PromptReport {
     /// The final output or the original typed failure.
     pub result:            Result<PromptOutput, Error>,
     /// Observed tokens used by this invocation.
-    pub usage:             TokenUsage,
+    pub usage:             TokenCounts,
     /// Known cost in USD micros, or `None` if no cost was reported.
     pub cost_usd_micros:   Option<u64>,
     /// Time spent in inference and tool execution, including failed work.

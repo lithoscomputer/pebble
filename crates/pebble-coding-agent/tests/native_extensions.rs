@@ -9,7 +9,7 @@ use lithos_llm::types::{ContentPart, ImageContent, MediaSource, Message as LlmMe
 use pebble_agent::{
     LifecycleError, ToolCallNext, ToolCallRequest, ToolMiddleware, ToolOutcome, ToolSystemError,
 };
-use pebble_coding_agent::events::{CodingEvent, TokenUsage};
+use pebble_coding_agent::events::{CodingEvent, TokenCounts};
 use pebble_coding_agent::extensions::{
     CompactionPolicy, CompactionPreparation, CompactionSummary, ContextPolicy, ContextPreparation,
 };
@@ -305,10 +305,10 @@ impl CompactionPolicy for Summarize {
         self.0.lock().expect("lock").push(context.messages.len());
         Ok(CompactionSummary {
             text:            "application handoff".into(),
-            usage:           TokenUsage {
+            usage:           TokenCounts {
                 input: 7,
                 output: 3,
-                ..TokenUsage::default()
+                ..TokenCounts::default()
             },
             cost_usd_micros: Some(19),
         })
@@ -366,7 +366,7 @@ impl CompactionPolicy for InvalidSummary {
         }
         Ok(CompactionSummary {
             text:            " \n ".into(),
-            usage:           TokenUsage::default(),
+            usage:           TokenCounts::default(),
             cost_usd_micros: None,
         })
     }

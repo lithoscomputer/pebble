@@ -10,9 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lithos_llm::types::TokenCounts;
-use pebble_coding_agent::events::{
-    CodingAgentEvent, EventSink, EventSinkError, PermissionLevel, TokenUsage,
-};
+use pebble_coding_agent::events::{CodingAgentEvent, EventSink, EventSinkError, PermissionLevel};
 use pebble_coding_agent::projection::{SessionActivity, SessionProjection};
 use pebble_coding_agent::test_support::{
     MockEnvironment, ScriptedCall, ScriptedCompletion, ScriptedProvider, client_from,
@@ -192,7 +190,7 @@ async fn the_projection_bills_a_compaction_as_the_report_does() {
         panic!("one compaction is in the fold: {live:?}");
     };
     assert_eq!(compaction.usage, account.usage);
-    assert_eq!(compaction.usage, TokenUsage::from(summary_usage));
+    assert_eq!(compaction.usage, summary_usage);
     assert_eq!(compaction.cost_usd_micros, Some(5));
     assert_eq!(report.usage.input, 160, "the response and the summary call");
     assert_eq!(report.cost_usd_micros, Some(8));

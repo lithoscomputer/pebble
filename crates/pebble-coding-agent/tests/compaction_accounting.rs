@@ -11,7 +11,6 @@
 use std::sync::Arc;
 
 use lithos_llm::types::TokenCounts;
-use pebble_coding_agent::events::TokenUsage;
 use pebble_coding_agent::test_support::{
     MockEnvironment, ScriptedCall, ScriptedCompletion, ScriptedProvider, client_from,
     text_response, with_cost, with_usage,
@@ -77,7 +76,7 @@ async fn a_threshold_compaction_is_on_the_report_with_its_usage_and_cost() {
     assert!(account.summary_token_estimate > 0, "{account:?}");
     assert_eq!(account.tracked_file_count, 0);
     assert!(!account.summary_truncated);
-    assert_eq!(account.usage, TokenUsage::from(summary_usage));
+    assert_eq!(account.usage, summary_usage);
     assert_eq!(account.cost_usd_micros, Some(5));
     assert_eq!(
         report.usage, account.usage,
@@ -134,7 +133,7 @@ async fn a_manual_compaction_between_prompts_is_on_no_report() {
         panic!("there was history to compact: {outcome:?}");
     };
     assert_eq!(result.reason(), CompactionReason::Manual);
-    assert_eq!(result.usage(), TokenUsage::from(summary_usage));
+    assert_eq!(result.usage(), summary_usage);
     assert!(second.result.is_ok(), "{second:?}");
     assert!(
         second.compactions.is_empty(),

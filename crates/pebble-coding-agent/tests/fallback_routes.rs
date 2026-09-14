@@ -13,7 +13,7 @@ use lithos_llm::types::{ErrorKind as LlmErrorKind, Message as LlmMessage, Reason
 use pebble_coding_agent::environment::Environment;
 use pebble_coding_agent::events::{
     CodingAgentEvent, CodingAgentState, CodingEvent, FailoverContinuation, FailoverStop,
-    PermissionLevel, TokenUsage,
+    PermissionLevel, TokenCounts,
 };
 use pebble_coding_agent::projection::SessionProjection;
 use pebble_coding_agent::state::Message;
@@ -341,7 +341,7 @@ async fn queued_follow_ups_move_with_the_conversation() {
     else {
         unreachable!()
     };
-    assert_eq!(*usage, TokenUsage::default(), "{usage:?}");
+    assert_eq!(*usage, TokenCounts::default(), "{usage:?}");
     assert_eq!(*cost_usd_micros, None);
     assert_eq!(*tool_ms, 0, "no tool ran on the failed route");
     assert_eq!(*continuation, FailoverContinuation::ReplayPrompt);
@@ -676,7 +676,7 @@ async fn a_prompt_resumed_mid_turn_continues_the_turn_on_the_new_route() {
     };
     assert_eq!(
         *usage,
-        TokenUsage::default(),
+        TokenCounts::default(),
         "the resumed route spent nothing before it failed: {usage:?}"
     );
     assert_eq!(

@@ -27,7 +27,7 @@ use crate::skills::Skill;
 use crate::tool::{AdvertisedTool, ToolVocabulary};
 use crate::types::{
     ContextWindowBreakdownItem, ContextWindowCategory, ContextWindowCountMethod,
-    ContextWindowSnapshot, ContextWindowStaleness, ContextWindowWarning, TokenUsage, ToolSource,
+    ContextWindowSnapshot, ContextWindowStaleness, ContextWindowWarning, TokenCounts, ToolSource,
 };
 
 /// The warning a snapshot carries once a skill has been expanded into the
@@ -143,9 +143,14 @@ pub(crate) fn scaled_snapshot(
 #[must_use]
 pub(crate) fn context_window_from_response_usage(
     local: &ContextWindowSnapshot,
-    usage: TokenUsage,
+    usage: TokenCounts,
 ) -> ContextWindowSnapshot {
-    let input_tokens = usage.prompt();
+    // What occupied the prompt: the three prompt buckets, output and
+    // reasoning never did.
+    let input_tokens = usage
+        .input
+        .saturating_add(usage.cache_read)
+        .saturating_add(usage.cache_write);
     if input_tokens == 0 {
         return local.clone();
     }
@@ -766,7 +771,7 @@ mod tests {
             item(ContextWindowCategory::Conversation, 20),
         ]);
 
-        let updated = context_window_from_response_usage(&local, TokenUsage {
+        let updated = context_window_from_response_usage(&local, TokenCounts {
             input:       100,
             output:      7,
             cache_read:  20,
@@ -794,9 +799,9 @@ mod tests {
     fn usage_without_prompt_tokens_leaves_the_local_snapshot_alone() {
         let local = local_snapshot(vec![item(ContextWindowCategory::Conversation, 20)]);
 
-        let updated = context_window_from_response_usage(&local, TokenUsage {
+        let updated = context_window_from_response_usage(&local, TokenCounts {
             output: 12,
-            ..TokenUsage::default()
+            ..TokenCounts::default()
         });
 
         assert_eq!(updated, local);

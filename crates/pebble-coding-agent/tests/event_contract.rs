@@ -23,7 +23,7 @@ use pebble_coding_agent::events::{
     ErrorKind, EventSinkError, ExecOutputTail, FailoverContinuation, FailoverStop, InputContent,
     InputSource, LlmOutputKind, LlmRetryPhase, McpToolSummary, MemoryFileSummary, PermissionLevel,
     ReasoningOutput, SkillActivationSource, SkillSummary, SkippedSkill, SkippedSkillReason,
-    TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoStatus, TodoUpdatedProps, TokenUsage,
+    TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoStatus, TodoUpdatedProps, TokenCounts,
     ToolCategory, ToolErrorKind, ToolSource, ToolSummary,
 };
 use pebble_coding_agent::{Error, InterruptReason};
@@ -48,8 +48,8 @@ fn moment() -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(1_767_225_600_500)
 }
 
-fn usage() -> TokenUsage {
-    TokenUsage {
+fn usage() -> TokenCounts {
+    TokenCounts {
         input:       1_200,
         output:      340,
         reasoning:   96,
