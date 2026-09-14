@@ -5,7 +5,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use lithos_llm::types::ErrorKind;
-use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent, EventSink, EventSinkError};
+use pebble_coding_agent::events::{
+    CodingAgentEvent, CodingEvent, EventSink, EventSinkError, Usage,
+};
 use pebble_coding_agent::test_support::{
     MockEnvironment, ScriptedCall, ScriptedFailure, ScriptedProvider, client_from, text_response,
     tool_call_response, with_cost,
@@ -53,7 +55,7 @@ async fn failures_preserve_observed_usage_cost_and_elapsed_work() {
                 "credentials rejected",
             )),
             Failure::Cancellation | Failure::Timeout => ScriptedCall::PendingOpen,
-            Failure::Sink => ScriptedCall::response(text_response("done")),
+            Failure::Sink => ScriptedCall::response(with_cost(text_response("done"), 8)),
         };
         let (client, _) = client_from(
             ScriptedProvider::new(vec![
@@ -110,9 +112,12 @@ async fn failures_preserve_observed_usage_cost_and_elapsed_work() {
             | (Failure::Sink, Err(Error::EventSink(_))) => {}
             _ => panic!("unexpected {failure:?} report: {report:?}"),
         }
-        assert!(report.usage.input >= 10, "{report:?}");
-        assert!(report.usage.output >= 5, "{report:?}");
-        assert_eq!(report.cost_usd_micros, Some(42));
+        assert!(report.usage.tokens.input >= 10, "{report:?}");
+        assert!(report.usage.tokens.output >= 5, "{report:?}");
+        assert!(
+            report.usage.cost.is_some_and(|cost| cost.usd_micros >= 42),
+            "every answer was priced, so the failure keeps the cost: {report:?}"
+        );
         assert!(
             report.timing.inference >= Duration::from_millis(2),
             "{report:?}"
@@ -122,8 +127,7 @@ async fn failures_preserve_observed_usage_cost_and_elapsed_work() {
         let _shutdown = agent.shutdown(ShutdownReason::Error).await;
         let rejected = agent.prompt("closed").await;
         assert!(matches!(rejected.result, Err(Error::SessionClosed)));
-        assert_eq!(rejected.usage.total(), 0);
-        assert_eq!(rejected.cost_usd_micros, None);
+        assert_eq!(rejected.usage, Usage::default());
         assert_eq!(rejected.timing, PromptTiming::default());
     }
 }
@@ -149,9 +153,9 @@ async fn each_report_contains_only_its_own_invocation() {
         second.result.expect("second succeeds").text.as_deref(),
         Some("second")
     );
-    assert_eq!(first.usage, second.usage);
-    assert_eq!(first.cost_usd_micros, Some(42));
-    assert_eq!(second.cost_usd_micros, None);
+    assert_eq!(first.usage.tokens, second.usage.tokens);
+    assert_eq!(first.usage.cost.map(|cost| cost.usd_micros), Some(42));
+    assert_eq!(second.usage.cost, None);
     agent
         .shutdown(ShutdownReason::Completed)
         .await

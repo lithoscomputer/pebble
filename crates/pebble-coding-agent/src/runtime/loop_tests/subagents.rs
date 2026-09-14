@@ -251,16 +251,12 @@ async fn background_agent_notifications_are_batched_into_one_parent_turn() {
     assert_eq!(
         projection.prompt.usage,
         parent.last_prompt_usage(),
-        "the delta spends what the report spends: the root's own answers"
-    );
-    assert_eq!(
-        projection.prompt.cost_usd_micros,
-        parent.last_prompt_cost_usd_micros()
+        "the delta spends what the report spends: the root's own answers, cost included"
     );
     assert_eq!(projection.prompt.messages, 2);
-    let (descendants, _) = projection.descendant_usage();
+    let descendants = projection.descendant_usage();
     assert_eq!(
-        descendants.total(),
+        descendants.total_tokens(),
         30,
         "two children answered once each: {:?}",
         projection.descendants

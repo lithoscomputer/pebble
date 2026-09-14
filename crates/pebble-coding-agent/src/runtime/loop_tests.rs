@@ -30,7 +30,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use lithos_llm::types::{TokenCounts, ToolDefinition, ToolResult};
+use lithos_llm::types::{Cost, CostSource, TokenCounts, ToolDefinition, ToolResult};
 use serde_json::json;
 use tokio::time::timeout;
 
@@ -730,7 +730,14 @@ async fn a_prompt_sums_the_cost_of_every_response() {
         .await
         .expect("the prompt succeeds");
 
-    assert_eq!(session.last_prompt_cost_usd_micros(), Some(100_000));
+    assert_eq!(
+        session.last_prompt_usage().cost,
+        Some(Cost {
+            usd_micros: 100_000,
+            source:     CostSource::Catalog,
+        }),
+        "two priced answers sum to one catalog cost"
+    );
 }
 
 #[tokio::test]

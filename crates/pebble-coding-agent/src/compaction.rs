@@ -34,7 +34,7 @@ use crate::history::{APPROX_CHARS_PER_TOKEN, History};
 use crate::policy::{CompactionPolicy, CompactionPreparation, CompactionSummary};
 use crate::profile::ModelFacts;
 use crate::tool::result_text;
-use crate::types::{CodingEvent, Message, TokenCounts};
+use crate::types::{CodingEvent, Message, Usage};
 
 /// The output budget for the summary text itself.
 const SUMMARY_MAX_TOKENS: u32 = 4_096;
@@ -129,8 +129,7 @@ pub struct CompactionResult {
     summary_token_estimate:  usize,
     tracked_file_count:      usize,
     summary_truncated:       bool,
-    usage:                   TokenCounts,
-    cost_usd_micros:         Option<u64>,
+    usage:                   Usage,
 }
 
 impl CompactionResult {
@@ -182,16 +181,11 @@ impl CompactionResult {
         self.summary_truncated
     }
 
-    /// Provider-reported token usage for the summarization call.
+    /// What the summarization call used and, where the catalog or the
+    /// provider priced it, cost.
     #[must_use]
-    pub const fn usage(&self) -> TokenCounts {
+    pub const fn usage(&self) -> Usage {
         self.usage
-    }
-
-    /// Provider-reported or catalog-derived cost in USD micros.
-    #[must_use]
-    pub const fn cost_usd_micros(&self) -> Option<u64> {
-        self.cost_usd_micros
     }
 
     /// The accounting of this compaction, as a prompt's report carries it.
@@ -205,7 +199,6 @@ impl CompactionResult {
             tracked_file_count:      self.tracked_file_count,
             summary_truncated:       self.summary_truncated,
             usage:                   self.usage,
-            cost_usd_micros:         self.cost_usd_micros,
         }
     }
 
@@ -220,8 +213,7 @@ impl CompactionResult {
             summary_token_estimate: 0,
             tracked_file_count: 0,
             summary_truncated: false,
-            usage: TokenCounts::default(),
-            cost_usd_micros: None,
+            usage: Usage::default(),
         }
     }
 }
@@ -230,8 +222,8 @@ impl CompactionResult {
 ///
 /// The facts the `Message::Compaction` turn records, without the summary
 /// text, so an application that meters compaction reads the report and not
-/// the history back. `usage` and `cost_usd_micros` are the summary call's;
-/// the report's own totals already include them.
+/// the history back. `usage` is the summary call's; the report's own total
+/// already includes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionAccount {
     /// Why the compaction ran.
@@ -248,11 +240,9 @@ pub struct CompactionAccount {
     pub tracked_file_count:      usize,
     /// Whether Pebble truncated the generated summary to its visible budget.
     pub summary_truncated:       bool,
-    /// Provider-reported token usage for the summarization call.
-    pub usage:                   TokenCounts,
-    /// Provider-reported or catalog-derived cost of the summarization call in
-    /// USD micros, when it was priced.
-    pub cost_usd_micros:         Option<u64>,
+    /// What the summarization call used and, where the catalog or the
+    /// provider priced it, cost.
+    pub usage:                   Usage,
 }
 
 /// The result of asking Pebble to compact now.
@@ -580,9 +570,8 @@ pub(crate) async fn compact_context(
                 .await
                 .map_err(CompactionError::Llm)?;
             Ok(CompactionSummary {
-                text:            response.text(),
-                usage:           response.usage,
-                cost_usd_micros: response.cost.map(|cost| cost.usd_micros),
+                text:  response.text(),
+                usage: response.usage_with_cost(),
             })
         }
     };
@@ -650,7 +639,6 @@ pub(crate) async fn compact_context(
         tracked_file_count: file_tracker.file_count(),
         summary_truncated,
         usage: response.usage,
-        cost_usd_micros: response.cost_usd_micros,
     };
 
     history.compact_from(preserve_start, &result);
@@ -662,7 +650,6 @@ pub(crate) async fn compact_context(
         tracked_file_count: file_tracker.file_count(),
         reason: request.reason,
         usage: result.usage(),
-        cost_usd_micros: result.cost_usd_micros(),
     });
 
     Ok(CompactionOutcome::Compacted(result))
@@ -704,7 +691,6 @@ fn emit_compaction_failure(
         reason,
         error: ErrorData::from(error),
         usage: answered.map(|summary| summary.usage),
-        cost_usd_micros: answered.and_then(|summary| summary.cost_usd_micros),
     });
 }
 

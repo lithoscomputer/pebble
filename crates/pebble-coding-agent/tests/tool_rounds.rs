@@ -120,7 +120,10 @@ async fn assert_exhausted_after(limit: usize) {
         "one turn for each round that ran, and the refused one"
     );
     assert_eq!(executions.load(Ordering::SeqCst), limit);
-    assert!(report.usage.input > 0, "accounting survives: {report:?}");
+    assert!(
+        report.usage.tokens.input > 0,
+        "accounting survives: {report:?}"
+    );
 
     let turns = agent.history().turns().to_vec();
     assert_eq!(

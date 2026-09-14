@@ -93,13 +93,18 @@
       "tracked_file_count": 1,
       "summary_truncated": false,
       "usage": {
-        "input": 1200,
-        "output": 340,
-        "reasoning": 96,
-        "cache_read": 800,
-        "cache_write": 64
+        "tokens": {
+          "input": 1200,
+          "output": 340,
+          "reasoning": 96,
+          "cache_read": 800,
+          "cache_write": 64
+        },
+        "cost": {
+          "usd_micros": 1250,
+          "source": "catalog"
+        }
       },
-      "cost_usd_micros": 1250,
       "timestamp": "2026-01-01T00:00:00.500Z"
     },
     {

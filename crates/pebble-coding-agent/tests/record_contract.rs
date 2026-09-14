@@ -10,7 +10,7 @@ use lithos_llm::types::{
     ToolResult,
 };
 use pebble_agent::{SessionId, SessionScope};
-use pebble_coding_agent::events::{CompactionReason, TokenCounts};
+use pebble_coding_agent::events::{CompactionReason, Cost, CostSource, TokenCounts, Usage};
 use pebble_coding_agent::state::{
     History, Message, SESSION_RECORD_FORMAT_VERSION, SessionRecord, StoredMessage,
 };
@@ -86,8 +86,13 @@ fn every_turn() -> Vec<Message> {
             summary_token_estimate:  24,
             tracked_file_count:      1,
             summary_truncated:       false,
-            usage:                   usage(),
-            cost_usd_micros:         Some(1_250),
+            usage:                   Usage {
+                tokens: usage(),
+                cost:   Some(Cost {
+                    usd_micros: 1_250,
+                    source:     CostSource::Catalog,
+                }),
+            },
             timestamp:               moment(),
         },
         Message::Steering {

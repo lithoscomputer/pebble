@@ -37,7 +37,7 @@ use lithos_llm::client::ClientBuild;
 use lithos_llm::credentials::ConventionalCredentials;
 use lithos_llm::middleware::{RetryMiddleware, RetryPolicy};
 use pebble_coding_agent::environment::LocalEnvironment;
-use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent, RetryEventObserver, TokenCounts};
+use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent, RetryEventObserver, Usage};
 use pebble_coding_agent::{
     CodingAgent, CodingAgentControlHandle, CodingAgentOptions, PromptReport, ShutdownReason,
 };
@@ -324,20 +324,15 @@ async fn wait_until(
 /// wants a session total keeps its own.
 #[derive(Debug, Default)]
 struct Totals {
-    usage:           TokenCounts,
-    cost_usd_micros: u64,
-    priced:          bool,
-    prompts:         usize,
+    /// Every prompt's usage summed: priced only when every prompt was.
+    usage:   Usage,
+    prompts: usize,
 }
 
 impl Totals {
     /// Adds what the prompt that just finished reported.
     fn add(&mut self, outcome: &PromptReport) {
         self.usage = self.usage.saturating_add(outcome.usage);
-        if let Some(cost) = outcome.cost_usd_micros {
-            self.cost_usd_micros += cost;
-            self.priced = true;
-        }
         self.prompts += 1;
     }
 }
@@ -416,13 +411,15 @@ fn render(event: &CodingEvent, observed: &mut Observed, streaming: &mut bool) {
         CodingEvent::LlmRequestStarted { requested_model } => eprintln!("[ask] {requested_model}"),
         CodingEvent::AssistantMessage {
             usage,
-            cost_usd_micros,
             tool_call_count,
             ..
         } => eprintln!(
             "[turn] {} tokens, {tool_call_count} tool call(s){}",
-            usage.total(),
-            cost_usd_micros.map_or_else(String::new, |cost| format!(", {}", dollars(cost)))
+            usage.total_tokens(),
+            usage.cost.map_or_else(String::new, |cost| format!(
+                ", {}",
+                dollars(cost.usd_micros)
+            ))
         ),
         CodingEvent::AssistantOutputReplace { .. } => {
             eprintln!("[replay] the last output was withdrawn and the turn is being asked again");
@@ -513,18 +510,18 @@ fn report(model: &str, workspace: &Path, turns: usize, totals: &Totals, observed
     if !named.is_empty() {
         eprintln!("            {named}");
     }
+    let tokens = totals.usage.tokens;
     eprintln!(
         "tokens:     {} in, {} out, {} reasoning, {} cached ({} total)",
-        totals.usage.input,
-        totals.usage.output,
-        totals.usage.reasoning,
-        totals.usage.cache_read + totals.usage.cache_write,
-        totals.usage.total()
+        tokens.input,
+        tokens.output,
+        tokens.reasoning,
+        tokens.cache_read + tokens.cache_write,
+        tokens.total()
     );
-    if totals.priced {
-        eprintln!("cost:       {}", dollars(totals.cost_usd_micros));
-    } else {
-        eprintln!("cost:       not reported for this model");
+    match totals.usage.cost {
+        Some(cost) => eprintln!("cost:       {}", dollars(cost.usd_micros)),
+        None => eprintln!("cost:       not reported for this model"),
     }
     eprintln!("steers:     {}", observed.steers);
     eprintln!("interrupts: {}", observed.interrupts);

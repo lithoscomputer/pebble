@@ -43,8 +43,7 @@ use crate::tool::{RegisteredTool, ToolEnvProvider, ToolRegistrationError};
 use crate::types::{
     Actor, AgentProfileKind, CodingAgentEvent, CodingAgentState, CodingEvent,
     ContextWindowSnapshot, FailoverContinuation, FailoverStop, InputContent, InputSource,
-    McpServerStatus, MemoryFileSummary, Message, PermissionLevel, SkillSummary, TokenCounts,
-    ToolSummary,
+    McpServerStatus, MemoryFileSummary, Message, PermissionLevel, SkillSummary, ToolSummary, Usage,
 };
 
 /// A route a prompt continues on when its model fails for a reason another
@@ -199,8 +198,7 @@ impl FailoverOutlook {
 /// What one prompt accumulated across every route it ran on.
 #[derive(Default)]
 struct RouteTotals {
-    usage:             TokenCounts,
-    cost_usd_micros:   Option<u64>,
+    usage:             Usage,
     timing:            PromptTiming,
     files_touched:     Vec<String>,
     last_file_touched: Option<String>,
@@ -217,9 +215,6 @@ impl RouteTotals {
             .committed_turns
             .saturating_add(runtime.last_prompt_committed_turns());
         self.usage = self.usage.saturating_add(runtime.last_prompt_usage());
-        if let Some(cost) = runtime.last_prompt_cost_usd_micros() {
-            self.cost_usd_micros = Some(self.cost_usd_micros.unwrap_or(0).saturating_add(cost));
-        }
         let timing = runtime.last_prompt_timing();
         self.timing.inference = self.timing.inference.saturating_add(timing.inference);
         self.timing.tool = self.timing.tool.saturating_add(timing.tool);
@@ -493,10 +488,10 @@ impl CodingAgentExport {
 pub struct PromptReport {
     /// The final output or the original typed failure.
     pub result:            Result<PromptOutput, Error>,
-    /// Observed tokens used by this invocation.
-    pub usage:             TokenCounts,
-    /// Known cost in USD micros, or `None` if no cost was reported.
-    pub cost_usd_micros:   Option<u64>,
+    /// What this invocation used and, where every response that used tokens
+    /// was priced, what it cost. `usage.cost` is `None` when a response had
+    /// no price, never a subtotal.
+    pub usage:             Usage,
     /// Time spent in inference and tool execution, including failed work.
     pub timing:            PromptTiming,
     /// Every file this prompt wrote or edited, sorted, each once: this
@@ -511,8 +506,8 @@ pub struct PromptReport {
     /// fallback route, not the route the prompt started on.
     pub route:             String,
     /// Every compaction this prompt performed, in order, with the summary
-    /// call's usage and cost. A breakdown of `usage` and `cost_usd_micros`,
-    /// which already include those calls, not an addition to them. This
+    /// call's usage and cost. A breakdown of `usage`, which already includes
+    /// those calls, not an addition to it. This
     /// session's own: a child's compactions are not listed, and a manual
     /// `compact` between prompts belongs to no prompt.
     pub compactions:       Vec<CompactionAccount>,
@@ -1923,7 +1918,6 @@ impl CodingAgent {
         // The failed route's account of this prompt, read before its session
         // closes.
         let usage = self.inner.last_prompt_usage();
-        let cost_usd_micros = self.inner.last_prompt_cost_usd_micros();
         let timing = self.inner.last_prompt_timing();
         // Taken before the session closes: the queues belong to the prompt,
         // not to the runtime that happened to hold them.
@@ -1968,7 +1962,6 @@ impl CodingAgent {
             attempt,
             error: failed_error,
             usage,
-            cost_usd_micros,
             inference_ms: millis(timing.inference),
             tool_ms: millis(timing.tool),
             continuation,
@@ -1999,7 +1992,6 @@ impl CodingAgent {
                 final_message: self.inner.final_assistant_message(),
             }),
             usage: totals.usage,
-            cost_usd_micros: totals.cost_usd_micros,
             timing: totals.timing,
             files_touched,
             last_file_touched: totals.last_file_touched,

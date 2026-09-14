@@ -22,7 +22,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::SessionScope;
 use crate::compaction::CompactionReason;
-use crate::types::{InputContent, TokenCounts, rfc3339_millis};
+use crate::types::{InputContent, TokenCounts, Usage, rfc3339_millis};
 
 /// The record format version this build writes.
 ///
@@ -217,12 +217,9 @@ pub enum StoredMessage {
         /// Whether Pebble truncated the generated summary.
         #[serde(default)]
         summary_truncated:       bool,
-        /// Usage from the summarization call.
+        /// What the summarization call used and, when priced, cost.
         #[serde(default, deserialize_with = "null_as_default")]
-        usage:                   TokenCounts,
-        /// Cost of the summarization call in USD micros.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cost_usd_micros:         Option<u64>,
+        usage:                   Usage,
         /// When the summary was recorded.
         #[serde(with = "rfc3339_millis")]
         timestamp:               SystemTime,

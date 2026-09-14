@@ -10,7 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use lithos_llm::types::TokenCounts;
-use pebble_coding_agent::events::{CodingAgentEvent, EventSink, EventSinkError, PermissionLevel};
+use pebble_coding_agent::events::{
+    CodingAgentEvent, Cost, CostSource, EventSink, EventSinkError, PermissionLevel, Usage,
+};
 use pebble_coding_agent::projection::{SessionActivity, SessionProjection};
 use pebble_coding_agent::test_support::{
     MockEnvironment, ScriptedCall, ScriptedCompletion, ScriptedProvider, client_from,
@@ -143,9 +145,8 @@ fn priced_summary(usage: TokenCounts, usd_micros: u64) -> ScriptedCompletion {
 fn assert_agrees_with_the_report(projection: &SessionProjection, report: &PromptReport) {
     assert_eq!(
         projection.prompt.usage, report.usage,
-        "the delta spends what the report spends"
+        "the delta spends what the report spends, cost included"
     );
-    assert_eq!(projection.prompt.cost_usd_micros, report.cost_usd_micros);
 }
 
 #[tokio::test]
@@ -190,10 +191,25 @@ async fn the_projection_bills_a_compaction_as_the_report_does() {
         panic!("one compaction is in the fold: {live:?}");
     };
     assert_eq!(compaction.usage, account.usage);
-    assert_eq!(compaction.usage, summary_usage);
-    assert_eq!(compaction.cost_usd_micros, Some(5));
-    assert_eq!(report.usage.input, 160, "the response and the summary call");
-    assert_eq!(report.cost_usd_micros, Some(8));
+    assert_eq!(compaction.usage, Usage {
+        tokens: summary_usage,
+        cost:   Some(Cost {
+            usd_micros: 5,
+            source:     CostSource::Catalog,
+        }),
+    });
+    assert_eq!(
+        report.usage.tokens.input, 160,
+        "the response and the summary call"
+    );
+    assert_eq!(
+        report.usage.cost,
+        Some(Cost {
+            usd_micros: 8,
+            source:     CostSource::Catalog,
+        }),
+        "both priced from the catalog, so the sum is too"
+    );
     assert_agrees_with_the_report(&live, &report);
     assert_eq!(live.usage, report.usage);
     assert_eq!(live.compactions, live.prompt.compactions);

@@ -14,7 +14,7 @@ use lithos_llm::types::{
     ContentPart, Message as LlmMessage, ReasoningContent, Role, ToolArguments, ToolCall, ToolInput,
     ToolResult,
 };
-use pebble_coding_agent::events::{CompactionReason, TokenCounts};
+use pebble_coding_agent::events::{CompactionReason, Cost, CostSource, TokenCounts, Usage};
 use pebble_coding_agent::state::{History, Message};
 use serde_json::json;
 
@@ -118,12 +118,17 @@ fn every_variant() -> Vec<Message> {
             summary_token_estimate:  800,
             tracked_file_count:      3,
             summary_truncated:       false,
-            usage:                   TokenCounts {
-                input: 180_000,
-                output: 800,
-                ..TokenCounts::default()
+            usage:                   Usage {
+                tokens: TokenCounts {
+                    input: 180_000,
+                    output: 800,
+                    ..TokenCounts::default()
+                },
+                cost:   Some(Cost {
+                    usd_micros: 9_500,
+                    source:     CostSource::Catalog,
+                }),
             },
-            cost_usd_micros:         Some(9_500),
             timestamp:               moment(),
         },
         Message::Steering {
