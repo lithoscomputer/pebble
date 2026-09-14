@@ -12,7 +12,8 @@ use lithos_llm::types::{
     ContentPart, Error as LlmError, ReasoningEffort, RequestBuildError, Speed,
 };
 use pebble_agent::{
-    AgentControlHandle, AgentPendingInput, QueueOutcome, ToolMiddleware, UserMessage,
+    AgentControlHandle, AgentPendingInput, CompletionLease, QueueOutcome, ToolMiddleware,
+    UserMessage,
 };
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -34,8 +35,8 @@ use crate::prompt_transform::SystemPromptTransform;
 use crate::record::{SessionRecord, StoredMessage};
 use crate::redact::Redactor;
 use crate::runtime::{
-    CodingRuntime, CodingRuntimeBuilder, InterruptReasonHandle, StateMachine, SteeringLease,
-    WarmState, actor_from_attribution, input_message, steering_message,
+    CodingRuntime, CodingRuntimeBuilder, InterruptReasonHandle, StateMachine, WarmState,
+    actor_from_attribution, input_message, steering_message,
 };
 use crate::search::seam::SearchProvider;
 use crate::subagent::SubagentOptions;
@@ -1049,15 +1050,29 @@ impl CodingAgentBuilder {
 /// Whether a prompt is running and whether the agent is closed are read from
 /// the session's own control rather than tracked again here.
 struct CodingControl {
-    /// The runtime the handle reaches. Replaced when a failover rebuilds the
-    /// runtime, so a handle taken before the prompt keeps working after it.
+    /// The runtime the handle reaches, and the holds the handles keep on it.
+    /// Replaced when a failover rebuilds the runtime, so a handle taken
+    /// before the prompt keeps working after it and a hold taken before it
+    /// keeps holding. One lock covers both, so a hold is never taken on a
+    /// runtime that is being replaced.
     target: RwLock<ControlTarget>,
 }
 
-/// One runtime's control surface: cheap handles, every one of them shared with
-/// the runtime they came from.
-#[derive(Clone)]
+/// One runtime's control surface, and the holds the handles keep on it.
 struct ControlTarget {
+    runtime: RuntimeHandles,
+    /// One completion lease on `runtime.session` per live [`SteeringLease`].
+    ///
+    /// A hold belongs to the conversation, not to the runtime that happens to
+    /// run it: `retarget` takes each one again on the replacement, and a
+    /// lease's drop releases whichever runtime the handles reach then.
+    holds:   Vec<CompletionLease>,
+}
+
+/// One runtime's cheap control handles, every one of them shared with the
+/// runtime they came from.
+#[derive(Clone)]
+struct RuntimeHandles {
     session:          AgentControlHandle,
     cancel:           CancellationToken,
     interrupt_reason: InterruptReasonHandle,
@@ -1147,25 +1162,93 @@ impl From<Vec<ContentPart>> for CodingInput {
 impl CodingControl {
     fn new(session: &CodingRuntime) -> Arc<Self> {
         Arc::new(Self {
-            target: RwLock::new(ControlTarget::of(session)),
+            target: RwLock::new(ControlTarget {
+                runtime: RuntimeHandles::of(session),
+                holds:   Vec::new(),
+            }),
         })
     }
 
-    /// Points every handle at `session` from now on.
+    /// Points every handle at `session` from now on, and moves every hold the
+    /// handles keep onto it.
+    ///
+    /// The leases on the runtime being replaced drop here. It is closed, and
+    /// nothing reads its count again.
     fn retarget(&self, session: &CodingRuntime) {
-        *self.target.write().unwrap_or_else(PoisonError::into_inner) = ControlTarget::of(session);
+        let mut target = self.target.write().unwrap_or_else(PoisonError::into_inner);
+        let runtime = RuntimeHandles::of(session);
+        target.holds = (0..target.holds.len())
+            .map(|_| runtime.session.hold_completion())
+            .collect();
+        target.runtime = runtime;
     }
 
     /// The runtime the handle reaches right now.
-    fn target(&self) -> ControlTarget {
+    fn target(&self) -> RuntimeHandles {
         self.target
             .read()
             .unwrap_or_else(PoisonError::into_inner)
+            .runtime
             .clone()
+    }
+
+    /// Holds natural completion open on the runtime the handles reach, and on
+    /// every runtime that replaces it, until
+    /// [`release_hold`](Self::release_hold).
+    fn hold(&self) {
+        let mut target = self.target.write().unwrap_or_else(PoisonError::into_inner);
+        let lease = target.runtime.session.hold_completion();
+        target.holds.push(lease);
+    }
+
+    /// Releases one hold taken with [`hold`](Self::hold) from the runtime the
+    /// handles reach now.
+    fn release_hold(&self) {
+        let lease = self
+            .target
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .holds
+            .pop();
+        // Dropped outside the lock: the last lease wakes the runtime's parked
+        // prompt, which needs nothing from here.
+        drop(lease);
     }
 }
 
-impl ControlTarget {
+/// A hold that keeps natural completion open for steering.
+///
+/// Taken through [`CodingAgentControlHandle::hold_open_for_steering`]. The
+/// hold follows the conversation: after a route failover it holds the
+/// replacement runtime, and dropping it releases whichever runtime the handle
+/// reaches then.
+#[must_use = "the lease parks completion only while it is held"]
+pub struct SteeringLease {
+    control: Arc<CodingControl>,
+}
+
+impl SteeringLease {
+    fn acquire(control: Arc<CodingControl>) -> Self {
+        control.hold();
+        Self { control }
+    }
+}
+
+impl Drop for SteeringLease {
+    fn drop(&mut self) {
+        self.control.release_hold();
+    }
+}
+
+impl fmt::Debug for SteeringLease {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SteeringLease")
+            .finish_non_exhaustive()
+    }
+}
+
+impl RuntimeHandles {
     fn of(session: &CodingRuntime) -> Self {
         Self {
             session:          session.control_handle(),
@@ -1481,8 +1564,11 @@ impl CodingAgentControlHandle {
     /// final lease wakes a parked prompt and lets it complete. This is the
     /// supported replacement for reaching into the drain, park, and generation
     /// protocol directly.
+    ///
+    /// The lease follows the conversation across a route failover: it holds
+    /// whichever runtime the handle reaches, and its drop releases that one.
     pub fn hold_open_for_steering(&self) -> SteeringLease {
-        SteeringLease::acquire(&self.control.target().session)
+        SteeringLease::acquire(Arc::clone(&self.control))
     }
 
     /// Queues input to run as its own user turn once the current prompt
@@ -1896,8 +1982,8 @@ impl CodingAgent {
 
     /// Moves the conversation to `route`: closes the failed session, resumes
     /// its record on the route with the route's controls, points every control
-    /// handle at the replacement, and requeues the input the failed session
-    /// still held.
+    /// handle at the replacement with every hold the handles keep, and
+    /// requeues the input the failed session still held.
     ///
     /// `committed_output` says whether the prompt has committed an assistant
     /// turn or a tool result on any route so far; with the record it decides

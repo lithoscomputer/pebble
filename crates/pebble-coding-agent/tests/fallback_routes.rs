@@ -8,6 +8,7 @@
 //! so from the new route, and the report names the route the prompt ended on.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use lithos_llm::types::{ErrorKind as LlmErrorKind, Message as LlmMessage, ReasoningEffort, Role};
 use pebble_coding_agent::environment::Environment;
@@ -26,6 +27,7 @@ use pebble_coding_agent::{
 };
 use serde_json::json;
 use tokio::sync::broadcast;
+use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 /// The route every test starts on.
@@ -42,6 +44,12 @@ fn credentials_rejected() -> ScriptedCall {
         "primary key revoked",
     ))
 }
+
+/// How long a test waits for something that should happen.
+const PATIENCE: Duration = Duration::from_secs(5);
+
+/// How long a test waits for something that should not happen.
+const A_MOMENT: Duration = Duration::from_millis(200);
 
 /// A failure that is the request's own fault, so no route would do better.
 fn bad_request() -> ScriptedCall {
@@ -76,6 +84,30 @@ fn failovers(published: &[CodingAgentEvent]) -> Vec<&CodingAgentEvent> {
         .collect()
 }
 
+/// The events published after the last failover in `published`.
+fn since_failover(published: &[CodingAgentEvent]) -> &[CodingAgentEvent] {
+    let moved = published
+        .iter()
+        .rposition(|event| matches!(event.event, CodingEvent::RouteFailover { .. }))
+        .expect("a failover was published");
+    &published[moved + 1..]
+}
+
+/// Waits for the first event `wanted` accepts; `false` when the stream ends
+/// first.
+async fn wait_for(
+    events: &mut broadcast::Receiver<CodingAgentEvent>,
+    wanted: impl Fn(&CodingEvent) -> bool,
+) -> bool {
+    loop {
+        match events.recv().await {
+            Ok(event) if wanted(&event.event) => return true,
+            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => return false,
+        }
+    }
+}
+
 /// The failover stops in `published`, in order.
 fn stops(published: &[CodingAgentEvent]) -> Vec<&CodingAgentEvent> {
     published
@@ -91,7 +123,17 @@ async fn agent_with(
     calls: Vec<ScriptedCall>,
     routes: Vec<FallbackRoute>,
 ) -> (CodingAgent, Arc<ScriptedProvider>, Arc<MockEnvironment>) {
-    let (client, provider) = client_from(ScriptedProvider::new(calls));
+    agent_on(ScriptedProvider::new(calls), routes).await
+}
+
+/// An agent on [`PRIMARY`] answered by `provider` on every route in the test
+/// catalog, with `routes` to fall over to, working in a mock environment the
+/// test keeps a handle on.
+async fn agent_on(
+    provider: ScriptedProvider,
+    routes: Vec<FallbackRoute>,
+) -> (CodingAgent, Arc<ScriptedProvider>, Arc<MockEnvironment>) {
+    let (client, provider) = client_from(provider);
     let environment = Arc::new(MockEnvironment::linux());
     let agent = CodingAgent::builder(client, environment.clone() as Arc<dyn Environment>)
         .model(PRIMARY)
@@ -692,6 +734,133 @@ async fn a_prompt_resumed_mid_turn_continues_the_turn_on_the_new_route() {
         requests[1].messages().last().map(LlmMessage::role),
         Some(Role::Tool),
         "the fallback was asked on the tool result the record held"
+    );
+    agent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the agent shuts down");
+}
+
+#[tokio::test]
+async fn a_hold_taken_before_the_prompt_holds_the_route_it_fails_over_to() {
+    let (mut agent, provider, _environment) = agent_with(
+        vec![
+            credentials_rejected(),
+            ScriptedCall::response(text_response("recovered")),
+        ],
+        vec![FallbackRoute::new(FALLBACK)],
+    )
+    .await;
+    let handle = agent.control_handle();
+    // A human paired before the prompt: the hold is on the conversation, on
+    // whatever route it ends up running.
+    let hold = handle.hold_open_for_steering();
+    let mut events = agent.subscribe();
+
+    let mut prompt = Box::pin(agent.prompt("first"));
+    // The fallback answers, and the hold parks that answer instead of
+    // letting the prompt end.
+    assert!(
+        timeout(A_MOMENT, &mut prompt).await.is_err(),
+        "the prompt ended on the fallback while it was held"
+    );
+    let published = drained(&mut events);
+    assert_eq!(failovers(&published).len(), 1, "{published:?}");
+    let on_fallback = since_failover(&published);
+    assert_eq!(
+        count(on_fallback, |event| {
+            matches!(event, CodingEvent::AssistantMessage { text, .. } if text == "recovered")
+        }),
+        1,
+        "the fallback answered: {on_fallback:?}"
+    );
+    assert_eq!(
+        count(on_fallback, |event| matches!(
+            event,
+            CodingEvent::ProcessingEnd
+        )),
+        0,
+        "the answer is parked on the hold: {on_fallback:?}"
+    );
+    assert!(handle.is_running(), "the prompt is parked, not ended");
+
+    drop(hold);
+
+    let report = timeout(PATIENCE, prompt)
+        .await
+        .expect("dropping the hold lets the parked prompt complete");
+    assert_eq!(
+        report.result.expect("the prompt succeeds").text.as_deref(),
+        Some("recovered")
+    );
+    assert_eq!(report.route, FALLBACK);
+    assert_eq!(provider.call_count(), 2);
+    assert!(!handle.is_running());
+    let published = drained(&mut events);
+    assert_eq!(
+        count(&published, |event| matches!(
+            event,
+            CodingEvent::ProcessingEnd
+        )),
+        1,
+        "the released prompt ended once: {published:?}"
+    );
+    agent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the agent shuts down");
+}
+
+#[tokio::test]
+async fn a_hold_dropped_during_the_failover_releases_the_replacement() {
+    // Every call takes a moment, so the route moves while the fallback is
+    // still being asked and a hold dropped then is dropped before it answers.
+    let (mut agent, provider, _environment) = agent_on(
+        ScriptedProvider::new(vec![
+            credentials_rejected(),
+            ScriptedCall::response(text_response("recovered")),
+        ])
+        .delayed(A_MOMENT),
+        vec![FallbackRoute::new(FALLBACK)],
+    )
+    .await;
+    let handle = agent.control_handle();
+    let hold = handle.hold_open_for_steering();
+    let mut events = agent.subscribe();
+    let mut watched = agent.subscribe();
+
+    // The human leaves as soon as the stream says the route moved.
+    let releaser = tokio::spawn(async move {
+        let moved = wait_for(&mut watched, |event| {
+            matches!(event, CodingEvent::RouteFailover { .. })
+        })
+        .await;
+        assert!(moved, "the prompt ended without moving routes");
+        drop(hold);
+    });
+
+    let report = timeout(PATIENCE, agent.prompt("first"))
+        .await
+        .expect("the released replacement completes on its own");
+    releaser.await.expect("the releaser finishes");
+
+    assert_eq!(
+        report.result.expect("the prompt succeeds").text.as_deref(),
+        Some("recovered")
+    );
+    assert_eq!(report.route, FALLBACK);
+    assert_eq!(provider.call_count(), 2);
+    assert!(!handle.is_running());
+    let published = drained(&mut events);
+    assert_eq!(failovers(&published).len(), 1, "{published:?}");
+    let on_fallback = since_failover(&published);
+    assert_eq!(
+        count(on_fallback, |event| matches!(
+            event,
+            CodingEvent::ProcessingEnd
+        )),
+        1,
+        "the replacement ended the prompt once the hold was gone: {on_fallback:?}"
     );
     agent
         .shutdown(ShutdownReason::Completed)

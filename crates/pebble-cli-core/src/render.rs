@@ -1,6 +1,29 @@
 //! Rendering the event stream to standard error.
+//!
+//! [`Style`] says how the stream reaches the terminal: readable lines, JSON
+//! envelopes, or nothing but the summary. [`RenderOptions`] says what more
+//! the readable lines carry. Every option is off by default, so a renderer
+//! built without them prints what it always has. The `pebble` command turns
+//! them on from its `--tool-results`, `--transcript`, and `--verbose` flags;
+//! an embedder that runs its own command over the same session (fabro's
+//! `fabro exec`) opts in through [`crate::session::run_prompt_with`].
+//!
+//! By default the readable lines say which model was asked, stream the
+//! model's text as it arrives, and give each turn's size, each tool call's
+//! name with its arguments cut to one line, each failed call, and each
+//! process's exit. [`RenderOptions::tool_results`] prints the arguments in
+//! full under the `[tool]` line and adds a `[result]` block with what each
+//! call answered. [`RenderOptions::transcript`] adds a `[reasoning]` block
+//! for each turn that carried one, and the text of a turn that did not
+//! stream, so the transcript is whole on a route that answers in one piece.
+//! Every block is cut to [`BLOCK_LIMIT`] bytes, with the byte count when it
+//! was longer. The answer on standard output is the session's, not the
+//! renderer's, and is not changed by any option.
 
+use std::collections::HashSet;
 use std::io::{self, Write as _};
+#[cfg(test)]
+use std::sync::{Arc, Mutex, PoisonError};
 
 use pebble_coding_agent::CodingAgent;
 use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent};
@@ -10,6 +33,13 @@ use tokio::sync::broadcast;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::terminal::{print_err, print_err_fragment};
+
+/// How much of a block the readable lines show, in bytes.
+///
+/// A tool's arguments, a tool's result, and a turn's reasoning are each cut
+/// here, at a character boundary, and the cut is reported with the byte
+/// count.
+pub const BLOCK_LIMIT: usize = 4096;
 
 /// How events reach the terminal.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -21,6 +51,52 @@ pub enum Style {
     Json,
     /// Nothing but the closing summary.
     Quiet,
+}
+
+/// What the readable lines of [`Style::Text`] say beyond the default.
+///
+/// Every option is off by default, so a renderer built without them prints
+/// what it always has. The options apply to [`Style::Text`] only: JSON
+/// carries every event whole, and quiet says nothing.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RenderOptions {
+    tool_results: bool,
+    transcript:   bool,
+}
+
+impl RenderOptions {
+    /// Everything the readable lines can say: tool results and the
+    /// transcript.
+    #[must_use]
+    pub fn verbose() -> Self {
+        Self {
+            tool_results: true,
+            transcript:   true,
+        }
+    }
+
+    /// Prints each tool call's arguments in full under its `[tool]` line and
+    /// a `[result]` block with what the call answered, success or failure.
+    /// Both are cut to [`BLOCK_LIMIT`] bytes, with the byte count when
+    /// longer. Off, a call is one line with its arguments abbreviated, and
+    /// only a failed call says what it answered.
+    #[must_use]
+    pub fn tool_results(mut self, enabled: bool) -> Self {
+        self.tool_results = enabled;
+        self
+    }
+
+    /// Prints a `[reasoning]` block for each turn that carried reasoning:
+    /// the model's summary of it, or its verbatim trace when there is no
+    /// summary. Also prints the text of a turn that did not stream, so a
+    /// route that answers in one piece still shows what the model said;
+    /// text that streamed is not repeated. The final answer on standard
+    /// output is unchanged.
+    #[must_use]
+    pub fn transcript(mut self, enabled: bool) -> Self {
+        self.transcript = enabled;
+        self
+    }
 }
 
 /// Where the JSON envelopes of [`Style::Json`] go.
@@ -39,8 +115,49 @@ pub enum JsonStream {
 pub struct Renderer {
     style:     Style,
     json_to:   JsonStream,
+    options:   RenderOptions,
+    sink:      Sink,
     summary:   Summary,
+    /// Whether a streamed line is open on the terminal.
     streaming: bool,
+    /// The sessions whose text has streamed since their last turn.
+    streamed:  HashSet<String>,
+}
+
+/// Where the readable lines go.
+enum Sink {
+    /// Standard error, through the command's boundary.
+    Stderr,
+    /// A buffer, so a test can read what was said.
+    #[cfg(test)]
+    Memory(Arc<Mutex<String>>),
+}
+
+impl Sink {
+    /// Writes one line.
+    fn line(&self, text: &str) {
+        match self {
+            Self::Stderr => print_err(text),
+            #[cfg(test)]
+            Self::Memory(buffer) => {
+                let mut buffer = buffer.lock().unwrap_or_else(PoisonError::into_inner);
+                buffer.push_str(text);
+                buffer.push('\n');
+            }
+        }
+    }
+
+    /// Writes text with no line ending, for streamed output.
+    fn fragment(&self, text: &str) {
+        match self {
+            Self::Stderr => print_err_fragment(text),
+            #[cfg(test)]
+            Self::Memory(buffer) => buffer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push_str(text),
+        }
+    }
 }
 
 /// What the stream said, kept for the closing report.
@@ -61,8 +178,11 @@ impl Renderer {
         Self {
             style,
             json_to: JsonStream::default(),
+            options: RenderOptions::default(),
+            sink: Sink::Stderr,
             summary: Summary::default(),
             streaming: false,
+            streamed: HashSet::new(),
         }
     }
 
@@ -70,6 +190,13 @@ impl Renderer {
     #[must_use]
     pub fn json_to(mut self, stream: JsonStream) -> Self {
         self.json_to = stream;
+        self
+    }
+
+    /// Says what more the readable lines of [`Style::Text`] carry.
+    #[must_use]
+    pub fn options(mut self, options: RenderOptions) -> Self {
+        self.options = options;
         self
     }
 
@@ -94,7 +221,7 @@ impl Renderer {
             }
         }
         if self.streaming {
-            print_err("");
+            self.sink.line("");
         }
         self.summary
     }
@@ -104,7 +231,7 @@ impl Renderer {
         match self.style {
             Style::Json => match serde_json::to_string(event) {
                 Ok(line) => match self.json_to {
-                    JsonStream::Stderr => print_err(&line),
+                    JsonStream::Stderr => self.sink.line(&line),
                     // A closed pipe is the reader's choice; nothing can be
                     // said to them about it.
                     JsonStream::Stdout => {
@@ -115,69 +242,111 @@ impl Renderer {
                             .and_then(|()| stdout.flush());
                     }
                 },
-                Err(error) => print_err(&format!("error: rendering an event as JSON: {error}")),
+                Err(error) => self
+                    .sink
+                    .line(&format!("error: rendering an event as JSON: {error}")),
             },
-            Style::Text => self.render_text(&event.event),
+            Style::Text => self.render_text(event),
             Style::Quiet => {}
         }
     }
 
-    fn render_text(&mut self, event: &CodingEvent) {
+    fn render_text(&mut self, envelope: &CodingAgentEvent) {
+        let event = &envelope.event;
         // The model's text arrives in pieces and is printed as it arrives; it
         // is the one thing that gets no line of its own.
         if let CodingEvent::TextDelta { delta } = event {
-            print_err_fragment(delta);
+            self.sink.fragment(delta);
             self.streaming = true;
+            if !self.streamed.contains(&envelope.session_id) {
+                self.streamed.insert(envelope.session_id.clone());
+            }
             return;
         }
         if self.streaming {
-            print_err("");
+            self.sink.line("");
             self.streaming = false;
         }
         match event {
-            CodingEvent::SessionStarted { provider, model } => print_err(&format!(
+            CodingEvent::SessionStarted { provider, model } => self.sink.line(&format!(
                 "[open] {}/{}",
                 provider.as_deref().unwrap_or("?"),
                 model.as_deref().unwrap_or("?")
             )),
             CodingEvent::LlmRequestStarted { requested_model } => {
-                print_err(&format!("[ask] {requested_model}"));
+                self.sink.line(&format!("[ask] {requested_model}"));
             }
             CodingEvent::AssistantMessage {
+                text,
                 usage,
                 tool_call_count,
+                reasoning,
                 ..
-            } => print_err(&format!(
-                "[turn] {} tokens, {tool_call_count} tool call(s)",
-                usage.total_tokens()
-            )),
+            } => {
+                let streamed = self.streamed.remove(&envelope.session_id);
+                if self.options.transcript {
+                    let reasoning = reasoning
+                        .as_ref()
+                        .and_then(|reasoning| reasoning.summary().or_else(|| reasoning.trace()));
+                    if let Some(reasoning) = reasoning {
+                        self.block("[reasoning]", reasoning);
+                    }
+                    if !streamed && !text.is_empty() {
+                        self.sink.line(text.trim_end_matches('\n'));
+                    }
+                }
+                self.sink.line(&format!(
+                    "[turn] {} tokens, {tool_call_count} tool call(s)",
+                    usage.total_tokens()
+                ));
+            }
             CodingEvent::ToolCallStarted {
                 tool_name,
                 arguments,
                 ..
-            } => print_err(&format!(
-                "[tool] {tool_name} {}",
-                // A custom tool's arguments are one free-form string, shown as
-                // text rather than as a JSON literal.
-                abbreviate(&match arguments {
-                    Value::String(text) => text.clone(),
-                    other => other.to_string(),
-                })
-            )),
+            } => {
+                if self.options.tool_results {
+                    self.block(&format!("[tool] {tool_name}"), &value_text(arguments));
+                } else {
+                    self.sink.line(&format!(
+                        "[tool] {tool_name} {}",
+                        // A custom tool's arguments are one free-form string,
+                        // shown as text rather than as a JSON literal.
+                        abbreviate(&match arguments {
+                            Value::String(text) => text.clone(),
+                            other => other.to_string(),
+                        })
+                    ));
+                }
+            }
             CodingEvent::ToolCallCompleted {
                 tool_name,
-                is_error: true,
+                is_error,
                 output,
+                output_bytes_omitted,
                 ..
-            } => print_err(&format!(
-                "[tool] {tool_name} failed: {}",
-                abbreviate(output.as_str().unwrap_or_default())
-            )),
+            } => {
+                if self.options.tool_results {
+                    let failed = if *is_error { " failed" } else { "" };
+                    let omitted = if *output_bytes_omitted > 0 {
+                        format!(" ({output_bytes_omitted} bytes not retained)")
+                    } else {
+                        String::new()
+                    };
+                    let header = format!("[result] {tool_name}{failed}{omitted}");
+                    self.block(&header, &value_text(output));
+                } else if *is_error {
+                    self.sink.line(&format!(
+                        "[tool] {tool_name} failed: {}",
+                        abbreviate(output.as_str().unwrap_or_default())
+                    ));
+                }
+            }
             CodingEvent::ToolProcessCompleted {
                 exit_code,
                 duration_ms,
                 ..
-            } => print_err(&format!(
+            } => self.sink.line(&format!(
                 "[exec] exit {} in {duration_ms} ms",
                 exit_code.map_or_else(|| "?".to_owned(), |code| code.to_string())
             )),
@@ -186,18 +355,18 @@ impl Renderer {
                 delay_secs,
                 error,
                 ..
-            } => print_err(&format!(
+            } => self.sink.line(&format!(
                 "[retry] attempt {attempt} in {delay_secs:.1}s: {}",
                 error.message
             )),
-            CodingEvent::LoopDetected => print_err("[loop] the agent is repeating itself"),
+            CodingEvent::LoopDetected => self.sink.line("[loop] the agent is repeating itself"),
             CodingEvent::RouteFailover {
                 from,
                 to,
                 attempt,
                 error,
                 ..
-            } => print_err(&format!(
+            } => self.sink.line(&format!(
                 "[failover] {from} -> {to} (attempt {attempt}): {}",
                 error.message
             )),
@@ -206,7 +375,7 @@ impl Renderer {
                 reason,
                 error,
                 ..
-            } => print_err(&format!(
+            } => self.sink.line(&format!(
                 "[failover] stopped on {route}, {reason}: {}",
                 error.message
             )),
@@ -214,33 +383,59 @@ impl Renderer {
                 original_turn_count,
                 preserved_turn_count,
                 ..
-            } => print_err(&format!(
+            } => self.sink.line(&format!(
                 "[compact] {original_turn_count} turns down to {preserved_turn_count}"
             )),
-            CodingEvent::Error { error } => print_err(&format!("[error] {}", error.message)),
+            CodingEvent::Error { error } => self.sink.line(&format!("[error] {}", error.message)),
             CodingEvent::Warning { kind, message, .. } => {
-                print_err(&format!("[warning] {kind}: {message}"));
+                self.sink.line(&format!("[warning] {kind}: {message}"));
             }
             CodingEvent::SubAgentSpawned {
                 agent_id, depth, ..
             } => {
-                print_err(&format!("[spawn] {agent_id} at depth {depth}"));
+                self.sink
+                    .line(&format!("[spawn] {agent_id} at depth {depth}"));
             }
             CodingEvent::SubAgentCompleted {
                 agent_id,
                 success,
                 turns_used,
                 ..
-            } => print_err(&format!(
+            } => self.sink.line(&format!(
                 "[child] {agent_id} {} after {turns_used} turn(s)",
                 if *success { "completed" } else { "failed" }
             )),
             CodingEvent::SubAgentFailed {
                 agent_id, error, ..
-            } => print_err(&format!("[child] {agent_id} failed: {}", error.message)),
+            } => self
+                .sink
+                .line(&format!("[child] {agent_id} failed: {}", error.message)),
             // Everything else is left off a terminal that is busy enough.
             // `CodingEvent` is `#[non_exhaustive]`, so this arm is required.
             _ => {}
+        }
+    }
+
+    /// Prints `text` under `header`, each line indented, cut to
+    /// [`BLOCK_LIMIT`] bytes with the byte count when it was longer.
+    fn block(&self, header: &str, text: &str) {
+        let text = text.trim_end_matches('\n');
+        if text.is_empty() {
+            self.sink.line(&format!("{header} (empty)"));
+            return;
+        }
+        self.sink.line(header);
+        let shown = floor_char_boundary(text, BLOCK_LIMIT);
+        for line in text[..shown].lines() {
+            if line.is_empty() {
+                self.sink.line("");
+            } else {
+                self.sink.line(&format!("  {line}"));
+            }
+        }
+        if shown < text.len() {
+            self.sink
+                .line(&format!("  … {shown} of {} bytes", text.len()));
         }
     }
 }
@@ -343,6 +538,28 @@ fn dollars(usd_micros: u64) -> String {
     format!("${:.4}", usd_micros as f64 / 1_000_000.0)
 }
 
+/// A JSON value as text: a string as itself, anything else pretty-printed.
+fn value_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+/// The largest char boundary at or below `index`, so a byte budget never
+/// cuts a character. `text.len()` when `index` is at or past the end.
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    let mut boundary = index;
+    while !text.is_char_boundary(boundary) {
+        // Byte 0 is always a boundary, so this terminates.
+        boundary -= 1;
+    }
+    boundary
+}
+
 /// One line of text, short enough to read.
 fn abbreviate(text: &str) -> String {
     const LIMIT: usize = 120;
@@ -378,7 +595,7 @@ mod tests {
 
     use pebble_coding_agent::events::{
         CompactionReason, Cost, CostSource, ErrorData, ErrorKind, InputSource, LlmRetryPhase,
-        TokenCounts, Usage,
+        ReasoningOutput, TokenCounts, Usage,
     };
     use serde_json::json;
 
@@ -429,16 +646,49 @@ mod tests {
     }
 
     fn tool_completed(tool_name: &str, tool_call_id: &str, is_error: bool) -> CodingEvent {
+        tool_answered(tool_name, tool_call_id, json!("done"), is_error, 0)
+    }
+
+    fn tool_answered(
+        tool_name: &str,
+        tool_call_id: &str,
+        output: Value,
+        is_error: bool,
+        output_bytes_omitted: usize,
+    ) -> CodingEvent {
         CodingEvent::ToolCallCompleted {
             tool_name: tool_name.into(),
             tool_call_id: tool_call_id.into(),
-            output: json!("done"),
+            output,
             metadata: pebble_agent::ToolOutputMetadata::default(),
             is_error,
             error_kind: None,
             output_bytes_observed: 0,
             output_bytes_retained: 0,
-            output_bytes_omitted: 0,
+            output_bytes_omitted,
+        }
+    }
+
+    fn ask() -> CodingEvent {
+        CodingEvent::LlmRequestStarted {
+            requested_model: "model".into(),
+        }
+    }
+
+    fn delta(text: &str) -> CodingEvent {
+        CodingEvent::TextDelta { delta: text.into() }
+    }
+
+    /// A committed turn with `text`, and its reasoning when the route
+    /// carried one.
+    fn turn(text: &str, reasoning: Option<ReasoningOutput>) -> CodingEvent {
+        CodingEvent::AssistantMessage {
+            text: text.into(),
+            model: "model".into(),
+            usage: priced(10, 5, None),
+            tool_call_count: 0,
+            context_window: None,
+            reasoning,
         }
     }
 
@@ -499,6 +749,247 @@ mod tests {
                 .expect("the renderer holds the receiver");
         }
         Renderer::new(Style::Quiet).run(receiver).await
+    }
+
+    /// What the readable lines say of `events` under `options`.
+    async fn rendered(events: &[CodingAgentEvent], options: RenderOptions) -> String {
+        let (sender, receiver) = broadcast::channel(events.len().max(1));
+        for event in events {
+            sender
+                .send(event.clone())
+                .expect("the renderer holds the receiver");
+        }
+        let buffer = Arc::new(Mutex::new(String::new()));
+        let mut renderer = Renderer::new(Style::Text).options(options);
+        renderer.sink = Sink::Memory(Arc::clone(&buffer));
+        renderer.run(receiver).await;
+        let said = buffer.lock().unwrap_or_else(PoisonError::into_inner);
+        said.clone()
+    }
+
+    /// A tool round as the stream tells it: the model asks for a tool while
+    /// answering, the tool answers, and the model answers again.
+    fn scripted_tool_round() -> Vec<CodingAgentEvent> {
+        vec![
+            root(ask()),
+            root(delta("Reading.")),
+            root(turn("Reading.", None)),
+            root(tool_started("read_file", "r1")),
+            root(tool_answered(
+                "read_file",
+                "r1",
+                json!("one\ntwo\n"),
+                false,
+                0,
+            )),
+            root(tool_started("edit_file", "e1")),
+            root(tool_answered(
+                "edit_file",
+                "e1",
+                json!("no such anchor"),
+                true,
+                0,
+            )),
+            root(ask()),
+            root(delta("Done.")),
+            root(turn("Done.", None)),
+            root(CodingEvent::ProcessingEnd),
+            root(CodingEvent::SessionEnded),
+        ]
+    }
+
+    #[tokio::test]
+    async fn the_default_lines_are_unchanged() {
+        let said = rendered(&scripted_tool_round(), RenderOptions::default()).await;
+        assert_eq!(
+            said,
+            "\
+[ask] model
+Reading.
+[turn] 15 tokens, 0 tool call(s)
+[tool] read_file {\"path\":\"/w/a.txt\"}
+[tool] edit_file {\"path\":\"/w/a.txt\"}
+[tool] edit_file failed: no such anchor
+[ask] model
+Done.
+[turn] 15 tokens, 0 tool call(s)
+"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_results_show_each_calls_arguments_and_answer() {
+        let options = RenderOptions::default().tool_results(true);
+        let said = rendered(&scripted_tool_round(), options).await;
+        assert_eq!(
+            said,
+            "\
+[ask] model
+Reading.
+[turn] 15 tokens, 0 tool call(s)
+[tool] read_file
+  {
+    \"path\": \"/w/a.txt\"
+  }
+[result] read_file
+  one
+  two
+[tool] edit_file
+  {
+    \"path\": \"/w/a.txt\"
+  }
+[result] edit_file failed
+  no such anchor
+[ask] model
+Done.
+[turn] 15 tokens, 0 tool call(s)
+"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_result_is_cut_at_a_character_with_its_byte_count() {
+        // Three bytes a character, so the limit falls inside one: the cut
+        // steps back to the boundary before it.
+        let long = "€".repeat(BLOCK_LIMIT / 3 + 1);
+        let shown = BLOCK_LIMIT - BLOCK_LIMIT % 3;
+        let events = [
+            root(tool_started("shell", "s1")),
+            root(tool_answered("shell", "s1", json!(long), false, 7)),
+            root(tool_started("shell", "s2")),
+            root(tool_answered("shell", "s2", json!(""), false, 0)),
+            root(CodingEvent::SessionEnded),
+        ];
+        let options = RenderOptions::default().tool_results(true);
+        let said = rendered(&events, options).await;
+        let expected = format!(
+            "[tool] shell\n  {{\n    \"path\": \"/w/a.txt\"\n  }}\n[result] shell (7 bytes not \
+             retained)\n  {}\n  … {shown} of {} bytes\n[tool] shell\n  {{\n    \"path\": \
+             \"/w/a.txt\"\n  }}\n[result] shell (empty)\n",
+            &long[..shown],
+            long.len()
+        );
+        assert_eq!(said, expected);
+    }
+
+    #[tokio::test]
+    async fn a_structured_result_is_pretty_printed_and_a_blank_line_stays_blank() {
+        let events = [
+            root(tool_started("lookup", "l1")),
+            root(tool_answered(
+                "lookup",
+                "l1",
+                json!({"lines": "a\n\nb"}),
+                false,
+                0,
+            )),
+            root(CodingEvent::SessionEnded),
+        ];
+        let options = RenderOptions::default().tool_results(true);
+        let said = rendered(&events, options).await;
+        assert_eq!(
+            said,
+            "\
+[tool] lookup
+  {
+    \"path\": \"/w/a.txt\"
+  }
+[result] lookup
+  {
+    \"lines\": \"a\\n\\nb\"
+  }
+"
+        );
+        let events = [
+            root(tool_started("shell", "s1")),
+            root(tool_answered("shell", "s1", json!("a\n\nb\n"), false, 0)),
+            root(CodingEvent::SessionEnded),
+        ];
+        let said = rendered(&events, options).await;
+        assert_eq!(
+            said,
+            "\
+[tool] shell
+  {
+    \"path\": \"/w/a.txt\"
+  }
+[result] shell
+  a
+
+  b
+"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_transcript_adds_reasoning_and_the_text_that_did_not_stream() {
+        let events = [
+            root(ask()),
+            root(delta("Forty-")),
+            root(delta("two.")),
+            root(turn(
+                "Forty-two.",
+                Some(ReasoningOutput::from_trace("Six times seven.\n")),
+            )),
+            // A route that answers in one piece streams nothing: the text
+            // is on the turn alone.
+            root(ask()),
+            root(turn(
+                "Yes.\n",
+                Some(ReasoningOutput::new("Confirming.", "It is 42.")),
+            )),
+            // A child's streamed text is the child's, not the root's.
+            child(delta("hello")),
+            root(ask()),
+            root(turn("Bye.", None)),
+            root(CodingEvent::ProcessingEnd),
+            root(CodingEvent::SessionEnded),
+        ];
+
+        let plain = rendered(&events, RenderOptions::default()).await;
+        assert_eq!(
+            plain,
+            "\
+[ask] model
+Forty-two.
+[turn] 15 tokens, 0 tool call(s)
+[ask] model
+[turn] 15 tokens, 0 tool call(s)
+hello
+[ask] model
+[turn] 15 tokens, 0 tool call(s)
+"
+        );
+
+        let transcript = rendered(&events, RenderOptions::default().transcript(true)).await;
+        assert_eq!(
+            transcript,
+            "\
+[ask] model
+Forty-two.
+[reasoning]
+  Six times seven.
+[turn] 15 tokens, 0 tool call(s)
+[ask] model
+[reasoning]
+  Confirming.
+Yes.
+[turn] 15 tokens, 0 tool call(s)
+hello
+[ask] model
+Bye.
+[turn] 15 tokens, 0 tool call(s)
+"
+        );
+    }
+
+    #[test]
+    fn verbose_is_every_option() {
+        assert_eq!(
+            RenderOptions::verbose(),
+            RenderOptions::default().tool_results(true).transcript(true)
+        );
+        assert_ne!(RenderOptions::verbose(), RenderOptions::default());
     }
 
     #[tokio::test]
