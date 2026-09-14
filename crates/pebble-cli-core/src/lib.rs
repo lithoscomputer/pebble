@@ -5,8 +5,10 @@
 //! needs: [`session::run_prompt`] runs one prompt on an agent it built, with
 //! the [`render`] module's event renderer and closing summary and the
 //! [`approval`] module's terminal prompt for tools the permission level does
-//! not allow outright; [`exec`], [`auth`], and [`interactive`] are the
-//! binary's commands whole, arguments included.
+//! not allow outright; [`session::run_prompt_with`] takes the renderer's
+//! [`render::RenderOptions`] as well, for a front end with a verbose mode;
+//! [`exec`], [`auth`], and [`interactive`] are the binary's commands whole,
+//! arguments included.
 
 pub mod application;
 pub mod approval;

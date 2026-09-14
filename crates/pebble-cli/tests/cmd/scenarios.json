@@ -2292,6 +2292,108 @@
         },
         "response_text": " and done."
       }
+    },
+    {
+      "scenario_id": "exec_shows_tool_results/1",
+      "namespace": "exec_shows_tool_results",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Running.",
+        "tool_calls": [
+          {
+            "id": "call_shell",
+            "name": "shell",
+            "arguments": {
+              "command": "echo built; echo warn >&2"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_shows_tool_results/2",
+      "namespace": "exec_shows_tool_results",
+      "matcher": {
+        "endpoint": "responses"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "The build printed built."
+      }
+    },
+    {
+      "scenario_id": "exec_shows_the_transcript/1",
+      "namespace": "exec_shows_the_transcript",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Forty-two.",
+        "reasoning": [
+          "Let me think about this carefully."
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_verbose_shows_everything/1",
+      "namespace": "exec_verbose_shows_everything",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "Reading.",
+        "reasoning": [
+          "The notes come first."
+        ],
+        "tool_calls": [
+          {
+            "id": "call_read",
+            "name": "Read",
+            "arguments": {
+              "path": "notes.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "scenario_id": "exec_verbose_shows_everything/2",
+      "namespace": "exec_verbose_shows_everything",
+      "matcher": {
+        "endpoint": "chat.completions"
+      },
+      "script": {
+        "kind": "success",
+        "usage": {
+          "input_tokens": 10,
+          "output_tokens": 5
+        },
+        "response_text": "The notes say colour.",
+        "reasoning": [
+          "One word, British spelling."
+        ]
+      }
     }
   ]
 }

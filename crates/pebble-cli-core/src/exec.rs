@@ -17,9 +17,9 @@ use tokio::signal::ctrl_c;
 use tokio_util::sync::CancellationToken;
 
 use crate::application::{Application, DEFAULT_MODEL, PermissionArg, model_route};
-use crate::render::{JsonStream, Style};
+use crate::render::{JsonStream, RenderOptions, Style};
 use crate::resources;
-use crate::session::{SessionOptions, run_prompt};
+use crate::session::{SessionOptions, run_prompt_with};
 use crate::settings::project;
 use crate::terminal::print_err;
 
@@ -59,6 +59,18 @@ pub struct ExecArgs {
     /// Write nothing to standard error but errors.
     #[arg(short = 'q', long, conflicts_with = "json")]
     quiet: bool,
+
+    /// Print each tool call's arguments and its result in full.
+    #[arg(long)]
+    tool_results: bool,
+
+    /// Print the reasoning behind each turn, when the model reports it.
+    #[arg(long)]
+    transcript: bool,
+
+    /// Print everything: implies --tool-results and --transcript.
+    #[arg(long)]
+    verbose: bool,
 
     /// Let the agent spawn subagents for independent work.
     #[arg(long)]
@@ -141,11 +153,20 @@ async fn exec(args: ExecArgs, style: Style) -> Result<Ending> {
             }
         }
     });
-    let report = run_prompt(agent, prompt, &cancel, SessionOptions {
-        style,
-        json_to: JsonStream::Stderr,
-        write_answer: true,
-    })
+    let render = RenderOptions::default()
+        .tool_results(args.tool_results || args.verbose)
+        .transcript(args.transcript || args.verbose);
+    let report = run_prompt_with(
+        agent,
+        prompt,
+        &cancel,
+        SessionOptions {
+            style,
+            json_to: JsonStream::Stderr,
+            write_answer: true,
+        },
+        render,
+    )
     .await;
     interrupt.abort();
     match report?.result {
