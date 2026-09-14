@@ -321,10 +321,10 @@ async fn a_finished_prompt_reports_what_it_used() {
     outcome.result.expect("the prompt succeeds");
 
     let usage = outcome.usage;
-    assert_eq!(usage.input, 10);
-    assert_eq!(usage.output, 5);
-    assert_eq!(usage.total(), 15);
-    assert_eq!(outcome.cost_usd_micros, Some(12_500));
+    assert_eq!(usage.tokens.input, 10);
+    assert_eq!(usage.tokens.output, 5);
+    assert_eq!(usage.total_tokens(), 15);
+    assert_eq!(usage.cost.map(|cost| cost.usd_micros), Some(12_500));
     assert_eq!(
         session.history().turns().len(),
         2,

@@ -10,7 +10,7 @@ use lithos_llm::types::{
     ToolResult,
 };
 use pebble_agent::{SessionId, SessionScope};
-use pebble_coding_agent::events::{CompactionReason, TokenUsage};
+use pebble_coding_agent::events::{CompactionReason, Cost, CostSource, TokenCounts, Usage};
 use pebble_coding_agent::state::{
     History, Message, SESSION_RECORD_FORMAT_VERSION, SessionRecord, StoredMessage,
 };
@@ -23,8 +23,8 @@ fn moment() -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(1_767_225_600_500)
 }
 
-fn usage() -> TokenUsage {
-    TokenUsage {
+fn usage() -> TokenCounts {
+    TokenCounts {
         input:       1_200,
         output:      340,
         reasoning:   96,
@@ -86,8 +86,13 @@ fn every_turn() -> Vec<Message> {
             summary_token_estimate:  24,
             tracked_file_count:      1,
             summary_truncated:       false,
-            usage:                   usage(),
-            cost_usd_micros:         Some(1_250),
+            usage:                   Usage {
+                tokens: usage(),
+                cost:   Some(Cost {
+                    usd_micros: 1_250,
+                    source:     CostSource::Catalog,
+                }),
+            },
             timestamp:               moment(),
         },
         Message::Steering {
@@ -226,7 +231,7 @@ fn a_record_whose_members_are_null_still_resumes() {
         content:        "hello".into(),
         tool_calls:     Vec::new(),
         provider_parts: Vec::new(),
-        usage:          TokenUsage::default(),
+        usage:          TokenCounts::default(),
         response_id:    "resp_1".into(),
         timestamp:      moment(),
     }]);

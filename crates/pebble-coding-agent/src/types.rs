@@ -30,7 +30,7 @@ pub use self::context_window::{
     ContextWindowBreakdownItem, ContextWindowCategory, ContextWindowCountMethod,
     ContextWindowSnapshot, ContextWindowStaleness, ContextWindowWarning,
 };
-pub use self::llm::{CostSource, LlmOutputKind, LlmRetryPhase, TokenUsage};
+pub use self::llm::{Cost, CostSource, LlmOutputKind, LlmRetryPhase, TokenCounts, Usage};
 pub use self::process::{CommandTermination, ExecOutputTail, ExecOutputTailTrace};
 pub use self::todo::{
     TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoListProjection, TodoProjection,
@@ -482,7 +482,7 @@ pub enum Message {
         /// blocks with their signatures, and opaque provider items.
         provider_parts: Vec<ContentPart>,
         /// The token accounting the provider reported for this turn.
-        usage:          TokenUsage,
+        usage:          TokenCounts,
         /// The provider's identifier for the response.
         response_id:    String,
         /// When the turn was committed.
@@ -520,10 +520,8 @@ pub enum Message {
         tracked_file_count:      usize,
         /// Whether Pebble truncated the generated summary.
         summary_truncated:       bool,
-        /// Usage from the summarization call.
-        usage:                   TokenUsage,
-        /// Cost of the summarization call in USD micros.
-        cost_usd_micros:         Option<u64>,
+        /// What the summarization call used and, when priced, cost.
+        usage:                   Usage,
         /// When the summary was recorded.
         timestamp:               SystemTime,
     },
@@ -552,7 +550,6 @@ impl Message {
             tracked_file_count:      result.tracked_file_count(),
             summary_truncated:       result.summary_was_truncated(),
             usage:                   result.usage(),
-            cost_usd_micros:         result.cost_usd_micros(),
             timestamp:               SystemTime::now(),
         }
     }
@@ -675,7 +672,6 @@ impl Message {
                 tracked_file_count,
                 summary_truncated,
                 usage,
-                cost_usd_micros,
                 timestamp,
             } => StoredMessage::Compaction {
                 summary:                 summary.clone(),
@@ -687,7 +683,6 @@ impl Message {
                 tracked_file_count:      *tracked_file_count,
                 summary_truncated:       *summary_truncated,
                 usage:                   *usage,
-                cost_usd_micros:         *cost_usd_micros,
                 timestamp:               *timestamp,
             },
             Self::Steering { content, timestamp } => StoredMessage::Steering {
@@ -738,7 +733,6 @@ impl Message {
                 tracked_file_count,
                 summary_truncated,
                 usage,
-                cost_usd_micros,
                 timestamp,
             } => Self::Compaction {
                 summary:                 summary.clone(),
@@ -750,7 +744,6 @@ impl Message {
                 tracked_file_count:      *tracked_file_count,
                 summary_truncated:       *summary_truncated,
                 usage:                   *usage,
-                cost_usd_micros:         *cost_usd_micros,
                 timestamp:               *timestamp,
             },
             StoredMessage::Steering { content, timestamp } => Self::Steering {
@@ -1084,14 +1077,9 @@ pub enum CodingEvent {
         text:            String,
         /// The catalog identifier of the model that answered.
         model:           String,
-        /// The token accounting the provider reported.
-        usage:           TokenUsage,
-        /// The cost of this response, in USD micros.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cost_usd_micros: Option<u64>,
-        /// Where `cost_usd_micros` came from.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cost_source:     Option<CostSource>,
+        /// The tokens the provider reported for this response and, where the
+        /// catalog or the provider priced it, what it cost.
+        usage:           Usage,
         /// How many tool calls the turn requested.
         tool_call_count: usize,
         /// How much of the context window the session is using.
@@ -1264,33 +1252,30 @@ pub enum CodingEvent {
     /// [`FailoverStop::Exhausted`], and ends with the error.
     RouteFailover {
         /// The `provider/model` that failed.
-        from:            String,
+        from:         String,
         /// The `provider/model` the prompt continues on.
-        to:              String,
+        to:           String,
         /// How many routes the prompt has moved through, this one included.
-        attempt:         u32,
+        attempt:      u32,
         /// The failure that ended the previous route.
-        error:           ErrorData,
-        /// The tokens this prompt used on the failed route: its committed
-        /// responses and the summary call of each compaction it performed
-        /// there. A call that failed before it answered adds nothing.
+        error:        ErrorData,
+        /// What this prompt used on the failed route, and what it cost where
+        /// the catalog or the provider priced it: its committed responses and
+        /// the summary call of each compaction it performed there. A call
+        /// that failed before it answered adds nothing.
         #[serde(default)]
-        usage:           TokenUsage,
-        /// What the same work cost in USD micros, where the catalog or the
-        /// provider priced it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cost_usd_micros: Option<u64>,
+        usage:        Usage,
         /// Time this prompt spent waiting on the failed route's model, in
         /// milliseconds, the failed call included.
         #[serde(default)]
-        inference_ms:    u64,
+        inference_ms: u64,
         /// Time this prompt spent running tools on the failed route, in
         /// milliseconds.
         #[serde(default)]
-        tool_ms:         u64,
+        tool_ms:      u64,
         /// How the new route carries the prompt on.
         #[serde(default = "continuation_before_it_was_recorded")]
-        continuation:    FailoverContinuation,
+        continuation: FailoverContinuation,
     },
     /// The prompt's model failed and it stays on its route, although
     /// fallback routes were named: the failure does not qualify for one, or
@@ -1355,32 +1340,25 @@ pub enum CodingEvent {
         /// Why this compaction ran.
         #[serde(default, skip_serializing_if = "is_threshold_reason")]
         reason:                 CompactionReason,
-        /// The tokens the summary call used, as the provider reported them.
-        /// Absent from streams recorded before it existed, which read back as
-        /// nothing used.
+        /// What the summary call used, as the provider reported it, and what
+        /// it cost where the catalog or the provider priced it.
         #[serde(default)]
-        usage:                  TokenUsage,
-        /// What the summary call cost in USD micros, where the catalog or the
-        /// provider priced it.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cost_usd_micros:        Option<u64>,
+        usage:                  Usage,
     },
     /// Compaction ended without changing history.
     CompactionFailed {
         /// Why this compaction ran.
-        reason:          CompactionReason,
+        reason: CompactionReason,
         /// The failure projected for transport.
-        error:           ErrorData,
-        /// The tokens the summary call used before the compaction failed,
-        /// when it answered: a summary that came back empty was still paid
-        /// for. `None` when the call itself failed or was never made. The
-        /// prompt's report does not bill a failed compaction, so a view that
-        /// agrees with the report leaves this out of its totals.
+        error:  ErrorData,
+        /// What the summary call used, and cost where it was priced, before
+        /// the compaction failed, when it answered: a summary that came back
+        /// empty was still paid for. `None` when the call itself failed or
+        /// was never made. The prompt's report does not bill a failed
+        /// compaction, so a view that agrees with the report leaves this out
+        /// of its totals.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        usage:           Option<TokenUsage>,
-        /// What that call cost in USD micros, when it answered and was priced.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cost_usd_micros: Option<u64>,
+        usage:  Option<Usage>,
     },
     /// Compaction was cancelled before it changed history.
     CompactionCancelled {
@@ -1586,8 +1564,9 @@ impl CodingEvent {
                 debug!(
                     session_id,
                     model = model.as_str(),
-                    input_tokens = usage.input,
-                    output_tokens = usage.output,
+                    input_tokens = usage.tokens.input,
+                    output_tokens = usage.tokens.output,
+                    cost_usd_micros = usage.cost.map(|cost| cost.usd_micros),
                     tool_call_count,
                     "Assistant message"
                 );
@@ -1718,7 +1697,6 @@ impl CodingEvent {
                 attempt,
                 error,
                 usage,
-                cost_usd_micros,
                 inference_ms,
                 tool_ms,
                 continuation,
@@ -1729,8 +1707,8 @@ impl CodingEvent {
                     to = to.as_str(),
                     attempt,
                     error = error.message.as_str(),
-                    tokens = usage.total(),
-                    cost_usd_micros,
+                    tokens = usage.total_tokens(),
+                    cost_usd_micros = usage.cost.map(|cost| cost.usd_micros),
                     inference_ms,
                     tool_ms,
                     continuation = continuation.as_str(),
@@ -1778,7 +1756,6 @@ impl CodingEvent {
                 tracked_file_count,
                 reason,
                 usage,
-                cost_usd_micros,
             } => {
                 info!(
                     session_id,
@@ -1787,8 +1764,8 @@ impl CodingEvent {
                     summary_token_estimate,
                     tracked_file_count,
                     reason = ?reason,
-                    tokens = usage.total(),
-                    cost_usd_micros,
+                    tokens = usage.total_tokens(),
+                    cost_usd_micros = usage.cost.map(|cost| cost.usd_micros),
                     "Context compaction completed"
                 );
             }
@@ -1796,14 +1773,13 @@ impl CodingEvent {
                 reason,
                 error,
                 usage,
-                cost_usd_micros,
             } => {
                 warn!(
                     session_id,
                     reason = ?reason,
                     error = error.message.as_str(),
-                    tokens = usage.map(TokenUsage::total),
-                    cost_usd_micros,
+                    tokens = usage.map(Usage::total_tokens),
+                    cost_usd_micros = usage.and_then(|usage| usage.cost).map(|cost| cost.usd_micros),
                     "Context compaction failed"
                 );
             }
@@ -2244,7 +2220,7 @@ mod tests {
             content:        "on it".into(),
             tool_calls:     vec![ToolCall::function("call_1", "shell", json!({"cmd": "ls"}))],
             provider_parts: vec![ContentPart::opaque("openai.reasoning", json!({"id": "r"}))],
-            usage:          TokenUsage::default(),
+            usage:          TokenCounts::default(),
             response_id:    "resp_1".into(),
             timestamp:      moment(),
         };
@@ -2264,7 +2240,7 @@ mod tests {
             content:        String::new(),
             tool_calls:     vec![ToolCall::function("call_1", "shell", json!({}))],
             provider_parts: Vec::new(),
-            usage:          TokenUsage::default(),
+            usage:          TokenCounts::default(),
             response_id:    "resp_1".into(),
             timestamp:      moment(),
         };
@@ -2342,7 +2318,7 @@ mod tests {
             content:        String::new(),
             tool_calls:     Vec::new(),
             provider_parts: vec![redacted, readable],
-            usage:          TokenUsage::default(),
+            usage:          TokenCounts::default(),
             response_id:    "resp_1".into(),
             timestamp:      moment(),
         };
@@ -2504,15 +2480,19 @@ mod tests {
         let event = CodingEvent::AssistantMessage {
             text:            "hello".into(),
             model:           "claude-sonnet-5".into(),
-            usage:           TokenUsage {
-                input:       100,
-                output:      50,
-                reasoning:   20,
-                cache_read:  80,
-                cache_write: 10,
+            usage:           Usage {
+                tokens: TokenCounts {
+                    input:       100,
+                    output:      50,
+                    reasoning:   20,
+                    cache_read:  80,
+                    cache_write: 10,
+                },
+                cost:   Some(Cost {
+                    usd_micros: 125_000,
+                    source:     CostSource::Catalog,
+                }),
             },
-            cost_usd_micros: Some(125_000),
-            cost_source:     Some(CostSource::Catalog),
             tool_call_count: 2,
             context_window:  None,
             reasoning:       None,
@@ -2521,9 +2501,9 @@ mod tests {
         let payload = &value["AssistantMessage"];
 
         assert_eq!(payload["model"], json!("claude-sonnet-5"));
-        assert_eq!(payload["usage"]["cache_read"], json!(80));
-        assert_eq!(payload["cost_usd_micros"], json!(125_000));
-        assert_eq!(payload["cost_source"], json!("catalog"));
+        assert_eq!(payload["usage"]["tokens"]["cache_read"], json!(80));
+        assert_eq!(payload["usage"]["cost"]["usd_micros"], json!(125_000));
+        assert_eq!(payload["usage"]["cost"]["source"], json!("catalog"));
         assert!(payload.get("context_window").is_none());
         assert!(payload.get("reasoning").is_none());
         assert_eq!(
@@ -2872,14 +2852,12 @@ mod tests {
                 summary_token_estimate: 500,
                 tracked_file_count:     3,
                 reason:                 CompactionReason::Threshold,
-                usage:                  TokenUsage::default(),
-                cost_usd_micros:        None,
+                usage:                  Usage::default(),
             },
             CodingEvent::CompactionFailed {
-                reason:          CompactionReason::Manual,
-                error:           ErrorData::new(ErrorKind::Compaction, "summary failed"),
-                usage:           None,
-                cost_usd_micros: None,
+                reason: CompactionReason::Manual,
+                error:  ErrorData::new(ErrorKind::Compaction, "summary failed"),
+                usage:  None,
             },
             CodingEvent::CompactionCancelled {
                 reason: CompactionReason::Manual,

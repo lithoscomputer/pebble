@@ -19,12 +19,12 @@ use lithos_llm::types::{
 use pebble_coding_agent::events::{
     Actor, AgentProfileKind, CodingAgentEvent, CodingEvent, CommandTermination, CompactionReason,
     ContextWindowBreakdownItem, ContextWindowCategory, ContextWindowCountMethod,
-    ContextWindowSnapshot, ContextWindowStaleness, ContextWindowWarning, CostSource, ErrorData,
-    ErrorKind, EventSinkError, ExecOutputTail, FailoverContinuation, FailoverStop, InputContent,
-    InputSource, LlmOutputKind, LlmRetryPhase, McpToolSummary, MemoryFileSummary, PermissionLevel,
-    ReasoningOutput, SkillActivationSource, SkillSummary, SkippedSkill, SkippedSkillReason,
-    TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoStatus, TodoUpdatedProps, TokenUsage,
-    ToolCategory, ToolErrorKind, ToolSource, ToolSummary,
+    ContextWindowSnapshot, ContextWindowStaleness, ContextWindowWarning, Cost, CostSource,
+    ErrorData, ErrorKind, EventSinkError, ExecOutputTail, FailoverContinuation, FailoverStop,
+    InputContent, InputSource, LlmOutputKind, LlmRetryPhase, McpToolSummary, MemoryFileSummary,
+    PermissionLevel, ReasoningOutput, SkillActivationSource, SkillSummary, SkippedSkill,
+    SkippedSkillReason, TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoStatus,
+    TodoUpdatedProps, TokenCounts, ToolCategory, ToolErrorKind, ToolSource, ToolSummary, Usage,
 };
 use pebble_coding_agent::{Error, InterruptReason};
 use serde::Serialize;
@@ -48,13 +48,24 @@ fn moment() -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(1_767_225_600_500)
 }
 
-fn usage() -> TokenUsage {
-    TokenUsage {
+fn usage() -> TokenCounts {
+    TokenCounts {
         input:       1_200,
         output:      340,
         reasoning:   96,
         cache_read:  800,
         cache_write: 64,
+    }
+}
+
+/// The sample counts, priced from the catalog.
+fn priced(usd_micros: u64) -> Usage {
+    Usage {
+        tokens: usage(),
+        cost:   Some(Cost {
+            usd_micros,
+            source: CostSource::Catalog,
+        }),
     }
 }
 
@@ -114,9 +125,7 @@ fn every_variant() -> Vec<CodingEvent> {
         CodingEvent::AssistantMessage {
             text:            "I updated the parser.".into(),
             model:           "claude-sonnet-5".into(),
-            usage:           usage(),
-            cost_usd_micros: Some(12_500),
-            cost_source:     Some(CostSource::Catalog),
+            usage:           priced(12_500),
             tool_call_count: 2,
             context_window:  Some(context_window()),
             reasoning:       Some(ReasoningOutput::new("checked the parser", "step one")),
@@ -200,15 +209,14 @@ fn every_variant() -> Vec<CodingEvent> {
             error:  "transport closed".into(),
         },
         CodingEvent::RouteFailover {
-            from:            "anthropic/claude-sonnet-5".into(),
-            to:              "openai/gpt-5.6".into(),
-            attempt:         1,
-            error:           ErrorData::from(&rate_limited()),
-            usage:           usage(),
-            cost_usd_micros: Some(4_200),
-            inference_ms:    1_850,
-            tool_ms:         320,
-            continuation:    FailoverContinuation::ContinueTurn,
+            from:         "anthropic/claude-sonnet-5".into(),
+            to:           "openai/gpt-5.6".into(),
+            attempt:      1,
+            error:        ErrorData::from(&rate_limited()),
+            usage:        priced(4_200),
+            inference_ms: 1_850,
+            tool_ms:      320,
+            continuation: FailoverContinuation::ContinueTurn,
         },
         CodingEvent::RouteFailoverStopped {
             route:   "openai/gpt-5.6".into(),
@@ -236,14 +244,12 @@ fn every_variant() -> Vec<CodingEvent> {
             summary_token_estimate: 900,
             tracked_file_count:     7,
             reason:                 CompactionReason::Threshold,
-            usage:                  usage(),
-            cost_usd_micros:        Some(1_900),
+            usage:                  priced(1_900),
         },
         CodingEvent::CompactionFailed {
-            reason:          CompactionReason::Manual,
-            error:           ErrorData::new(ErrorKind::Compaction, "summary request failed"),
-            usage:           Some(usage()),
-            cost_usd_micros: None,
+            reason: CompactionReason::Manual,
+            error:  ErrorData::new(ErrorKind::Compaction, "summary request failed"),
+            usage:  Some(Usage::from(usage())),
         },
         CodingEvent::CompactionCancelled {
             reason: CompactionReason::Manual,

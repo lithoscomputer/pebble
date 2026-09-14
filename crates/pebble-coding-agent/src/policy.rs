@@ -10,7 +10,7 @@ use lithos_llm::types::{Message as LlmMessage, Request};
 use pebble_agent::{LifecycleError, ToolCatalog, TurnContext};
 use tokio_util::sync::CancellationToken;
 
-use crate::types::{Message, TokenUsage};
+use crate::types::{Message, Usage};
 use crate::{CompactionReason, SessionScope};
 
 /// The request view available to a context policy after compaction and
@@ -60,11 +60,9 @@ pub struct CompactionPreparation<'a> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompactionSummary {
     /// Handoff text. Pebble rejects empty summaries and bounds the stored text.
-    pub text:            String,
-    /// Token usage of the summarization operation.
-    pub usage:           TokenUsage,
-    /// Cost in USD micros, when known.
-    pub cost_usd_micros: Option<u64>,
+    pub text:  String,
+    /// What the summarization operation used and, when known, cost.
+    pub usage: Usage,
 }
 
 /// Supplies summary generation while Pebble owns history replacement and

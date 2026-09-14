@@ -38,9 +38,8 @@ use crate::subagent::SubagentSupervisor;
 use crate::task_reminder::maybe_task_reminder;
 use crate::tool::{CodingToolService, NativeTool, canonical_tool_name};
 use crate::types::{
-    CodingAgentState, CodingEvent, ContextWindowSnapshot, ContextWindowStaleness, CostSource,
-    InputContent, InputSource, LlmOutputKind, LlmRetryPhase, Message, SkillActivationSource,
-    TokenUsage,
+    CodingAgentState, CodingEvent, ContextWindowSnapshot, ContextWindowStaleness, InputContent,
+    InputSource, LlmOutputKind, LlmRetryPhase, Message, SkillActivationSource, Usage,
 };
 use crate::{SessionId, SessionScope};
 
@@ -218,40 +217,28 @@ impl ConversationState {
         true
     }
 
-    fn record_response_usage(
-        &mut self,
-        usage: TokenUsage,
-        cost: Option<u64>,
-    ) -> Option<ContextWindowSnapshot> {
+    fn record_response_usage(&mut self, usage: Usage) -> Option<ContextWindowSnapshot> {
         let context_window = self
             .local_context_window
             .take()
-            .map(|local| context_window_from_response_usage(&local, usage));
+            .map(|local| context_window_from_response_usage(&local, usage.tokens));
         if let Some(context_window) = &context_window {
             let mut stored = context_window.clone();
             stored.staleness = ContextWindowStaleness::Stored;
             self.context_window = Some(stored);
         }
-        self.accumulate_usage(usage, cost);
+        self.accumulate_usage(usage);
         context_window
     }
 
-    fn accumulate_usage(&mut self, usage: TokenUsage, cost: Option<u64>) {
+    fn accumulate_usage(&mut self, usage: Usage) {
         self.totals.usage = self.totals.usage.saturating_add(usage);
-        if let Some(cost) = cost {
-            self.totals.cost_usd_micros = Some(
-                self.totals
-                    .cost_usd_micros
-                    .unwrap_or(0)
-                    .saturating_add(cost),
-            );
-        }
     }
 
     /// Bills a completed compaction's summary call to this prompt and lists
     /// the compaction on its report.
     fn record_compaction(&mut self, result: &CompactionResult) {
-        self.accumulate_usage(result.usage(), result.cost_usd_micros());
+        self.accumulate_usage(result.usage());
         self.totals.compactions.push(result.account());
     }
 
@@ -571,15 +558,14 @@ impl CodingAgentBridge {
         let tool_calls = tool_calls_of(response);
         let reasoning = response.reasoning();
         let provider_parts = provider_parts_of(response);
-        let usage = TokenUsage::from(response.usage);
+        let usage = response.usage_with_cost();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let context_window =
-            state.record_response_usage(usage, response.cost.map(|cost| cost.usd_micros));
+        let context_window = state.record_response_usage(usage);
         state.push_assistant(Message::Assistant {
             content: text.clone(),
             tool_calls: tool_calls.clone(),
             provider_parts,
-            usage,
+            usage: usage.tokens,
             response_id: response.id.clone().unwrap_or_default(),
             timestamp: SystemTime::now(),
         });
@@ -605,8 +591,6 @@ impl CodingAgentBridge {
                 answering_model.to_owned()
             },
             usage,
-            cost_usd_micros: response.cost.map(|cost| cost.usd_micros),
-            cost_source: response.cost.map(|cost| CostSource::from(cost.source)),
             tool_call_count: tool_calls.len(),
             context_window,
             reasoning,

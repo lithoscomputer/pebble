@@ -9,7 +9,7 @@ use lithos_llm::types::{ContentPart, ImageContent, MediaSource, Message as LlmMe
 use pebble_agent::{
     LifecycleError, ToolCallNext, ToolCallRequest, ToolMiddleware, ToolOutcome, ToolSystemError,
 };
-use pebble_coding_agent::events::{CodingEvent, TokenUsage};
+use pebble_coding_agent::events::{CodingEvent, Cost, CostSource, TokenCounts, Usage};
 use pebble_coding_agent::extensions::{
     CompactionPolicy, CompactionPreparation, CompactionSummary, ContextPolicy, ContextPreparation,
 };
@@ -304,13 +304,18 @@ impl CompactionPolicy for Summarize {
         assert!(!context.default_request.messages().is_empty());
         self.0.lock().expect("lock").push(context.messages.len());
         Ok(CompactionSummary {
-            text:            "application handoff".into(),
-            usage:           TokenUsage {
-                input: 7,
-                output: 3,
-                ..TokenUsage::default()
+            text:  "application handoff".into(),
+            usage: Usage {
+                tokens: TokenCounts {
+                    input: 7,
+                    output: 3,
+                    ..TokenCounts::default()
+                },
+                cost:   Some(Cost {
+                    usd_micros: 19,
+                    source:     CostSource::Application,
+                }),
             },
-            cost_usd_micros: Some(19),
         })
     }
 }
@@ -336,8 +341,15 @@ async fn application_compaction_keeps_recent_turns_and_records_usage() {
         panic!("expected compaction");
     };
     assert!(result.summary().contains("application handoff"));
-    assert_eq!(result.usage().input, 7);
-    assert_eq!(result.cost_usd_micros(), Some(19));
+    assert_eq!(result.usage().tokens.input, 7);
+    assert_eq!(
+        result.usage().cost,
+        Some(Cost {
+            usd_micros: 19,
+            source:     CostSource::Application,
+        }),
+        "the application's price is kept with its source"
+    );
     assert_eq!(*policy.0.lock().expect("lock"), vec![3]);
     assert_eq!(
         agent.history().to_llm_messages().last(),
@@ -365,9 +377,8 @@ impl CompactionPolicy for InvalidSummary {
             return Err(LifecycleError::new("Application summarizer unavailable"));
         }
         Ok(CompactionSummary {
-            text:            " \n ".into(),
-            usage:           TokenUsage::default(),
-            cost_usd_micros: None,
+            text:  " \n ".into(),
+            usage: Usage::default(),
         })
     }
 }

@@ -71,8 +71,7 @@ use crate::tools::skill::make_use_skill_tool_for_vocabulary;
 use crate::tools::{WebFetchSummarizer, make_question_tool, make_web_search_tool};
 use crate::types::{
     AgentProfileKind, CodingAgentEvent, CodingAgentState, CodingEvent, ContextWindowSnapshot,
-    MemoryFileSummary, Message, PermissionLevel, SkillSummary, TokenUsage, ToolSummary,
-    rfc3339_millis,
+    MemoryFileSummary, Message, PermissionLevel, SkillSummary, ToolSummary, Usage, rfc3339_millis,
 };
 use crate::{SessionId, SessionScope, discovery};
 
@@ -103,13 +102,12 @@ pub(crate) struct WarmState {
 
 /// What one prompt accumulated across every input it processed.
 ///
-/// `usage` and `cost_usd_micros` include the summary call of each entry in
-/// `compactions`, which is their breakdown, not an addition to them.
+/// `usage` includes the summary call of each entry in `compactions`, which
+/// is its breakdown, not an addition to it.
 #[derive(Clone, Debug, Default)]
 struct PromptTotals {
     timing:          PromptTiming,
-    usage:           TokenUsage,
-    cost_usd_micros: Option<u64>,
+    usage:           Usage,
     /// The compactions this prompt completed, in order.
     compactions:     Vec<CompactionAccount>,
     /// The assistant turns and tool results this prompt committed to the
@@ -1531,15 +1529,10 @@ impl CodingRuntime {
         self.conversation().totals.timing
     }
 
-    /// What the last prompt cost in tokens, summed over every response.
-    pub(crate) fn last_prompt_usage(&self) -> TokenUsage {
+    /// What the last prompt used, summed over every response, and what it
+    /// cost where the catalog or the provider priced every one of them.
+    pub(crate) fn last_prompt_usage(&self) -> Usage {
         self.conversation().totals.usage
-    }
-
-    /// What the last prompt cost in USD micros, where the catalog or the
-    /// provider priced it.
-    pub(crate) fn last_prompt_cost_usd_micros(&self) -> Option<u64> {
-        self.conversation().totals.cost_usd_micros
     }
 
     /// The files the last prompt wrote or edited, this session's and its

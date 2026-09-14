@@ -36,14 +36,18 @@ expression: render(&every_variant())
       "text": "I updated the parser.",
       "model": "claude-sonnet-5",
       "usage": {
-        "input": 1200,
-        "output": 340,
-        "reasoning": 96,
-        "cache_read": 800,
-        "cache_write": 64
+        "tokens": {
+          "input": 1200,
+          "output": 340,
+          "reasoning": 96,
+          "cache_read": 800,
+          "cache_write": 64
+        },
+        "cost": {
+          "usd_micros": 12500,
+          "source": "catalog"
+        }
       },
-      "cost_usd_micros": 12500,
-      "cost_source": "catalog",
       "tool_call_count": 2,
       "context_window": {
         "provider": "anthropic",
@@ -209,13 +213,18 @@ expression: render(&every_variant())
         "provider_retry_after_millis": 2000
       },
       "usage": {
-        "input": 1200,
-        "output": 340,
-        "reasoning": 96,
-        "cache_read": 800,
-        "cache_write": 64
+        "tokens": {
+          "input": 1200,
+          "output": 340,
+          "reasoning": 96,
+          "cache_read": 800,
+          "cache_write": 64
+        },
+        "cost": {
+          "usd_micros": 4200,
+          "source": "catalog"
+        }
       },
-      "cost_usd_micros": 4200,
       "inference_ms": 1850,
       "tool_ms": 320,
       "continuation": "continue_turn"
@@ -269,13 +278,18 @@ expression: render(&every_variant())
       "summary_token_estimate": 900,
       "tracked_file_count": 7,
       "usage": {
-        "input": 1200,
-        "output": 340,
-        "reasoning": 96,
-        "cache_read": 800,
-        "cache_write": 64
-      },
-      "cost_usd_micros": 1900
+        "tokens": {
+          "input": 1200,
+          "output": 340,
+          "reasoning": 96,
+          "cache_read": 800,
+          "cache_write": 64
+        },
+        "cost": {
+          "usd_micros": 1900,
+          "source": "catalog"
+        }
+      }
     }
   },
   {
@@ -286,11 +300,13 @@ expression: render(&every_variant())
         "message": "summary request failed"
       },
       "usage": {
-        "input": 1200,
-        "output": 340,
-        "reasoning": 96,
-        "cache_read": 800,
-        "cache_write": 64
+        "tokens": {
+          "input": 1200,
+          "output": 340,
+          "reasoning": 96,
+          "cache_read": 800,
+          "cache_write": 64
+        }
       }
     }
   },

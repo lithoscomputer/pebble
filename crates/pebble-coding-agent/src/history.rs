@@ -19,7 +19,7 @@ use lithos_llm::types::{ContentPart, Message as LlmMessage};
 
 use crate::compaction::CompactionResult;
 use crate::record::StoredMessage;
-use crate::types::{Message, TokenUsage};
+use crate::types::{Message, TokenCounts};
 
 /// How many tokens of discarded user input compaction carries forward.
 const COMPACTION_USER_MESSAGE_TOKEN_BUDGET: usize = 20_000;
@@ -156,7 +156,7 @@ impl History {
 fn invalidate_preserved_usage(preserved: &mut [Message]) {
     for turn in preserved {
         if let Message::Assistant { usage, .. } = turn {
-            *usage = TokenUsage::default();
+            *usage = TokenCounts::default();
         }
     }
 }
@@ -251,7 +251,7 @@ mod tests {
             content:        content.to_owned(),
             tool_calls:     Vec::new(),
             provider_parts: Vec::new(),
-            usage:          TokenUsage::default(),
+            usage:          TokenCounts::default(),
             response_id:    response_id.to_owned(),
             timestamp:      now(),
         }
@@ -347,7 +347,7 @@ mod tests {
                     json!({ "file_path": format!("{index}.txt") }),
                 )],
                 provider_parts: Vec::new(),
-                usage:          TokenUsage::default(),
+                usage:          TokenCounts::default(),
                 response_id:    format!("resp_{index}"),
                 timestamp:      now(),
             });
@@ -364,7 +364,7 @@ mod tests {
                 json!({ "file_path": "3.txt" }),
             )],
             provider_parts: Vec::new(),
-            usage:          TokenUsage::default(),
+            usage:          TokenCounts::default(),
             response_id:    "resp_3".into(),
             timestamp:      now(),
         });
@@ -394,7 +394,7 @@ mod tests {
             content:        String::new(),
             tool_calls:     vec![tool_call("call_1", "read_file", json!({}))],
             provider_parts: Vec::new(),
-            usage:          TokenUsage::default(),
+            usage:          TokenCounts::default(),
             response_id:    "resp_1".into(),
             timestamp:      now(),
         });
@@ -467,7 +467,7 @@ mod tests {
                 json!({ "path": "foo.rs" }),
             )],
             provider_parts: Vec::new(),
-            usage:          TokenUsage::default(),
+            usage:          TokenCounts::default(),
             response_id:    "resp_2".into(),
             timestamp:      now(),
         });
@@ -490,7 +490,7 @@ mod tests {
             content:        "The answer is 42".into(),
             tool_calls:     Vec::new(),
             provider_parts: vec![thinking_part("Let me think about this...", None)],
-            usage:          TokenUsage::default(),
+            usage:          TokenCounts::default(),
             response_id:    "resp_3".into(),
             timestamp:      now(),
         });
@@ -512,7 +512,7 @@ mod tests {
             content:        "The answer".into(),
             tool_calls:     Vec::new(),
             provider_parts: vec![thinking_part("Let me think...", Some("sig_abc123"))],
-            usage:          TokenUsage::default(),
+            usage:          TokenCounts::default(),
             response_id:    "resp_4".into(),
             timestamp:      now(),
         });
@@ -537,7 +537,7 @@ mod tests {
             content:        String::new(),
             tool_calls:     vec![tool_call("call_1", "search", json!({}))],
             provider_parts: vec![openai_reasoning_part()],
-            usage:          TokenUsage::default(),
+            usage:          TokenCounts::default(),
             response_id:    "resp_1".into(),
             timestamp:      now(),
         });
@@ -608,10 +608,10 @@ mod tests {
             content:        "Reading".into(),
             tool_calls:     vec![tool_call("call_1", "read_file", json!({ "path": "a.rs" }))],
             provider_parts: vec![thinking_part("weighing it", Some("sig_1"))],
-            usage:          TokenUsage {
+            usage:          TokenCounts {
                 input: 10,
                 output: 3,
-                ..TokenUsage::default()
+                ..TokenCounts::default()
             },
             response_id:    "resp_1".into(),
             timestamp:      now(),
@@ -651,10 +651,10 @@ mod tests {
             content:        "Hi".into(),
             tool_calls:     vec![tool_call("c1", "shell", json!({ "cmd": "ls" }))],
             provider_parts: vec![thinking_part("thinking...", None)],
-            usage:          TokenUsage {
+            usage:          TokenCounts {
                 input: 10,
                 output: 5,
-                ..TokenUsage::default()
+                ..TokenCounts::default()
             },
             response_id:    "resp_1".into(),
             timestamp:      now(),
@@ -681,7 +681,7 @@ mod tests {
             content:        "response".into(),
             tool_calls:     vec![tool_call("call_1", "search", json!({}))],
             provider_parts: vec![openai_reasoning_part()],
-            usage:          TokenUsage::default(),
+            usage:          TokenCounts::default(),
             response_id:    "resp_1".into(),
             timestamp:      now(),
         });
@@ -718,7 +718,7 @@ mod tests {
                 ContentPart::opaque("openai_reasoning", json!({ "id": "rs_1" })),
                 ContentPart::opaque("openai_message", json!({ "id": "msg_1" })),
             ],
-            usage:          TokenUsage::default(),
+            usage:          TokenCounts::default(),
             response_id:    "resp_1".into(),
             timestamp:      now(),
         });
@@ -740,7 +740,7 @@ mod tests {
             content:        "answer".into(),
             tool_calls:     Vec::new(),
             provider_parts: vec![thinking_part("deep thought", Some("sig_xyz"))],
-            usage:          TokenUsage::default(),
+            usage:          TokenCounts::default(),
             response_id:    "resp_1".into(),
             timestamp:      now(),
         });
@@ -769,7 +769,7 @@ mod tests {
                 "openai_compat_reasoning_details",
                 json!([{ "type": "reasoning.text", "text": "kept" }]),
             )],
-            usage:          TokenUsage::default(),
+            usage:          TokenCounts::default(),
             response_id:    "resp_1".into(),
             timestamp:      now(),
         });
@@ -792,7 +792,7 @@ mod tests {
             content:        "answer".into(),
             tool_calls:     vec![call.clone()],
             provider_parts: vec![thinking.clone()],
-            usage:          TokenUsage {
+            usage:          TokenCounts {
                 input:       10,
                 output:      20,
                 reasoning:   30,
@@ -825,7 +825,7 @@ mod tests {
         assert_eq!(tool_calls, &[call]);
         assert_eq!(provider_parts, &[thinking]);
         assert_eq!(response_id, "resp_1");
-        assert_eq!(*usage, TokenUsage::default());
+        assert_eq!(*usage, TokenCounts::default());
     }
 
     #[test]
@@ -840,7 +840,7 @@ mod tests {
                     "openai.reasoning",
                     json!({ "type": "reasoning", "id": format!("rs_{index}") }),
                 )],
-                usage:          TokenUsage::default(),
+                usage:          TokenCounts::default(),
                 response_id:    format!("resp_{index}"),
                 timestamp:      now(),
             });

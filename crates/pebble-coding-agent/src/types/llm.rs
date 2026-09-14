@@ -1,125 +1,18 @@
-//! Vocabulary describing one model call: token accounting, cost provenance,
-//! and the two observed properties of a streaming attempt.
+//! Vocabulary describing one model call: token accounting and cost, and the
+//! two observed properties of a streaming attempt.
+//!
+//! Token accounting and cost are lithos-llm's types, re-exported here so an
+//! application reads one vocabulary for what a call used and what it cost:
+//! [`TokenCounts`] is five disjoint token buckets, [`Cost`] is a price in USD
+//! micros with its [`CostSource`], and [`Usage`] pairs the two with the cost
+//! optional. Every usage a pebble event, report, or projection carries is a
+//! [`Usage`]; a sum is [`Usage::saturating_add`], which keeps a cost only when
+//! every part that used tokens is priced.
 
 use std::fmt;
 
-use lithos_llm::types::{CostSource as LlmCostSource, TokenCounts};
+pub use lithos_llm::types::{Cost, CostSource, TokenCounts, Usage};
 use serde::{Deserialize, Serialize};
-
-/// Token accounting for one model response.
-///
-/// The five buckets are **disjoint**: every token is counted in exactly one of
-/// them, so [`TokenUsage::total`] is their plain sum. The field names mirror
-/// [`lithos_llm::types::TokenCounts`], which normalizes the inclusive counters
-/// providers report.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TokenUsage {
-    /// Prompt tokens that were neither read from nor written to a cache.
-    #[serde(default)]
-    pub input:       u64,
-    /// Completion tokens that are not reasoning tokens.
-    #[serde(default)]
-    pub output:      u64,
-    /// Completion tokens spent on reasoning, billed at the output rate.
-    #[serde(default)]
-    pub reasoning:   u64,
-    /// Prompt tokens served from a provider cache.
-    #[serde(default)]
-    pub cache_read:  u64,
-    /// Prompt tokens written into a provider cache.
-    #[serde(default)]
-    pub cache_write: u64,
-}
-
-impl TokenUsage {
-    /// Adds every bucket without wrapping a counter that reached its limit.
-    #[must_use]
-    pub const fn saturating_add(self, other: Self) -> Self {
-        Self {
-            input:       self.input.saturating_add(other.input),
-            output:      self.output.saturating_add(other.output),
-            reasoning:   self.reasoning.saturating_add(other.reasoning),
-            cache_read:  self.cache_read.saturating_add(other.cache_read),
-            cache_write: self.cache_write.saturating_add(other.cache_write),
-        }
-    }
-
-    /// The sum of all five disjoint buckets.
-    #[must_use]
-    pub const fn total(self) -> u64 {
-        self.input
-            .saturating_add(self.output)
-            .saturating_add(self.reasoning)
-            .saturating_add(self.cache_read)
-            .saturating_add(self.cache_write)
-    }
-
-    /// Tokens billed at the output rate: `output + reasoning`.
-    #[must_use]
-    pub const fn billable_output(self) -> u64 {
-        self.output.saturating_add(self.reasoning)
-    }
-
-    /// Tokens that occupied the prompt: `input + cache_read + cache_write`.
-    #[must_use]
-    pub const fn prompt(self) -> u64 {
-        self.input
-            .saturating_add(self.cache_read)
-            .saturating_add(self.cache_write)
-    }
-}
-
-impl From<TokenCounts> for TokenUsage {
-    fn from(counts: TokenCounts) -> Self {
-        Self {
-            input:       counts.input,
-            output:      counts.output,
-            reasoning:   counts.reasoning,
-            cache_read:  counts.cache_read,
-            cache_write: counts.cache_write,
-        }
-    }
-}
-
-impl From<TokenUsage> for TokenCounts {
-    fn from(usage: TokenUsage) -> Self {
-        Self {
-            input:       usage.input,
-            output:      usage.output,
-            reasoning:   usage.reasoning,
-            cache_read:  usage.cache_read,
-            cache_write: usage.cache_write,
-        }
-    }
-}
-
-/// Where a reported cost came from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum CostSource {
-    /// Priced locally from the model catalog.
-    Catalog,
-    /// Reported by the provider itself.
-    Provider,
-    /// Supplied by the embedding application.
-    Application,
-}
-
-impl From<LlmCostSource> for CostSource {
-    /// Maps a lithos-llm cost source onto pebble's.
-    ///
-    /// `lithos_llm::types::CostSource` is `#[non_exhaustive]`. A source pebble
-    /// does not yet know is reported as [`CostSource::Application`], the
-    /// weakest claim of the three.
-    fn from(source: LlmCostSource) -> Self {
-        match source {
-            LlmCostSource::Catalog => Self::Catalog,
-            LlmCostSource::Provider => Self::Provider,
-            _ => Self::Application,
-        }
-    }
-}
 
 /// Which kind of output a provider produced first for an inference attempt.
 ///
@@ -195,87 +88,6 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-
-    #[test]
-    fn token_usage_round_trips_through_lithos_counts() {
-        let usage = TokenUsage {
-            input:       100,
-            output:      50,
-            reasoning:   20,
-            cache_read:  80,
-            cache_write: 10,
-        };
-        let counts = TokenCounts::from(usage);
-        assert_eq!(counts.input, 100);
-        assert_eq!(counts.cache_write, 10);
-        assert_eq!(TokenUsage::from(counts), usage);
-    }
-
-    #[test]
-    fn token_usage_sums_disjoint_buckets() {
-        let usage = TokenUsage {
-            input:       100,
-            output:      50,
-            reasoning:   20,
-            cache_read:  80,
-            cache_write: 10,
-        };
-        assert_eq!(usage.total(), 260);
-        assert_eq!(usage.billable_output(), 70);
-        assert_eq!(usage.prompt(), 190);
-    }
-
-    #[test]
-    fn token_usage_addition_saturates_each_bucket() {
-        let almost_full = TokenUsage {
-            input: u64::MAX,
-            output: 2,
-            ..TokenUsage::default()
-        };
-        let added = almost_full.saturating_add(TokenUsage {
-            input: 1,
-            output: 3,
-            cache_read: 4,
-            ..TokenUsage::default()
-        });
-
-        assert_eq!(added.input, u64::MAX);
-        assert_eq!(added.output, 5);
-        assert_eq!(added.cache_read, 4);
-    }
-
-    #[test]
-    fn token_usage_defaults_every_missing_bucket() {
-        let usage: TokenUsage = serde_json::from_value(json!({"input": 7})).expect("parses");
-        assert_eq!(usage, TokenUsage {
-            input: 7,
-            ..TokenUsage::default()
-        });
-    }
-
-    #[test]
-    fn cost_source_is_snake_case_on_the_wire() {
-        assert_eq!(
-            serde_json::to_value(CostSource::Application).expect("serializes"),
-            json!("application")
-        );
-    }
-
-    #[test]
-    fn cost_source_maps_from_lithos() {
-        assert_eq!(
-            CostSource::from(LlmCostSource::Catalog),
-            CostSource::Catalog
-        );
-        assert_eq!(
-            CostSource::from(LlmCostSource::Provider),
-            CostSource::Provider
-        );
-        assert_eq!(
-            CostSource::from(LlmCostSource::Application),
-            CostSource::Application
-        );
-    }
 
     #[test]
     fn output_kind_and_retry_phase_render_their_wire_spelling() {

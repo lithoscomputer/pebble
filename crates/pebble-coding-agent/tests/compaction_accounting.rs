@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use lithos_llm::types::TokenCounts;
-use pebble_coding_agent::events::TokenUsage;
+use pebble_coding_agent::events::{Cost, CostSource, Usage};
 use pebble_coding_agent::test_support::{
     MockEnvironment, ScriptedCall, ScriptedCompletion, ScriptedProvider, client_from,
     text_response, with_cost, with_usage,
@@ -24,6 +24,17 @@ use pebble_coding_agent::{
 /// An input long enough to fill the 100-token window of `test/small`.
 fn large_input() -> String {
     "x".repeat(400)
+}
+
+/// `tokens` priced from the catalog, as the scripted provider prices them.
+fn priced(tokens: TokenCounts, usd_micros: u64) -> Usage {
+    Usage {
+        tokens,
+        cost: Some(Cost {
+            usd_micros,
+            source: CostSource::Catalog,
+        }),
+    }
 }
 
 /// The summary call's answer, with the usage and cost the provider reports
@@ -77,13 +88,11 @@ async fn a_threshold_compaction_is_on_the_report_with_its_usage_and_cost() {
     assert!(account.summary_token_estimate > 0, "{account:?}");
     assert_eq!(account.tracked_file_count, 0);
     assert!(!account.summary_truncated);
-    assert_eq!(account.usage, TokenUsage::from(summary_usage));
-    assert_eq!(account.cost_usd_micros, Some(5));
+    assert_eq!(account.usage, priced(summary_usage, 5));
     assert_eq!(
         report.usage, account.usage,
-        "the summary call is in the report's totals, which the list breaks down"
+        "the summary call is in the report's total, cost included, which the list breaks down"
     );
-    assert_eq!(report.cost_usd_micros, Some(5));
     agent
         .shutdown(ShutdownReason::Completed)
         .await
@@ -100,7 +109,7 @@ async fn a_prompt_that_compacted_nothing_reports_no_compactions() {
 
     assert!(report.result.is_ok(), "{report:?}");
     assert!(report.compactions.is_empty(), "{report:?}");
-    assert_eq!(report.cost_usd_micros, None);
+    assert_eq!(report.usage.cost, None);
     agent
         .shutdown(ShutdownReason::Completed)
         .await
@@ -134,14 +143,14 @@ async fn a_manual_compaction_between_prompts_is_on_no_report() {
         panic!("there was history to compact: {outcome:?}");
     };
     assert_eq!(result.reason(), CompactionReason::Manual);
-    assert_eq!(result.usage(), TokenUsage::from(summary_usage));
+    assert_eq!(result.usage(), priced(summary_usage, 9));
     assert!(second.result.is_ok(), "{second:?}");
     assert!(
         second.compactions.is_empty(),
         "a compaction between prompts belongs to no prompt: {second:?}"
     );
     assert_eq!(
-        second.cost_usd_micros, None,
+        second.usage.cost, None,
         "nor is its summary call on the next prompt's bill"
     );
     assert_eq!(second.usage, first.usage);

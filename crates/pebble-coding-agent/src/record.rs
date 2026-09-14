@@ -22,7 +22,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::SessionScope;
 use crate::compaction::CompactionReason;
-use crate::types::{InputContent, TokenUsage, rfc3339_millis};
+use crate::types::{InputContent, TokenCounts, Usage, rfc3339_millis};
 
 /// The record format version this build writes.
 ///
@@ -167,7 +167,7 @@ pub enum StoredMessage {
         /// Stored as typed counts, so restoring a record returns exactly the
         /// numbers that were saved.
         #[serde(default, deserialize_with = "null_as_default")]
-        usage:          TokenUsage,
+        usage:          TokenCounts,
         /// The provider's identifier for the response.
         #[serde(default)]
         response_id:    String,
@@ -217,12 +217,9 @@ pub enum StoredMessage {
         /// Whether Pebble truncated the generated summary.
         #[serde(default)]
         summary_truncated:       bool,
-        /// Usage from the summarization call.
+        /// What the summarization call used and, when priced, cost.
         #[serde(default, deserialize_with = "null_as_default")]
-        usage:                   TokenUsage,
-        /// Cost of the summarization call in USD micros.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cost_usd_micros:         Option<u64>,
+        usage:                   Usage,
         /// When the summary was recorded.
         #[serde(with = "rfc3339_millis")]
         timestamp:               SystemTime,
@@ -282,8 +279,8 @@ mod tests {
         UNIX_EPOCH + Duration::from_millis(1_767_225_600_500)
     }
 
-    fn usage() -> TokenUsage {
-        TokenUsage {
+    fn usage() -> TokenCounts {
+        TokenCounts {
             input:       1_200,
             output:      340,
             reasoning:   96,
@@ -421,7 +418,7 @@ mod tests {
         else {
             panic!("expected an assistant turn");
         };
-        assert_eq!(usage, TokenUsage::default());
+        assert_eq!(usage, TokenCounts::default());
         assert!(tool_calls.is_empty());
         assert!(provider_parts.is_empty());
     }
@@ -439,7 +436,7 @@ mod tests {
             content:        "hello".into(),
             tool_calls:     Vec::new(),
             provider_parts: Vec::new(),
-            usage:          TokenUsage::default(),
+            usage:          TokenCounts::default(),
             response_id:    String::new(),
             timestamp:      moment(),
         });

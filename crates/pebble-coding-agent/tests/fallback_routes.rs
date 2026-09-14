@@ -14,7 +14,7 @@ use lithos_llm::types::{ErrorKind as LlmErrorKind, Message as LlmMessage, Reason
 use pebble_coding_agent::environment::Environment;
 use pebble_coding_agent::events::{
     CodingAgentEvent, CodingAgentState, CodingEvent, FailoverContinuation, FailoverStop,
-    PermissionLevel, TokenUsage,
+    PermissionLevel, Usage,
 };
 use pebble_coding_agent::projection::SessionProjection;
 use pebble_coding_agent::state::Message;
@@ -159,7 +159,7 @@ async fn a_failover_eligible_error_moves_the_conversation_to_the_next_route() {
                 7,
             )),
             credentials_rejected(),
-            ScriptedCall::response(text_response("recovered on the fallback")),
+            ScriptedCall::response(with_cost(text_response("recovered on the fallback"), 3)),
         ],
         vec![FallbackRoute::new(FALLBACK)],
     )
@@ -189,7 +189,7 @@ async fn a_failover_eligible_error_moves_the_conversation_to_the_next_route() {
         "the tool effect is not repeated"
     );
     assert!(
-        report.usage.input > 0,
+        report.usage.tokens.input > 0,
         "accounting spans both routes: {report:?}"
     );
 
@@ -234,7 +234,6 @@ async fn a_failover_eligible_error_moves_the_conversation_to_the_next_route() {
         attempt,
         error,
         usage,
-        cost_usd_micros,
         continuation,
         ..
     } = &failovers[0].event
@@ -248,11 +247,11 @@ async fn a_failover_eligible_error_moves_the_conversation_to_the_next_route() {
     // The failed route answered once before it failed: that answer is what
     // it spent, and what the next route continues from.
     assert_eq!(
-        usage.input, 10,
+        usage.tokens.input, 10,
         "the tool-call response's tokens: {usage:?}"
     );
-    assert_eq!(usage.output, 5);
-    assert_eq!(*cost_usd_micros, Some(7));
+    assert_eq!(usage.tokens.output, 5);
+    assert_eq!(usage.cost.map(|cost| cost.usd_micros), Some(7));
     assert_eq!(*continuation, FailoverContinuation::ContinueTurn);
     assert!(
         stops(&published).is_empty(),
@@ -293,11 +292,14 @@ async fn a_failover_eligible_error_moves_the_conversation_to_the_next_route() {
     projection.apply_all(&published);
     assert_eq!(
         projection.prompt.usage, report.usage,
-        "the fold spends what the report spends, on both routes"
+        "the fold spends what the report spends, on both routes, cost included"
     );
-    assert_eq!(projection.prompt.cost_usd_micros, report.cost_usd_micros);
-    assert_eq!(report.usage.input, 20, "one answer on each route");
-    assert_eq!(report.cost_usd_micros, Some(7));
+    assert_eq!(report.usage.tokens.input, 20, "one answer on each route");
+    assert_eq!(
+        report.usage.cost.map(|cost| cost.usd_micros),
+        Some(10),
+        "the failed route's answer and the fallback's are both on the report's bill"
+    );
     assert!(projection.prompt.descendants.is_empty());
     assert_eq!(projection.route.model.as_deref(), Some("vision"));
     // The move is in the fold as the stream told it, and nothing says the
@@ -306,8 +308,10 @@ async fn a_failover_eligible_error_moves_the_conversation_to_the_next_route() {
     assert_eq!(projection.failovers[0].from, PRIMARY);
     assert_eq!(projection.failovers[0].to, FALLBACK);
     assert_eq!(projection.failovers[0].attempt, 1);
-    assert_eq!(projection.failovers[0].usage, *usage);
-    assert_eq!(projection.failovers[0].cost_usd_micros, Some(7));
+    assert_eq!(
+        projection.failovers[0].usage, *usage,
+        "the fold keeps the failed route's spend as the event told it, cost included"
+    );
     assert_eq!(projection.prompt.failovers, 1);
     assert!(projection.failover_stopped.is_none());
     let mut seqs: Vec<u64> = published.iter().map(|event| event.seq).collect();
@@ -375,7 +379,6 @@ async fn queued_follow_ups_move_with_the_conversation() {
     assert_eq!(failovers.len(), 1, "{published:?}");
     let CodingEvent::RouteFailover {
         usage,
-        cost_usd_micros,
         tool_ms,
         continuation,
         ..
@@ -383,8 +386,7 @@ async fn queued_follow_ups_move_with_the_conversation() {
     else {
         unreachable!()
     };
-    assert_eq!(*usage, TokenUsage::default(), "{usage:?}");
-    assert_eq!(*cost_usd_micros, None);
+    assert_eq!(*usage, Usage::default(), "{usage:?}");
     assert_eq!(*tool_ms, 0, "no tool ran on the failed route");
     assert_eq!(*continuation, FailoverContinuation::ReplayPrompt);
     let follow_ups = agent
@@ -718,7 +720,7 @@ async fn a_prompt_resumed_mid_turn_continues_the_turn_on_the_new_route() {
     };
     assert_eq!(
         *usage,
-        TokenUsage::default(),
+        Usage::default(),
         "the resumed route spent nothing before it failed: {usage:?}"
     );
     assert_eq!(

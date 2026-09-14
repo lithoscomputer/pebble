@@ -1,8 +1,8 @@
 //! A value that folds a session's events into what a view or an accountant
 //! needs, the same way live or replayed.
 //!
-//! Both embedders kept their own tallies over the durable event stream — token
-//! counts and provider-reported cost, the context window, which tools ran,
+//! Both embedders kept their own tallies over the durable event stream — what
+//! each answer used and cost, the context window, which tools ran,
 //! skills, todo lists, the children and how they ended, compactions, and the
 //! files a prompt touched — each written once per application in a different
 //! shape. [`SessionProjection`] is that fold, once: feed it every
@@ -12,8 +12,10 @@
 //! progress, because a retained session spans stages and a stage wants what
 //! its own prompts did, not the session's lifetime total.
 //!
-//! The projection reports counts and provider-reported cost only; pricing a
-//! count from a catalog is the application's.
+//! Every spend the projection reports is a [`Usage`]: the tokens the events
+//! carry and the cost the catalog or the provider put on them, summed with
+//! [`Usage::saturating_add`], so a total has a cost only when every answer in
+//! it was priced. Pricing an unpriced answer is the application's.
 
 use std::collections::BTreeMap;
 
@@ -25,7 +27,7 @@ use crate::file_tracker;
 use crate::types::{
     CodingAgentEvent, CodingEvent, ContextWindowSnapshot, FailoverContinuation, FailoverStop,
     InputSource, McpToolSummary, SkillActivationSource, SkillSummary, TodoListProjection,
-    TodoProjection, TokenUsage,
+    TodoProjection, Usage,
 };
 
 /// Where a session stands, as its events tell it.
@@ -55,20 +57,21 @@ pub struct RouteProjection {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DescendantAccount {
     /// The session that spawned it.
-    pub parent:          String,
+    pub parent:      String,
     /// The route it runs on, as its `SessionStarted` reported it, so an
     /// application prices its tokens at its own model. When the start was
     /// not seen, the model of its first answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider:        Option<String>,
+    pub provider:    Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub model:           Option<String>,
-    pub usage:           TokenUsage,
-    pub cost_usd_micros: Option<u64>,
+    pub model:       Option<String>,
+    /// What it spent: its answers and the summary call of each compaction it
+    /// completed.
+    pub usage:       Usage,
     /// Committed assistant messages.
-    pub messages:        u64,
+    pub messages:    u64,
     /// Compactions it completed.
-    pub compactions:     u64,
+    pub compactions: u64,
 }
 
 /// How one tool has been used across the tree.
@@ -154,14 +157,10 @@ pub struct CompactionProjection {
     pub preserved_turn_count:   usize,
     pub summary_token_estimate: usize,
     pub tracked_file_count:     usize,
-    /// The summary call's tokens: a breakdown of the session's and the
-    /// prompt's usage, which already include them.
+    /// The summary call's usage: a breakdown of the session's and the
+    /// prompt's, which already include it.
     #[serde(default)]
-    pub usage:                  TokenUsage,
-    /// The summary call's provider-reported cost, included in the totals the
-    /// same way.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cost_usd_micros:        Option<u64>,
+    pub usage:                  Usage,
 }
 
 /// One move the root session made to a fallback route, as the stream reported
@@ -169,27 +168,25 @@ pub struct CompactionProjection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteFailoverProjection {
     /// The `provider/model` that failed.
-    pub from:            String,
+    pub from:         String,
     /// The `provider/model` the prompt continued on.
-    pub to:              String,
+    pub to:           String,
     /// How many routes the prompt had moved through, this one included.
-    pub attempt:         u32,
+    pub attempt:      u32,
     /// The failure that ended the previous route.
-    pub error:           ErrorData,
+    pub error:        ErrorData,
     /// What the prompt spent on the failed route. Already in the session's
     /// and the prompt's totals through that route's committed answers, so a
     /// breakdown of them and not an addition.
-    pub usage:           TokenUsage,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cost_usd_micros: Option<u64>,
+    pub usage:        Usage,
     /// Time the prompt spent waiting on the failed route's model, in
     /// milliseconds.
-    pub inference_ms:    u64,
+    pub inference_ms: u64,
     /// Time the prompt spent running tools on the failed route, in
     /// milliseconds.
-    pub tool_ms:         u64,
+    pub tool_ms:      u64,
     /// How the new route carried the prompt on.
-    pub continuation:    FailoverContinuation,
+    pub continuation: FailoverContinuation,
 }
 
 /// Why a prompt stayed on its route and ended there although fallback routes
@@ -213,8 +210,7 @@ pub struct PromptDelta {
     /// Whether the prompt reached its end.
     pub completed:         bool,
     /// The root session's usage over the prompt.
-    pub usage:             TokenUsage,
-    pub cost_usd_micros:   Option<u64>,
+    pub usage:             Usage,
     /// Committed assistant messages.
     pub messages:          u64,
     /// The latest context window the prompt reported.
@@ -241,7 +237,7 @@ pub struct PromptDelta {
 impl PromptDelta {
     /// What every descendant spent during the prompt, summed.
     #[must_use]
-    pub fn descendant_usage(&self) -> (TokenUsage, Option<u64>) {
+    pub fn descendant_usage(&self) -> Usage {
         sum_accounts(self.descendants.values())
     }
 
@@ -264,8 +260,7 @@ pub struct SessionProjection {
     pub route:             RouteProjection,
     pub activity:          SessionActivity,
     /// The root session's lifetime usage.
-    pub usage:             TokenUsage,
-    pub cost_usd_micros:   Option<u64>,
+    pub usage:             Usage,
     pub messages:          u64,
     /// Every descendant session, by id.
     pub descendants:       BTreeMap<String, DescendantAccount>,
@@ -357,7 +352,6 @@ impl SessionProjection {
                 attempt,
                 error,
                 usage,
-                cost_usd_micros,
                 inference_ms,
                 tool_ms,
                 continuation,
@@ -370,15 +364,14 @@ impl SessionProjection {
                 }
                 self.prompt.failovers += 1;
                 self.failovers.push(RouteFailoverProjection {
-                    from:            from.clone(),
-                    to:              to.clone(),
-                    attempt:         *attempt,
-                    error:           error.clone(),
-                    usage:           *usage,
-                    cost_usd_micros: *cost_usd_micros,
-                    inference_ms:    *inference_ms,
-                    tool_ms:         *tool_ms,
-                    continuation:    *continuation,
+                    from:         from.clone(),
+                    to:           to.clone(),
+                    attempt:      *attempt,
+                    error:        error.clone(),
+                    usage:        *usage,
+                    inference_ms: *inference_ms,
+                    tool_ms:      *tool_ms,
+                    continuation: *continuation,
                 });
             }
             CodingEvent::RouteFailoverStopped {
@@ -418,16 +411,13 @@ impl SessionProjection {
             CodingEvent::AssistantMessage {
                 model,
                 usage,
-                cost_usd_micros,
                 context_window,
                 ..
             } => {
                 if is_root {
                     self.usage = self.usage.saturating_add(*usage);
-                    add_cost(&mut self.cost_usd_micros, *cost_usd_micros);
                     self.messages += 1;
                     self.prompt.usage = self.prompt.usage.saturating_add(*usage);
-                    add_cost(&mut self.prompt.cost_usd_micros, *cost_usd_micros);
                     self.prompt.messages += 1;
                     if let Some(window) = context_window {
                         self.context_window = Some(window.clone());
@@ -439,7 +429,6 @@ impl SessionProjection {
                         descendant(&mut self.prompt.descendants, &event.session_id, parent),
                     ] {
                         account.usage = account.usage.saturating_add(*usage);
-                        add_cost(&mut account.cost_usd_micros, *cost_usd_micros);
                         account.messages += 1;
                         // The start names the route; an answer seen without
                         // one still says which model to price it at.
@@ -629,13 +618,10 @@ impl SessionProjection {
                 tracked_file_count,
                 reason,
                 usage,
-                cost_usd_micros,
             } => {
                 if is_root {
                     self.usage = self.usage.saturating_add(*usage);
-                    add_cost(&mut self.cost_usd_micros, *cost_usd_micros);
                     self.prompt.usage = self.prompt.usage.saturating_add(*usage);
-                    add_cost(&mut self.prompt.cost_usd_micros, *cost_usd_micros);
                     let compaction = CompactionProjection {
                         reason:                 *reason,
                         original_turn_count:    *original_turn_count,
@@ -643,7 +629,6 @@ impl SessionProjection {
                         summary_token_estimate: *summary_token_estimate,
                         tracked_file_count:     *tracked_file_count,
                         usage:                  *usage,
-                        cost_usd_micros:        *cost_usd_micros,
                     };
                     self.prompt.compactions.push(compaction.clone());
                     self.compactions.push(compaction);
@@ -653,7 +638,6 @@ impl SessionProjection {
                         descendant(&mut self.prompt.descendants, &event.session_id, parent),
                     ] {
                         account.usage = account.usage.saturating_add(*usage);
-                        add_cost(&mut account.cost_usd_micros, *cost_usd_micros);
                         account.compactions += 1;
                     }
                 }
@@ -671,7 +655,7 @@ impl SessionProjection {
 
     /// What every descendant spent over the session's life, summed.
     #[must_use]
-    pub fn descendant_usage(&self) -> (TokenUsage, Option<u64>) {
+    pub fn descendant_usage(&self) -> Usage {
         sum_accounts(self.descendants.values())
     }
 
@@ -701,22 +685,10 @@ fn descendant<'a>(
         })
 }
 
-fn sum_accounts<'a>(
-    accounts: impl Iterator<Item = &'a DescendantAccount>,
-) -> (TokenUsage, Option<u64>) {
-    let mut usage = TokenUsage::default();
-    let mut cost = None;
-    for account in accounts {
-        usage = usage.saturating_add(account.usage);
-        add_cost(&mut cost, account.cost_usd_micros);
-    }
-    (usage, cost)
-}
-
-fn add_cost(total: &mut Option<u64>, cost: Option<u64>) {
-    if let Some(cost) = cost {
-        *total = Some(total.unwrap_or(0).saturating_add(cost));
-    }
+fn sum_accounts<'a>(accounts: impl Iterator<Item = &'a DescendantAccount>) -> Usage {
+    accounts.fold(Usage::default(), |sum, account| {
+        sum.saturating_add(account.usage)
+    })
 }
 
 /// The server segment of an `mcp__<server>__<tool>` name.
@@ -748,7 +720,8 @@ mod tests {
     use super::*;
     use crate::error::ErrorKind;
     use crate::types::{
-        LlmRetryPhase, TodoCreatedProps, TodoDeletedProps, TodoListKind, TodoStatus,
+        Cost, CostSource, LlmRetryPhase, TodoCreatedProps, TodoDeletedProps, TodoListKind,
+        TodoStatus, TokenCounts,
     };
 
     fn root(event: CodingEvent) -> CodingAgentEvent {
@@ -760,16 +733,25 @@ mod tests {
             .with_parent_session_id("ses_root".to_owned())
     }
 
+    /// `input` tokens, priced from the catalog when `cost` is given.
+    fn priced(input: u64, cost: Option<u64>) -> Usage {
+        Usage {
+            tokens: TokenCounts {
+                input,
+                ..TokenCounts::default()
+            },
+            cost:   cost.map(|usd_micros| Cost {
+                usd_micros,
+                source: CostSource::Catalog,
+            }),
+        }
+    }
+
     fn message(input: u64, cost: Option<u64>) -> CodingEvent {
         CodingEvent::AssistantMessage {
             text:            "ok".into(),
             model:           "model".into(),
-            usage:           TokenUsage {
-                input,
-                ..TokenUsage::default()
-            },
-            cost_usd_micros: cost,
-            cost_source:     None,
+            usage:           priced(input, cost),
             tool_call_count: 0,
             context_window:  None,
             reasoning:       None,
@@ -794,19 +776,20 @@ mod tests {
         projection.apply(&root(CodingEvent::ProcessingEnd));
 
         assert_eq!(projection.route.model.as_deref(), Some("model"));
-        assert_eq!(projection.usage.input, 30);
-        assert_eq!(projection.cost_usd_micros, Some(6));
+        assert_eq!(projection.usage, priced(30, Some(6)));
         assert_eq!(projection.messages, 2);
-        assert_eq!(projection.prompt.usage.input, 30);
+        assert_eq!(projection.prompt.usage, priced(30, Some(6)));
         assert!(projection.prompt.completed);
         assert_eq!(projection.activity, SessionActivity::Idle);
-        let (descendant_usage, descendant_cost) = projection.descendant_usage();
-        assert_eq!(descendant_usage.input, 7);
-        assert_eq!(descendant_cost, None);
+        assert_eq!(
+            projection.descendant_usage(),
+            priced(7, None),
+            "an unpriced answer leaves the sum unpriced"
+        );
         assert_eq!(projection.descendants["ses_child"].parent, "ses_root");
         assert_eq!(
-            projection.prompt.descendant_usage().0.input,
-            7,
+            projection.prompt.descendant_usage(),
+            priced(7, None),
             "the prompt's delta keeps the descendants' spend apart from the root's"
         );
         assert_eq!(projection.prompts, 1);
@@ -827,11 +810,7 @@ mod tests {
             summary_token_estimate: 40,
             tracked_file_count:     1,
             reason:                 CompactionReason::Threshold,
-            usage:                  TokenUsage {
-                input,
-                ..TokenUsage::default()
-            },
-            cost_usd_micros:        cost,
+            usage:                  priced(input, cost),
         }
     }
 
@@ -847,33 +826,28 @@ mod tests {
         projection.apply(&root(compaction(30, Some(2))));
         projection.apply(&child(compaction(4, None)));
         projection.apply(&root(CodingEvent::CompactionFailed {
-            reason:          CompactionReason::Manual,
-            error:           ErrorData::new(ErrorKind::Compaction, "empty summary"),
-            usage:           Some(TokenUsage {
-                input: 100,
-                ..TokenUsage::default()
-            }),
-            cost_usd_micros: Some(50),
+            reason: CompactionReason::Manual,
+            error:  ErrorData::new(ErrorKind::Compaction, "empty summary"),
+            usage:  Some(priced(100, Some(50))),
         }));
 
         assert_eq!(
-            projection.usage.input, 40,
-            "the summary call is in the total"
+            projection.usage,
+            priced(40, Some(7)),
+            "the summary call is in the total, its cost included"
         );
-        assert_eq!(projection.cost_usd_micros, Some(7));
-        assert_eq!(projection.prompt.usage.input, 40);
-        assert_eq!(projection.prompt.cost_usd_micros, Some(7));
+        assert_eq!(projection.prompt.usage, priced(40, Some(7)));
         assert_eq!(projection.messages, 1, "a compaction is not a turn");
-        assert_eq!(projection.compactions[0].usage.input, 30);
-        assert_eq!(projection.compactions[0].cost_usd_micros, Some(2));
+        assert_eq!(projection.compactions[0].usage, priced(30, Some(2)));
         assert_eq!(projection.prompt.compactions, projection.compactions);
         assert_eq!(
-            projection.descendants["ses_child"].usage.input, 4,
+            projection.descendants["ses_child"].usage,
+            priced(4, None),
             "a child's compaction is the child's spend"
         );
         assert_eq!(projection.descendants["ses_child"].compactions, 1);
         assert_eq!(
-            projection.usage.input, 40,
+            projection.usage.tokens.input, 40,
             "a failed compaction is not billed, as the report does not bill it"
         );
     }
@@ -913,9 +887,7 @@ mod tests {
             CodingEvent::AssistantMessage {
                 text:            "ok".into(),
                 model:           "tiny".into(),
-                usage:           TokenUsage::default(),
-                cost_usd_micros: None,
-                cost_source:     None,
+                usage:           Usage::default(),
                 tool_call_count: 0,
                 context_window:  None,
                 reasoning:       None,
@@ -933,7 +905,7 @@ mod tests {
             Some("small"),
             "the start's route wins over the answer's model"
         );
-        assert_eq!(child_account.usage.input, 7);
+        assert_eq!(child_account.usage, priced(7, None));
         assert_eq!(
             projection.prompt.descendants["ses_child"].model.as_deref(),
             Some("small"),
@@ -977,11 +949,7 @@ mod tests {
             to: to.into(),
             attempt,
             error: ErrorData::new(ErrorKind::Llm, "key revoked"),
-            usage: TokenUsage {
-                input: 10,
-                ..TokenUsage::default()
-            },
-            cost_usd_micros: Some(7),
+            usage: priced(10, Some(7)),
             inference_ms: 120,
             tool_ms: 30,
             continuation: FailoverContinuation::ContinueTurn,
@@ -1015,8 +983,7 @@ mod tests {
         assert_eq!(projection.failovers[0].from, "a/one");
         assert_eq!(projection.failovers[0].to, "b/two");
         assert_eq!(projection.failovers[0].attempt, 1);
-        assert_eq!(projection.failovers[0].usage.input, 10);
-        assert_eq!(projection.failovers[0].cost_usd_micros, Some(7));
+        assert_eq!(projection.failovers[0].usage, priced(10, Some(7)));
         assert_eq!(projection.failovers[0].inference_ms, 120);
         assert_eq!(projection.failovers[0].tool_ms, 30);
         assert_eq!(
@@ -1028,10 +995,10 @@ mod tests {
         assert_eq!(projection.route.provider.as_deref(), Some("c"));
         assert_eq!(projection.route.model.as_deref(), Some("three"));
         assert_eq!(
-            projection.usage.input, 10,
+            projection.usage,
+            priced(10, Some(7)),
             "the failed route's spend on the event is not counted again"
         );
-        assert_eq!(projection.cost_usd_micros, Some(7));
         let stopped = projection
             .failover_stopped
             .as_ref()
@@ -1073,7 +1040,7 @@ mod tests {
         }));
         projection.apply(&root(message(5, None)));
         assert_eq!(
-            projection.prompt.usage.input, 15,
+            projection.prompt.usage.tokens.input, 15,
             "a follow-up is the same prompt"
         );
         projection.apply(&root(CodingEvent::ProcessingEnd));
@@ -1083,12 +1050,12 @@ mod tests {
             source:  InputSource::Prompt,
         }));
         assert_eq!(
-            projection.prompt.usage.input, 0,
+            projection.prompt.usage.tokens.input, 0,
             "a new prompt starts from nothing"
         );
         assert!(!projection.prompt.completed);
         assert_eq!(
-            projection.usage.input, 15,
+            projection.usage.tokens.input, 15,
             "the lifetime total keeps counting"
         );
         assert_eq!(projection.prompts, 2);
@@ -1326,6 +1293,6 @@ mod tests {
         let mut resumed: SessionProjection = serde_json::from_str(&stored).expect("parses");
         assert_eq!(resumed, projection);
         resumed.apply(&root(message(5, None)));
-        assert_eq!(resumed.usage.input, 15);
+        assert_eq!(resumed.usage.tokens.input, 15);
     }
 }
