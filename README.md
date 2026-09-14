@@ -84,20 +84,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
 `CodingAgentBuilder::build().await` returns a ready coding agent. Resource loading
 and system-prompt construction happen inside the build. There is no separate
-initialization step to remember. `prompt` returns a `PromptReport` with token usage, known cost, and timing
-on success and failure. Its `result` contains either a `PromptOutput` with the
-final message and text, or the prompt error. Accounting covers accepted main-model
-responses in this session, including queued follow-ups, and the summary call of
-each compaction the prompt performed. It excludes subagents and model calls made
-inside tools. Known cost is a subtotal when some responses have no price. A
+initialization step to remember. `prompt` returns a `PromptReport` with usage
+and timing on success and failure. Its `result` contains either a
+`PromptOutput` with the final message and text, or the prompt error.
+Accounting covers accepted main-model responses in this session, including
+queued follow-ups, and the summary call of each compaction the prompt
+performed. It excludes subagents and model calls made inside tools. Usage is
+lithos-llm's `Usage`: the five token buckets and, when the catalog or the
+provider priced every response, a `Cost` with its source. The cost is `None`
+rather than a subtotal when a response that used tokens had no price. A
 dropped prompt future cannot return a report. The report also names every file
 the prompt wrote or edited (`files_touched`, sorted, the children's work
 included, deletions left out), the one it touched last, and the
 `provider/model` route it ended on. Its `compactions` list each compaction the
 prompt performed, in order, as a `CompactionAccount` with the facts the
-`Message::Compaction` turn records and the summary call's usage and cost: a
-breakdown of the report's usage and cost, not an addition to them, and a manual
-`compact` between prompts is on no report.
+`Message::Compaction` turn records and the summary call's usage: a breakdown of
+the report's usage, not an addition to it, and a manual `compact` between
+prompts is on no report.
 
 `continue_prompt` continues a prompt the history left unfinished, without new
 input: the history ends with the prompt itself or with tool results the model
@@ -158,8 +161,9 @@ git probe, the walk, and the checks through the `Environment`; explicit
 `with_memory_files` and `with_skill_dirs` still work and come first.
 
 `pebble_coding_agent::projection::SessionProjection` folds one session
-tree's events into what a view or an accountant needs: the root's token
-counts and provider-reported cost, each descendant's and the model it ran,
+tree's events into what a view or an accountant needs: the root's usage as
+one `Usage` (tokens, and cost where every answer was priced), each
+descendant's and the model it ran,
 the context window, which tools ran and how often they failed, how many model
 calls were retried, the route and every failover that moved it, the MCP
 servers and whether they were called, skills, todo lists, the children and
@@ -230,7 +234,7 @@ skills, tools, and the latest context-window measurement.
 Automatic context compaction remains policy-driven. An application can also
 call `CodingAgent::compact(CompactionOptions)` while the agent is idle. The
 operation returns a structured `CompactionOutcome`. A completed summary is a
-dedicated `Message::Compaction` turn with its reason, counts, usage, and cost.
+dedicated `Message::Compaction` turn with its reason, counts, and usage.
 Each started compaction ends with a completed, failed, or cancelled event.
 Pass a token to `compact_with_cancellation`, or use
 `CodingAgentControlHandle::cancel_compaction` from another task.
@@ -494,7 +498,7 @@ Pebble rejects unpaired tool calls and results before sending the request.
 Install `extensions::CompactionPolicy` with `compaction_policy` to supply summary
 generation for both automatic and manual compaction. The hook receives the
 selected history, recent turns, and the default summary request. It returns
-summary text, usage, and optional cost. Pebble owns the safe cut, summary limits,
+summary text and its usage, with the cost optional. Pebble owns the safe cut, summary limits,
 history replacement, and terminal events. Failed, empty, or cancelled summaries
 leave history intact. Existing compaction rules still clear stale usage
 estimates and non-replayable provider data in retained turns.
