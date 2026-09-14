@@ -22,12 +22,16 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::SessionScope;
 use crate::compaction::CompactionReason;
-use crate::types::{InputContent, TokenCounts, Usage, rfc3339_millis};
+use crate::types::{InputContent, Usage, rfc3339_millis};
 
 /// The record format version this build writes.
 ///
-/// Version 4 stores the canonical session scope, including parent and depth.
-pub const SESSION_RECORD_FORMAT_VERSION: u32 = 4;
+/// Version 5 stores each assistant and compaction turn's `usage` as
+/// lithos-llm's `Usage`: its token counts under `tokens` and, when priced,
+/// its `cost`. Version 4 stored the counts bare with a `cost_usd_micros`
+/// beside them on compaction turns, and is refused rather than read back as
+/// nothing used.
+pub const SESSION_RECORD_FORMAT_VERSION: u32 = 5;
 
 /// One session, stored.
 ///
@@ -162,12 +166,13 @@ pub enum StoredMessage {
         /// Provider-native parts preserved for lossless replay.
         #[serde(default, deserialize_with = "null_as_default")]
         provider_parts: Vec<ContentPart>,
-        /// The token accounting the provider reported for this turn.
+        /// What the provider reported for this turn: its tokens and, where
+        /// the catalog or the provider priced it, its cost.
         ///
         /// Stored as typed counts, so restoring a record returns exactly the
         /// numbers that were saved.
         #[serde(default, deserialize_with = "null_as_default")]
-        usage:          TokenCounts,
+        usage:          Usage,
         /// The provider's identifier for the response.
         #[serde(default)]
         response_id:    String,
@@ -273,20 +278,20 @@ mod tests {
 
     use super::*;
     use crate::SessionId;
-    use crate::types::Message;
+    use crate::types::{Message, TokenCounts};
 
     fn moment() -> SystemTime {
         UNIX_EPOCH + Duration::from_millis(1_767_225_600_500)
     }
 
-    fn usage() -> TokenCounts {
-        TokenCounts {
+    fn usage() -> Usage {
+        Usage::from(TokenCounts {
             input:       1_200,
             output:      340,
             reasoning:   96,
             cache_read:  800,
             cache_write: 64,
-        }
+        })
     }
 
     fn tool_call() -> ToolCall {
@@ -418,7 +423,7 @@ mod tests {
         else {
             panic!("expected an assistant turn");
         };
-        assert_eq!(usage, TokenCounts::default());
+        assert_eq!(usage, Usage::default());
         assert!(tool_calls.is_empty());
         assert!(provider_parts.is_empty());
     }
@@ -436,7 +441,7 @@ mod tests {
             content:        "hello".into(),
             tool_calls:     Vec::new(),
             provider_parts: Vec::new(),
-            usage:          TokenCounts::default(),
+            usage:          Usage::default(),
             response_id:    String::new(),
             timestamp:      moment(),
         });

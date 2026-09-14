@@ -3,7 +3,7 @@ source: crates/pebble-coding-agent/tests/record_contract.rs
 expression: rendered
 ---
 {
-  "format_version": 4,
+  "format_version": 5,
   "scope": {
     "session_id": "ses_root",
     "root_session_id": "ses_root",
@@ -60,11 +60,17 @@ expression: rendered
         }
       ],
       "usage": {
-        "input": 1200,
-        "output": 340,
-        "reasoning": 96,
-        "cache_read": 800,
-        "cache_write": 64
+        "tokens": {
+          "input": 1200,
+          "output": 340,
+          "reasoning": 96,
+          "cache_read": 800,
+          "cache_write": 64
+        },
+        "cost": {
+          "usd_micros": 12500,
+          "source": "catalog"
+        }
       },
       "response_id": "resp_1",
       "timestamp": "2026-01-01T00:00:00.500Z"
