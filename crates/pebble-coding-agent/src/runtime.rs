@@ -32,7 +32,6 @@ use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-pub use self::control::SteeringLease;
 pub(crate) use self::control::{actor_from_attribution, input_message, steering_message};
 pub use self::retry::RetryEventObserver;
 use self::turn::{CodingAgentBridge, ConversationState};
@@ -1643,13 +1642,6 @@ impl CodingRuntime {
     #[cfg(test)]
     pub(crate) fn steer(&self, text: impl Into<String>) {
         let _ = self.agent_control.enqueue_steering(text.into());
-    }
-
-    /// Hands out a steering lease that parks natural completion while an
-    /// external steering source is attached.
-    #[cfg(test)]
-    pub(crate) fn steering_lease(&self) -> SteeringLease {
-        SteeringLease::acquire(&self.agent_control)
     }
 
     /// Queues more input to process once the current input is finished.
