@@ -353,8 +353,8 @@ async fn a_broken_stream_after_an_edit_does_not_execute_the_edit_twice() {
         report.result.unwrap().text.as_deref(),
         Some("Implemented and checked task.sh.")
     );
-    assert_eq!(report.usage.input, 30);
-    assert_eq!(report.usage.output, 15);
+    assert_eq!(report.usage.tokens.input, 30);
+    assert_eq!(report.usage.tokens.output, 15);
     agent.shutdown(ShutdownReason::Completed).await.unwrap();
 
     assert_eq!(
@@ -460,17 +460,18 @@ async fn a_coding_task_survives_compaction_between_failing_and_passing_tests() {
         report.result.unwrap().text.as_deref(),
         Some("Fixed clamp.sh; all four tests pass.")
     );
-    assert_eq!(report.usage.input, 900_050, "summary usage is included");
-    assert_eq!(report.usage.output, 30);
+    assert_eq!(
+        report.usage.tokens.input, 900_050,
+        "summary usage is included"
+    );
+    assert_eq!(report.usage.tokens.output, 30);
     agent.shutdown(ShutdownReason::Completed).await.unwrap();
     let summary_cost: u64 = agent
         .history()
         .turns()
         .iter()
         .filter_map(|message| match message {
-            Message::Compaction {
-                cost_usd_micros, ..
-            } => *cost_usd_micros,
+            Message::Compaction { usage, .. } => usage.cost.map(|cost| cost.usd_micros),
             _ => None,
         })
         .sum();
@@ -520,13 +521,15 @@ async fn a_coding_task_survives_compaction_between_failing_and_passing_tests() {
     let coding_cost: u64 = published
         .iter()
         .filter_map(|event| match &event.event {
-            CodingEvent::AssistantMessage {
-                cost_usd_micros, ..
-            } => *cost_usd_micros,
+            CodingEvent::AssistantMessage { usage, .. } => usage.cost.map(|cost| cost.usd_micros),
             _ => None,
         })
         .sum();
-    assert_eq!(report.cost_usd_micros, Some(coding_cost + summary_cost));
+    assert_eq!(
+        report.usage.cost.map(|cost| cost.usd_micros),
+        Some(coding_cost + summary_cost),
+        "every answer and the summary call were priced, so the report's cost is their sum"
+    );
     let progress: Vec<_> = published
         .iter()
         .filter_map(|event| match &event.event {
@@ -685,9 +688,9 @@ wait "$worker"
             report.result,
             Err(Error::Interrupted(InterruptReason::Cancelled))
         ));
-        assert_eq!(report.usage.input, 10);
-        assert_eq!(report.usage.output, 5);
-        assert!(report.cost_usd_micros.is_some_and(|cost| cost > 0));
+        assert_eq!(report.usage.tokens.input, 10);
+        assert_eq!(report.usage.tokens.output, 5);
+        assert!(report.usage.cost.is_some_and(|cost| cost.usd_micros > 0));
         // Check before shutdown: prompt cancellation must own this cleanup.
         for pid in pids {
             assert_eq!(
@@ -731,8 +734,11 @@ wait "$worker"
             next.result.unwrap().text.as_deref(),
             Some("Ready for more work.")
         );
-        assert_eq!(next.usage.input, 10, "usage belongs to this invocation");
-        assert_eq!(next.usage.output, 5);
+        assert_eq!(
+            next.usage.tokens.input, 10,
+            "usage belongs to this invocation"
+        );
+        assert_eq!(next.usage.tokens.output, 5);
         agent.shutdown(ShutdownReason::Completed).await.unwrap();
         let requests = twin.requests();
         assert_eq!(

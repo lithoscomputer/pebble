@@ -124,14 +124,13 @@ impl Transcript {
                 text,
                 reasoning,
                 usage,
-                cost_usd_micros,
                 context_window,
                 ..
             } => {
-                self.input_tokens = self.input_tokens.saturating_add(usage.input);
-                self.output_tokens = self.output_tokens.saturating_add(usage.output);
-                if let Some(cost) = cost_usd_micros {
-                    self.cost = self.cost.saturating_add(*cost);
+                self.input_tokens = self.input_tokens.saturating_add(usage.tokens.input);
+                self.output_tokens = self.output_tokens.saturating_add(usage.tokens.output);
+                if let Some(cost) = usage.cost {
+                    self.cost = self.cost.saturating_add(cost.usd_micros);
                 } else {
                     self.unknown_cost = true;
                 }
@@ -427,7 +426,7 @@ fn append_tail(destination: &mut String, delta: &str) {
 mod tests {
     use std::time::SystemTime;
 
-    use pebble_coding_agent::events::TokenCounts;
+    use pebble_coding_agent::events::Usage;
 
     use super::*;
 
@@ -451,9 +450,7 @@ mod tests {
             &event(2, CodingEvent::AssistantMessage {
                 text:            "Hello\n\nWorld".into(),
                 model:           "model".into(),
-                usage:           TokenCounts::default(),
-                cost_usd_micros: None,
-                cost_source:     None,
+                usage:           Usage::default(),
                 tool_call_count: 0,
                 context_window:  None,
                 reasoning:       None,

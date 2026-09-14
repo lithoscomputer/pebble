@@ -149,7 +149,7 @@ impl Renderer {
                 ..
             } => print_err(&format!(
                 "[turn] {} tokens, {tool_call_count} tool call(s)",
-                usage.total()
+                usage.total_tokens()
             )),
             CodingEvent::ToolCallStarted {
                 tool_name,
@@ -295,32 +295,34 @@ impl Summary {
             lines.push(format!("        {named}"));
         }
 
-        let usage = projection.usage;
+        let tokens = projection.usage.tokens;
         lines.push(format!(
             "tokens: {} in, {} out, {} reasoning, {} cached ({} total)",
-            usage.input,
-            usage.output,
-            usage.reasoning,
-            usage.cache_read + usage.cache_write,
-            usage.total()
+            tokens.input,
+            tokens.output,
+            tokens.reasoning,
+            tokens.cache_read + tokens.cache_write,
+            tokens.total()
         ));
-        lines.push(match projection.cost_usd_micros {
-            Some(cost) => format!("cost:   {}", dollars(cost)),
+        lines.push(match projection.usage.cost {
+            Some(cost) => format!("cost:   {}", dollars(cost.usd_micros)),
             None => "cost:   not reported for this model".to_owned(),
         });
 
         let spawned = projection.subagent_counts.spawned;
         if spawned > 0 || !projection.descendants.is_empty() {
-            let (usage, cost) = projection.descendant_usage();
+            let usage = projection.descendant_usage();
             let turns: u64 = projection
                 .descendants
                 .values()
                 .map(|account| account.messages)
                 .sum();
-            let cost = cost.map_or_else(String::new, |cost| format!(", {}", dollars(cost)));
+            let cost = usage.cost.map_or_else(String::new, |cost| {
+                format!(", {}", dollars(cost.usd_micros))
+            });
             lines.push(format!(
                 "subagents: {spawned} spawned, {turns} turn(s), {} tokens{cost}",
-                usage.total()
+                usage.total_tokens()
             ));
         }
         if projection.retries > 0 {
@@ -375,7 +377,8 @@ mod tests {
     use std::time::SystemTime;
 
     use pebble_coding_agent::events::{
-        CompactionReason, ErrorData, ErrorKind, InputSource, LlmRetryPhase, TokenCounts,
+        CompactionReason, Cost, CostSource, ErrorData, ErrorKind, InputSource, LlmRetryPhase,
+        TokenCounts, Usage,
     };
     use serde_json::json;
 
@@ -390,17 +393,27 @@ mod tests {
             .with_parent_session_id("ses_root")
     }
 
-    fn message(input: u64, output: u64, cost: Option<u64>) -> CodingEvent {
-        CodingEvent::AssistantMessage {
-            text:            "ok".into(),
-            model:           "model".into(),
-            usage:           TokenCounts {
+    /// `input` and `output` tokens, priced from the catalog when `cost` is
+    /// given.
+    fn priced(input: u64, output: u64, cost: Option<u64>) -> Usage {
+        Usage {
+            tokens: TokenCounts {
                 input,
                 output,
                 ..TokenCounts::default()
             },
-            cost_usd_micros: cost,
-            cost_source:     None,
+            cost:   cost.map(|usd_micros| Cost {
+                usd_micros,
+                source: CostSource::Catalog,
+            }),
+        }
+    }
+
+    fn message(input: u64, output: u64, cost: Option<u64>) -> CodingEvent {
+        CodingEvent::AssistantMessage {
+            text:            "ok".into(),
+            model:           "model".into(),
+            usage:           priced(input, output, cost),
             tool_call_count: 0,
             context_window:  None,
             reasoning:       None,
@@ -547,12 +560,7 @@ mod tests {
                 summary_token_estimate: 20,
                 tracked_file_count:     0,
                 reason:                 CompactionReason::Threshold,
-                usage:                  TokenCounts {
-                    input: 30,
-                    output: 2,
-                    ..TokenCounts::default()
-                },
-                cost_usd_micros:        Some(200),
+                usage:                  priced(30, 2, Some(200)),
             }),
             root(CodingEvent::ProcessingEnd),
             root(CodingEvent::SessionEnded),
