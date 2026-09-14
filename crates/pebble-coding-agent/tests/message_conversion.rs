@@ -74,12 +74,18 @@ fn every_variant() -> Vec<Message> {
                 ContentPart::opaque("openai.reasoning", json!({ "id": "rs_1" })),
                 ContentPart::opaque("openai.message", json!({ "id": "msg_1" })),
             ],
-            usage:          TokenCounts {
-                input:       1_200,
-                output:      340,
-                reasoning:   96,
-                cache_read:  800,
-                cache_write: 64,
+            usage:          Usage {
+                tokens: TokenCounts {
+                    input:       1_200,
+                    output:      340,
+                    reasoning:   96,
+                    cache_read:  800,
+                    cache_write: 64,
+                },
+                cost:   Some(Cost {
+                    usd_micros: 12_500,
+                    source:     CostSource::Catalog,
+                }),
             },
             response_id:    "resp_1".into(),
             timestamp:      moment(),

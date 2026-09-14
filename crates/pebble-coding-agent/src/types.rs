@@ -481,8 +481,9 @@ pub enum Message {
         /// Provider-native parts preserved for lossless replay: reasoning
         /// blocks with their signatures, and opaque provider items.
         provider_parts: Vec<ContentPart>,
-        /// The token accounting the provider reported for this turn.
-        usage:          TokenCounts,
+        /// What the provider reported for this turn: its tokens and, where
+        /// the catalog or the provider priced it, its cost.
+        usage:          Usage,
         /// The provider's identifier for the response.
         response_id:    String,
         /// When the turn was committed.
@@ -2220,7 +2221,7 @@ mod tests {
             content:        "on it".into(),
             tool_calls:     vec![ToolCall::function("call_1", "shell", json!({"cmd": "ls"}))],
             provider_parts: vec![ContentPart::opaque("openai.reasoning", json!({"id": "r"}))],
-            usage:          TokenCounts::default(),
+            usage:          Usage::default(),
             response_id:    "resp_1".into(),
             timestamp:      moment(),
         };
@@ -2240,7 +2241,7 @@ mod tests {
             content:        String::new(),
             tool_calls:     vec![ToolCall::function("call_1", "shell", json!({}))],
             provider_parts: Vec::new(),
-            usage:          TokenCounts::default(),
+            usage:          Usage::default(),
             response_id:    "resp_1".into(),
             timestamp:      moment(),
         };
@@ -2318,7 +2319,7 @@ mod tests {
             content:        String::new(),
             tool_calls:     Vec::new(),
             provider_parts: vec![redacted, readable],
-            usage:          TokenCounts::default(),
+            usage:          Usage::default(),
             response_id:    "resp_1".into(),
             timestamp:      moment(),
         };

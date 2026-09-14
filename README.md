@@ -595,10 +595,16 @@ additive: new variants and new optional fields. Consumers should ignore members
 they do not know and tolerate variants they do not know.
 
 `pebble_coding_agent::state::SessionRecord` is also public API. Its format
-version changes when a stored shape changes. Version 4 stores a required `scope`
-with the session ID, root ID, immediate parent ID, and depth. This build requires
-version 4; it does not infer ancestry from older records. Warm exports preserve
-the same scope.
+version changes when a stored shape changes. Version 5 stores each assistant
+and compaction turn's `usage` as lithos-llm's `Usage`, its token counts under
+`tokens` and its `cost` when priced; version 4 stored the counts bare, with a
+`cost_usd_micros` beside them on compaction turns. Every version since 4
+stores a required `scope` with the session ID, root ID, immediate parent ID,
+and depth. This build requires version 5: `SessionRecord::is_supported` is
+false for any other version and resuming one fails with
+`CodingAgentBuildError::UnsupportedRecord`, so an older record is refused
+rather than read back as nothing used, and no ancestry is inferred from it.
+Warm exports preserve the same scope.
 
 Ignoring an unknown member is free; tolerating an unknown *variant* is the
 reader's own work, because a variant a build has never heard of fails the whole

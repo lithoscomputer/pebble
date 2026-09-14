@@ -37,7 +37,10 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 /// The current format fixture, which names a route the test catalog lacks.
-const SAMPLE_RECORD_V1: &str = include_str!("fixtures/session_record_v4.json");
+const SAMPLE_RECORD_V1: &str = include_str!("fixtures/session_record_v5.json");
+
+/// The previous format, whose turns store their usage in another shape.
+const PREVIOUS_RECORD: &str = include_str!("fixtures/session_record_v4.json");
 
 /// A second provider offering a model called `model`, like the `test` provider
 /// does, so a resume that matched on the model name alone could pick the
@@ -605,6 +608,31 @@ async fn a_record_from_a_format_this_build_does_not_read_is_refused() {
             error,
             CodingAgentBuildError::UnsupportedRecord { version, supported }
                 if version == SESSION_RECORD_FORMAT_VERSION + 1
+                    && supported == SESSION_RECORD_FORMAT_VERSION
+        ),
+        "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_record_from_the_previous_format_is_refused_before_its_route_is_read() {
+    let record: SessionRecord =
+        serde_json::from_str(PREVIOUS_RECORD).expect("a version 4 record still parses as JSON");
+    let (client, _) = scripted_client(vec![ScriptedCall::response(text_response("never"))]);
+
+    let error = CodingAgent::resume(client, environment(), record, ResumeMode::RecordedModel)
+        .build()
+        .await
+        .err()
+        .expect("the previous format is refused");
+
+    // The version is checked first: the fixture names a route this catalog
+    // lacks, and that is not what the error says.
+    assert!(
+        matches!(
+            error,
+            CodingAgentBuildError::UnsupportedRecord { version, supported }
+                if version == SESSION_RECORD_FORMAT_VERSION - 1
                     && supported == SESSION_RECORD_FORMAT_VERSION
         ),
         "{error:?}"
