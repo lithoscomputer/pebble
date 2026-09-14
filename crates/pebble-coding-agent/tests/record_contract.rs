@@ -17,7 +17,11 @@ use pebble_coding_agent::state::{
 use serde_json::json;
 
 /// A record with complete ancestry and typed tool input.
-const SAMPLE_RECORD: &str = include_str!("fixtures/session_record_v4.json");
+const SAMPLE_RECORD: &str = include_str!("fixtures/session_record_v5.json");
+
+/// The previous format, as this build's predecessor wrote it: usage as bare
+/// counts, with `cost_usd_micros` beside them on the compaction turn.
+const PREVIOUS_RECORD: &str = include_str!("fixtures/session_record_v4.json");
 
 fn moment() -> SystemTime {
     UNIX_EPOCH + Duration::from_millis(1_767_225_600_500)
@@ -30,6 +34,17 @@ fn usage() -> TokenCounts {
         reasoning:   96,
         cache_read:  800,
         cache_write: 64,
+    }
+}
+
+/// The sample counts, priced from the catalog.
+fn priced(usd_micros: u64) -> Usage {
+    Usage {
+        tokens: usage(),
+        cost:   Some(Cost {
+            usd_micros,
+            source: CostSource::Catalog,
+        }),
     }
 }
 
@@ -62,7 +77,7 @@ fn every_turn() -> Vec<Message> {
                 }),
                 ContentPart::opaque("openai.reasoning", json!({ "id": "rs_1" })),
             ],
-            usage:          usage(),
+            usage:          priced(12_500),
             response_id:    "resp_1".into(),
             timestamp:      moment(),
         },
@@ -86,13 +101,7 @@ fn every_turn() -> Vec<Message> {
             summary_token_estimate:  24,
             tracked_file_count:      1,
             summary_truncated:       false,
-            usage:                   Usage {
-                tokens: usage(),
-                cost:   Some(Cost {
-                    usd_micros: 1_250,
-                    source:     CostSource::Catalog,
-                }),
-            },
+            usage:                   priced(1_250),
             timestamp:               moment(),
         },
         Message::Steering {
@@ -146,7 +155,7 @@ fn the_stored_record_restores_history_and_accounting() {
     else {
         panic!("expected an assistant turn");
     };
-    assert_eq!(*restored_usage, usage());
+    assert_eq!(*restored_usage, priced(12_500));
     assert_eq!(tool_calls, &[tool_call()]);
     assert_eq!(provider_parts.len(), 2);
     assert_eq!(response_id, "resp_1");
@@ -231,10 +240,23 @@ fn a_record_whose_members_are_null_still_resumes() {
         content:        "hello".into(),
         tool_calls:     Vec::new(),
         provider_parts: Vec::new(),
-        usage:          TokenCounts::default(),
+        usage:          Usage::default(),
         response_id:    "resp_1".into(),
         timestamp:      moment(),
     }]);
+}
+
+#[test]
+fn a_record_from_the_previous_format_is_refused() {
+    let record: SessionRecord =
+        serde_json::from_str(PREVIOUS_RECORD).expect("a version 4 record still parses as JSON");
+
+    assert_eq!(record.format_version, SESSION_RECORD_FORMAT_VERSION - 1);
+    assert!(
+        !record.is_supported(),
+        "a version 4 record's usage has another shape, so it is refused rather than read back \
+         as nothing used"
+    );
 }
 
 #[test]

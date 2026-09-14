@@ -565,7 +565,7 @@ impl CodingAgentBridge {
             content: text.clone(),
             tool_calls: tool_calls.clone(),
             provider_parts,
-            usage: usage.tokens,
+            usage,
             response_id: response.id.clone().unwrap_or_default(),
             timestamp: SystemTime::now(),
         });

@@ -804,7 +804,7 @@ fn latest_reported_usage(turns: &[Message]) -> Option<(usize, usize)> {
         let Message::Assistant { usage, .. } = turn else {
             return None;
         };
-        let total = usage.total();
+        let total = usage.total_tokens();
         (total > 0).then(|| (index, usize::try_from(total).unwrap_or(usize::MAX)))
     })
 }
@@ -984,7 +984,7 @@ mod tests {
         ScriptedCompletion, ScriptedFailure, ScriptedProvider, client_from, message_text,
         test_catalog, text_response,
     };
-    use crate::types::{CodingAgentEvent, TokenCounts};
+    use crate::types::{CodingAgentEvent, TokenCounts, Usage};
 
     static NEVER_CANCEL: LazyLock<CancellationToken> = LazyLock::new(CancellationToken::new);
 
@@ -1020,12 +1020,12 @@ mod tests {
 
     fn assistant(content: &str, usage: TokenCounts) -> Message {
         Message::Assistant {
-            content: content.to_owned(),
-            tool_calls: Vec::new(),
+            content:        content.to_owned(),
+            tool_calls:     Vec::new(),
             provider_parts: Vec::new(),
-            usage,
-            response_id: "resp_1".to_owned(),
-            timestamp: now(),
+            usage:          Usage::from(usage),
+            response_id:    "resp_1".to_owned(),
+            timestamp:      now(),
         }
     }
 
@@ -1175,7 +1175,7 @@ mod tests {
                     json!({ "path": "foo.rs" }),
                 )],
                 provider_parts: Vec::new(),
-                usage:          TokenCounts::default(),
+                usage:          Usage::default(),
                 response_id:    "resp_1".to_owned(),
                 timestamp:      now(),
             },
@@ -1217,7 +1217,7 @@ mod tests {
             content:        String::new(),
             tool_calls:     vec![ToolCall::function("c1", "write_file", arguments.clone())],
             provider_parts: Vec::new(),
-            usage:          TokenCounts::default(),
+            usage:          Usage::default(),
             response_id:    "resp_1".to_owned(),
             timestamp:      now(),
         }]);
@@ -1262,7 +1262,7 @@ mod tests {
                     json!({ "path": "foo.rs" }),
                 )],
                 provider_parts: Vec::new(),
-                usage:          TokenCounts::default(),
+                usage:          Usage::default(),
                 response_id:    "resp_1".to_owned(),
                 timestamp:      now(),
             },
@@ -1547,7 +1547,7 @@ mod tests {
             content:        "working on it".to_owned(),
             tool_calls:     vec![ToolCall::function("call_1", "shell", json!({}))],
             provider_parts: Vec::new(),
-            usage:          TokenCounts::default(),
+            usage:          Usage::default(),
             response_id:    "resp_1".to_owned(),
             timestamp:      now(),
         }]);

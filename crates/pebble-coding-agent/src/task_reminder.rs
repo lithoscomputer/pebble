@@ -131,7 +131,7 @@ mod tests {
 
     use super::*;
     use crate::runtime::testing::history_from;
-    use crate::types::TokenCounts;
+    use crate::types::Usage;
 
     fn assistant(tool_name: Option<&str>) -> Message {
         Message::Assistant {
@@ -140,7 +140,7 @@ mod tests {
                 .map(|name| vec![ToolCall::function("call_1", name, json!({}))])
                 .unwrap_or_default(),
             provider_parts: Vec::new(),
-            usage:          TokenCounts::default(),
+            usage:          Usage::default(),
             response_id:    "resp".into(),
             timestamp:      SystemTime::now(),
         }
