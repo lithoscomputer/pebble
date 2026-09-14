@@ -516,7 +516,7 @@ async fn a_tool_that_ignores_its_cancellation_holds_the_round_open() {
     );
 }
 
-/// A steering lease parks natural completion, so a steer that arrives after
+/// A completion lease parks natural completion, so a steer that arrives after
 /// the first answer still reaches the session and drives another round.
 ///
 /// This is the close-door race the removed completion coordinator used to
@@ -533,7 +533,7 @@ async fn a_steering_lease_lets_a_late_steer_drive_another_round() {
     let mut events = session.subscribe();
     // Held across the whole prompt: the first answer parks rather than
     // completing while this is alive.
-    let lease = session.steering_lease();
+    let lease = handle.hold_completion();
 
     let steering = tokio::spawn(async move {
         wait_for_event(&mut events, |event| {
@@ -560,14 +560,14 @@ async fn a_steering_lease_lets_a_late_steer_drive_another_round() {
     );
 }
 
-/// Dropping the final steering lease with nothing queued wakes a parked prompt
-/// and lets it complete.
+/// Dropping the final completion lease with nothing queued wakes a parked
+/// prompt and lets it complete.
 #[tokio::test]
 async fn dropping_the_last_lease_wakes_a_parked_prompt() {
     let (mut session, _provider) =
         TestSession::answering(vec![ScriptedCall::response(text_response("only reply"))]);
     let mut events = session.subscribe();
-    let lease = session.steering_lease();
+    let lease = session.control_handle().hold_completion();
 
     let releaser = tokio::spawn(async move {
         wait_for_event(&mut events, |event| {

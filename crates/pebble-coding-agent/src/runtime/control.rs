@@ -1,8 +1,6 @@
 //! Coding-specific values carried through generic agent control.
 
-use std::fmt;
-
-use pebble_agent::{AgentControlHandle, CompletionLease, UserMessage};
+use pebble_agent::UserMessage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -15,28 +13,6 @@ struct CodingAttribution {
     actor:  Option<Actor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source: Option<InputSource>,
-}
-
-/// A hold that keeps natural completion open for steering.
-#[must_use = "the lease parks completion only while it is held"]
-pub struct SteeringLease {
-    _lease: CompletionLease,
-}
-
-impl SteeringLease {
-    pub(crate) fn acquire(control: &AgentControlHandle) -> Self {
-        Self {
-            _lease: control.hold_completion(),
-        }
-    }
-}
-
-impl fmt::Debug for SteeringLease {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SteeringLease")
-            .finish_non_exhaustive()
-    }
 }
 
 /// A steering message for the generic queue, with its coding-layer author as

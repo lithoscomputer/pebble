@@ -77,7 +77,7 @@ pub use self::coding_agent::{
     CodingAgent, CodingAgentBuildError, CodingAgentBuilder, CodingAgentControlHandle,
     CodingAgentExport, CodingAgentObservation, CodingAgentSnapshot, CodingInput, ControlSnapshot,
     FallbackRoute, PendingInput, PromptOutput, PromptReport, PromptTiming, ResumeMode,
-    ShutdownReason, SteeringMessage, SteeringOutcome,
+    ShutdownReason, SteeringLease, SteeringMessage, SteeringOutcome,
 };
 pub use self::compaction::{
     CompactionAccount, CompactionOptions, CompactionOutcome, CompactionReason, CompactionResult,
@@ -88,6 +88,5 @@ pub use self::discovery::{
 };
 pub use self::error::{CompactionError, Error, InterruptReason, Result, TaskKind};
 pub use self::memory::{MemoryDocument, ProjectMemory};
-pub use self::runtime::SteeringLease;
 pub use self::skills::SkillExpansionError;
 pub use self::types::{InputContent, InputSource};
