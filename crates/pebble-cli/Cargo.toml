@@ -33,10 +33,6 @@ lithos-llm = { workspace = true, features = [
   "runtime",
   "builtin-catalog",
   "environment-credentials",
-  "anthropic",
-  "gemini",
-  "openai",
-  "openai-compatible",
 ] }
 pebble-agent = { path = "../pebble-agent" }
 pebble-coding-agent = { path = "../pebble-coding-agent" }
@@ -48,7 +44,7 @@ tokio-util.workspace = true
 unicode-width = "=0.2.2"
 uuid = { version = "=1.18.1", features = ["v4"] }
 trycmd = "1.2.1"
-twin-openai = { git = "https://github.com/lithoscomputer/twins", rev = "fedab8e6b9b8e2577bee7d93812a318d6adb4aa4" }
+twin-openai = { git = "https://github.com/lithoscomputer/twins", rev = "f461f9cf028684a042e4e3e5930ff34bcc5f47fe" }
 
 [lints]
 workspace = true
