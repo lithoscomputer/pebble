@@ -24,10 +24,6 @@ lithos-llm = { workspace = true, features = [
   "runtime",
   "builtin-catalog",
   "environment-credentials",
-  "anthropic",
-  "gemini",
-  "openai",
-  "openai-compatible",
 ] }
 pebble-coding-agent = { path = "../pebble-coding-agent" }
 pebble-agent = { path = "../pebble-agent" }

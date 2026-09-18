@@ -73,10 +73,6 @@ rustix = { version = "1.1.4", features = ["process"] }
 lithos-llm = { workspace = true, features = [
   "runtime",
   "builtin-catalog",
-  "openai",
-  "anthropic",
-  "gemini",
-  "openai-compatible",
   "environment-credentials",
 ] }
 # The search providers are tested against a fake engine, and the MCP HTTP
