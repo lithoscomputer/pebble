@@ -118,10 +118,12 @@ impl fmt::Debug for ProfileDeps {
 /// fails.
 ///
 /// Fabro keyed this on its own `CodecKind`; pebble reads the lithos catalog's
-/// provider codec, which is where the same fact lives. The two spell the
-/// identifier differently — fabro's `openai_responses`, lithos's
-/// `openai-responses` — and lithos has no per-model codec, which is
-/// behaviour-compatible because no fabro catalog row ever set one.
+/// codecs, which is where the same fact lives. The two spell the identifier
+/// differently — fabro's `openai_responses`, lithos's `openai-responses`. A
+/// lithos provider lists the codecs its host speaks and each model row reaches
+/// a subset of them in that order; the client sends a generation call on the
+/// first generation codec the row reaches, so the row's first codec is the one
+/// the editor has to suit.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum FileEditToolKind {
     /// Codex's freeform patch grammar.
@@ -133,12 +135,12 @@ pub(crate) enum FileEditToolKind {
 }
 
 impl FileEditToolKind {
-    /// The editor a route speaking `codec` can carry.
-    pub(crate) fn for_codec(codec: &CodecId) -> Self {
-        if codec.as_str() == codec_ids::OPENAI_RESPONSES {
-            Self::ApplyPatch
-        } else {
-            Self::EditFile
+    /// The editor a route reaching `codecs`, a model row's codec list in the
+    /// provider's order, can carry.
+    pub(crate) fn for_codecs(codecs: &[CodecId]) -> Self {
+        match codecs.first() {
+            Some(codec) if codec.as_str() == codec_ids::OPENAI_RESPONSES => Self::ApplyPatch,
+            _ => Self::EditFile,
         }
     }
 
@@ -541,7 +543,7 @@ pub(crate) mod tests {
     #[test]
     fn the_responses_codec_is_the_only_one_that_carries_a_patch_grammar() {
         assert_eq!(
-            FileEditToolKind::for_codec(&CodecId::from("openai-responses")),
+            FileEditToolKind::for_codecs(&[CodecId::from("openai-responses")]),
             FileEditToolKind::ApplyPatch
         );
         for codec in [
@@ -552,11 +554,38 @@ pub(crate) mod tests {
             "something-new",
         ] {
             assert_eq!(
-                FileEditToolKind::for_codec(&CodecId::from(codec)),
+                FileEditToolKind::for_codecs(&[CodecId::from(codec)]),
                 FileEditToolKind::EditFile,
                 "{codec} cannot carry a freeform tool"
             );
         }
+    }
+
+    /// The client sends a generation call on the first codec the row reaches,
+    /// so a host that lists Chat Completions ahead of Responses gets the
+    /// JSON-schema editor, and a row reaching no codec does too.
+    #[test]
+    fn the_first_codec_the_row_reaches_decides_the_editor() {
+        let chat_first = [
+            CodecId::from("openai-chat"),
+            CodecId::from("openai-responses"),
+        ];
+        assert_eq!(
+            FileEditToolKind::for_codecs(&chat_first),
+            FileEditToolKind::EditFile
+        );
+        let responses_first = [
+            CodecId::from("openai-responses"),
+            CodecId::from("openai-chat"),
+        ];
+        assert_eq!(
+            FileEditToolKind::for_codecs(&responses_first),
+            FileEditToolKind::ApplyPatch
+        );
+        assert_eq!(
+            FileEditToolKind::for_codecs(&[]),
+            FileEditToolKind::EditFile
+        );
     }
 
     #[test]

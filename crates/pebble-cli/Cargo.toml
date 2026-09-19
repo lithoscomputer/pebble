@@ -44,7 +44,7 @@ tokio-util.workspace = true
 unicode-width = "=0.2.2"
 uuid = { version = "=1.18.1", features = ["v4"] }
 trycmd = "1.2.1"
-twin-openai = { git = "https://github.com/lithoscomputer/twins", rev = "f461f9cf028684a042e4e3e5930ff34bcc5f47fe" }
+twin-openai = { git = "https://github.com/lithoscomputer/twins", rev = "9e9861d714f8de2e4be127f96e67cee5d3a917f5" }
 
 [lints]
 workspace = true

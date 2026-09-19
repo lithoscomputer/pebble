@@ -567,8 +567,6 @@ mod tests {
 
                 [providers.mock]
                 display_name = "Mock"
-                adapter = "openai"
-                codec = "openai-chat"
                 base_url = "https://example.invalid"
                 auth = { type = "none" }
 
@@ -615,8 +613,6 @@ mod tests {
 
                     [providers.mock]
                     display_name = "Mock"
-                    adapter = "openai"
-                    codec = "openai-chat"
                     base_url = "https://example.invalid"
                     auth = {{ type = "none" }}
 
