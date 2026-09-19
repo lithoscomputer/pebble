@@ -482,8 +482,7 @@ mod tests {
 schema_version = 1
 [providers.{id}]
 display_name = "Fixture"
-adapter = "openai"
-codec = "openai-responses"
+codecs = ["openai-responses"]
 base_url = "http://127.0.0.1:1/v1"
 auth = {{ {scheme} }}
 "#

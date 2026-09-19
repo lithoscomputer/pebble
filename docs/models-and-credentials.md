@@ -181,8 +181,7 @@ schema_version = 1
 
 [providers.my-proxy]
 display_name = "My proxy"
-adapter = "openai"
-codec = "openai-responses"
+codecs = ["openai-responses"]
 base_url = "http://localhost:8080/v1"
 auth = { type = "bearer" }
 default_model = "coding"
@@ -197,6 +196,8 @@ capabilities = { text = true, tools = true }
 limits = { context_tokens = 128000, max_output_tokens = 8192 }
 ```
 
+`codecs` names the wire protocol the host speaks. A host that speaks OpenAI
+Chat Completions can leave the line out; `["openai-chat"]` is the default.
 Replace the endpoint, API model id, capabilities, limits, and profile with the
 values for your model. Use `pebble auth login my-proxy` or configure its
 environment source. Select it with `/model my-proxy/coding` or

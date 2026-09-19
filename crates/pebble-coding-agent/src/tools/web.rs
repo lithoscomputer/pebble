@@ -553,7 +553,7 @@ schema_version = 1
 [providers.running]
 display_name = "Running"
 adapter = "test-adapter"
-codec = "test-codec"
+codecs = ["test-codec"]
 base_url = "http://127.0.0.1"
 default_model = "big"
 
@@ -568,7 +568,7 @@ capabilities = { text = true }
 [providers.summarizing]
 display_name = "Summarizing"
 adapter = "test-adapter"
-codec = "test-codec"
+codecs = ["test-codec"]
 base_url = "http://127.0.0.1"
 default_model = "small"
 

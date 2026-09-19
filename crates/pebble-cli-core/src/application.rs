@@ -362,8 +362,7 @@ mod tests {
 schema_version = 1
 [providers.local]
 display_name = "Local"
-adapter = "openai"
-codec = "openai-responses"
+codecs = ["openai-responses"]
 base_url = "http://127.0.0.1:1/v1"
 auth = { type = "none" }
 metadata.agent.profile = "openai"
@@ -382,8 +381,7 @@ api_model = "malformed"
 metadata.agent.profile = 123
 [providers.private]
 display_name = "Private"
-adapter = "openai"
-codec = "openai-responses"
+codecs = ["openai-responses"]
 base_url = "http://127.0.0.1:1/v1"
 auth = { type = "bearer" }
 metadata.agent.profile = "openai"
@@ -393,7 +391,7 @@ api_model = "locked"
 [providers.unavailable]
 display_name = "Unavailable"
 adapter = "not-installed"
-codec = "openai-responses"
+codecs = ["openai-responses"]
 base_url = "http://127.0.0.1:1/v1"
 auth = { type = "none" }
 metadata.agent.profile = "openai"

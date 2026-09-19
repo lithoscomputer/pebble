@@ -522,7 +522,7 @@ impl CodingRuntimeBuilder {
             .map(|model| Arc::new(WebFetchSummarizer::new(self.client.clone(), model)));
         let deps = ProfileDeps {
             provider_display_name: route.provider().display_name().to_owned(),
-            file_edit_tool: FileEditToolKind::for_codec(route.provider().codec()),
+            file_edit_tool: FileEditToolKind::for_codecs(route.model().codecs()),
             search_provider: self.search_provider.clone(),
             web_fetch_summarizer,
         };
