@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::turn::ConversationState;
-use super::{CodingRuntime, PromptResources, SessionModel, StateMachine};
+use super::{CodingRuntime, InterruptReasonHandle, PromptResources, SessionModel, StateMachine};
 use crate::coding_agent::CodingAgentBuildError;
 use crate::compaction::CompactionControl;
 use crate::config::CodingAgentOptions;
@@ -170,13 +170,13 @@ impl CodingRuntimeBuilder {
         self
     }
 
-    /// Whether a model has been named on this builder.
     /// The environment the session will act through, once named.
     #[cfg(feature = "mcp")]
     pub(crate) const fn environment_ref(&self) -> Option<&Arc<dyn Environment>> {
         self.environment.as_ref()
     }
 
+    /// Whether a model has been named on this builder.
     pub(crate) const fn has_model(&self) -> bool {
         self.model.is_some()
     }
@@ -538,7 +538,7 @@ impl CodingRuntimeBuilder {
             redactor: self.redactor,
             agent_control: AgentControlHandle::detached(),
             cancel_token: CancellationToken::new(),
-            interrupt_reason: Arc::new(Mutex::new(None)),
+            interrupt_reason: InterruptReasonHandle::default(),
             compaction: CompactionControl::default(),
             memory_summaries: Vec::new(),
             subagents: supervisor,

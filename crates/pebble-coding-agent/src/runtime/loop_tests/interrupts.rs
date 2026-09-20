@@ -864,7 +864,7 @@ async fn a_budget_that_runs_out_during_compaction_answers_the_tool_call_before_e
         .await;
         // The summary is held until the timer has fired, so the budget runs
         // out while the summarizing call is in flight.
-        while reason.reason().is_none() {
+        while reason.current().is_none() {
             sleep(Duration::from_millis(1)).await;
         }
         // The timer records its reason, then cancels the prompt; let its task
@@ -915,7 +915,7 @@ async fn the_reason_an_outside_task_recorded_first_is_the_one_reported() {
         matches!(error, Error::Interrupted(InterruptReason::WallClockTimeout)),
         "{error:?}"
     );
-    assert_eq!(reason.reason(), Some(InterruptReason::WallClockTimeout));
+    assert_eq!(reason.current(), Some(InterruptReason::WallClockTimeout));
 }
 
 #[tokio::test]

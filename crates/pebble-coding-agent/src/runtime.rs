@@ -122,7 +122,7 @@ enum PromptStart {
 /// First writer wins: the reason a prompt reports is the first one recorded,
 /// and [`record`](Self::record) is the only way to write, so a later task
 /// cannot overwrite what already explains the interrupt.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct InterruptReasonHandle(Arc<Mutex<Option<InterruptReason>>>);
 
 impl InterruptReasonHandle {
@@ -139,10 +139,15 @@ impl InterruptReasonHandle {
     }
 
     /// The reason recorded so far, if any.
-    #[cfg(test)]
     #[must_use]
-    pub(crate) fn reason(&self) -> Option<InterruptReason> {
+    pub(crate) fn current(&self) -> Option<InterruptReason> {
         *self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Forgets the recorded reason, once the prompt it explained has
+    /// reported it.
+    fn clear(&self) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = None;
     }
 }
 
@@ -208,7 +213,8 @@ pub(crate) struct CodingRuntime {
     /// Ends the whole prompt. Distinct from the round token, which ends one
     /// turn.
     cancel_token:      CancellationToken,
-    interrupt_reason:  Arc<Mutex<Option<InterruptReason>>>,
+    /// Why the prompt in progress is being ended, when an outside task said.
+    interrupt_reason:  InterruptReasonHandle,
     compaction:        CompactionControl,
     memory_summaries:  Vec<MemoryFileSummary>,
     subagents:         Option<SubagentSupervisor>,
@@ -285,20 +291,18 @@ impl CodingRuntime {
             });
         }
 
-        let recorded = match mode {
+        // The selector the build resolves, and the exact route it must
+        // answer with when the record's own model is asked for.
+        let (selector, recorded) = match mode {
             ResumeMode::RecordedModel => {
                 let route = record.recorded_route().ok_or_else(|| {
                     CodingAgentBuildError::RecordedRouteMissing {
                         session_id: record.scope.session_id().to_string(),
                     }
                 })?;
-                Some(route)
+                (route.clone(), Some(route))
             }
-            ResumeMode::UseModel(_) => None,
-        };
-        let selector = match mode {
-            ResumeMode::RecordedModel => recorded.clone().unwrap_or_default(),
-            ResumeMode::UseModel(selector) => selector.clone(),
+            ResumeMode::UseModel(selector) => (selector.clone(), None),
         };
 
         let mut deps = deps;
@@ -318,10 +322,7 @@ impl CodingRuntime {
             (built, _) => built?,
         };
         if let Some(recorded) = recorded {
-            let resolved = format!(
-                "{}/{}",
-                session.model_context.provider, session.model_context.model
-            );
+            let resolved = session.route();
             if resolved != recorded {
                 return Err(CodingAgentBuildError::RecordedRouteMismatch { recorded, resolved });
             }
@@ -351,18 +352,22 @@ impl CodingRuntime {
         deps: CodingRuntimeBuilder,
     ) -> StdResult<Self, CodingAgentBuildError> {
         let mut session = Self::from_record(state.record, &ResumeMode::RecordedModel, deps)?;
+        let resources = Arc::make_mut(&mut session.resources);
         if !state.skills.is_empty() {
-            let vocabulary = session.resources.registry.vocabulary();
-            Arc::make_mut(&mut session.resources).registry.register(
-                make_use_skill_tool_for_vocabulary(Arc::from(state.skills.clone()), vocabulary),
-            )?;
+            let vocabulary = resources.registry.vocabulary();
+            resources
+                .registry
+                .register(make_use_skill_tool_for_vocabulary(
+                    Arc::from(state.skills.clone()),
+                    vocabulary,
+                ))?;
         }
-        Arc::make_mut(&mut session.resources).skills = state.skills;
-        Arc::make_mut(&mut session.resources).skill_dirs = state.skill_dirs;
+        resources.skills = state.skills;
+        resources.skill_dirs = state.skill_dirs;
+        resources.system_prompt = state.system_prompt;
+        resources.memory_tokens = state.memory_tokens;
+        resources.skills_tokens = state.skills_tokens;
         session.memory_summaries = state.memory_summaries;
-        Arc::make_mut(&mut session.resources).system_prompt = state.system_prompt;
-        Arc::make_mut(&mut session.resources).memory_tokens = state.memory_tokens;
-        Arc::make_mut(&mut session.resources).skills_tokens = state.skills_tokens;
         {
             let mut conversation = session.conversation();
             conversation.file_tracker = state.file_tracker;
@@ -957,7 +962,7 @@ impl CodingRuntime {
     /// cancelling gets that reason reported instead of a plain cancellation.
     #[must_use]
     pub(crate) fn interrupt_reason_handle(&self) -> InterruptReasonHandle {
-        InterruptReasonHandle(Arc::clone(&self.interrupt_reason))
+        self.interrupt_reason.clone()
     }
 
     /// Changes how hard the model is asked to think, from the next round on.
@@ -1174,10 +1179,7 @@ impl CodingRuntime {
         // before it cancels, and still stops one prompt's reason reaching the
         // next.
         if self.state.current() != CodingAgentState::Closed {
-            *self
-                .interrupt_reason
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = None;
+            self.interrupt_reason.clear();
         }
 
         if self.state.current() == CodingAgentState::Closed {
@@ -1398,19 +1400,17 @@ impl CodingRuntime {
     }
 
     fn set_interrupt_reason(&self, reason: InterruptReason) {
-        self.interrupt_reason_handle().record(reason);
+        self.interrupt_reason.record(reason);
     }
 
     /// The error an interrupted prompt ends with, naming whatever reason was
     /// recorded first.
     fn interrupted_error(&self) -> Error {
-        let reason = *self
-            .interrupt_reason
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .unwrap_or(&InterruptReason::Cancelled);
-        Error::Interrupted(reason)
+        Error::Interrupted(
+            self.interrupt_reason
+                .current()
+                .unwrap_or(InterruptReason::Cancelled),
+        )
     }
 
     /// Publishes one event on this session's stream.
