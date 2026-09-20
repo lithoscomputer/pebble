@@ -35,7 +35,8 @@ use crate::event::{EventSink, EventSinkError};
 use crate::human_input::{Answer, HumanInputError, HumanInputProvider, Question};
 use crate::projection::SessionProjection;
 use crate::subagent::{
-    ChildObserver, SubagentLimits, SubagentResult, SubagentStatus, SubagentSupervisor,
+    ChildObserver, SubagentLimits, SubagentOptions, SubagentResult, SubagentStatus,
+    SubagentSupervisor,
 };
 use crate::test_support::{
     MockEnvironment, RoutedProvider, ScriptedCompletion, ScriptedProvider, message_text,
