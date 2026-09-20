@@ -113,6 +113,12 @@ fn tail_suffix(tail: Option<&SharedTail>) -> String {
     let text = tail
         .map(|tail| tail.lock().unwrap_or_else(PoisonError::into_inner).text())
         .unwrap_or_default();
+    wrote_suffix(&text)
+}
+
+/// What a failure message says about the server's own output: nothing when
+/// it wrote nothing.
+fn wrote_suffix(text: &str) -> String {
     let text = text.trim();
     if text.is_empty() {
         String::new()
@@ -126,6 +132,7 @@ fn tail_suffix(tail: Option<&SharedTail>) -> String {
 struct EnvironmentProcess {
     environment: Arc<dyn Environment>,
     pid:         String,
+    stdout_log:  String,
     stderr_log:  String,
 }
 
@@ -147,12 +154,7 @@ impl EnvironmentProcess {
         let text = outcome
             .map(|outcome| outcome.result.stdout)
             .unwrap_or_default();
-        let text = text.trim();
-        if text.is_empty() {
-            String::new()
-        } else {
-            format!("; the server wrote: {text}")
-        }
+        wrote_suffix(&text)
     }
 
     /// `SIGTERM` to the process and its group, a second, then `SIGKILL`, and
@@ -162,7 +164,7 @@ impl EnvironmentProcess {
         let command = format!(
             "kill -TERM -{pid} 2>/dev/null; kill -TERM {pid} 2>/dev/null; sleep 1; kill -KILL -{pid} \
              2>/dev/null; kill -KILL {pid} 2>/dev/null; rm -f {out} {err}; true",
-            out = shell_quote(&self.stderr_log.replace(".err", ".out")),
+            out = shell_quote(&self.stdout_log),
             err = shell_quote(&self.stderr_log),
         );
         if let Err(error) = self
@@ -655,11 +657,7 @@ async fn start_in_environment(
         None => (format!("http://127.0.0.1:{port}"), BTreeMap::new()),
     };
     let url = match hosted.path {
-        Some(path) => format!(
-            "{}/{}",
-            url.trim_end_matches('/'),
-            path.trim_start_matches('/')
-        ),
+        Some(path) => join_url(&url, path),
         None => url,
     };
     if let Err(error) = probe_until_ready(&url, &headers, startup.deadline()).await {
@@ -819,10 +817,7 @@ async fn launch_in_environment(
          2>&1 & else set -m; bash -c {inner} </dev/null >/dev/null 2>&1 & fi\necho $!",
         inner = shell_quote(&inner),
     );
-    let env_vars: HashMap<String, String> = env
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
+    let env_vars: HashMap<String, String> = env.clone().into_iter().collect();
     let outcome = environment
         .exec(ExecRequest {
             timeout_ms: Some(ENVIRONMENT_COMMAND_TIMEOUT_MS),
@@ -854,8 +849,19 @@ async fn launch_in_environment(
     Ok(EnvironmentProcess {
         environment: Arc::clone(environment),
         pid,
+        stdout_log,
         stderr_log,
     })
+}
+
+/// `path` appended to `base` with exactly one slash between them, however
+/// many either side brought.
+fn join_url(base: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
 }
 
 /// `text` as one single-quoted shell word.
@@ -944,6 +950,20 @@ mod tests {
         let text = tail.text();
         assert_eq!(text.len(), STDERR_TAIL_BYTES);
         assert!(text.ends_with("tail"));
+    }
+
+    #[test]
+    fn a_path_joins_a_route_with_one_slash() {
+        assert_eq!(join_url("http://h:1", "sse"), "http://h:1/sse");
+        assert_eq!(join_url("http://h:1/", "/sse"), "http://h:1/sse");
+        assert_eq!(join_url("http://h:1/", "sse"), "http://h:1/sse");
+        assert_eq!(join_url("http://h:1", "/sse"), "http://h:1/sse");
+    }
+
+    #[test]
+    fn a_failure_quotes_the_servers_output_only_when_there_is_some() {
+        assert_eq!(wrote_suffix("  \n"), "");
+        assert_eq!(wrote_suffix("boom\n"), "; the server wrote: boom");
     }
 
     #[test]
