@@ -29,8 +29,6 @@ mod fixtures;
 mod summary;
 mod text;
 
-use std::io::{self, Write as _};
-
 use pebble_coding_agent::CodingAgent;
 use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent};
 use tokio::sync::broadcast;
@@ -39,7 +37,7 @@ use tokio::sync::broadcast::error::RecvError;
 pub use self::summary::Summary;
 pub use self::text::RenderOptions;
 use self::text::TextRenderer;
-use crate::terminal::print_err;
+use crate::terminal::{print_err, print_out};
 
 /// How much of a block the readable lines show, in bytes.
 ///
@@ -133,15 +131,7 @@ impl Renderer {
             Style::Json => match serde_json::to_string(event) {
                 Ok(line) => match self.json_to {
                     JsonStream::Stderr => print_err(&line),
-                    // A closed pipe is the reader's choice; nothing can be
-                    // said to them about it.
-                    JsonStream::Stdout => {
-                        let mut stdout = io::stdout().lock();
-                        let _ = stdout
-                            .write_all(line.as_bytes())
-                            .and_then(|()| stdout.write_all(b"\n"))
-                            .and_then(|()| stdout.flush());
-                    }
+                    JsonStream::Stdout => print_out(&line),
                 },
                 Err(error) => print_err(&format!("error: rendering an event as JSON: {error}")),
             },
