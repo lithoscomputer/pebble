@@ -9,6 +9,8 @@
 //! environment-hosted server's port.
 
 use std::collections::{BTreeMap, HashMap};
+use std::error::Error as StdError;
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, PoisonError};
@@ -21,17 +23,16 @@ use rmcp::model::{
     ProtocolVersion, RawContent, RequestId, ServerResult,
 };
 use rmcp::service::{
-    ClientInitializeError, Peer, PeerRequestOptions, RequestHandle, RoleClient, RunningService,
-    ServiceError, serve_client_with_ct,
+    Peer, PeerRequestOptions, RequestHandle, RoleClient, RunningService, ServiceError,
+    serve_client_with_ct,
 };
-use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::{IntoTransport, StreamableHttpClientTransport};
 use serde_json::{Map, Value};
 use tokio::io::{AsyncBufReadExt as _, BufReader};
-use tokio::process::Command;
+use tokio::process::{ChildStderr, Command};
 use tokio::sync::Mutex;
-use tokio::time::error::Elapsed;
 use tokio::time::{sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -112,6 +113,12 @@ fn tail_suffix(tail: Option<&SharedTail>) -> String {
     let text = tail
         .map(|tail| tail.lock().unwrap_or_else(PoisonError::into_inner).text())
         .unwrap_or_default();
+    wrote_suffix(&text)
+}
+
+/// What a failure message says about the server's own output: nothing when
+/// it wrote nothing.
+fn wrote_suffix(text: &str) -> String {
     let text = text.trim();
     if text.is_empty() {
         String::new()
@@ -125,6 +132,7 @@ fn tail_suffix(tail: Option<&SharedTail>) -> String {
 struct EnvironmentProcess {
     environment: Arc<dyn Environment>,
     pid:         String,
+    stdout_log:  String,
     stderr_log:  String,
 }
 
@@ -146,12 +154,7 @@ impl EnvironmentProcess {
         let text = outcome
             .map(|outcome| outcome.result.stdout)
             .unwrap_or_default();
-        let text = text.trim();
-        if text.is_empty() {
-            String::new()
-        } else {
-            format!("; the server wrote: {text}")
-        }
+        wrote_suffix(&text)
     }
 
     /// `SIGTERM` to the process and its group, a second, then `SIGKILL`, and
@@ -161,7 +164,7 @@ impl EnvironmentProcess {
         let command = format!(
             "kill -TERM -{pid} 2>/dev/null; kill -TERM {pid} 2>/dev/null; sleep 1; kill -KILL -{pid} \
              2>/dev/null; kill -KILL {pid} 2>/dev/null; rm -f {out} {err}; true",
-            out = shell_quote(&self.stderr_log.replace(".err", ".out")),
+            out = shell_quote(&self.stdout_log),
             err = shell_quote(&self.stderr_log),
         );
         if let Err(error) = self
@@ -194,19 +197,33 @@ impl Route {
     }
 }
 
-/// Everything a failed start has to put back.
-struct Cleanup {
+/// What a connection launched in the environment and must put back: the
+/// process it started and the route it opened to that process's port.
+/// Released once, by a start that failed or by the close.
+#[derive(Default)]
+struct OwnedResources {
     process: Option<EnvironmentProcess>,
     route:   Option<Route>,
 }
 
-impl Cleanup {
-    async fn run(self) {
+impl OwnedResources {
+    /// Stops the process and releases the route. Best effort, like both.
+    async fn release(&self) {
         if let Some(process) = &self.process {
             process.stop().await;
         }
         if let Some(route) = &self.route {
             route.release().await;
+        }
+    }
+
+    /// The failure detail the launched process wrote, or nothing when no
+    /// process was launched. Read before [`release`](Self::release), which
+    /// removes the log it comes from.
+    async fn stderr_tail(&self) -> String {
+        match &self.process {
+            Some(process) => process.stderr_tail().await,
+            None => String::new(),
         }
     }
 }
@@ -216,10 +233,8 @@ pub(super) struct Connection {
     peer:                Peer<RoleClient>,
     service:             Mutex<Option<RunningService<RoleClient, ClientInfo>>>,
     tool_timeout:        Duration,
-    /// The process an environment-hosted server runs in.
-    process:             Option<EnvironmentProcess>,
-    /// The route to an environment-hosted server's port.
-    route:               Option<Route>,
+    /// The process and the route of an environment-hosted server.
+    owned:               OwnedResources,
     /// What closed the connection, set once by the first call that observed
     /// the close; every later call fails without reaching the server.
     disconnect:          OnceLock<String>,
@@ -227,238 +242,61 @@ pub(super) struct Connection {
     disconnect_reported: AtomicBool,
 }
 
+/// The way a handshake did not happen.
+enum HandshakeFailure {
+    /// The startup timeout passed first.
+    Timeout,
+    /// The server answered, and the protocol did not complete: why, as the
+    /// client put it.
+    Failed(String),
+}
+
+impl HandshakeFailure {
+    /// The start error this failure is, with what the server wrote attached.
+    fn into_start_error(self, startup: Duration, tail: String) -> StartError {
+        match self {
+            Self::Timeout => StartError::HandshakeTimeout {
+                timeout: startup,
+                tail,
+            },
+            Self::Failed(reason) => StartError::Handshake { reason, tail },
+        }
+    }
+}
+
 /// The protocol handshake, or the way it did not happen.
-type Handshake =
-    Result<Result<RunningService<RoleClient, ClientInfo>, ClientInitializeError>, Elapsed>;
+type Handshake = Result<RunningService<RoleClient, ClientInfo>, HandshakeFailure>;
 
 impl Connection {
     /// Launches or reaches the server, completes the handshake, and lists its
     /// tools.
+    ///
+    /// Whatever a failed start launched in the environment is put back here,
+    /// and nowhere else: the placement launchers only attach what the server
+    /// wrote to the error they return.
     pub(super) async fn start(
         server: &McpServer,
         environment: &Arc<dyn Environment>,
         routes: Option<&Arc<dyn PortRoutes>>,
     ) -> Result<(Self, Vec<DiscoveredTool>), StartError> {
-        let startup = server.startup_timeout;
-        let tool_timeout = server.tool_timeout;
-        let info = ClientInfo::new(
-            ClientCapabilities::default(),
-            Implementation::new("pebble", env!("CARGO_PKG_VERSION")),
-        )
-        .with_protocol_version(ProtocolVersion::V_2025_03_26);
-        let cancel = CancellationToken::new();
-        let began = Instant::now();
-        let mut cleanup = Cleanup {
-            process: None,
-            route:   None,
-        };
-        let mut tail: Option<SharedTail> = None;
-        let handshake: Handshake = match &server.placement {
-            McpPlacement::Stdio {
-                command,
-                env,
-                current_dir,
-                clear_env,
-            } => {
-                let (program, args) = command.split_first().ok_or_else(|| StartError::Launch {
-                    program: String::new(),
-                    reason:  "the command is empty".into(),
-                })?;
-                let mut cmd = Command::new(program);
-                cmd.args(args).kill_on_drop(true);
-                if *clear_env {
-                    cmd.env_clear();
-                }
-                cmd.envs(env);
-                if let Some(dir) = current_dir {
-                    cmd.current_dir(dir);
-                }
-                #[cfg(unix)]
-                cmd.process_group(0);
-                let (transport, stderr) = TokioChildProcess::builder(cmd)
-                    .stderr(Stdio::piped())
-                    .spawn()
-                    .map_err(|error| StartError::Launch {
-                        program: program.clone(),
-                        reason:  error.to_string(),
-                    })?;
-                let shared: SharedTail = Arc::default();
-                if let Some(stderr) = stderr {
-                    let shared = Arc::clone(&shared);
-                    let name = server.name.clone();
-                    // Disposable: the server's own diagnostics, kept for a
-                    // failure message and traced; the child owns the pipe.
-                    tokio::spawn(async move {
-                        let mut lines = BufReader::new(stderr).lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            tracing::debug!(server = %name, line = %line, "MCP server stderr");
-                            let mut tail = shared.lock().unwrap_or_else(PoisonError::into_inner);
-                            tail.push(line.as_bytes());
-                            tail.push(b"\n");
-                        }
-                    });
-                }
-                tail = Some(shared);
-                timeout(
-                    startup,
-                    serve_client_with_ct(info, transport, cancel.child_token()),
-                )
-                .await
+        let mut owned = OwnedResources::default();
+        match connect(server, environment, routes, &mut owned).await {
+            Ok((service, tools)) => Ok((
+                Self {
+                    peer: service.peer().clone(),
+                    service: Mutex::new(Some(service)),
+                    tool_timeout: server.tool_timeout,
+                    owned,
+                    disconnect: OnceLock::new(),
+                    disconnect_reported: AtomicBool::new(false),
+                },
+                tools,
+            )),
+            Err(error) => {
+                owned.release().await;
+                Err(error)
             }
-            McpPlacement::Http {
-                url,
-                headers,
-                protocol,
-            } => {
-                // The server gets the startup timeout to start answering, as
-                // an environment-hosted one does: an application often spawns
-                // it just before building the agent.
-                let deadline = began + startup;
-                if let Err(error) = probe_until_ready(url, headers, deadline).await {
-                    return Err(match error {
-                        ProbeError::Build(reason) => StartError::Unsupported(reason),
-                        ProbeError::Deadline => StartError::HandshakeTimeout {
-                            timeout: startup,
-                            tail:    String::new(),
-                        },
-                    });
-                }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                connect_http(*protocol, url, headers, info, &cancel, remaining).await?
-            }
-            McpPlacement::Environment {
-                command,
-                port,
-                env,
-                protocol,
-                path,
-            } => {
-                let process =
-                    launch_in_environment(environment, &server.name, command, env).await?;
-                cleanup.process = Some(process);
-                // The address pebble reaches the port at is the application's
-                // route to it, or the loopback address when the environment
-                // shares the host's network. An application whose environment
-                // routes to no port says so through the same error, and the
-                // server is reported as having no route.
-                let (url, headers) = match routes {
-                    Some(routes) => match routes.route(*port).await {
-                        Ok(route) => {
-                            cleanup.route = Some(Route {
-                                routes: Arc::clone(routes),
-                                port:   *port,
-                            });
-                            (route.url, route.headers)
-                        }
-                        Err(error) => {
-                            cleanup.run().await;
-                            return Err(StartError::Route {
-                                port:   *port,
-                                reason: error.detail(),
-                            });
-                        }
-                    },
-                    None => (format!("http://127.0.0.1:{port}"), BTreeMap::new()),
-                };
-                let url = match path {
-                    Some(path) => format!(
-                        "{}/{}",
-                        url.trim_end_matches('/'),
-                        path.trim_start_matches('/')
-                    ),
-                    None => url,
-                };
-                let deadline = began + startup;
-                if let Err(error) = probe_until_ready(&url, &headers, deadline).await {
-                    let tail = match &cleanup.process {
-                        Some(process) => process.stderr_tail().await,
-                        None => String::new(),
-                    };
-                    cleanup.run().await;
-                    return Err(match error {
-                        ProbeError::Build(reason) => StartError::Route {
-                            port: *port,
-                            reason,
-                        },
-                        ProbeError::Deadline => StartError::HandshakeTimeout {
-                            timeout: startup,
-                            tail,
-                        },
-                    });
-                }
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                match connect_http(*protocol, &url, &headers, info, &cancel, remaining).await {
-                    Ok(handshake) => handshake,
-                    Err(error) => {
-                        cleanup.run().await;
-                        return Err(error);
-                    }
-                }
-            }
-        };
-        let service = match handshake {
-            Ok(Ok(service)) => service,
-            Ok(Err(error)) => {
-                let tail = environment_or_pipe_tail(cleanup.process.as_ref(), tail.as_ref()).await;
-                cleanup.run().await;
-                return Err(StartError::Handshake {
-                    reason: error.to_string(),
-                    tail,
-                });
-            }
-            Err(_) => {
-                let tail = environment_or_pipe_tail(cleanup.process.as_ref(), tail.as_ref()).await;
-                cleanup.run().await;
-                return Err(StartError::HandshakeTimeout {
-                    timeout: startup,
-                    tail,
-                });
-            }
-        };
-        if let Some(peer_info) = service.peer().peer_info() {
-            tracing::info!(
-                server = %server.name,
-                server_name = %peer_info.server_info.name,
-                server_version = %peer_info.server_info.version,
-                "MCP server initialized"
-            );
         }
-        let remaining = (began + startup).saturating_duration_since(Instant::now());
-        let tools = match timeout(remaining.max(PROBE_TIMEOUT), service.list_all_tools()).await {
-            Ok(Ok(tools)) => tools,
-            Ok(Err(error)) => {
-                cleanup.run().await;
-                return Err(StartError::ListTools {
-                    reason: error.to_string(),
-                });
-            }
-            Err(_) => {
-                cleanup.run().await;
-                return Err(StartError::ListTools {
-                    reason: format!("no answer within {}s", startup.as_secs()),
-                });
-            }
-        };
-        let tools = tools
-            .into_iter()
-            .map(|tool| DiscoveredTool {
-                name:         tool.name.to_string(),
-                description:  tool.description.as_deref().unwrap_or("").to_owned(),
-                input_schema: serde_json::to_value(&*tool.input_schema).unwrap_or_default(),
-            })
-            .collect();
-        Ok((
-            Self {
-                peer: service.peer().clone(),
-                service: Mutex::new(Some(service)),
-                tool_timeout,
-                process: cleanup.process,
-                route: cleanup.route,
-                disconnect: OnceLock::new(),
-                disconnect_reported: AtomicBool::new(false),
-            },
-            tools,
-        ))
     }
 
     /// Forwards one call. The server's tool timeout and the caller's
@@ -551,24 +389,321 @@ impl Connection {
                 Err(_) => tracing::warn!("MCP client did not close in time"),
             }
         }
-        if let Some(process) = &self.process {
-            process.stop().await;
-        }
-        if let Some(route) = &self.route {
-            route.release().await;
-        }
+        self.owned.release().await;
     }
 }
 
-/// The failure detail for a handshake that did not complete: the environment
-/// server's log when there is one, else the pipe tail a child process wrote.
-async fn environment_or_pipe_tail(
-    process: Option<&EnvironmentProcess>,
-    tail: Option<&SharedTail>,
-) -> String {
-    match process {
-        Some(process) => process.stderr_tail().await,
-        None => tail_suffix(tail),
+/// Launches or reaches the server by its placement, runs the handshake, and
+/// lists the tools. What it launches in the environment goes into `owned`,
+/// whether or not it succeeds.
+async fn connect(
+    server: &McpServer,
+    environment: &Arc<dyn Environment>,
+    routes: Option<&Arc<dyn PortRoutes>>,
+    owned: &mut OwnedResources,
+) -> Result<(RunningService<RoleClient, ClientInfo>, Vec<DiscoveredTool>), StartError> {
+    let startup = server.startup_timeout;
+    let info = ClientInfo::new(
+        ClientCapabilities::default(),
+        Implementation::new("pebble", env!("CARGO_PKG_VERSION")),
+    )
+    .with_protocol_version(ProtocolVersion::V_2025_03_26);
+    let cancel = CancellationToken::new();
+    let began = Instant::now();
+    let service = match &server.placement {
+        McpPlacement::Stdio {
+            command,
+            env,
+            current_dir,
+            clear_env,
+        } => {
+            let process = StdioProcess {
+                command,
+                env,
+                current_dir: current_dir.as_deref(),
+                clear_env: *clear_env,
+            };
+            start_stdio(&server.name, &process, info, &cancel, startup).await?
+        }
+        McpPlacement::Http {
+            url,
+            headers,
+            protocol,
+        } => start_http(*protocol, url, headers, info, &cancel, startup, began).await?,
+        McpPlacement::Environment {
+            command,
+            port,
+            env,
+            protocol,
+            path,
+        } => {
+            let hosted = HostedServer {
+                command,
+                port: *port,
+                env,
+                protocol: *protocol,
+                path: path.as_deref(),
+            };
+            start_in_environment(
+                &server.name,
+                &hosted,
+                environment,
+                routes,
+                info,
+                &cancel,
+                Startup {
+                    timeout: startup,
+                    began,
+                },
+                owned,
+            )
+            .await?
+        }
+    };
+    if let Some(peer_info) = service.peer().peer_info() {
+        tracing::info!(
+            server = %server.name,
+            server_name = %peer_info.server_info.name,
+            server_version = %peer_info.server_info.version,
+            "MCP server initialized"
+        );
+    }
+    let remaining = (began + startup).saturating_duration_since(Instant::now());
+    let tools = match timeout(remaining.max(PROBE_TIMEOUT), service.list_all_tools()).await {
+        Ok(Ok(tools)) => tools,
+        Ok(Err(error)) => {
+            return Err(StartError::ListTools {
+                reason: error.to_string(),
+            });
+        }
+        Err(_) => {
+            return Err(StartError::ListTools {
+                reason: format!("no answer within {}s", startup.as_secs()),
+            });
+        }
+    };
+    let tools = tools
+        .into_iter()
+        .map(|tool| DiscoveredTool {
+            name:         tool.name.to_string(),
+            description:  tool.description.as_deref().unwrap_or("").to_owned(),
+            input_schema: serde_json::to_value(&*tool.input_schema).unwrap_or_default(),
+        })
+        .collect();
+    Ok((service, tools))
+}
+
+/// The [`McpPlacement::Stdio`] members, borrowed.
+struct StdioProcess<'a> {
+    command:     &'a [String],
+    env:         &'a BTreeMap<String, String>,
+    current_dir: Option<&'a Path>,
+    clear_env:   bool,
+}
+
+/// Spawns the server as a child of this process and runs the handshake over
+/// its standard streams. What it writes to its error output is kept for the
+/// failure message.
+async fn start_stdio(
+    server_name: &str,
+    process: &StdioProcess<'_>,
+    info: ClientInfo,
+    cancel: &CancellationToken,
+    startup: Duration,
+) -> Result<RunningService<RoleClient, ClientInfo>, StartError> {
+    let (program, args) = process
+        .command
+        .split_first()
+        .ok_or_else(|| StartError::Launch {
+            program: String::new(),
+            reason:  "the command is empty".into(),
+        })?;
+    let mut cmd = Command::new(program);
+    cmd.args(args).kill_on_drop(true);
+    if process.clear_env {
+        cmd.env_clear();
+    }
+    cmd.envs(process.env);
+    if let Some(dir) = process.current_dir {
+        cmd.current_dir(dir);
+    }
+    #[cfg(unix)]
+    cmd.process_group(0);
+    let (transport, stderr) = TokioChildProcess::builder(cmd)
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| StartError::Launch {
+            program: program.clone(),
+            reason:  error.to_string(),
+        })?;
+    let tail = stderr.map(|stderr| spawn_stderr_reader(stderr, server_name.to_owned()));
+    handshake(info, transport, cancel, startup)
+        .await
+        .map_err(|failure| failure.into_start_error(startup, tail_suffix(tail.as_ref())))
+}
+
+/// Keeps the last of what a child server writes to its error output, and
+/// traces every line. Disposable: the child owns the pipe, and the task ends
+/// when it closes.
+fn spawn_stderr_reader(stderr: ChildStderr, server_name: String) -> SharedTail {
+    let shared: SharedTail = Arc::default();
+    let tail = Arc::clone(&shared);
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            tracing::debug!(server = %server_name, line = %line, "MCP server stderr");
+            let mut tail = tail.lock().unwrap_or_else(PoisonError::into_inner);
+            tail.push(line.as_bytes());
+            tail.push(b"\n");
+        }
+    });
+    shared
+}
+
+/// The startup timeout and when it started counting.
+#[derive(Clone, Copy)]
+struct Startup {
+    timeout: Duration,
+    began:   Instant,
+}
+
+impl Startup {
+    fn deadline(self) -> Instant {
+        self.began + self.timeout
+    }
+
+    fn remaining(self) -> Duration {
+        self.deadline().saturating_duration_since(Instant::now())
+    }
+}
+
+/// Reaches a server the application runs, giving it the startup timeout to
+/// start answering: an application often spawns it just before building the
+/// agent.
+async fn start_http(
+    protocol: McpHttpProtocol,
+    url: &str,
+    headers: &BTreeMap<String, String>,
+    info: ClientInfo,
+    cancel: &CancellationToken,
+    startup: Duration,
+    began: Instant,
+) -> Result<RunningService<RoleClient, ClientInfo>, StartError> {
+    let deadline = began + startup;
+    probe_until_ready(url, headers, deadline)
+        .await
+        .map_err(|error| match error {
+            ProbeError::Build(reason) => StartError::Unsupported(reason),
+            ProbeError::Deadline => StartError::HandshakeTimeout {
+                timeout: startup,
+                tail:    String::new(),
+            },
+        })?;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    connect_http(protocol, url, headers, info, cancel, remaining)
+        .await?
+        .map_err(|failure| failure.into_start_error(startup, String::new()))
+}
+
+/// The [`McpPlacement::Environment`] members, borrowed.
+struct HostedServer<'a> {
+    command:  &'a [String],
+    port:     u16,
+    env:      &'a BTreeMap<String, String>,
+    protocol: McpHttpProtocol,
+    path:     Option<&'a str>,
+}
+
+/// Launches the server in the environment, routes to its port, gives it the
+/// rest of the startup timeout to answer, and runs the handshake. The process
+/// and the route go into `owned` as soon as they exist, so the caller can put
+/// them back whichever step fails.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the launcher takes the placement, the environment, the route source, and the handshake's inputs, each with one owner"
+)]
+async fn start_in_environment(
+    server_name: &str,
+    hosted: &HostedServer<'_>,
+    environment: &Arc<dyn Environment>,
+    routes: Option<&Arc<dyn PortRoutes>>,
+    info: ClientInfo,
+    cancel: &CancellationToken,
+    startup: Startup,
+    owned: &mut OwnedResources,
+) -> Result<RunningService<RoleClient, ClientInfo>, StartError> {
+    let port = hosted.port;
+    owned.process =
+        Some(launch_in_environment(environment, server_name, hosted.command, hosted.env).await?);
+    // The address pebble reaches the port at is the application's route to
+    // it, or the loopback address when the environment shares the host's
+    // network. An application whose environment routes to no port says so
+    // through the same error, and the server is reported as having no route.
+    let (url, headers) = match routes {
+        Some(routes) => {
+            let route = routes
+                .route(port)
+                .await
+                .map_err(|error| StartError::Route {
+                    port,
+                    reason: error.detail(),
+                })?;
+            owned.route = Some(Route {
+                routes: Arc::clone(routes),
+                port,
+            });
+            (route.url, route.headers)
+        }
+        None => (format!("http://127.0.0.1:{port}"), BTreeMap::new()),
+    };
+    let url = match hosted.path {
+        Some(path) => join_url(&url, path),
+        None => url,
+    };
+    if let Err(error) = probe_until_ready(&url, &headers, startup.deadline()).await {
+        return Err(match error {
+            ProbeError::Build(reason) => StartError::Route { port, reason },
+            ProbeError::Deadline => StartError::HandshakeTimeout {
+                timeout: startup.timeout,
+                tail:    owned.stderr_tail().await,
+            },
+        });
+    }
+    match connect_http(
+        hosted.protocol,
+        &url,
+        &headers,
+        info,
+        cancel,
+        startup.remaining(),
+    )
+    .await?
+    {
+        Ok(service) => Ok(service),
+        Err(failure) => Err(failure.into_start_error(startup.timeout, owned.stderr_tail().await)),
+    }
+}
+
+/// Runs the protocol handshake over `transport`, giving it `within`.
+async fn handshake<T, E, A>(
+    info: ClientInfo,
+    transport: T,
+    cancel: &CancellationToken,
+    within: Duration,
+) -> Handshake
+where
+    T: IntoTransport<RoleClient, E, A>,
+    E: StdError + Send + Sync + 'static,
+{
+    match timeout(
+        within,
+        serve_client_with_ct(info, transport, cancel.child_token()),
+    )
+    .await
+    {
+        Ok(Ok(service)) => Ok(service),
+        Ok(Err(error)) => Err(HandshakeFailure::Failed(error.to_string())),
+        Err(_) => Err(HandshakeFailure::Timeout),
     }
 }
 
@@ -588,20 +723,12 @@ async fn connect_http(
             let mut config = StreamableHttpClientTransportConfig::with_uri(url.to_owned());
             config.custom_headers = headers;
             let transport = StreamableHttpClientTransport::with_client(http_client()?, config);
-            timeout(
-                within,
-                serve_client_with_ct(info, transport, cancel.child_token()),
-            )
-            .await
+            handshake(info, transport, cancel, within).await
         }
         McpHttpProtocol::Sse => {
             let transport = SseClientTransport::new(url, http_client()?, headers)
                 .map_err(|error| StartError::Unsupported(error.to_string()))?;
-            timeout(
-                within,
-                serve_client_with_ct(info, transport, cancel.child_token()),
-            )
-            .await
+            handshake(info, transport, cancel, within).await
         }
     })
 }
@@ -671,7 +798,7 @@ async fn launch_in_environment(
     let token = uuid::Uuid::new_v4().simple().to_string();
     let base = format!(
         "/tmp/pebble-mcp-{}-{token}",
-        super::sanitize_name(server_name)
+        super::sanitize_mcp_name(server_name)
     );
     let stdout_log = format!("{base}.out");
     let stderr_log = format!("{base}.err");
@@ -690,10 +817,7 @@ async fn launch_in_environment(
          2>&1 & else set -m; bash -c {inner} </dev/null >/dev/null 2>&1 & fi\necho $!",
         inner = shell_quote(&inner),
     );
-    let env_vars: HashMap<String, String> = env
-        .iter()
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect();
+    let env_vars: HashMap<String, String> = env.clone().into_iter().collect();
     let outcome = environment
         .exec(ExecRequest {
             timeout_ms: Some(ENVIRONMENT_COMMAND_TIMEOUT_MS),
@@ -725,8 +849,19 @@ async fn launch_in_environment(
     Ok(EnvironmentProcess {
         environment: Arc::clone(environment),
         pid,
+        stdout_log,
         stderr_log,
     })
+}
+
+/// `path` appended to `base` with exactly one slash between them, however
+/// many either side brought.
+fn join_url(base: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
 }
 
 /// `text` as one single-quoted shell word.
@@ -815,6 +950,20 @@ mod tests {
         let text = tail.text();
         assert_eq!(text.len(), STDERR_TAIL_BYTES);
         assert!(text.ends_with("tail"));
+    }
+
+    #[test]
+    fn a_path_joins_a_route_with_one_slash() {
+        assert_eq!(join_url("http://h:1", "sse"), "http://h:1/sse");
+        assert_eq!(join_url("http://h:1/", "/sse"), "http://h:1/sse");
+        assert_eq!(join_url("http://h:1/", "sse"), "http://h:1/sse");
+        assert_eq!(join_url("http://h:1", "/sse"), "http://h:1/sse");
+    }
+
+    #[test]
+    fn a_failure_quotes_the_servers_output_only_when_there_is_some() {
+        assert_eq!(wrote_suffix("  \n"), "");
+        assert_eq!(wrote_suffix("boom\n"), "; the server wrote: boom");
     }
 
     #[test]

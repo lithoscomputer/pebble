@@ -35,7 +35,8 @@ use crate::event::{EventSink, EventSinkError};
 use crate::human_input::{Answer, HumanInputError, HumanInputProvider, Question};
 use crate::projection::SessionProjection;
 use crate::subagent::{
-    ChildObserver, SubagentLimits, SubagentResult, SubagentStatus, SubagentSupervisor,
+    ChildObserver, SubagentLimits, SubagentOptions, SubagentResult, SubagentStatus,
+    SubagentSupervisor,
 };
 use crate::test_support::{
     MockEnvironment, RoutedProvider, ScriptedCompletion, ScriptedProvider, message_text,
@@ -249,30 +250,30 @@ async fn background_agent_notifications_are_batched_into_one_parent_turn() {
     // beside it, each under its own session and model.
     let projection = projected(&mut events);
     assert_eq!(
-        projection.prompt.usage,
+        projection.prompt.totals.usage,
         parent.last_prompt_usage(),
         "the delta spends what the report spends: the root's own answers, cost included"
     );
-    assert_eq!(projection.prompt.messages, 2);
-    let descendants = projection.descendant_usage();
+    assert_eq!(projection.prompt.totals.messages, 2);
+    let descendants = projection.totals.descendant_usage();
     assert_eq!(
         descendants.total_tokens(),
         30,
         "two children answered once each: {:?}",
-        projection.descendants
+        projection.totals.descendants
     );
     assert!(
-        projection.prompt.descendants.is_empty(),
+        projection.prompt.totals.descendants.is_empty(),
         "the children answered before the prompt began"
     );
     // The accounts are by session id; the spawn's agent id names the row.
     assert_eq!(
-        projection.descendants.len(),
+        projection.totals.descendants.len(),
         2,
         "{:?}",
-        projection.descendants
+        projection.totals.descendants
     );
-    for account in projection.descendants.values() {
+    for account in projection.totals.descendants.values() {
         assert_eq!(account.parent, parent.id());
         assert_eq!(account.messages, 1);
         assert_eq!(account.provider.as_deref(), Some("test"));

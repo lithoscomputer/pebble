@@ -121,11 +121,58 @@ impl fmt::Display for PermissionLevel {
     }
 }
 
+/// The `(server, tool)` an MCP tool's qualified name `mcp__{server}__{tool}`
+/// was built from, or `None` when the name is not in that shape.
+///
+/// Defined here, beside [`ToolSource::Mcp`], rather than with the MCP client:
+/// the projection is always compiled and reads server names back out of the
+/// tool names the registry produced.
+#[must_use]
+pub(crate) fn parse_qualified_name(qualified: &str) -> Option<(String, String)> {
+    let rest = qualified.strip_prefix("mcp__")?;
+    let (server, tool) = rest.split_once("__")?;
+    if server.is_empty() || tool.is_empty() {
+        return None;
+    }
+    Some((server.to_owned(), tool.to_owned()))
+}
+
+/// A server or tool name as a qualified tool name spells it: every character
+/// outside `[A-Za-z0-9_]` replaced by `_`.
+pub(crate) fn sanitize_mcp_name(name: &str) -> String {
+    name.chars()
+        .map(|character| {
+            if character.is_alphanumeric() || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn qualified_names_parse_back() {
+        assert_eq!(
+            parse_qualified_name("mcp__filesystem__read_file"),
+            Some(("filesystem".to_owned(), "read_file".to_owned()))
+        );
+        assert_eq!(parse_qualified_name("not_mcp__server__tool"), None);
+        assert_eq!(parse_qualified_name("mcp__serveronly"), None);
+        assert_eq!(parse_qualified_name("mcp____tool"), None);
+    }
+
+    #[test]
+    fn a_name_is_sanitized_to_the_qualified_alphabet() {
+        assert_eq!(sanitize_mcp_name("my-server.v2"), "my_server_v2");
+        assert_eq!(sanitize_mcp_name("plain_name"), "plain_name");
+    }
 
     #[test]
     fn tool_source_defaults_to_native() {

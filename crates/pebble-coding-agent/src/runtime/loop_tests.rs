@@ -25,7 +25,7 @@ mod requests;
 mod subagents;
 mod tools;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -43,7 +43,7 @@ use crate::test_support::{
     ScriptedCall, ScriptedFailure, multi_tool_call_response, text_response, tool_call_response,
     with_cost, with_usage,
 };
-use crate::tool::{ToolError, result_text};
+use crate::tool::{RegisteredTool, ToolError, result_text};
 use crate::types::{ContextWindowCountMethod, Message, ToolSource};
 
 /// The one-call script most tests want: answer with this text, forever.

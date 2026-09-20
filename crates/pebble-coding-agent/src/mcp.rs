@@ -57,7 +57,10 @@ use serde_json::Value;
 
 use crate::environment::Environment;
 use crate::tool::{RegisteredTool, ToolContext, ToolError};
-use crate::types::{CodingEvent, McpServerStatus, McpToolSummary, ToolSource};
+use crate::types::{
+    CodingEvent, McpServerStatus, McpToolSummary, ToolSource, parse_qualified_name as parse_name,
+    sanitize_mcp_name,
+};
 
 /// How long a server gets to close after the agent ends.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -191,31 +194,18 @@ pub enum McpHttpProtocol {
 /// `_`.
 #[must_use]
 pub fn qualified_tool_name(server: &str, tool: &str) -> String {
-    format!("mcp__{}__{}", sanitize_name(server), sanitize_name(tool))
+    format!(
+        "mcp__{}__{}",
+        sanitize_mcp_name(server),
+        sanitize_mcp_name(tool)
+    )
 }
 
 /// The `(server, tool)` a qualified name was built from, or `None` when the
 /// name is not in the qualified shape.
 #[must_use]
 pub fn parse_qualified_name(qualified: &str) -> Option<(String, String)> {
-    let rest = qualified.strip_prefix("mcp__")?;
-    let (server, tool) = rest.split_once("__")?;
-    if server.is_empty() || tool.is_empty() {
-        return None;
-    }
-    Some((server.to_owned(), tool.to_owned()))
-}
-
-fn sanitize_name(name: &str) -> String {
-    name.chars()
-        .map(|character| {
-            if character.is_alphanumeric() || character == '_' {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    parse_name(qualified)
 }
 
 /// What became of one configured server when the agent was built.
@@ -478,9 +468,6 @@ mod tests {
             parse_qualified_name(&qualified_tool_name("my-server", "read.file")),
             Some(("my_server".to_owned(), "read_file".to_owned()))
         );
-        assert_eq!(parse_qualified_name("not_mcp__server__tool"), None);
-        assert_eq!(parse_qualified_name("mcp__serveronly"), None);
-        assert_eq!(parse_qualified_name("mcp____tool"), None);
     }
 
     #[test]
