@@ -20,7 +20,7 @@
 //! that gives the same instructions to a model call of its own. The runtime
 //! underneath is not public.
 
-mod char_boundary;
+pub mod char_boundary;
 mod coding_agent;
 mod compaction;
 mod config;
