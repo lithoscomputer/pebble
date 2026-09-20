@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 
+use pebble_coding_agent::char_boundary::floor_char_boundary;
 use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent, ReasoningOutput, Usage};
 use serde_json::Value;
 
@@ -342,20 +343,6 @@ fn value_line(value: &Value) -> String {
         Value::String(text) => text.clone(),
         other => other.to_string(),
     }
-}
-
-/// The largest char boundary at or below `index`, so a byte budget never
-/// cuts a character. `text.len()` when `index` is at or past the end.
-fn floor_char_boundary(text: &str, index: usize) -> usize {
-    if index >= text.len() {
-        return text.len();
-    }
-    let mut boundary = index;
-    while !text.is_char_boundary(boundary) {
-        // Byte 0 is always a boundary, so this terminates.
-        boundary -= 1;
-    }
-    boundary
 }
 
 /// One line of text, short enough to read.

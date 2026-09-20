@@ -3,13 +3,14 @@
 //! `str::floor_char_boundary` and `str::ceil_char_boundary` stabilized after
 //! pebble's minimum supported Rust version, so the crate carries equivalents.
 //! Both are used wherever a byte budget cuts text that may hold multi-byte
-//! characters: output truncation, retained process output, and event tails.
+//! characters: output truncation, retained process output, event tails, and
+//! the blocks a front end prints from the stream.
 
 /// The largest char boundary at or below `index`.
 ///
 /// Returns `text.len()` when `index` is at or past the end, so a budget larger
 /// than the text keeps all of it.
-pub(crate) fn floor_char_boundary(text: &str, index: usize) -> usize {
+pub fn floor_char_boundary(text: &str, index: usize) -> usize {
     if index >= text.len() {
         return text.len();
     }
@@ -27,7 +28,7 @@ pub(crate) fn floor_char_boundary(text: &str, index: usize) -> usize {
 /// Returns `text.len()` when `index` is at or past the end. Unlike the
 /// standard library's unstable equivalent, an out-of-range index saturates
 /// instead of panicking.
-pub(crate) fn ceil_char_boundary(text: &str, index: usize) -> usize {
+pub fn ceil_char_boundary(text: &str, index: usize) -> usize {
     if index >= text.len() {
         return text.len();
     }
