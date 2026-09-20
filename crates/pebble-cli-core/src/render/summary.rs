@@ -55,7 +55,7 @@ impl Summary {
     /// and retries are the tree's.
     pub(super) fn lines(&self) -> Vec<String> {
         let projection = &self.projection;
-        let mut lines = vec![format!("turns:  {}", projection.messages)];
+        let mut lines = vec![format!("turns:  {}", projection.totals.messages)];
 
         let calls: u64 = projection.tools.values().map(|tool| tool.calls).sum();
         let failed: u64 = projection.tools.values().map(|tool| tool.errors).sum();
@@ -78,7 +78,7 @@ impl Summary {
             lines.push(format!("        {named}"));
         }
 
-        let tokens = projection.usage.tokens;
+        let tokens = projection.totals.usage.tokens;
         lines.push(format!(
             "tokens: {} in, {} out, {} reasoning, {} cached ({} total)",
             tokens.input,
@@ -87,15 +87,16 @@ impl Summary {
             tokens.cache_read + tokens.cache_write,
             tokens.total()
         ));
-        lines.push(match projection.usage.cost {
+        lines.push(match projection.totals.usage.cost {
             Some(cost) => format!("cost:   {}", dollars(cost.usd_micros)),
             None => "cost:   not reported for this model".to_owned(),
         });
 
-        let spawned = projection.subagent_counts.spawned;
-        if spawned > 0 || !projection.descendants.is_empty() {
-            let usage = projection.descendant_usage();
+        let spawned = projection.totals.subagent_counts.spawned;
+        if spawned > 0 || !projection.totals.descendants.is_empty() {
+            let usage = projection.totals.descendant_usage();
             let turns: u64 = projection
+                .totals
                 .descendants
                 .values()
                 .map(|account| account.messages)
@@ -108,8 +109,8 @@ impl Summary {
                 usage.total_tokens()
             ));
         }
-        if projection.retries > 0 {
-            lines.push(format!("retries: {}", projection.retries));
+        if projection.totals.retries > 0 {
+            lines.push(format!("retries: {}", projection.totals.retries));
         }
         if self.dropped > 0 {
             lines.push(format!(
@@ -149,9 +150,9 @@ mod tests {
         let mut projection = SessionProjection::new();
         projection.apply_all(&events);
         assert_eq!(summary.projection(), &projection);
-        assert_eq!(projection.messages, 2, "the root's turns");
-        assert_eq!(projection.retries, 1);
-        assert_eq!(projection.descendants["ses_child"].messages, 1);
+        assert_eq!(projection.totals.messages, 2, "the root's turns");
+        assert_eq!(projection.totals.retries, 1);
+        assert_eq!(projection.totals.descendants["ses_child"].messages, 1);
 
         assert_eq!(summary.lines(), [
             "turns:  2",

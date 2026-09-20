@@ -203,44 +203,64 @@ pub struct FailoverStopProjection {
     pub error:   ErrorData,
 }
 
-/// What the prompt in progress, or the last one, did: reset when a prompt
-/// starts, complete once [`completed`](Self::completed) is set.
+/// What a span of the session did and spent: the tallies kept once for the
+/// session's life and once for the prompt in progress, and moved the same way
+/// by every event that touches them.
+///
+/// Embedded flat in [`SessionProjection`] and [`PromptDelta`], so a stored
+/// value has these members at the top level of each.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct PromptDelta {
-    /// Whether the prompt reached its end.
-    pub completed:         bool,
-    /// The root session's usage over the prompt.
+pub struct Totals {
+    /// The root session's usage.
     pub usage:             Usage,
     /// Committed assistant messages.
     pub messages:          u64,
-    /// The latest context window the prompt reported.
+    /// The root session's latest context window.
     pub context_window:    Option<ContextWindowSnapshot>,
-    /// Tool calls started, across the tree.
-    pub tool_calls:        u64,
-    /// Model calls retried after a failed attempt, across the tree.
+    /// Model calls retried after a failed attempt, across the tree: every
+    /// `LlmRetry`, whichever session's call was replayed.
     #[serde(default)]
     pub retries:           u64,
-    /// Moves the root made to a fallback route during the prompt.
-    #[serde(default)]
-    pub failovers:         u32,
-    /// What each descendant spent during the prompt, by session id.
+    /// What each descendant session spent, by id.
     pub descendants:       BTreeMap<String, DescendantAccount>,
-    /// Child lifecycle events during the prompt.
-    pub subagents:         SubagentCounts,
-    /// Compactions the root completed during the prompt.
+    /// Child lifecycle events, across the tree: a child's own children count.
+    #[serde(alias = "subagents")]
+    pub subagent_counts:   SubagentCounts,
+    /// The root session's compactions, in order.
     pub compactions:       Vec<CompactionProjection>,
-    /// Files written or edited during the prompt, across the tree, sorted.
+    /// Files written or edited, across the tree, sorted.
     pub files_touched:     Vec<String>,
     pub last_file_touched: Option<String>,
 }
 
-impl PromptDelta {
-    /// What every descendant spent during the prompt, summed.
+impl Totals {
+    /// What every descendant spent, summed.
     #[must_use]
     pub fn descendant_usage(&self) -> Usage {
-        sum_accounts(self.descendants.values())
+        self.descendants
+            .values()
+            .fold(Usage::default(), |sum, account| {
+                sum.saturating_add(account.usage)
+            })
     }
 
+    /// One more answer from the root, and the context window it reported.
+    fn record_answer(&mut self, usage: Usage, context_window: Option<&ContextWindowSnapshot>) {
+        self.usage = self.usage.saturating_add(usage);
+        self.messages += 1;
+        if let Some(window) = context_window {
+            self.context_window = Some(window.clone());
+        }
+    }
+
+    /// A compaction the root completed. Its summary call is billed to the
+    /// root, as the prompt report bills it.
+    fn record_compaction(&mut self, compaction: CompactionProjection) {
+        self.usage = self.usage.saturating_add(compaction.usage);
+        self.compactions.push(compaction);
+    }
+
+    /// Paths a successful write or edit touched, in touch order.
     fn touch(&mut self, paths: &[String]) {
         for path in paths {
             if !self.files_touched.contains(path) {
@@ -250,56 +270,65 @@ impl PromptDelta {
             self.last_file_touched = Some(path.clone());
         }
     }
+
+    /// The account of one descendant, opened under `parent` on first sight.
+    fn descendant(&mut self, session_id: &str, parent: &str) -> &mut DescendantAccount {
+        self.descendants
+            .entry(session_id.to_owned())
+            .or_insert_with(|| DescendantAccount {
+                parent: parent.to_owned(),
+                ..DescendantAccount::default()
+            })
+    }
+}
+
+/// What the prompt in progress, or the last one, did: reset when a prompt
+/// starts, complete once [`completed`](Self::completed) is set.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PromptDelta {
+    /// Whether the prompt reached its end.
+    pub completed:  bool,
+    /// What the prompt did and spent.
+    #[serde(flatten)]
+    pub totals:     Totals,
+    /// Tool calls started, across the tree.
+    pub tool_calls: u64,
+    /// Moves the root made to a fallback route during the prompt.
+    #[serde(default)]
+    pub failovers:  u32,
 }
 
 /// The fold over one session tree's events.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionProjection {
     /// The root session, once an event named it.
-    pub root_session_id:   Option<String>,
-    pub route:             RouteProjection,
-    pub activity:          SessionActivity,
-    /// The root session's lifetime usage.
-    pub usage:             Usage,
-    pub messages:          u64,
-    /// Every descendant session, by id.
-    pub descendants:       BTreeMap<String, DescendantAccount>,
-    /// The root session's latest context window.
-    pub context_window:    Option<ContextWindowSnapshot>,
+    pub root_session_id:  Option<String>,
+    pub route:            RouteProjection,
+    pub activity:         SessionActivity,
+    /// What the session did and spent over its life.
+    #[serde(flatten)]
+    pub totals:           Totals,
     /// Every tool called anywhere in the tree, by the name the model used.
-    pub tools:             BTreeMap<String, ToolActivity>,
-    /// Model calls retried after a failed attempt, across the tree: every
-    /// `LlmRetry`, whichever session's call was replayed.
-    #[serde(default)]
-    pub retries:           u64,
+    pub tools:            BTreeMap<String, ToolActivity>,
     /// Every MCP server the root configured, by name.
-    pub mcp_servers:       BTreeMap<String, McpServerProjection>,
-    pub skills:            SkillsProjection,
-    /// Child lifecycle events over the session's life, across the tree: a
-    /// child's own children count.
-    pub subagent_counts:   SubagentCounts,
+    pub mcp_servers:      BTreeMap<String, McpServerProjection>,
+    pub skills:           SkillsProjection,
     /// Every todo list in the tree, by list id.
-    pub todos:             BTreeMap<String, TodoListProjection>,
-    pub subagents:         Vec<SubagentProjection>,
-    /// The root session's compactions, in order.
-    pub compactions:       Vec<CompactionProjection>,
+    pub todos:            BTreeMap<String, TodoListProjection>,
+    pub subagents:        Vec<SubagentProjection>,
     /// Every move the root made to a fallback route over the session's life,
     /// in order.
     #[serde(default)]
-    pub failovers:         Vec<RouteFailoverProjection>,
+    pub failovers:        Vec<RouteFailoverProjection>,
     /// Why the prompt in progress, or the last one, stayed on its route and
     /// ended there although routes were named, when it did. Cleared when a
     /// prompt starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failover_stopped:  Option<FailoverStopProjection>,
-    /// Files written or edited over the session's life, across the tree,
-    /// sorted.
-    pub files_touched:     Vec<String>,
-    pub last_file_touched: Option<String>,
+    pub failover_stopped: Option<FailoverStopProjection>,
     /// How many prompts have started.
-    pub prompts:           u64,
+    pub prompts:          u64,
     /// What the prompt in progress, or the last one, did.
-    pub prompt:            PromptDelta,
+    pub prompt:           PromptDelta,
     /// Writes and edits started and not yet completed, by tool call id.
     ///
     /// In-flight bookkeeping, not a fact about the session: it is filled
@@ -307,7 +336,7 @@ pub struct SessionProjection {
     /// empty otherwise, so it is serialized only when a value is taken
     /// mid-write and a value stored between prompts has no such member.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pending_writes:        BTreeMap<String, Vec<String>>,
+    pending_writes:       BTreeMap<String, Vec<String>>,
 }
 
 impl SessionProjection {
@@ -322,27 +351,31 @@ impl SessionProjection {
     /// Events are applied in stream order; an event of a session whose root
     /// this projection has not seen is taken to belong to the same tree.
     pub fn apply(&mut self, event: &CodingAgentEvent) {
-        let is_root = event.parent_session_id.is_none();
+        // A descendant's event names its parent; the root's names none.
+        let descendant = event
+            .parent_session_id
+            .as_deref()
+            .map(|parent| (event.session_id.as_str(), parent));
+        let is_root = descendant.is_none();
         if is_root && self.root_session_id.is_none() {
             self.root_session_id = Some(event.session_id.clone());
         }
         match &event.event {
-            CodingEvent::SessionStarted { provider, model } => {
-                if is_root {
+            CodingEvent::SessionStarted { provider, model } => match descendant {
+                None => {
                     self.route = RouteProjection {
                         provider: provider.clone(),
                         model:    model.clone(),
                     };
-                } else if let Some(parent) = &event.parent_session_id {
-                    for account in [
-                        descendant(&mut self.descendants, &event.session_id, parent),
-                        descendant(&mut self.prompt.descendants, &event.session_id, parent),
-                    ] {
+                }
+                Some((session_id, parent)) => {
+                    for totals in self.both() {
+                        let account = totals.descendant(session_id, parent);
                         account.provider.clone_from(provider);
                         account.model.clone_from(model);
                     }
                 }
-            }
+            },
             // The failed route's usage on the event is what that route's
             // `AssistantMessage`s already folded in, so the report and this
             // projection agree without counting it again.
@@ -413,21 +446,15 @@ impl SessionProjection {
                 usage,
                 context_window,
                 ..
-            } => {
-                if is_root {
-                    self.usage = self.usage.saturating_add(*usage);
-                    self.messages += 1;
-                    self.prompt.usage = self.prompt.usage.saturating_add(*usage);
-                    self.prompt.messages += 1;
-                    if let Some(window) = context_window {
-                        self.context_window = Some(window.clone());
-                        self.prompt.context_window = Some(window.clone());
+            } => match descendant {
+                None => {
+                    for totals in self.both() {
+                        totals.record_answer(*usage, context_window.as_ref());
                     }
-                } else if let Some(parent) = &event.parent_session_id {
-                    for account in [
-                        descendant(&mut self.descendants, &event.session_id, parent),
-                        descendant(&mut self.prompt.descendants, &event.session_id, parent),
-                    ] {
+                }
+                Some((session_id, parent)) => {
+                    for totals in self.both() {
+                        let account = totals.descendant(session_id, parent);
                         account.usage = account.usage.saturating_add(*usage);
                         account.messages += 1;
                         // The start names the route; an answer seen without
@@ -435,11 +462,12 @@ impl SessionProjection {
                         account.model.get_or_insert_with(|| model.clone());
                     }
                 }
-            }
+            },
             // A child's retries count for the tree, as its tool calls do.
             CodingEvent::LlmRetry { .. } => {
-                self.retries += 1;
-                self.prompt.retries += 1;
+                for totals in self.both() {
+                    totals.retries += 1;
+                }
             }
             CodingEvent::ToolCallStarted {
                 tool_name,
@@ -479,13 +507,8 @@ impl SessionProjection {
                 if let Some(paths) = self.pending_writes.remove(tool_call_id)
                     && !*is_error
                 {
-                    self.prompt.touch(&paths);
-                    for path in paths {
-                        if !self.files_touched.contains(&path) {
-                            self.files_touched.push(path.clone());
-                            self.files_touched.sort();
-                        }
-                        self.last_file_touched = Some(path);
+                    for totals in self.both() {
+                        totals.touch(&paths);
                     }
                 }
             }
@@ -562,8 +585,9 @@ impl SessionProjection {
                 task,
                 ..
             } => {
-                self.subagent_counts.spawned += 1;
-                self.prompt.subagents.spawned += 1;
+                for totals in self.both() {
+                    totals.subagent_counts.spawned += 1;
+                }
                 if let Some(existing) = self.subagent_mut(agent_id) {
                     existing.status = SubagentStatus::Running;
                 } else {
@@ -576,8 +600,9 @@ impl SessionProjection {
                 }
             }
             CodingEvent::SubAgentTurnStarted { agent_id, .. } => {
-                self.subagent_counts.turns_started += 1;
-                self.prompt.subagents.turns_started += 1;
+                for totals in self.both() {
+                    totals.subagent_counts.turns_started += 1;
+                }
                 self.set_subagent_status(agent_id, SubagentStatus::Running);
             }
             CodingEvent::SubAgentCompleted {
@@ -586,8 +611,9 @@ impl SessionProjection {
                 turns_used,
                 ..
             } => {
-                self.subagent_counts.completed += 1;
-                self.prompt.subagents.completed += 1;
+                for totals in self.both() {
+                    totals.subagent_counts.completed += 1;
+                }
                 self.set_subagent_status(agent_id, SubagentStatus::Completed {
                     success:    *success,
                     turns_used: *turns_used,
@@ -596,15 +622,17 @@ impl SessionProjection {
             CodingEvent::SubAgentFailed {
                 agent_id, error, ..
             } => {
-                self.subagent_counts.failed += 1;
-                self.prompt.subagents.failed += 1;
+                for totals in self.both() {
+                    totals.subagent_counts.failed += 1;
+                }
                 self.set_subagent_status(agent_id, SubagentStatus::Failed {
                     error: error.clone(),
                 });
             }
             CodingEvent::SubAgentClosed { agent_id, .. } => {
-                self.subagent_counts.closed += 1;
-                self.prompt.subagents.closed += 1;
+                for totals in self.both() {
+                    totals.subagent_counts.closed += 1;
+                }
                 self.set_subagent_status(agent_id, SubagentStatus::Closed);
             }
             // The summary call is billed to the session that compacted, as
@@ -618,10 +646,8 @@ impl SessionProjection {
                 tracked_file_count,
                 reason,
                 usage,
-            } => {
-                if is_root {
-                    self.usage = self.usage.saturating_add(*usage);
-                    self.prompt.usage = self.prompt.usage.saturating_add(*usage);
+            } => match descendant {
+                None => {
                     let compaction = CompactionProjection {
                         reason:                 *reason,
                         original_turn_count:    *original_turn_count,
@@ -630,18 +656,18 @@ impl SessionProjection {
                         tracked_file_count:     *tracked_file_count,
                         usage:                  *usage,
                     };
-                    self.prompt.compactions.push(compaction.clone());
-                    self.compactions.push(compaction);
-                } else if let Some(parent) = &event.parent_session_id {
-                    for account in [
-                        descendant(&mut self.descendants, &event.session_id, parent),
-                        descendant(&mut self.prompt.descendants, &event.session_id, parent),
-                    ] {
+                    for totals in self.both() {
+                        totals.record_compaction(compaction.clone());
+                    }
+                }
+                Some((session_id, parent)) => {
+                    for totals in self.both() {
+                        let account = totals.descendant(session_id, parent);
                         account.usage = account.usage.saturating_add(*usage);
                         account.compactions += 1;
                     }
                 }
-            }
+            },
             _ => {}
         }
     }
@@ -653,10 +679,9 @@ impl SessionProjection {
         }
     }
 
-    /// What every descendant spent over the session's life, summed.
-    #[must_use]
-    pub fn descendant_usage(&self) -> Usage {
-        sum_accounts(self.descendants.values())
+    /// The session's lifetime tallies and the prompt's, for a fact both keep.
+    fn both(&mut self) -> [&mut Totals; 2] {
+        [&mut self.totals, &mut self.prompt.totals]
     }
 
     fn subagent_mut(&mut self, agent_id: &str) -> Option<&mut SubagentProjection> {
@@ -670,25 +695,6 @@ impl SessionProjection {
             subagent.status = status;
         }
     }
-}
-
-fn descendant<'a>(
-    accounts: &'a mut BTreeMap<String, DescendantAccount>,
-    session_id: &str,
-    parent: &str,
-) -> &'a mut DescendantAccount {
-    accounts
-        .entry(session_id.to_owned())
-        .or_insert_with(|| DescendantAccount {
-            parent: parent.to_owned(),
-            ..DescendantAccount::default()
-        })
-}
-
-fn sum_accounts<'a>(accounts: impl Iterator<Item = &'a DescendantAccount>) -> Usage {
-    accounts.fold(Usage::default(), |sum, account| {
-        sum.saturating_add(account.usage)
-    })
 }
 
 #[cfg(test)]
@@ -756,19 +762,22 @@ mod tests {
         projection.apply(&root(CodingEvent::ProcessingEnd));
 
         assert_eq!(projection.route.model.as_deref(), Some("model"));
-        assert_eq!(projection.usage, priced(30, Some(6)));
-        assert_eq!(projection.messages, 2);
-        assert_eq!(projection.prompt.usage, priced(30, Some(6)));
+        assert_eq!(projection.totals.usage, priced(30, Some(6)));
+        assert_eq!(projection.totals.messages, 2);
+        assert_eq!(projection.prompt.totals.usage, priced(30, Some(6)));
         assert!(projection.prompt.completed);
         assert_eq!(projection.activity, SessionActivity::Idle);
         assert_eq!(
-            projection.descendant_usage(),
+            projection.totals.descendant_usage(),
             priced(7, None),
             "an unpriced answer leaves the sum unpriced"
         );
-        assert_eq!(projection.descendants["ses_child"].parent, "ses_root");
         assert_eq!(
-            projection.prompt.descendant_usage(),
+            projection.totals.descendants["ses_child"].parent,
+            "ses_root"
+        );
+        assert_eq!(
+            projection.prompt.totals.descendant_usage(),
             priced(7, None),
             "the prompt's delta keeps the descendants' spend apart from the root's"
         );
@@ -779,8 +788,12 @@ mod tests {
             content: None,
             source:  InputSource::Prompt,
         }));
-        assert!(projection.prompt.descendants.is_empty());
-        assert_eq!(projection.descendants.len(), 1, "the lifetime map keeps it");
+        assert!(projection.prompt.totals.descendants.is_empty());
+        assert_eq!(
+            projection.totals.descendants.len(),
+            1,
+            "the lifetime map keeps it"
+        );
     }
 
     fn compaction(input: u64, cost: Option<u64>) -> CodingEvent {
@@ -812,22 +825,25 @@ mod tests {
         }));
 
         assert_eq!(
-            projection.usage,
+            projection.totals.usage,
             priced(40, Some(7)),
             "the summary call is in the total, its cost included"
         );
-        assert_eq!(projection.prompt.usage, priced(40, Some(7)));
-        assert_eq!(projection.messages, 1, "a compaction is not a turn");
-        assert_eq!(projection.compactions[0].usage, priced(30, Some(2)));
-        assert_eq!(projection.prompt.compactions, projection.compactions);
+        assert_eq!(projection.prompt.totals.usage, priced(40, Some(7)));
+        assert_eq!(projection.totals.messages, 1, "a compaction is not a turn");
+        assert_eq!(projection.totals.compactions[0].usage, priced(30, Some(2)));
         assert_eq!(
-            projection.descendants["ses_child"].usage,
+            projection.prompt.totals.compactions,
+            projection.totals.compactions
+        );
+        assert_eq!(
+            projection.totals.descendants["ses_child"].usage,
             priced(4, None),
             "a child's compaction is the child's spend"
         );
-        assert_eq!(projection.descendants["ses_child"].compactions, 1);
+        assert_eq!(projection.totals.descendants["ses_child"].compactions, 1);
         assert_eq!(
-            projection.usage.tokens.input, 40,
+            projection.totals.usage.tokens.input, 40,
             "a failed compaction is not billed, as the report does not bill it"
         );
     }
@@ -878,7 +894,7 @@ mod tests {
         projection.apply(&grandchild);
 
         assert_eq!(projection.route.model.as_deref(), Some("big"));
-        let child_account = &projection.descendants["ses_child"];
+        let child_account = &projection.totals.descendants["ses_child"];
         assert_eq!(child_account.provider.as_deref(), Some("test"));
         assert_eq!(
             child_account.model.as_deref(),
@@ -887,11 +903,13 @@ mod tests {
         );
         assert_eq!(child_account.usage, priced(7, None));
         assert_eq!(
-            projection.prompt.descendants["ses_child"].model.as_deref(),
+            projection.prompt.totals.descendants["ses_child"]
+                .model
+                .as_deref(),
             Some("small"),
             "the prompt's account names the model too"
         );
-        let grandchild_account = &projection.descendants["ses_grandchild"];
+        let grandchild_account = &projection.totals.descendants["ses_grandchild"];
         assert_eq!(grandchild_account.parent, "ses_child");
         assert_eq!(grandchild_account.provider, None);
         assert_eq!(grandchild_account.model.as_deref(), Some("tiny"));
@@ -907,8 +925,11 @@ mod tests {
         }));
         projection.apply(&root(retry()));
         projection.apply(&child(retry()));
-        assert_eq!(projection.retries, 2, "a child's retry counts for the tree");
-        assert_eq!(projection.prompt.retries, 2);
+        assert_eq!(
+            projection.totals.retries, 2,
+            "a child's retry counts for the tree"
+        );
+        assert_eq!(projection.prompt.totals.retries, 2);
 
         projection.apply(&root(CodingEvent::ProcessingEnd));
         projection.apply(&root(CodingEvent::UserInput {
@@ -917,10 +938,13 @@ mod tests {
             source:  InputSource::Prompt,
         }));
         assert_eq!(
-            projection.prompt.retries, 0,
+            projection.prompt.totals.retries, 0,
             "a new prompt starts from nothing"
         );
-        assert_eq!(projection.retries, 2, "the lifetime count keeps counting");
+        assert_eq!(
+            projection.totals.retries, 2,
+            "the lifetime count keeps counting"
+        );
     }
 
     fn failover(from: &str, to: &str, attempt: u32) -> CodingEvent {
@@ -975,7 +999,7 @@ mod tests {
         assert_eq!(projection.route.provider.as_deref(), Some("c"));
         assert_eq!(projection.route.model.as_deref(), Some("three"));
         assert_eq!(
-            projection.usage,
+            projection.totals.usage,
             priced(10, Some(7)),
             "the failed route's spend on the event is not counted again"
         );
@@ -1020,7 +1044,7 @@ mod tests {
         }));
         projection.apply(&root(message(5, None)));
         assert_eq!(
-            projection.prompt.usage.tokens.input, 15,
+            projection.prompt.totals.usage.tokens.input, 15,
             "a follow-up is the same prompt"
         );
         projection.apply(&root(CodingEvent::ProcessingEnd));
@@ -1030,12 +1054,12 @@ mod tests {
             source:  InputSource::Prompt,
         }));
         assert_eq!(
-            projection.prompt.usage.tokens.input, 0,
+            projection.prompt.totals.usage.tokens.input, 0,
             "a new prompt starts from nothing"
         );
         assert!(!projection.prompt.completed);
         assert_eq!(
-            projection.usage.tokens.input, 15,
+            projection.totals.usage.tokens.input, 15,
             "the lifetime total keeps counting"
         );
         assert_eq!(projection.prompts, 2);
@@ -1081,9 +1105,14 @@ mod tests {
                 projection.apply(&root(event));
             }
         }
-        assert_eq!(projection.files_touched, ["/w/a.txt", "/w/b.txt"]);
-        assert_eq!(projection.last_file_touched.as_deref(), Some("/w/a.txt"));
-        assert_eq!(projection.prompt.files_touched, ["/w/a.txt", "/w/b.txt"]);
+        assert_eq!(projection.totals.files_touched, ["/w/a.txt", "/w/b.txt"]);
+        assert_eq!(
+            projection.totals.last_file_touched.as_deref(),
+            Some("/w/a.txt")
+        );
+        assert_eq!(projection.prompt.totals.files_touched, [
+            "/w/a.txt", "/w/b.txt"
+        ]);
         assert_eq!(projection.tools["write_file"].calls, 2);
         assert_eq!(projection.tools["write_file"].errors, 1);
         assert_eq!(projection.tools["write_file"].open, 0);
@@ -1203,14 +1232,17 @@ mod tests {
             "a reused child stays one row"
         );
         assert_eq!(projection.subagents[0].status, SubagentStatus::Running);
-        assert_eq!(projection.subagent_counts, SubagentCounts {
+        assert_eq!(projection.totals.subagent_counts, SubagentCounts {
             spawned:       1,
             turns_started: 1,
             completed:     1,
             failed:        0,
             closed:        0,
         });
-        assert_eq!(projection.prompt.subagents, projection.subagent_counts);
+        assert_eq!(
+            projection.prompt.totals.subagent_counts,
+            projection.totals.subagent_counts
+        );
 
         // A grandchild is spawned by the child and counts for the tree.
         projection.apply(&child(CodingEvent::SubAgentSpawned {
@@ -1219,7 +1251,7 @@ mod tests {
             task:       "deeper".into(),
             generation: 1,
         }));
-        assert_eq!(projection.subagent_counts.spawned, 2);
+        assert_eq!(projection.totals.subagent_counts.spawned, 2);
         assert_eq!(projection.subagents.len(), 2);
         assert_eq!(projection.subagents[1].depth, 2);
     }
@@ -1257,7 +1289,7 @@ mod tests {
             settled.get("pending_writes").is_none(),
             "nothing in flight, nothing on the wire: {settled}"
         );
-        assert_eq!(projection.files_touched, ["/w/b.txt"]);
+        assert_eq!(projection.totals.files_touched, ["/w/b.txt"]);
     }
 
     #[test]
@@ -1273,6 +1305,33 @@ mod tests {
         let mut resumed: SessionProjection = serde_json::from_str(&stored).expect("parses");
         assert_eq!(resumed, projection);
         resumed.apply(&root(message(5, None)));
-        assert_eq!(resumed.usage.tokens.input, 15);
+        assert_eq!(resumed.totals.usage.tokens.input, 15);
+    }
+
+    /// The tallies are one type held twice, but a stored value shows them
+    /// flat: at the top level of the session and of its prompt, as before
+    /// there was one type.
+    #[test]
+    fn the_tallies_are_stored_flat_in_the_session_and_the_prompt() {
+        let mut projection = SessionProjection::new();
+        projection.apply(&root(CodingEvent::UserInput {
+            text:    "go".into(),
+            content: None,
+            source:  InputSource::Prompt,
+        }));
+        projection.apply(&root(message(10, None)));
+        let stored = serde_json::to_value(&projection).expect("serializes");
+
+        for object in [&stored, &stored["prompt"]] {
+            let keys = object.as_object().expect("an object");
+            assert!(keys.contains_key("usage"), "{object}");
+            assert!(keys.contains_key("messages"), "{object}");
+            assert!(keys.contains_key("subagent_counts"), "{object}");
+            assert!(keys.contains_key("files_touched"), "{object}");
+            assert!(!keys.contains_key("totals"), "{object}");
+        }
+        assert_eq!(stored["messages"], 1);
+        assert_eq!(stored["prompt"]["messages"], 1);
+        assert_eq!(stored["prompt"]["completed"], false);
     }
 }

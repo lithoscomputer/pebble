@@ -291,7 +291,7 @@ async fn a_failover_eligible_error_moves_the_conversation_to_the_next_route() {
     let mut projection = SessionProjection::new();
     projection.apply_all(&published);
     assert_eq!(
-        projection.prompt.usage, report.usage,
+        projection.prompt.totals.usage, report.usage,
         "the fold spends what the report spends, on both routes, cost included"
     );
     assert_eq!(report.usage.tokens.input, 20, "one answer on each route");
@@ -300,7 +300,7 @@ async fn a_failover_eligible_error_moves_the_conversation_to_the_next_route() {
         Some(10),
         "the failed route's answer and the fallback's are both on the report's bill"
     );
-    assert!(projection.prompt.descendants.is_empty());
+    assert!(projection.prompt.totals.descendants.is_empty());
     assert_eq!(projection.route.model.as_deref(), Some("vision"));
     // The move is in the fold as the stream told it, and nothing says the
     // prompt stopped.

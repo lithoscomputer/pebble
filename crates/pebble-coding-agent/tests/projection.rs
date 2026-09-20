@@ -76,13 +76,16 @@ async fn the_projection_agrees_with_the_prompt_report_live_and_resumed() {
     assert_eq!(live.route.model.as_deref(), Some("model"));
     assert_eq!(live.activity, SessionActivity::Idle);
     assert!(live.prompt.completed);
-    assert_eq!(live.prompt.files_touched, first.files_touched);
-    assert_eq!(live.prompt.last_file_touched, first.last_file_touched);
+    assert_eq!(live.prompt.totals.files_touched, first.files_touched);
     assert_eq!(
-        live.prompt.usage, first.usage,
+        live.prompt.totals.last_file_touched,
+        first.last_file_touched
+    );
+    assert_eq!(
+        live.prompt.totals.usage, first.usage,
         "the fold spends what the report spends"
     );
-    assert_eq!(live.usage, first.usage);
+    assert_eq!(live.totals.usage, first.usage);
     assert_eq!(live.prompt.tool_calls, 2);
     assert_eq!(live.tools["write_file"].calls, 2);
     assert_eq!(live.tools["write_file"].open, 0);
@@ -100,15 +103,15 @@ async fn the_projection_agrees_with_the_prompt_report_live_and_resumed() {
 
     assert_eq!(resumed, live, "resuming from a stored value loses nothing");
     assert_eq!(resumed.prompts, 2);
-    assert!(resumed.prompt.files_touched.is_empty());
-    assert_eq!(resumed.prompt.usage, second.usage);
+    assert!(resumed.prompt.totals.files_touched.is_empty());
+    assert_eq!(resumed.prompt.totals.usage, second.usage);
     assert_eq!(
-        resumed.usage,
+        resumed.totals.usage,
         first.usage.saturating_add(second.usage),
         "the lifetime total spans prompts"
     );
     assert_eq!(
-        resumed.files_touched,
+        resumed.totals.files_touched,
         ["/home/test/alpha.txt", "/home/test/zeta.txt"],
         "the lifetime list keeps the first prompt's files"
     );
@@ -144,7 +147,7 @@ fn priced_summary(usage: TokenCounts, usd_micros: u64) -> ScriptedCompletion {
 /// keeps out and the fold keeps beside.
 fn assert_agrees_with_the_report(projection: &SessionProjection, report: &PromptReport) {
     assert_eq!(
-        projection.prompt.usage, report.usage,
+        projection.prompt.totals.usage, report.usage,
         "the delta spends what the report spends, cost included"
     );
 }
@@ -187,7 +190,7 @@ async fn the_projection_bills_a_compaction_as_the_report_does() {
     let [account] = report.compactions.as_slice() else {
         panic!("one compaction is on the report: {report:?}");
     };
-    let [compaction] = live.prompt.compactions.as_slice() else {
+    let [compaction] = live.prompt.totals.compactions.as_slice() else {
         panic!("one compaction is in the fold: {live:?}");
     };
     assert_eq!(compaction.usage, account.usage);
@@ -211,8 +214,8 @@ async fn the_projection_bills_a_compaction_as_the_report_does() {
         "both priced from the catalog, so the sum is too"
     );
     assert_agrees_with_the_report(&live, &report);
-    assert_eq!(live.usage, report.usage);
-    assert_eq!(live.compactions, live.prompt.compactions);
+    assert_eq!(live.totals.usage, report.usage);
+    assert_eq!(live.totals.compactions, live.prompt.totals.compactions);
     agent
         .shutdown(ShutdownReason::Completed)
         .await
