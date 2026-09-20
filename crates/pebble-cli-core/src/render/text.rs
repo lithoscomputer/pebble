@@ -89,12 +89,15 @@ impl Sink {
 
 /// Writes one readable line per event, with the model's text streamed.
 pub(super) struct TextRenderer {
-    options:   RenderOptions,
-    sink:      Sink,
-    /// Whether a streamed line is open on the terminal.
-    streaming: bool,
-    /// The sessions whose text has streamed since their last turn.
-    streamed:  HashSet<String>,
+    options:             RenderOptions,
+    sink:                Sink,
+    /// Whether a streamed line is open on the terminal. Any event but a
+    /// delta ends it.
+    line_open:           bool,
+    /// The sessions whose text has streamed since their last turn. A
+    /// session's turn clears its entry, so the turn's text is not printed
+    /// twice.
+    streamed_since_turn: HashSet<String>,
 }
 
 impl TextRenderer {
@@ -102,16 +105,16 @@ impl TextRenderer {
         Self {
             options,
             sink: Sink::Stderr,
-            streaming: false,
-            streamed: HashSet::new(),
+            line_open: false,
+            streamed_since_turn: HashSet::new(),
         }
     }
 
     /// Ends a streamed line left open, once the stream is over.
     pub(super) fn close(&mut self) {
-        if self.streaming {
+        if self.line_open {
             self.sink.line("");
-            self.streaming = false;
+            self.line_open = false;
         }
     }
 
@@ -121,10 +124,8 @@ impl TextRenderer {
         // is the one thing that gets no line of its own.
         if let CodingEvent::TextDelta { delta } = event {
             self.sink.fragment(delta);
-            self.streaming = true;
-            if !self.streamed.contains(&envelope.session_id) {
-                self.streamed.insert(envelope.session_id.clone());
-            }
+            self.line_open = true;
+            self.streamed_since_turn.insert(envelope.session_id.clone());
             return;
         }
         self.close();
@@ -246,7 +247,7 @@ impl TextRenderer {
         tool_call_count: usize,
         reasoning: Option<&ReasoningOutput>,
     ) {
-        let streamed = self.streamed.remove(session_id);
+        let streamed = self.streamed_since_turn.remove(session_id);
         if self.options.transcript {
             let reasoning =
                 reasoning.and_then(|reasoning| reasoning.summary().or_else(|| reasoning.trace()));
