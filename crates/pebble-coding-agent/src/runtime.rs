@@ -475,63 +475,15 @@ impl CodingRuntime {
         let profile_kind = self.profile.profile_kind();
         let profile = profile_kind.as_str().to_owned();
 
-        // The conventions the application named, resolved to paths: one git
-        // probe serves both when either asks for the root.
-        let needs_git_root = matches!(
-            self.config
-                .memory_discovery
-                .as_ref()
-                .map(discovery::MemoryDiscovery::root),
-            Some(discovery::MemoryRoot::GitRoot)
-        ) || self
-            .config
-            .skill_discovery
-            .as_ref()
-            .is_some_and(discovery::SkillDiscovery::needs_git_root);
-        let git_root = if needs_git_root {
-            discovery::git_root(self.env.as_ref(), &cancel).await?
-        } else {
-            None
-        };
-        let mut memory_files = match &self.config.memory_discovery {
-            Some(memory) => match memory.root() {
-                discovery::MemoryRoot::GitRoot => discovery::MemoryDiscovery::candidates(
-                    profile_kind,
-                    git_root.as_deref(),
-                    self.env.working_directory(),
-                ),
-                _ => {
-                    memory
-                        .resolve(self.env.as_ref(), profile_kind, &cancel)
-                        .await?
-                }
-            },
-            None => Vec::new(),
-        };
-        for path in &self.config.memory_files {
-            if !memory_files.contains(path) {
-                memory_files.push(path.clone());
-            }
-        }
-        let mut skill_dirs = self.config.skill_dirs.clone();
-        let mut skill_skipped = Vec::new();
-        if let Some(skills) = &self.config.skill_discovery {
-            let resolved = skills
-                .resolve(self.env.as_ref(), git_root.as_deref(), &cancel)
+        let sources =
+            discovery::resolve_sources(&self.config, self.env.as_ref(), profile_kind, &cancel)
                 .await?;
-            for dir in resolved.dirs {
-                if !skill_dirs.contains(&dir) {
-                    skill_dirs.push(dir);
-                }
-            }
-            skill_skipped = resolved.skipped;
-        }
 
         // Independent reads of the environment, overlapped; the events they
         // feed stay in their documented order below.
         let (memory, skills) = tokio::join!(
-            ProjectMemory::load(self.env.as_ref(), &memory_files, &cancel),
-            discover_skills(self.env.as_ref(), &skill_dirs, &cancel),
+            ProjectMemory::load(self.env.as_ref(), &sources.memory_files, &cancel),
+            discover_skills(self.env.as_ref(), &sources.skill_dirs, &cancel),
         );
 
         let memory = memory?;
@@ -548,21 +500,16 @@ impl CodingRuntime {
         });
 
         let discovered = skills?;
-        Arc::make_mut(&mut self.resources).skills = discovered.skills;
-        Arc::make_mut(&mut self.resources)
-            .skill_dirs
-            .clone_from(&skill_dirs);
-        skill_skipped.extend(discovered.skipped);
+        let resources = Arc::make_mut(&mut self.resources);
+        resources.skills = discovered.skills;
+        resources.skill_dirs = sources.skill_dirs;
+        let mut skipped = sources.skipped_skills;
+        skipped.extend(discovered.skipped);
         self.emit(CodingEvent::SkillsDiscovered {
             profile,
-            source_dirs: skill_dirs,
-            skills: self
-                .resources
-                .skills
-                .iter()
-                .map(Skill::to_summary)
-                .collect(),
-            skipped: skill_skipped,
+            source_dirs: self.resources.skill_dirs.clone(),
+            skills: self.skill_summaries(),
+            skipped,
         });
         // The one tool that cannot be built by the builder: what it loads is
         // discovered here, and a session that discovered no skills advertises
@@ -597,46 +544,51 @@ impl CodingRuntime {
             .into_iter()
             .map(|document| document.content)
             .collect();
-        // The registry is complete by now — the builder froze it and the skill
-        // tool above is the last addition — so a profile that gates a prompt
-        // section on a tool reads the session's real answer.
+        let system_prompt = self.compose_system_prompt(&env_context, &memory, &memory_summaries);
+        Arc::make_mut(&mut self.resources).system_prompt = system_prompt;
+
+        self.flush_events().await.map(|_| ())
+    }
+
+    /// The words the model reads first: the profile's prompt for this
+    /// session, adjusted once by the application's transform when it has one.
+    ///
+    /// Called once the registry is complete — the builder froze it and the
+    /// skill tool is the last addition — so a profile that gates a prompt
+    /// section on a tool reads the session's real answer. The transform sees
+    /// the prompt as written and the session as the prompt describes it. Tool
+    /// summaries are the registered starting set; per-turn middleware can
+    /// narrow what the model sees later.
+    fn compose_system_prompt(
+        &self,
+        env_context: &EnvContext,
+        memory: &[String],
+        memory_summaries: &[MemoryFileSummary],
+    ) -> String {
         let default_prompt = self.profile.build_system_prompt(
             &self.resources.registry,
-            &env_context,
-            &memory,
+            env_context,
+            memory,
             self.config.user_instructions.as_deref(),
             &self.resources.skills,
         );
-        // The application's one chance to adjust the words the model reads
-        // first. It sees the prompt as written and the session as the prompt
-        // describes it. Tool summaries are the registered starting set;
-        // per-turn middleware can narrow what the model sees later.
-        Arc::make_mut(&mut self.resources).system_prompt = match &self.prompt_transform {
-            Some(transform) => {
-                let tools: Vec<_> = self
-                    .registered_tools()
-                    .iter()
-                    .map(ToolDefinitionWithSource::to_tool_summary)
-                    .collect();
-                let skills: Vec<_> = self
-                    .resources
-                    .skills
-                    .iter()
-                    .map(Skill::to_summary)
-                    .collect();
-                let context = SystemPromptContext::new(
-                    &default_prompt,
-                    &env_context,
-                    &tools,
-                    &memory_summaries,
-                    &skills,
-                );
-                transform.transform(context).apply(default_prompt)
-            }
-            None => default_prompt,
+        let Some(transform) = &self.prompt_transform else {
+            return default_prompt;
         };
-
-        self.flush_events().await.map(|_| ())
+        let tools: Vec<_> = self
+            .registered_tools()
+            .iter()
+            .map(ToolDefinitionWithSource::to_tool_summary)
+            .collect();
+        let skills = self.skill_summaries();
+        let context = SystemPromptContext::new(
+            &default_prompt,
+            env_context,
+            &tools,
+            memory_summaries,
+            &skills,
+        );
+        transform.transform(context).apply(default_prompt)
     }
 
     /// Gathers what the system prompt says about where the session is working.

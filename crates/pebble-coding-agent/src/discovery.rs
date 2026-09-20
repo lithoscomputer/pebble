@@ -16,6 +16,7 @@
 
 use tokio_util::sync::CancellationToken;
 
+use crate::config::CodingAgentOptions;
 use crate::environment::{Environment, ExecRequest};
 use crate::error::{Error, InterruptReason, Result};
 use crate::types::{AgentProfileKind, SkippedSkill, SkippedSkillReason};
@@ -103,6 +104,12 @@ impl MemoryDiscovery {
         &self.root
     }
 
+    /// Whether the walk starts at the git root.
+    #[must_use]
+    pub const fn needs_git_root(&self) -> bool {
+        matches!(self.root, MemoryRoot::GitRoot)
+    }
+
     /// The candidate paths for `profile` in every directory from `root` down
     /// to `working_dir`, root first. With no root, or a working directory
     /// outside the root, the working directory alone.
@@ -148,16 +155,29 @@ impl MemoryDiscovery {
         profile: AgentProfileKind,
         cancel: &CancellationToken,
     ) -> Result<Vec<String>> {
+        let git_root = if self.needs_git_root() {
+            git_root(env, cancel).await?
+        } else {
+            None
+        };
+        Ok(self.candidates_in(env, profile, git_root.as_deref()))
+    }
+
+    /// The candidate paths for `profile` in `env`. `git_root` is the probe's
+    /// answer when the walk starts there.
+    #[must_use]
+    pub fn candidates_in(
+        &self,
+        env: &dyn Environment,
+        profile: AgentProfileKind,
+        git_root: Option<&str>,
+    ) -> Vec<String> {
         let root = match &self.root {
             MemoryRoot::WorkingDirectory => None,
-            MemoryRoot::Path(path) => Some(path.clone()),
-            MemoryRoot::GitRoot => git_root(env, cancel).await?,
+            MemoryRoot::Path(path) => Some(path.as_str()),
+            MemoryRoot::GitRoot => git_root,
         };
-        Ok(Self::candidates(
-            profile,
-            root.as_deref(),
-            env.working_directory(),
-        ))
+        Self::candidates(profile, root, env.working_directory())
     }
 }
 
@@ -345,6 +365,78 @@ pub struct ResolvedSkillDirs {
     pub skipped: Vec<SkippedSkill>,
 }
 
+/// The memory files and skill directories one session reads: the explicit
+/// paths its options name, and what the conventions they name resolve to.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ResolvedSources {
+    /// The memory files to load: the discovered candidates, then the explicit
+    /// paths not already among them, each once.
+    pub(crate) memory_files:   Vec<String>,
+    /// The skill directories to search: the explicit ones, then the
+    /// discovered ones not already among them, each once.
+    pub(crate) skill_dirs:     Vec<String>,
+    /// The required skill directories that are not there.
+    pub(crate) skipped_skills: Vec<SkippedSkill>,
+}
+
+/// Resolves the conventions `options` name to paths in `env`, for a session
+/// running `profile`. One git probe serves both conventions when either asks
+/// for the root.
+///
+/// # Errors
+///
+/// Returns [`Error::Interrupted`] when `cancel` fires around a probe or a
+/// check.
+pub(crate) async fn resolve_sources(
+    options: &CodingAgentOptions,
+    env: &dyn Environment,
+    profile: AgentProfileKind,
+    cancel: &CancellationToken,
+) -> Result<ResolvedSources> {
+    let needs_git_root = options
+        .memory_discovery
+        .as_ref()
+        .is_some_and(MemoryDiscovery::needs_git_root)
+        || options
+            .skill_discovery
+            .as_ref()
+            .is_some_and(SkillDiscovery::needs_git_root);
+    let git_root = if needs_git_root {
+        git_root(env, cancel).await?
+    } else {
+        None
+    };
+
+    let mut memory_files = match &options.memory_discovery {
+        Some(memory) => memory.candidates_in(env, profile, git_root.as_deref()),
+        None => Vec::new(),
+    };
+    extend_unique(&mut memory_files, options.memory_files.iter().cloned());
+
+    let mut skill_dirs = options.skill_dirs.clone();
+    let mut skipped_skills = Vec::new();
+    if let Some(skills) = &options.skill_discovery {
+        let resolved = skills.resolve(env, git_root.as_deref(), cancel).await?;
+        extend_unique(&mut skill_dirs, resolved.dirs);
+        skipped_skills = resolved.skipped;
+    }
+
+    Ok(ResolvedSources {
+        memory_files,
+        skill_dirs,
+        skipped_skills,
+    })
+}
+
+/// Appends each of `paths` that `into` does not already hold, in order.
+fn extend_unique(into: &mut Vec<String>, paths: impl IntoIterator<Item = String>) {
+    for path in paths {
+        if !into.contains(&path) {
+            into.push(path);
+        }
+    }
+}
+
 /// The root of the git repository `env`'s working directory is in, or `None`
 /// outside one or where git is unavailable.
 ///
@@ -461,6 +553,68 @@ mod tests {
             ["/home/test/AGENTS.md"],
             "an answer that is not a path is no root"
         );
+    }
+
+    #[tokio::test]
+    async fn sources_are_the_explicit_paths_when_no_convention_is_named() {
+        let options = CodingAgentOptions::default()
+            .with_memory_files(["/w/NOTES.md".to_owned()])
+            .with_skill_dirs(["/w/skills".to_owned()]);
+        let sources = resolve_sources(
+            &options,
+            &MockEnvironment::linux(),
+            AgentProfileKind::Kimi,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("resolves");
+        assert_eq!(sources, ResolvedSources {
+            memory_files:   vec!["/w/NOTES.md".to_owned()],
+            skill_dirs:     vec!["/w/skills".to_owned()],
+            skipped_skills: Vec::new(),
+        });
+    }
+
+    #[tokio::test]
+    async fn sources_anchor_both_conventions_at_the_git_root() {
+        let env = git_env("/home\n");
+        let options = CodingAgentOptions::default()
+            .with_memory_discovery(MemoryDiscovery::from_git_root())
+            .with_skill_discovery(SkillDiscovery::new().search_under_git_root("skills"))
+            .with_skill_dirs(["/elsewhere".to_owned()]);
+        let sources = resolve_sources(
+            &options,
+            &env,
+            AgentProfileKind::Kimi,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("resolves");
+        assert_eq!(sources.memory_files, [
+            "/home/AGENTS.md",
+            "/home/test/AGENTS.md"
+        ]);
+        assert_eq!(
+            sources.skill_dirs,
+            ["/elsewhere", "/home/skills"],
+            "the explicit directories come first"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_path_that_is_also_discovered_is_read_once() {
+        let options = CodingAgentOptions::default()
+            .with_memory_discovery(MemoryDiscovery::working_directory())
+            .with_memory_files(["/home/test/AGENTS.md".to_owned()]);
+        let sources = resolve_sources(
+            &options,
+            &MockEnvironment::linux(),
+            AgentProfileKind::Kimi,
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("resolves");
+        assert_eq!(sources.memory_files, ["/home/test/AGENTS.md"]);
     }
 
     #[tokio::test]
