@@ -798,7 +798,7 @@ async fn launch_in_environment(
     let token = uuid::Uuid::new_v4().simple().to_string();
     let base = format!(
         "/tmp/pebble-mcp-{}-{token}",
-        super::sanitize_name(server_name)
+        super::sanitize_mcp_name(server_name)
     );
     let stdout_log = format!("{base}.out");
     let stderr_log = format!("{base}.err");

@@ -27,7 +27,7 @@ use crate::file_tracker;
 use crate::types::{
     CodingAgentEvent, CodingEvent, ContextWindowSnapshot, FailoverContinuation, FailoverStop,
     InputSource, McpToolSummary, SkillActivationSource, SkillSummary, TodoListProjection,
-    TodoProjection, Usage,
+    TodoProjection, Usage, parse_qualified_name, sanitize_mcp_name,
 };
 
 /// Where a session stands, as its events tell it.
@@ -450,11 +450,11 @@ impl SessionProjection {
                 activity.calls += 1;
                 activity.open += 1;
                 self.prompt.tool_calls += 1;
-                if let Some(server) = mcp_server_of(tool_name)
+                if let Some((server, _)) = parse_qualified_name(tool_name)
                     && let Some(projection) = self
                         .mcp_servers
                         .iter_mut()
-                        .find(|(name, _)| sanitized(name) == server)
+                        .find(|(name, _)| sanitize_mcp_name(name) == server)
                         .map(|(_, projection)| projection)
                 {
                     projection.invoked = true;
@@ -689,26 +689,6 @@ fn sum_accounts<'a>(accounts: impl Iterator<Item = &'a DescendantAccount>) -> Us
     accounts.fold(Usage::default(), |sum, account| {
         sum.saturating_add(account.usage)
     })
-}
-
-/// The server segment of an `mcp__<server>__<tool>` name.
-fn mcp_server_of(tool_name: &str) -> Option<&str> {
-    let rest = tool_name.strip_prefix("mcp__")?;
-    let (server, _) = rest.split_once("__")?;
-    (!server.is_empty()).then_some(server)
-}
-
-/// A server name as the registry spells it in a qualified tool name.
-fn sanitized(name: &str) -> String {
-    name.chars()
-        .map(|character| {
-            if character.is_alphanumeric() || character == '_' {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]

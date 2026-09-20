@@ -37,6 +37,7 @@ pub use self::todo::{
     TodoStatus, TodoUpdatedProps,
 };
 pub use self::tool::{PermissionLevel, ToolCategory, ToolErrorKind, ToolSource, ToolSummary};
+pub(crate) use self::tool::{parse_qualified_name, sanitize_mcp_name};
 use crate::compaction::{CompactionReason, CompactionResult, is_threshold_reason};
 use crate::error::ErrorData;
 use crate::record::StoredMessage;
