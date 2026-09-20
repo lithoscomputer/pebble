@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent};
+use pebble_coding_agent::events::{CodingAgentEvent, CodingEvent, ReasoningOutput, Usage};
 use serde_json::Value;
 
 use super::BLOCK_LIMIT;
@@ -143,66 +143,25 @@ impl TextRenderer {
                 tool_call_count,
                 reasoning,
                 ..
-            } => {
-                let streamed = self.streamed.remove(&envelope.session_id);
-                if self.options.transcript {
-                    let reasoning = reasoning
-                        .as_ref()
-                        .and_then(|reasoning| reasoning.summary().or_else(|| reasoning.trace()));
-                    if let Some(reasoning) = reasoning {
-                        self.block("[reasoning]", reasoning);
-                    }
-                    if !streamed && !text.is_empty() {
-                        self.sink.line(text.trim_end_matches('\n'));
-                    }
-                }
-                self.sink.line(&format!(
-                    "[turn] {} tokens, {tool_call_count} tool call(s)",
-                    usage.total_tokens()
-                ));
-            }
+            } => self.turn(
+                &envelope.session_id,
+                text,
+                usage,
+                *tool_call_count,
+                reasoning.as_ref(),
+            ),
             CodingEvent::ToolCallStarted {
                 tool_name,
                 arguments,
                 ..
-            } => {
-                if self.options.tool_results {
-                    self.block(&format!("[tool] {tool_name}"), &value_text(arguments));
-                } else {
-                    self.sink.line(&format!(
-                        "[tool] {tool_name} {}",
-                        // A custom tool's arguments are one free-form string,
-                        // shown as text rather than as a JSON literal.
-                        abbreviate(&match arguments {
-                            Value::String(text) => text.clone(),
-                            other => other.to_string(),
-                        })
-                    ));
-                }
-            }
+            } => self.tool_call(tool_name, arguments),
             CodingEvent::ToolCallCompleted {
                 tool_name,
                 is_error,
                 output,
                 output_bytes_omitted,
                 ..
-            } => {
-                if self.options.tool_results {
-                    let failed = if *is_error { " failed" } else { "" };
-                    let omitted = if *output_bytes_omitted > 0 {
-                        format!(" ({output_bytes_omitted} bytes not retained)")
-                    } else {
-                        String::new()
-                    };
-                    let header = format!("[result] {tool_name}{failed}{omitted}");
-                    self.block(&header, &value_text(output));
-                } else if *is_error {
-                    self.sink.line(&format!(
-                        "[tool] {tool_name} failed: {}",
-                        abbreviate(output.as_str().unwrap_or_default())
-                    ));
-                }
-            }
+            } => self.tool_result(tool_name, *is_error, output, *output_bytes_omitted),
             CodingEvent::ToolProcessCompleted {
                 exit_code,
                 duration_ms,
@@ -277,6 +236,69 @@ impl TextRenderer {
         }
     }
 
+    /// A committed turn: its `[reasoning]` block and its text under the
+    /// transcript option, then its `[turn]` line.
+    fn turn(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        usage: &Usage,
+        tool_call_count: usize,
+        reasoning: Option<&ReasoningOutput>,
+    ) {
+        let streamed = self.streamed.remove(session_id);
+        if self.options.transcript {
+            let reasoning =
+                reasoning.and_then(|reasoning| reasoning.summary().or_else(|| reasoning.trace()));
+            if let Some(reasoning) = reasoning {
+                self.block("[reasoning]", reasoning);
+            }
+            // Text that streamed is already on the terminal.
+            if !streamed && !text.is_empty() {
+                self.sink.line(text.trim_end_matches('\n'));
+            }
+        }
+        self.sink.line(&format!(
+            "[turn] {} tokens, {tool_call_count} tool call(s)",
+            usage.total_tokens()
+        ));
+    }
+
+    /// A tool call: its `[tool]` line, with the arguments under it in full
+    /// under the tool-results option and cut to one line otherwise.
+    fn tool_call(&mut self, tool_name: &str, arguments: &Value) {
+        if self.options.tool_results {
+            self.block(&format!("[tool] {tool_name}"), &value_text(arguments));
+        } else {
+            self.sink.line(&format!(
+                "[tool] {tool_name} {}",
+                abbreviate(&value_line(arguments))
+            ));
+        }
+    }
+
+    /// A tool's answer: a `[result]` block under the tool-results option,
+    /// and otherwise one line for a call that failed.
+    fn tool_result(&mut self, tool_name: &str, is_error: bool, output: &Value, omitted: usize) {
+        if self.options.tool_results {
+            let failed = if is_error { " failed" } else { "" };
+            let omitted = if omitted > 0 {
+                format!(" ({omitted} bytes not retained)")
+            } else {
+                String::new()
+            };
+            self.block(
+                &format!("[result] {tool_name}{failed}{omitted}"),
+                &value_text(output),
+            );
+        } else if is_error {
+            self.sink.line(&format!(
+                "[tool] {tool_name} failed: {}",
+                abbreviate(output.as_str().unwrap_or_default())
+            ));
+        }
+    }
+
     /// Prints `text` under `header`, each line indented, cut to
     /// [`BLOCK_LIMIT`] bytes with the byte count when it was longer.
     fn block(&mut self, header: &str, text: &str) {
@@ -302,10 +324,22 @@ impl TextRenderer {
 }
 
 /// A JSON value as text: a string as itself, anything else pretty-printed.
+///
+/// A custom tool's arguments are one free-form string, so a string is shown
+/// as text rather than as a JSON literal. [`value_line`] makes the same
+/// choice for one line.
 fn value_text(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         other => serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string()),
+    }
+}
+
+/// A JSON value on one line: a string as itself, anything else compact.
+fn value_line(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
     }
 }
 
