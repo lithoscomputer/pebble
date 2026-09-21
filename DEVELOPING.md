@@ -102,9 +102,11 @@ and `e2e.rs` — the example's own flow, driven through the scripted provider
 and a real temporary directory, so it needs no credentials and no network.
 
 Tests that reach `pebble_coding_agent::test_support` need the `test-util`
-feature, and the search providers in `pebble_coding_agent::search::providers`
-need `search-providers` along with their tests, which is why the test tasks
-pass `--all-features`. The provider tests answer each search from a fake engine
+feature, the search providers in `pebble_coding_agent::search::providers`
+need `search-providers` along with their tests, and the sandbox-driver
+adapter in `pebble_coding_agent::sandbox_driver` needs `sandbox-driver` (its
+tests run over the driver's Host provider in a temporary directory), which is
+why the test tasks pass `--all-features`. The provider tests answer each search from a fake engine
 served by axum in the test process, so they need no key and no network.
 
 The `pebble` binary is tested with `trycmd`: each case under

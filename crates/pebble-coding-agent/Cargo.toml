@@ -16,6 +16,13 @@ mcp = ["dep:rmcp", "dep:reqwest", "dep:sse-stream", "dep:url"]
 # `pebble_coding_agent::search::providers`: Brave and Venice web search over
 # their public HTTP APIs, for an application that would rather not write them.
 search-providers = ["dep:reqwest"]
+# `pebble_coding_agent::sandbox_driver`: a sandbox-driver handle as the
+# `Environment` a session runs in, with the exec policy, the port routes (with
+# `mcp`), and the failure rendering an application over the driver needs.
+sandbox-driver = ["dep:sandbox-driver"]
+# `pebble_coding_agent::sandbox_driver::test_support`: a mock sandbox over the
+# driver's scripted doubles, for an application's tests.
+sandbox-driver-test-util = ["sandbox-driver", "dep:sandbox-driver-testing"]
 
 [dependencies]
 async-trait.workspace = true
@@ -61,6 +68,10 @@ rmcp = { version = "=1.7.0", default-features = false, features = [
   "transport-child-process",
   "transport-streamable-http-client-reqwest",
 ], optional = true }
+# The sandbox provider layer the `sandbox_driver` module adapts, and its
+# scripted doubles for the mock sandbox.
+sandbox-driver = { workspace = true, optional = true }
+sandbox-driver-testing = { workspace = true, optional = true }
 sse-stream = { version = "0.2", optional = true }
 url = { version = "2.5", optional = true }
 
@@ -80,6 +91,11 @@ lithos-llm = { workspace = true, features = [
 # in the lockfile through lithos-llm's own tests.
 axum = "0.8"
 insta = { version = "1.48.0", features = ["json"] }
+# The sandbox-driver adapter is tested over the driver's Host provider in a
+# temporary directory, and over its scripted doubles.
+sandbox-driver-host.workspace = true
+sandbox-driver-testing.workspace = true
+tempfile = "3"
 # `start_paused` test runtimes, so a test that waits out a retry delay does not
 # actually wait, the multi-threaded runtime the example's `#[tokio::main]`
 # asks for, and the listener the fake search engine binds. Adds no package to

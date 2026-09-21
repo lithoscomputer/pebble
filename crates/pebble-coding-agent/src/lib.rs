@@ -46,6 +46,8 @@ mod prompt_transform;
 mod record;
 mod redact;
 mod runtime;
+#[cfg(feature = "sandbox-driver")]
+pub mod sandbox_driver;
 pub mod search;
 mod skills;
 pub mod state;

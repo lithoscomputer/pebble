@@ -380,6 +380,20 @@ count bounded process output; and `classify_exec_error` names the error kind a
 command that failed to run reports. `LocalEnvironment` uses the same helpers,
 so an adapter built on them passes the `EnvironmentContract` checks they cover.
 
+One such adapter ships with the crate, behind the `sandbox-driver` feature:
+`pebble_coding_agent::sandbox_driver::SandboxEnvironment` is the trait over a
+[sandbox-driver](https://github.com/lithoscomputer/sandbox-driver) handle, for
+an application whose sandboxes (a host directory, a container, a remote
+workspace) come from that driver. It resolves paths against the working
+directory the application names, runs commands under `SandboxExec`'s policy
+(a stop grace, text-only output), answers pebble's MCP port routes from the
+driver's preview URLs when `mcp` is on too, and renders a driver failure for a
+log with `display_for_log`. The sandbox stays the application's to start and
+dispose of, and the places that render process output take the application's
+`Redactor`. `sandbox_driver::test_support::MockSandbox`, behind
+`sandbox-driver-test-util`, is the adapter over the driver's scripted doubles
+for an application's tests.
+
 **Somewhere for the events to go, if they matter.**
 `CodingAgent::subscribe` hands out a bounded broadcast receiver, which is
 lossy for a reader that falls behind: right for a terminal, wrong for a ledger.
