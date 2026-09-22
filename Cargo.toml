@@ -14,9 +14,9 @@ lithos-llm = { git = "https://github.com/lithoscomputer/lithos-llm", rev = "43a4
 # adapts to the `Environment` contract, behind the `sandbox-driver` feature.
 # Pinned by rev to the revision fabro and petri build, so an application that
 # links all three carries one copy of the driver.
-sandbox-driver = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "07600aa5c6695ec4c999da93c05d2cb78fe11b0c" }
-sandbox-driver-host = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "07600aa5c6695ec4c999da93c05d2cb78fe11b0c" }
-sandbox-driver-testing = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "07600aa5c6695ec4c999da93c05d2cb78fe11b0c" }
+sandbox-driver = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "583a16463320966e8f5c88bedd1d759e93fbd05f" }
+sandbox-driver-host = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "583a16463320966e8f5c88bedd1d759e93fbd05f" }
+sandbox-driver-testing = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "583a16463320966e8f5c88bedd1d759e93fbd05f" }
 async-trait = "0.1.89"
 futures-util = "0.3.32"
 serde = { version = "1.0.228", features = ["derive"] }
