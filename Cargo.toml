@@ -9,12 +9,6 @@ rust-version = "1.88"
 publish = false
 
 [workspace.dependencies]
-# Internal Lithos git dependencies name exactly `branch = "main"`: never a
-# `rev`, and never an omitted ref, which Cargo treats as a different source.
-# Every Lithos repository spells them the same way, so an application that
-# links pebble alongside fabro or petri unifies each into one copy, and the
-# application's `Cargo.lock` chooses the commit. This repository's
-# `Cargo.lock` records the commit its own builds and CI use.
 lithos-llm = { git = "https://github.com/lithoscomputer/lithos-llm", branch = "main", default-features = false }
 # sandbox-driver: the sandbox provider layer `pebble_coding_agent::sandbox_driver`
 # adapts to the `Environment` contract, behind the `sandbox-driver` feature.
