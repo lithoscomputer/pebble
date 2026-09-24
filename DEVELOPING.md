@@ -23,20 +23,14 @@ optional `models.toml` over the upstream catalog and supplies an application-own
 ## Setup
 
 Pebble is a library crate. It depends on `lithos-llm`, `sandbox-driver`, and
-(for tests) `twins` as git dependencies that name `branch = "main"`. Every
-Lithos repository spells its internal git dependencies exactly that way, never
-with a `rev` and never with the ref left out, which Cargo treats as a different
-source. An application that links pebble alongside fabro or petri then carries
-one copy of each, and the application's `Cargo.lock` is the single place a
-commit is chosen. The repositories are public, so Cargo fetches them over
-HTTPS with no credentials.
-
-This repository's `Cargo.lock` records the commits its own builds and CI use.
-To move one: push the upstream commit to `main`, run
-`cargo update -p <crate>` (or `cargo update -p <crate> --precise <sha>` to
-choose a specific commit), and commit `Cargo.lock`. Do not use a `[patch]`
-section. An upstream change that pebble does not need requires no pebble
-change at all; the application moves its own lockfile.
+(for tests) `twins` as git dependencies on exactly `branch = "main"`: not a
+`rev`, and not an omitted ref, which Cargo treats as a different source, so an
+application would link two copies. Pick up upstream changes with
+`cargo update -p <crate>` and commit `Cargo.lock`; an application's own
+`Cargo.lock` decides what it ships. If you change an API another Lithos
+repository uses, fix that repository promptly. Do not use a `[patch]` section.
+The repositories are public, so Cargo fetches them over HTTPS with no
+credentials.
 
 Install [Mise](https://mise.jdx.dev/), then install the locked tools and prepare
 the pinned Rust Style Guide:

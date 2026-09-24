@@ -628,10 +628,10 @@ with the event held as raw JSON, then parse the payload on its own.
 ## Setup
 
 Pebble depends on `lithos-llm` and `sandbox-driver` as git dependencies on
-`branch = "main"`. An application that embeds pebble chooses their commits in
-its own `Cargo.lock` (`cargo update -p <crate>`); this repository's lockfile
-records the commits its own builds use. The repositories are public, so Cargo
-fetches them over HTTPS with no credentials.
+exactly `branch = "main"` (not a `rev` or an omitted ref, which Cargo treats as
+a different source). Update them with `cargo update -p <crate>`; an
+application's own `Cargo.lock` decides what it ships. The repositories are
+public, so Cargo fetches them over HTTPS with no credentials.
 
 Install the locked tools and prepare the repository:
 
