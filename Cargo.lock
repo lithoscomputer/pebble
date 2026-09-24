@@ -1294,7 +1294,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 [[package]]
 name = "lithos-llm"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/lithos-llm?rev=43a42ac28e9d9bcf40a91abc02be4f12ca274ebb#43a42ac28e9d9bcf40a91abc02be4f12ca274ebb"
+source = "git+https://github.com/lithoscomputer/lithos-llm?branch=main#43a42ac28e9d9bcf40a91abc02be4f12ca274ebb"
 dependencies = [
  "async-trait",
  "futures-core",
@@ -2001,7 +2001,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver?rev=583a16463320966e8f5c88bedd1d759e93fbd05f#583a16463320966e8f5c88bedd1d759e93fbd05f"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#583a16463320966e8f5c88bedd1d759e93fbd05f"
 dependencies = [
  "async-trait",
  "globset",
@@ -2018,7 +2018,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver-host"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver?rev=583a16463320966e8f5c88bedd1d759e93fbd05f#583a16463320966e8f5c88bedd1d759e93fbd05f"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#583a16463320966e8f5c88bedd1d759e93fbd05f"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2036,7 +2036,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver-protocol"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver?rev=583a16463320966e8f5c88bedd1d759e93fbd05f#583a16463320966e8f5c88bedd1d759e93fbd05f"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#583a16463320966e8f5c88bedd1d759e93fbd05f"
 dependencies = [
  "async-trait",
  "base64",
@@ -2053,7 +2053,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver-testing"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver?rev=583a16463320966e8f5c88bedd1d759e93fbd05f#583a16463320966e8f5c88bedd1d759e93fbd05f"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#583a16463320966e8f5c88bedd1d759e93fbd05f"
 dependencies = [
  "async-trait",
  "sandbox-driver",
@@ -2776,7 +2776,7 @@ dependencies = [
 [[package]]
 name = "twin-core"
 version = "0.1.5"
-source = "git+https://github.com/lithoscomputer/twins?rev=9e9861d714f8de2e4be127f96e67cee5d3a917f5#9e9861d714f8de2e4be127f96e67cee5d3a917f5"
+source = "git+https://github.com/lithoscomputer/twins?branch=main#9e9861d714f8de2e4be127f96e67cee5d3a917f5"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2791,7 +2791,7 @@ dependencies = [
 [[package]]
 name = "twin-openai"
 version = "0.1.5"
-source = "git+https://github.com/lithoscomputer/twins?rev=9e9861d714f8de2e4be127f96e67cee5d3a917f5#9e9861d714f8de2e4be127f96e67cee5d3a917f5"
+source = "git+https://github.com/lithoscomputer/twins?branch=main#9e9861d714f8de2e4be127f96e67cee5d3a917f5"
 dependencies = [
  "anyhow",
  "async-stream",

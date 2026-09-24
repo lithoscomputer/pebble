@@ -22,15 +22,21 @@ optional `models.toml` over the upstream catalog and supplies an application-own
 
 ## Setup
 
-Pebble is a library crate. It depends on `lithos-llm` as a git dependency
-pinned to one commit (`rev`) in the workspace `Cargo.toml`. The repository is
-public, so Cargo fetches it over HTTPS with no credentials.
+Pebble is a library crate. It depends on `lithos-llm`, `sandbox-driver`, and
+(for tests) `twins` as git dependencies that name `branch = "main"`. Every
+Lithos repository spells its internal git dependencies exactly that way, never
+with a `rev` and never with the ref left out, which Cargo treats as a different
+source. An application that links pebble alongside fabro or petri then carries
+one copy of each, and the application's `Cargo.lock` is the single place a
+commit is chosen. The repositories are public, so Cargo fetches them over
+HTTPS with no credentials.
 
-To move the pin: push the lithos-llm commit (a branch under review is fine),
-change `rev` in `Cargo.toml` to the full sha, run `cargo update lithos-llm`,
-and commit `Cargo.toml` and `Cargo.lock` together. When the lithos-llm change
-merges, re-pin to the merge commit the same way. Do not use a `[patch]`
-section; the pinned sha is the single source of truth.
+This repository's `Cargo.lock` records the commits its own builds and CI use.
+To move one: push the upstream commit to `main`, run
+`cargo update -p <crate>` (or `cargo update -p <crate> --precise <sha>` to
+choose a specific commit), and commit `Cargo.lock`. Do not use a `[patch]`
+section. An upstream change that pebble does not need requires no pebble
+change at all; the application moves its own lockfile.
 
 Install [Mise](https://mise.jdx.dev/), then install the locked tools and prepare
 the pinned Rust Style Guide:
@@ -165,7 +171,9 @@ Every version in `Cargo.lock` matches the version in the `lithos-llm`
 lockfile. Pebble builds `lithos-llm` from source, so the two projects must
 agree. Pin new dependencies to the version that the `lithos-llm` or `fabro`
 lockfile already contains, and use `cargo update --precise` to keep the
-versions aligned.
+versions aligned. `cargo update -p <crate>` on a git dependency can also
+re-resolve unrelated entries; check `git diff Cargo.lock` and move any strays
+back with `--precise`.
 
 The rule covers every entry in the lockfile, not only the packages this
 project builds today. Cargo records the optional dependencies of a dependency
@@ -176,9 +184,9 @@ whatever version the lockfile named. A dependency that drags in entries no
 Test tooling follows the same rule. `trycmd` and `twin-openai` are
 dev-dependencies of `lithos-llm` too, so pebble's lockfile takes their
 entries from there. When one of them needs to move, move it in `lithos-llm`
-first, then re-pin here. The `twin-openai` revision may run ahead of
-`lithos-llm`'s while a twin feature pebble needs is still landing; the crate
-version stays the same and the two revisions meet at the next re-pin.
+first, then update it here. The `twin-openai` commit in this lockfile may
+run ahead of `lithos-llm`'s while a twin feature pebble needs is still landing;
+the crate version stays the same and the two commits meet at the next update.
 
 ## Releases
 

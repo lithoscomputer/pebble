@@ -9,14 +9,12 @@ rust-version = "1.88"
 publish = false
 
 [workspace.dependencies]
-lithos-llm = { git = "https://github.com/lithoscomputer/lithos-llm", rev = "43a42ac28e9d9bcf40a91abc02be4f12ca274ebb", default-features = false }
+lithos-llm = { git = "https://github.com/lithoscomputer/lithos-llm", branch = "main", default-features = false }
 # sandbox-driver: the sandbox provider layer `pebble_coding_agent::sandbox_driver`
 # adapts to the `Environment` contract, behind the `sandbox-driver` feature.
-# Pinned by rev to the revision fabro and petri build, so an application that
-# links all three carries one copy of the driver.
-sandbox-driver = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "583a16463320966e8f5c88bedd1d759e93fbd05f" }
-sandbox-driver-host = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "583a16463320966e8f5c88bedd1d759e93fbd05f" }
-sandbox-driver-testing = { git = "https://github.com/lithoscomputer/sandbox-driver", rev = "583a16463320966e8f5c88bedd1d759e93fbd05f" }
+sandbox-driver = { git = "https://github.com/lithoscomputer/sandbox-driver", branch = "main" }
+sandbox-driver-host = { git = "https://github.com/lithoscomputer/sandbox-driver", branch = "main" }
+sandbox-driver-testing = { git = "https://github.com/lithoscomputer/sandbox-driver", branch = "main" }
 async-trait = "0.1.89"
 futures-util = "0.3.32"
 serde = { version = "1.0.228", features = ["derive"] }
