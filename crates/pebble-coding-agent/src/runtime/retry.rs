@@ -41,7 +41,7 @@
 
 use std::time::Duration;
 
-use lithos_llm::middleware::{Call, Observer, RetryStage};
+use lithos_llm::middleware::{Call, Observer, RetryEvent, RetryStage};
 use lithos_llm::types::Error as LlmError;
 
 use crate::error::ErrorData;
@@ -59,16 +59,9 @@ use crate::types::{CodingEvent, LlmRetryPhase};
 pub struct RetryEventObserver;
 
 impl Observer for RetryEventObserver {
-    fn on_retry(
-        &self,
-        call: &Call,
-        error: &LlmError,
-        attempt: u32,
-        delay: Duration,
-        stage: RetryStage,
-    ) {
+    fn on_retry(&self, call: &Call, retry: RetryEvent<'_>) {
         if let Some(bridge) = call.context().extensions().get::<RetryEventBridge>() {
-            bridge.report(error, attempt, delay, stage);
+            bridge.report(retry.error, retry.attempt, retry.delay, retry.stage);
         }
     }
 }
