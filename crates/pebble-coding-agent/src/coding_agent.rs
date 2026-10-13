@@ -39,6 +39,7 @@ use crate::runtime::{
     actor_from_attribution, input_message, steering_message,
 };
 use crate::search::seam::SearchProvider;
+use crate::skills::SkillExpansion;
 use crate::subagent::SubagentOptions;
 use crate::tool::{RegisteredTool, ToolEnvProvider, ToolRegistrationError};
 use crate::types::{
@@ -1083,37 +1084,63 @@ struct RuntimeHandles {
 /// Input submitted through a coding agent's main prompt operation.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CodingInput {
-    content: InputContent,
-    source:  InputSource,
+    content:         InputContent,
+    source:          InputSource,
+    before:          InputContent,
+    after:           InputContent,
+    skill_expansion: SkillExpansion,
 }
 
 impl CodingInput {
     /// Creates input from provider-neutral content parts.
     #[must_use]
     pub fn new(content: impl IntoIterator<Item = ContentPart>) -> Self {
-        Self {
-            content: InputContent::new(content),
-            source:  InputSource::Prompt,
-        }
+        InputContent::new(content).into()
     }
 
     /// Creates plain text input.
     #[must_use]
     pub fn text(text: impl Into<String>) -> Self {
-        Self {
-            content: InputContent::text(text),
-            source:  InputSource::Prompt,
-        }
+        InputContent::text(text).into()
+    }
+
+    /// Surrounds authored input with context excluded from slash-command
+    /// expansion.
+    ///
+    /// Expansion applies only to the authored content. These parts remain
+    /// before and after it even when a skill template replaces that content.
+    /// Context parts retain their order, including attachments; no separators
+    /// are inserted. Calling this again replaces the previous context.
+    #[must_use]
+    pub fn with_context(
+        mut self,
+        before: impl Into<InputContent>,
+        after: impl Into<InputContent>,
+    ) -> Self {
+        self.before = before.into();
+        self.after = after.into();
+        self
+    }
+
+    /// Sends generated input verbatim, even if it begins with a skill name.
+    ///
+    /// Use for synthesized reports or repair requests, whose text is data.
+    #[must_use]
+    pub const fn without_skill_expansion(mut self) -> Self {
+        self.skill_expansion = SkillExpansion::Skip;
+        self
     }
 
     /// Records where this input came from.
+    /// This attribution does not change skill expansion policy.
     #[must_use]
     pub const fn with_source(mut self, source: InputSource) -> Self {
         self.source = source;
         self
     }
 
-    /// The ordered content sent to the model.
+    /// The authored content, before skill expansion and without surrounding
+    /// context.
     #[must_use]
     pub const fn content(&self) -> &InputContent {
         &self.content
@@ -1123,6 +1150,21 @@ impl CodingInput {
     #[must_use]
     pub const fn source(&self) -> InputSource {
         self.source
+    }
+
+    pub(crate) const fn skill_expansion(&self) -> SkillExpansion {
+        self.skill_expansion
+    }
+
+    /// Restores context after the authored content has been expanded.
+    pub(crate) fn assemble(self, content: InputContent) -> InputContent {
+        InputContent::new(
+            self.before
+                .into_parts()
+                .into_iter()
+                .chain(content.into_parts())
+                .chain(self.after.into_parts()),
+        )
     }
 }
 
@@ -1149,6 +1191,9 @@ impl From<InputContent> for CodingInput {
         Self {
             content,
             source: InputSource::Prompt,
+            before: InputContent::default(),
+            after: InputContent::default(),
+            skill_expansion: SkillExpansion::Apply,
         }
     }
 }

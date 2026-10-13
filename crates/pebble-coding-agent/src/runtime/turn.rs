@@ -933,6 +933,11 @@ impl CodingRuntime {
 
         let source = input.source();
         let content = input.content().clone();
+        let skill_expansion = if input.skill_expansion() == SkillExpansion::Skip {
+            SkillExpansion::Skip
+        } else {
+            skill_expansion
+        };
         let expanded = self.expand_input(content.text_content(), skill_expansion)?;
         if let Some(name) = &expanded.skill_name {
             self.conversation().activated_skill_context_observed = true;
@@ -942,7 +947,8 @@ impl CodingRuntime {
             });
         }
 
-        let message = input_message(content_after_skill_expansion(content, &expanded), source);
+        let content = input.assemble(content_after_skill_expansion(content, &expanded));
+        let message = input_message(content, source);
         self.drive_agent(Some(message), prompt_cancel).await
     }
 
