@@ -76,7 +76,8 @@ pub(crate) enum SkillParseError {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum SkillExpansionError {
-    /// The input named more than one skill. One input runs one skill.
+    /// Legacy error retained for compatibility. Leading-command parsing never
+    /// produces it: subsequent slash tokens are arguments.
     #[error("Only one skill reference per input is allowed")]
     MultipleReferences,
     /// The input named a skill this session did not discover.
@@ -157,8 +158,9 @@ pub(crate) fn parse_skill(content: &str) -> StdResult<Skill, SkillParseError> {
     })
 }
 
-/// Expands a `/name` reference in what a person typed.
+/// Expands a leading `/name` command in what a person typed.
 ///
+/// Leading whitespace is allowed. Later slash tokens are ordinary text.
 /// Input naming no skill passes through unchanged. Input naming one has the
 /// token removed and the remainder substituted into the template's
 /// `{{user_input}}` placeholder; a template with no placeholder replaces the
@@ -182,13 +184,7 @@ pub(crate) fn expand_skill(
     skills: &[Skill],
     input: &str,
 ) -> StdResult<ExpandedInput, SkillExpansionError> {
-    let mut references = find_skill_references(input);
-
-    if references.len() > 1 {
-        return Err(SkillExpansionError::MultipleReferences);
-    }
-
-    let Some(reference) = references.pop() else {
+    let Some(reference) = find_skill_reference(input) else {
         return Ok(ExpandedInput {
             text:       input.to_owned(),
             skill_name: None,
@@ -202,12 +198,10 @@ pub(crate) fn expand_skill(
             name: reference.name.clone(),
         })?;
 
-    let remainder = format!("{}{}", &input[..reference.start], &input[reference.end..])
-        .trim()
-        .to_owned();
+    let remainder = input[reference.end..].trim();
 
     Ok(ExpandedInput {
-        text:       substitute(&skill.template, &remainder),
+        text:       substitute(&skill.template, remainder),
         skill_name: Some(reference.name),
     })
 }
@@ -224,11 +218,9 @@ fn substitute(template: &str, input: &str) -> String {
 /// A `/name` token found in input: the name and the bytes it occupies.
 #[derive(Debug)]
 struct SkillReference {
-    name:  String,
-    /// Byte offset of the `/`.
-    start: usize,
+    name: String,
     /// Byte offset just past the name.
-    end:   usize,
+    end:  usize,
 }
 
 /// Whether a byte may appear after the first character of a skill name.
@@ -236,46 +228,32 @@ const fn is_name_byte(byte: u8) -> bool {
     byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'-'
 }
 
-/// Finds every `/name` token in `input`.
+/// Finds a `/name` command only at the beginning of `input`.
 ///
-/// A token starts at a `/` that begins the input or follows whitespace, its
-/// first character is a lowercase letter, and it ends at whitespace or the end
-/// of the input. That is what keeps `/usr/bin/bash` from reading as a skill.
-fn find_skill_references(input: &str) -> Vec<SkillReference> {
+/// Prose mentioning paths, skills, or echoed failures is not a command.
+/// A name begins with a lowercase letter and ends at whitespace or end of
+/// input, keeping `/usr/bin/bash` from reading as a skill.
+fn find_skill_reference(input: &str) -> Option<SkillReference> {
     let bytes = input.as_bytes();
-    let mut references = Vec::new();
-    let mut index = 0;
-
-    while index < bytes.len() {
-        if bytes[index] != b'/' {
-            index += 1;
-            continue;
-        }
-
-        let starts_a_token = index == 0 || bytes[index - 1].is_ascii_whitespace();
-        let name_start = index + 1;
-        if !starts_a_token || name_start >= bytes.len() || !bytes[name_start].is_ascii_lowercase() {
-            index += 1;
-            continue;
-        }
-
-        let mut end = name_start + 1;
-        while end < bytes.len() && is_name_byte(bytes[end]) {
-            end += 1;
-        }
-
-        if end >= bytes.len() || bytes[end].is_ascii_whitespace() {
-            references.push(SkillReference {
-                name: input[name_start..end].to_owned(),
-                start: index,
-                end,
-            });
-        }
-
-        index = end;
+    let start = input.len() - input.trim_start().len();
+    if bytes.get(start) != Some(&b'/') {
+        return None;
     }
-
-    references
+    let name_start = start + 1;
+    if !bytes.get(name_start)?.is_ascii_lowercase() {
+        return None;
+    }
+    let mut end = name_start + 1;
+    while end < bytes.len() && is_name_byte(bytes[end]) {
+        end += 1;
+    }
+    if !input[end..].is_empty() && !input[end..].starts_with(char::is_whitespace) {
+        return None;
+    }
+    Some(SkillReference {
+        name: input[name_start..end].to_owned(),
+        end,
+    })
 }
 
 /// Renders the skills section of a system prompt.
@@ -557,15 +535,12 @@ Review staged and unstaged changes, then create a well-crafted commit.
     }
 
     #[test]
-    fn a_reference_mid_line_is_removed_from_the_input() {
+    fn a_reference_mid_line_is_not_a_command() {
         let expanded =
             expand_skill(&test_skills(), "please /commit the auth changes").expect("it expands");
 
-        assert_eq!(
-            expanded.text,
-            "Review changes and commit.\n\nplease  the auth changes"
-        );
-        assert_eq!(expanded.skill_name.as_deref(), Some("commit"));
+        assert_eq!(expanded.text, "please /commit the auth changes");
+        assert_eq!(expanded.skill_name.as_deref(), None);
     }
 
     #[test]
@@ -603,11 +578,50 @@ Review staged and unstaged changes, then create a well-crafted commit.
     }
 
     #[test]
-    fn one_input_may_name_only_one_skill() {
+    fn a_leading_command_keeps_later_slash_tokens_as_arguments() {
+        let expanded = expand_skill(&test_skills(), "/commit and /test in /tmp")
+            .expect("one leading command expands");
+        assert_eq!(expanded.skill_name.as_deref(), Some("commit"));
         assert_eq!(
-            expand_skill(&test_skills(), "/commit and /test"),
-            Err(SkillExpansionError::MultipleReferences)
+            expanded.text,
+            "Review changes and commit.\n\nand /test in /tmp"
         );
+    }
+
+    // Regressions from denkhaus's Fabro PR #784, ported to Pebble.
+    #[test]
+    fn prior_stage_paths_and_failure_echoes_are_not_commands() {
+        for input in [
+            "Prior stage summary: smoke-tested via a /tmp build. The gate was green.",
+            "failure_signature: implementer|structural|precondition failed: agent session failed: invalid state: unknown skill: /tmp",
+            "Prior review feedback: run the /test checks yourself before finishing this pass. Now implement feature X.",
+        ] {
+            let expanded = expand_skill(&test_skills(), input).expect("context passes through");
+            assert_eq!(expanded.text, input);
+            assert_eq!(expanded.skill_name, None);
+        }
+    }
+
+    #[test]
+    fn leading_whitespace_is_allowed_but_non_command_prefixes_are_not() {
+        for input in [" \t\n/commit task", "\u{2003}/commit\u{2003}task"] {
+            let expanded = expand_skill(&test_skills(), input).expect("command expands");
+            assert_eq!(expanded.text, "Review changes and commit.\n\ntask");
+        }
+        for input in [
+            "",
+            " \t",
+            "/",
+            "/Commit",
+            "/commit.txt",
+            "/commit/path",
+            "`/commit`",
+            "text\n/commit",
+        ] {
+            let expanded = expand_skill(&test_skills(), input).expect("non-command passes through");
+            assert_eq!(expanded.text, input);
+            assert_eq!(expanded.skill_name, None);
+        }
     }
 
     #[test]

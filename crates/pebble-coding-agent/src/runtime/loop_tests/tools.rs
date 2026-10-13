@@ -18,6 +18,7 @@ use std::result::Result as StdResult;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
+use lithos_llm::types::{ContentPart, ImageContent, MediaSource, Role};
 
 use super::*;
 use crate::environment::{Environment, ExecResult};
@@ -34,6 +35,21 @@ use crate::tools::{
     WebFetchSummarizer, make_apply_patch_tool, make_shell_tool, make_web_fetch_tool,
 };
 use crate::types::{CommandTermination, ExecOutputTail, SkillActivationSource};
+
+/// The last user turn in the last captured model request.
+fn last_user_parts(provider: &ScriptedProvider) -> Vec<ContentPart> {
+    provider
+        .requests()
+        .last()
+        .expect("a model request")
+        .messages()
+        .iter()
+        .rev()
+        .find(|message| message.role() == Role::User)
+        .expect("a user turn")
+        .content()
+        .to_vec()
+}
 
 const SECRET: &str = "AKIAYRWQG5EJLPZLBYNP";
 
@@ -273,6 +289,10 @@ fn environment_with_skills(files: Vec<(&str, &str)>, globs: Vec<&str>) -> Arc<Mo
 
 /// A session whose one discovered skill is `commit`, answering `calls`.
 fn session_with_a_skill(calls: Vec<ScriptedCall>) -> (CodingRuntime, Arc<ScriptedProvider>) {
+    builder_with_a_skill(calls).build()
+}
+
+fn builder_with_a_skill(calls: Vec<ScriptedCall>) -> TestSession {
     TestSession::new(calls)
         .environment(environment_with_skills(
             vec![(
@@ -285,7 +305,6 @@ fn session_with_a_skill(calls: Vec<ScriptedCall>) -> (CodingRuntime, Arc<Scripte
             skill_dirs: vec!["/skills".to_owned()],
             ..CodingAgentOptions::default()
         })
-        .build()
 }
 
 /// Every `SkillActivated` in `events`, as `(name, source)` pairs.
@@ -373,6 +392,122 @@ async fn an_unknown_slash_skill_in_a_follow_up_keeps_its_typed_error() {
 
     assert!(matches!(error, Error::SkillExpansion(_)), "{error:?}");
     assert_eq!(ErrorData::from(&error).kind, ErrorKind::InvalidInput);
+}
+
+#[tokio::test]
+async fn incidental_slash_tokens_reach_the_model_without_activation() {
+    for text in [
+        "Prior stage: smoke-tested via a /tmp build. Now review the changes.",
+        "failure_signature: agent session failed: invalid state: unknown skill: /tmp",
+        "Prior review feedback: run the /commit checks yourself. Now implement feature X.",
+    ] {
+        let (mut session, provider) = session_with_a_skill(answers("done"));
+        session.initialize().await.expect("initializes");
+        let mut events = session.subscribe();
+        session
+            .prompt(text)
+            .await
+            .expect("context is not a command");
+        assert_eq!(last_user_parts(&provider), vec![ContentPart::Text {
+            text: text.into(),
+        }]);
+        let published = settled(&mut session, &mut events).await;
+        assert!(activations(&published).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn skill_expansion_preserves_surrounding_context_and_attachments() {
+    for (authored, expected, activate) in [
+        ("/commit", "Run commit.", true),
+        ("Review changes", "Review changes", false),
+    ] {
+        let (mut session, provider) = builder_with_a_skill(answers("done"))
+            .model("test/vision")
+            .build();
+        session.initialize().await.expect("initializes");
+        let mut events = session.subscribe();
+        let image = ContentPart::Image(ImageContent::new(MediaSource::url(
+            "https://example.test/image.png",
+        )));
+        let before = vec![
+            ContentPart::Text {
+                text: "/tmp build; feedback mentions /commit\n\n".into(),
+            },
+            image.clone(),
+        ];
+        let after = vec![image.clone(), ContentPart::Text {
+            text: "\n\nReturn JSON; item /tmp".into(),
+        }];
+        let input = CodingInput::new([
+            ContentPart::Text {
+                text: authored.into(),
+            },
+            image.clone(),
+        ])
+        .with_context(before.clone(), after.clone());
+        session
+            .prompt(input)
+            .await
+            .expect("only authored input expands");
+        let mut expected_parts = before;
+        expected_parts.extend([
+            ContentPart::Text {
+                text: expected.into(),
+            },
+            image,
+        ]);
+        expected_parts.extend(after);
+        assert_eq!(last_user_parts(&provider), expected_parts);
+        let published = settled(&mut session, &mut events).await;
+        let expected_activations = if activate {
+            vec![("commit".to_owned(), SkillActivationSource::Slash)]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(activations(&published), expected_activations);
+        let history = session.history();
+        let Some(Message::User { content, .. }) = history.turns().first() else {
+            panic!("the input is retained in history");
+        };
+        assert_eq!(content.parts(), expected_parts);
+    }
+}
+
+#[tokio::test]
+async fn generated_input_can_bypass_even_a_leading_skill_command() {
+    for text in ["/commit echoed output", "/tmp echoed path"] {
+        let (mut session, provider) = session_with_a_skill(answers("done"));
+        session.initialize().await.expect("initializes");
+        let mut events = session.subscribe();
+        session
+            .prompt(CodingInput::text(text).without_skill_expansion())
+            .await
+            .expect("generated input is verbatim");
+        assert_eq!(last_user_parts(&provider), vec![ContentPart::Text {
+            text: text.into(),
+        }]);
+        let published = settled(&mut session, &mut events).await;
+        assert!(activations(&published).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn follow_up_prose_does_not_activate_skills() {
+    let (mut session, provider) = session_with_a_skill(vec![
+        ScriptedCall::response(text_response("first")),
+        ScriptedCall::response(text_response("done")),
+    ]);
+    session.initialize().await.expect("initializes");
+    let mut events = session.subscribe();
+    let text = "Smoke-tested via a /tmp build; ready for /commit after review";
+    session.follow_up(text);
+    session.prompt("start").await.expect("follow-up is prose");
+    assert_eq!(last_user_parts(&provider), vec![ContentPart::Text {
+        text: text.into(),
+    }]);
+    let published = settled(&mut session, &mut events).await;
+    assert!(activations(&published).is_empty());
 }
 
 #[tokio::test]

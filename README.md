@@ -224,6 +224,21 @@ and documents. The stable `text` event member remains available to text-only
 renderers. `InputSource` distinguishes a direct prompt, a follow-up,
 agent-generated input, and input from another application integration.
 
+Slash skills run only when the authored input begins with `/name`, after
+optional leading whitespace. Later slash tokens are ordinary text, including
+arguments to a leading command. An unknown leading command is an input error
+when skills are loaded. A template with no `{{user_input}}` replaces the authored
+text; attachments remain. This also applies to queued follow-ups.
+
+Applications assembling workflow input should use
+`CodingInput::text(authored_prompt).with_context(preamble, suffix)`. Only the
+authored content is scanned for a command; the surrounding content remains in
+order even when a skill replaces the authored text. Context accepts text or
+`InputContent`, including attachments, and adds no separators automatically.
+Use `CodingInput::without_skill_expansion` for synthesized reports or repair
+requests that must pass through verbatim. `with_source` records attribution;
+it does not change expansion policy.
+
 Use `CodingAgent::observe` when a view needs a complete starting point and
 live updates. It returns a `CodingAgentSnapshot` and an event receiver at one
 committed event cursor. Apply the snapshot first. Discard queued events at or
