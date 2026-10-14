@@ -52,6 +52,8 @@ fn launch_terminal_child() {
 
 #[cfg(target_os = "linux")]
 fn batched_input_child() {
+    use std::thread;
+
     use crossterm::{event, terminal};
 
     terminal::enable_raw_mode().expect("raw input");
@@ -60,7 +62,7 @@ fn batched_input_child() {
     io::stdout().flush().expect("flush readiness");
     // Hold the reader while signal handlers can queue resize and the parent
     // writes Enter, so both descriptors are ready for the next poll.
-    std::thread::sleep(Duration::from_millis(500));
+    thread::sleep(Duration::from_millis(500));
     let mut events = vec![event::read().expect("first input event")];
     if event::poll(Duration::from_millis(250)).expect("second input event") {
         events.push(event::read().expect("read second event"));
