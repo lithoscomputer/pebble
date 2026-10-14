@@ -161,30 +161,26 @@ dependency fetch needs no credentials.
 
 ## Cargo.lock policy
 
-Pebble's `Cargo.lock` records the versions used to build and test this
-workspace. When another application depends on Pebble's libraries, that
-application's lockfile determines its resolved dependencies; the lockfiles
-in dependency repositories do not control Pebble's build.
+Every version in `Cargo.lock` matches the version in the `lithos-llm`
+lockfile. Pebble builds `lithos-llm` from source, so the two projects must
+agree. Pin new dependencies to the version that the `lithos-llm` or `fabro`
+lockfile already contains, and use `cargo update --precise` to keep the
+versions aligned. `cargo update -p <crate>` on a git dependency can also
+re-resolve unrelated entries; check `git diff Cargo.lock` and move any strays
+back with `--precise`.
 
-Use the `lithos-llm` and `fabro` lockfiles as references when selecting
-versions of shared dependencies. Prefer compatible, aligned versions and
-coordinate changes to shared dependency requirements, especially when
-dependency types cross library APIs. Conflicting exact pins can prevent
-resolution, and incompatible versions can introduce duplicate types.
+The rule covers every entry in the lockfile, not only the packages this
+project builds today. Cargo records the optional dependencies of a dependency
+even when no feature enables them, and enabling that feature later would build
+whatever version the lockfile named. A dependency that drags in entries no
+`lithos-llm` version covers is the wrong dependency.
 
-Dependencies specific to Pebble, including CLI implementation details and
-test tooling, may be added or updated here without first adding them to
-an upstream repository. Review their transitive dependencies and check the
-relevant library and application builds. The Linux CLI uses Crossterm's
-`use-dev-tty` feature with `filedescriptor` 0.8.3; that package is private
-to terminal I/O and exposes no types through the agent libraries.
-
-Keep lockfile updates focused. `cargo update -p <crate>` on a git dependency
-can also re-resolve unrelated entries; review the full `Cargo.lock` diff,
-including optional dependencies, and restore unintended version changes
-with `cargo update --precise`. Test tooling such as `trycmd` and
-`twin-openai` can move when Pebble needs it; coordinate upstream changes
-when a shared API or dependency requirement also needs to change.
+Test tooling follows the same rule. `trycmd` and `twin-openai` are
+dev-dependencies of `lithos-llm` too, so pebble's lockfile takes their
+entries from there. When one of them needs to move, move it in `lithos-llm`
+first, then update it here. The `twin-openai` commit in this lockfile may
+run ahead of `lithos-llm`'s while a twin feature pebble needs is still landing;
+the crate version stays the same and the two commits meet at the next update.
 
 ## Releases
 
