@@ -161,9 +161,10 @@ dependency fetch needs no credentials.
 
 ## Cargo.lock policy
 
-Every version in `Cargo.lock` matches the version in the `lithos-llm`
-lockfile. Pebble builds `lithos-llm` from source, so the two projects must
-agree. Pin new dependencies to the version that the `lithos-llm` or `fabro`
+Every version in `Cargo.lock` matches a version in the `lithos-llm` or
+`fabro` lockfile, apart from the CLI-only exception below. Pebble builds
+`lithos-llm` from source, so shared dependency versions must agree.
+Pin new dependencies to the version that the `lithos-llm` or `fabro`
 lockfile already contains, and use `cargo update --precise` to keep the
 versions aligned. `cargo update -p <crate>` on a git dependency can also
 re-resolve unrelated entries; check `git diff Cargo.lock` and move any strays
@@ -172,8 +173,16 @@ back with `--precise`.
 The rule covers every entry in the lockfile, not only the packages this
 project builds today. Cargo records the optional dependencies of a dependency
 even when no feature enables them, and enabling that feature later would build
-whatever version the lockfile named. A dependency that drags in entries no
-`lithos-llm` version covers is the wrong dependency.
+whatever version the lockfile named. Outside the CLI-only exception below,
+a dependency that drags in entries neither upstream lockfile covers is the
+wrong dependency.
+
+The Linux CLI's terminal input backend is a narrow exception:
+Crossterm's `use-dev-tty` feature requires `filedescriptor` 0.8.3, which is
+private to terminal I/O and exposes no types through the agent libraries.
+Keep this CLI-only package pinned in Pebble's lockfile. Its `thiserror`
+1.0.69 and `thiserror-impl` 1.0.69 dependencies use the versions already
+present in Fabro's lockfile. Other shared dependency versions remain aligned.
 
 Test tooling follows the same rule. `trycmd` and `twin-openai` are
 dev-dependencies of `lithos-llm` too, so pebble's lockfile takes their

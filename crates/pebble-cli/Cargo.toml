@@ -19,6 +19,9 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 rustix = { version = "=1.1.4", features = ["pty", "termios"] }
 vte = "=0.14.1"
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+crossterm = "=0.29.0"
+
 [dev-dependencies]
 # The CLI cases answer the model from a deterministic OpenAI-compatible server
 # running in the test process, so the real codec and transport are exercised

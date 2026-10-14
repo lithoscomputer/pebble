@@ -38,11 +38,45 @@ fn launch_terminal_child() {
     };
     let args: Vec<String> = serde_json::from_str(&args).expect("child arguments");
     setsid().expect("detach from runner terminal");
+    #[cfg(target_os = "linux")]
+    if env::var_os("PEBBLE_PTY_BATCHED_INPUT").is_some() {
+        batched_input_child();
+        return;
+    }
     writeln!(io::stdout(), "SHELL-HISTORY-MUST-SURVIVE").expect("shell output");
     let error = ProcessCommand::new(env!("CARGO_BIN_EXE_pebble"))
         .args(args)
         .exec();
     panic!("exec Pebble: {error}");
+}
+
+#[cfg(target_os = "linux")]
+fn batched_input_child() {
+    use crossterm::{event, terminal};
+
+    terminal::enable_raw_mode().expect("raw input");
+    event::poll(Duration::from_millis(1)).expect("initialize the input reader");
+    writeln!(io::stdout(), "\rINPUT_READER_READY").expect("reader ready");
+    io::stdout().flush().expect("flush readiness");
+    // Hold the reader while signal handlers can queue resize and the parent
+    // writes Enter, so both descriptors are ready for the next poll.
+    std::thread::sleep(Duration::from_millis(500));
+    let mut events = vec![event::read().expect("first input event")];
+    if event::poll(Duration::from_millis(250)).expect("second input event") {
+        events.push(event::read().expect("read second event"));
+    }
+    let enter = events
+        .iter()
+        .any(|event| matches!(event, event::Event::Key(key) if key.code == event::KeyCode::Enter));
+    let resize = events
+        .iter()
+        .any(|event| matches!(event, event::Event::Resize(70, 16)));
+    terminal::disable_raw_mode().expect("restore input modes");
+    writeln!(
+        io::stdout(),
+        "\rINPUT_READER_RESULT enter={enter} resize={resize}"
+    )
+    .expect("reader result");
 }
 
 async fn provider(scenarios: &str) -> (String, JoinHandle<()>) {
@@ -406,6 +440,33 @@ fn journal(root: &Path) -> (PathBuf, Vec<CodingAgentEvent>) {
             .map(|line| serde_json::from_str(line).expect("event"))
             .collect(),
     )
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_resize_does_not_lose_enter() {
+    // Exercise fresh readers with both inputs pending. The child uses the same
+    // Crossterm backend selected for the real binary.
+    for _ in 0..8 {
+        let root = tempfile::tempdir().expect("test directory");
+        let mut terminal = Terminal::start_with_env(
+            &arguments(root.path()),
+            "http://127.0.0.1:1/v1",
+            None,
+            root.path(),
+            &[("PEBBLE_PTY_BATCHED_INPUT", "1")],
+        );
+        terminal.contains("INPUT_READER_READY").await;
+        terminal.resize(70, 16);
+        terminal.send(b"\r").await;
+        terminal.contains("INPUT_READER_RESULT").await;
+        assert!(
+            terminal.screen.text().contains("enter=true resize=true"),
+            "pending terminal input was lost:\n{}",
+            terminal.screen.text()
+        );
+        terminal.finish_with("INPUT_READER_RESULT", true).await;
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
