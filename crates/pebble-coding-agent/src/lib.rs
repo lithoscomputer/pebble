@@ -64,14 +64,15 @@ mod types;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_support;
 
-// The README's coding agent is the snippet most readers start from, so the
-// verification gate compiles it: `cargo test --doc` builds every Rust block in
-// the file, and the one there is marked `no_run` because it would call a
-// provider. Nothing else compiles this module and it appears in no
-// documentation — rustdoc defines `doctest` only while it collects them.
+// Compile the public Markdown examples without duplicating them in rustdoc.
+// Network examples use `no_run`; offline examples execute during doctests.
 #[cfg(doctest)]
 #[doc = include_str!("../../../README.md")]
 mod readme {}
+
+#[cfg(doctest)]
+#[doc = include_str!("../../../docs/embedding.md")]
+mod embedding_guide {}
 
 pub use pebble_agent::{SessionId, SessionScope};
 

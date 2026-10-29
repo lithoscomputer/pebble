@@ -1,10 +1,11 @@
 # Developing
 
-Pebble is a workspace of two library crates, one example, and one binary.
+Pebble contains two agent libraries, a CLI library, examples, and one binary.
 `crates/pebble-agent` is the provider-neutral agent loop.
 `crates/pebble-coding-agent` is the coding-agent layer and owns the example.
-`crates/pebble-cli` is the `pebble` command, the smallest application that
-embeds the coding agent. Most coding-agent work is a change to
+`crates/pebble-cli-core` owns the command-line application.
+`crates/pebble-cli` parses arguments for the `pebble` command. Most
+coding-agent work is a change to
 `crates/pebble-coding-agent/src/`, its unit tests beside it, and the contract
 tests in `crates/pebble-coding-agent/tests/`. Generic turn-loop work belongs
 in `crates/pebble-agent/src/`.
@@ -63,7 +64,7 @@ Run `mise run check` before opening a pull request.
 `crates/pebble-coding-agent/examples/coding_agent.rs` runs a real coding agent.
 It builds a client, works in a new directory under the system temporary
 directory, steers one prompt, interrupts another, and prints what the agent
-used. It is the only thing in the repository that calls a provider.
+used. It calls a live provider.
 
 ```sh
 # The default model, claude-sonnet-5.
@@ -88,7 +89,7 @@ under the system temporary directory.
 # Every test, through Nextest.
 mise run test
 
-# The documentation tests, which Nextest does not run.
+# The documentation tests, including README and embedding-guide examples.
 mise run test:doc
 
 # Just the end-to-end suite.
@@ -184,5 +185,6 @@ the crate version stays the same and the two commits meet at the next update.
 
 ## Releases
 
-Both crates are libraries. Neither has a release pipeline. Consumers depend on
-the repository directly.
+The workspace packages have publication disabled and no release pipeline.
+Library consumers depend on the repository directly. CLI users install from
+Git with the command in [README.md](README.md#use-it-from-the-command-line).
