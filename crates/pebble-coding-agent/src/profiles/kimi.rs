@@ -1,3 +1,8 @@
+// The `edit_file` description in this file is adapted from MoonshotAI/kimi-code
+// (MIT), packages/agent-core-v2/src/app/edit/tools/edit.md at ceb158dc54.
+// Copyright (c) 2026 Moonshot AI. See docs/licenses/kimi-code-MIT.txt for the
+// copyright and permission notice.
+
 //! The harness Kimi Code's models expect.
 
 use std::sync::Arc;

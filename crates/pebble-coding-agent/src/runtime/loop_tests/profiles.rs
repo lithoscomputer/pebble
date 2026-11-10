@@ -321,10 +321,7 @@ async fn the_anthropic_prompt_mentions_subagents_exactly_when_the_session_can_sp
 
         assert_eq!(advertises(&session, "spawn_agent"), subagents);
         assert_eq!(
-            session
-                .resources
-                .system_prompt
-                .contains("Subagents are valuable for independent work"),
+            session.resources.system_prompt.contains("# Subagents"),
             subagents
         );
     }

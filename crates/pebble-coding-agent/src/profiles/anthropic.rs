@@ -168,51 +168,59 @@ mod tests {
     fn the_prompt_says_who_the_model_is_and_where_it_is_working() {
         let prompt = prompt(false, false);
 
-        assert!(prompt.contains("You are Claude, an AI coding assistant made by Anthropic"));
+        assert!(prompt.contains("You are Claude, a software engineering agent running in Pebble"));
         assert!(prompt.contains("<environment>"));
         assert!(prompt.contains("Working directory: /home/test"));
         assert!(prompt.contains("Platform: linux"));
     }
 
     #[test]
-    fn the_prompt_keeps_the_claude_code_style_sections() {
+    fn the_prompt_keeps_its_sections() {
         let prompt = prompt(false, false);
 
         for heading in [
-            "# System",
-            "# Doing tasks",
-            "# Executing actions with care",
-            "# Using your tools",
+            "# Harness",
+            "# Delivering work",
+            "# Working in the codebase",
+            "# Tool use",
             "# Communicating with the user",
-            "# Tone and style",
-            "# Coding Best Practices",
+            "# Context management",
         ] {
             assert!(prompt.contains(heading), "the prompt lost {heading}");
         }
     }
 
     #[test]
-    fn the_prompt_drills_the_habits_this_harness_was_trained_on() {
+    fn the_prompt_names_this_harnesses_own_tools() {
         let prompt = prompt(false, false);
 
-        assert!(prompt.contains(
-            "Do NOT use the shell tool to run commands when a relevant dedicated tool is provided"
-        ));
-        assert!(prompt.contains("Break down and manage your work with the TaskCreate tool"));
-        assert!(prompt.contains("Use TaskUpdate to keep task status current"));
-        assert!(prompt.contains("Mark each task as completed as soon as you are done"));
-        assert!(
-            prompt.contains("Before your first tool call, briefly state what you're about to do")
-        );
-        assert!(prompt.contains("Do not expose internal deliberation"));
-        assert!(prompt.contains("Do not create planning documents unless the user asks"));
-        assert!(prompt.contains("read or inspect it first"));
-        assert!(prompt.contains("Report outcomes faithfully"));
-        assert!(prompt.contains("Write clean, maintainable code"));
+        for tool in [
+            "`read_file`",
+            "`edit_file`",
+            "`write_file`",
+            "`grep`",
+            "`glob`",
+            "`shell`",
+            "`TaskCreate`",
+            "`TaskUpdate`",
+            "`web_fetch`",
+        ] {
+            assert!(prompt.contains(tool), "the prompt does not name {tool}");
+        }
+        // Claude 5's names belong to its own harness, not this one.
+        for other in ["`Read`", "`Edit`", "`Bash`", "`Agent`"] {
+            assert!(!prompt.contains(other), "the prompt names {other}");
+        }
         assert!(
             !prompt.contains("## read_file"),
             "per-tool detail belongs in the tool descriptions"
         );
+    }
+
+    #[test]
+    fn the_provenance_note_never_reaches_the_model() {
+        assert!(CORE_PROMPT.contains("Original text written for pebble"));
+        assert!(!prompt(false, false).contains("Original text written for pebble"));
     }
 
     #[test]
@@ -221,10 +229,8 @@ mod tests {
         let with = prompt(true, false);
 
         assert!(!without.contains(web_search_name(&profile(false))));
-        assert!(without.contains("To inspect a specific URL use web_fetch."));
-        assert!(
-            with.contains("To search the internet use web_search, and to inspect a specific URL")
-        );
+        assert!(without.contains("Use `web_fetch` to read a specific URL."));
+        assert!(with.contains("Use `web_search` when current external information is needed"));
     }
 
     #[test]
@@ -232,10 +238,15 @@ mod tests {
         let without = prompt(false, false);
         let with = prompt(false, true);
 
-        assert!(!without.contains("Subagents are valuable for independent work"));
-        assert!(with.contains("Subagents are valuable for independent work"));
-        assert!(with.contains("avoid duplicating work"));
-        assert!(with.contains("wait for their results and synthesize them"));
+        assert!(!without.contains("# Subagents"));
+        assert!(!without.contains("`spawn_agent`"));
+        assert!(with.contains("# Subagents"));
+        for tool in ["`spawn_agent`", "`send_input`", "`wait`", "`close_agent`"] {
+            assert!(
+                with.contains(tool),
+                "the subagent section does not name {tool}"
+            );
+        }
     }
 
     #[test]

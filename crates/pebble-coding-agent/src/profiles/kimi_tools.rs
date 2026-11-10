@@ -1,3 +1,8 @@
+// Tool descriptions in this file are adapted from MoonshotAI/kimi-code (MIT),
+// packages/agent-core-v2/src/os/backends/node-local/tools/{read,write,bash}.md
+// at ce0e3ceb04 and ceb158dc54. Copyright (c) 2026 Moonshot AI. See
+// docs/licenses/kimi-code-MIT.txt for the copyright and permission notice.
+
 //! The Kimi Code tools whose behavior differs from pebble's own.
 //!
 //! Where a Kimi Code tool behaves the way pebble's already does, the Kimi

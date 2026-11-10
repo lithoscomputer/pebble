@@ -171,3 +171,6 @@ README and embedding-guide Rust examples are checked by the documentation tests.
 ## License
 
 [MIT](https://github.com/lithoscomputer/pebble/blob/main/LICENSE).
+Some prompts and tool descriptions are adapted from other open-source projects
+and keep their original licenses; see
+[docs/licenses](https://github.com/lithoscomputer/pebble/blob/main/docs/licenses/README.md).

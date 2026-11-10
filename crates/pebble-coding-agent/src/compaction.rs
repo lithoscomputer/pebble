@@ -1,3 +1,10 @@
+// The summary prompt's section layout (Goal, Progress, Key Decisions, Next
+// Steps, and a tracked file-operations list) follows the compaction prompt in
+// earendil-works/pi (MIT), packages/coding-agent/src/core/compaction/
+// compaction.ts at d35935200f. The wording is pebble's own. Copyright (c) 2025
+// Mario Zechner. See docs/licenses/pi-MIT.txt for the copyright and permission
+// notice.
+
 //! Summarizing a conversation that has outgrown the context window.
 //!
 //! Compaction has two halves. [`check_context_usage`] answers whether the
