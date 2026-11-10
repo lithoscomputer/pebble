@@ -294,7 +294,7 @@ mod tests {
         ] {
             assert!(prompt.contains(heading), "the prompt lost {heading}");
         }
-        assert!(prompt.contains("This workspace tracks reads before writes"));
+        assert!(prompt.contains("The tools do not check this for you"));
         assert!(prompt.contains("`timeout` is measured in milliseconds"));
     }
 
