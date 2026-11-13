@@ -12,6 +12,11 @@ publish = false
 lithos-llm = { git = "https://github.com/lithoscomputer/lithos-llm", branch = "main", default-features = false }
 # sandbox-driver: the sandbox provider layer `pebble_coding_agent::sandbox_driver`
 # adapts to the `Environment` contract, behind the `sandbox-driver` feature.
+# Cargo.lock holds these at tag v2 (0a07380), the last sandbox-driver with the
+# old API, while its main becomes new-API-only. Do not `cargo update` them, and
+# keep `branch = "main"` so Fabro's and Petri's declarations stay the same
+# source. Lift the pin when Pebble, Fabro, and Petri move to the new API
+# together; see .github/workflows/internal-deps.yml.
 sandbox-driver = { git = "https://github.com/lithoscomputer/sandbox-driver", branch = "main" }
 sandbox-driver-host = { git = "https://github.com/lithoscomputer/sandbox-driver", branch = "main" }
 sandbox-driver-testing = { git = "https://github.com/lithoscomputer/sandbox-driver", branch = "main" }
