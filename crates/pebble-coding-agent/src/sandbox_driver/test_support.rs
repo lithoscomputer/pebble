@@ -1,28 +1,41 @@
 //! Test doubles for code that runs over a [`SandboxEnvironment`].
 //!
-//! [`MockSandbox`] is a configuration over the sandbox driver's scripted
-//! double: a test writes down the files, the command answer, and the
-//! failures it wants, and takes a [`SandboxEnvironment`] or the bare driver
-//! handle from it. What the code under test ran or wrote is read back from
-//! the driver double itself, through [`MockSandbox::driver`]; the few
-//! accessors here convert what a spec records into the shape an
-//! application's tests assert on. Nothing here fakes the adapter's own
-//! logic: every call goes through the real [`SandboxEnvironment`] and its
-//! exec policy, down to the scripted driver.
+//! [`MockSandbox`] is a configuration over a scripted sandbox-driver handle,
+//! [`ScriptedSandbox`]: a test writes down the files, the command answer, and
+//! the failures it wants, and takes a [`SandboxEnvironment`] or the bare
+//! driver handle from it. What the code under test ran or wrote is read back
+//! from the scripted handle through [`MockSandbox::driver`]. Nothing here
+//! fakes the adapter's own logic: every call goes through the real
+//! [`SandboxEnvironment`] and its exec policy, down to the scripted handle.
+//!
+//! Parity gap: the old driver's `sandbox-driver-testing` doubles answered a
+//! command by a closure, from a queue, or by default, and seeded an in-memory
+//! filesystem. The new fake (`FakeProvider`) answers only exact argv it was
+//! scripted with and fails every other command, so the scripted handle lives
+//! here, implementing the new [`Sandbox`] trait.
 
-use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::io::Cursor;
+use std::num::NonZeroU16;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use sandbox_driver::{
-    BASH_ENV_VAR, ExecResult, ExecSpec, GrepMatch, PlatformInfo, Sandbox, Termination,
+    ByteStream, Error as DriverError, ExecControls, ExecOutcome, ExecSpec, Expose, Exposure,
+    FileEntry, FileKind, FileRange, Files, MutationOutcome, NamespaceId, OutputLoss, OutputStream,
+    Ports, ProviderName, Resources, Sandbox, SandboxId, SandboxRef, SandboxState, Status,
+    Termination,
 };
-pub use sandbox_driver_testing::{ScriptedExec, ScriptedProvider, ScriptedSandbox};
+use tokio::io::AsyncReadExt as _;
 
 use super::environment::SandboxEnvironment;
+use super::exec::{BASH_ENV_VAR, ExecResult, shell_source};
+use super::path::resolve_path;
 
-/// A driver [`ExecResult`] with the given streams, for scripting a mock
-/// sandbox's answers.
+/// A driver-facing [`ExecResult`] with the given streams, for scripting a
+/// mock sandbox's answers.
 #[must_use]
 pub fn exec_result(
     stdout: &str,
@@ -51,15 +64,15 @@ pub struct MockSandbox {
     pub files:             HashMap<String, String>,
     pub exec_result:       ExecResult,
     /// Fails every command before any process runs, so callers see a
-    /// transport error rather than an `ExecResult`.
+    /// transport error rather than a result.
     pub exec_error:        Option<String>,
     pub working_dir:       &'static str,
     pub platform_str:      &'static str,
     pub os_version_str:    String,
     /// Lines every grep returns, as `path:line:content`.
     pub grep_results:      Vec<String>,
-    /// Reported by streaming execution. Set to `false` to model a provider
-    /// that cannot separate stdout from stderr.
+    /// Set to `false` to model a provider that cannot separate stdout from
+    /// stderr: output then arrives as one terminal stream.
     pub streams_separated: bool,
     /// The sandbox once built. Public only so `..Default::default()` works
     /// from other crates; leave it at its default.
@@ -111,22 +124,21 @@ impl MockSandbox {
         Arc::clone(&self.built().driver) as Arc<dyn Sandbox>
     }
 
-    /// The scripted driver double behind [`MockSandbox::sandbox`], for
-    /// scripting beyond what the fields express.
+    /// The scripted driver behind [`MockSandbox::sandbox`], for scripting
+    /// beyond what the fields express.
     pub fn driver(&self) -> Arc<ScriptedSandbox> {
         Arc::clone(&self.built().driver)
     }
 
     /// Answers commands by their Bash source, ahead of the queue and
     /// `exec_result`: a responder that returns `Some` decides the result,
-    /// `None` falls through. For tests that interleave different commands
-    /// and want each answered by what it is rather than by its position.
+    /// `None` falls through.
     pub fn respond_with(
         &self,
         responder: impl Fn(&str) -> Option<ExecResult> + Send + Sync + 'static,
     ) -> &Self {
         self.driver().scripted_exec().respond_with(move |spec| {
-            let command = spec.args.last().map(String::as_str).unwrap_or_default();
+            let command = spec.argv.last().map(String::as_str).unwrap_or_default();
             responder(command)
         });
         self
@@ -149,30 +161,34 @@ impl MockSandbox {
     }
 
     fn build_driver(&self) -> ScriptedSandbox {
-        let mut driver =
-            ScriptedSandbox::with_id_and_working_dir("mock-sandbox", self.working_dir).platform(
-                PlatformInfo::new(self.platform_str, "x86_64", self.os_version_str.clone()),
-            );
+        let driver = ScriptedSandbox::new("mock-sandbox", self.working_dir);
         for (path, content) in &self.files {
-            driver = driver.file(path, content);
+            driver.seed_file(path, content.as_bytes());
         }
         let exec = driver.scripted_exec();
         match &self.exec_error {
             Some(message) => exec.fail_by_default(message.clone()),
             None => exec.set_default(self.exec_result.clone()),
-        };
+        }
         exec.set_streams_separated(self.streams_separated);
-        driver.scripted_search().set_grep(
-            self.grep_results
-                .iter()
-                .map(|line| {
-                    let mut parts = line.splitn(3, ':');
-                    let path = parts.next().unwrap_or_default();
-                    let line_number = parts.next().and_then(|n| n.parse().ok()).unwrap_or(0);
-                    GrepMatch::new(path, line_number, parts.next().unwrap_or_default())
-                })
-                .collect(),
-        );
+        // The adapter greps by running ripgrep or grep, so the mock answers
+        // those commands with the lines in grep's NUL-separated form.
+        let mut grep_stdout = String::new();
+        for line in &self.grep_results {
+            let (path, rest) = line.split_once(':').unwrap_or((line, ""));
+            grep_stdout.push_str(path);
+            grep_stdout.push('\0');
+            grep_stdout.push_str(rest);
+            grep_stdout.push('\n');
+        }
+        exec.respond_with(move |spec| {
+            let source = shell_source(spec)?;
+            if source.starts_with("command -v rg") {
+                return Some(exec_result("", "", Some(0), Termination::Exited, 0));
+            }
+            let searched = source.contains("rg -H --line-number") || source.contains("grep -rnIH");
+            searched.then(|| exec_result(&grep_stdout, "", Some(0), Termination::Exited, 0))
+        });
         driver
     }
 
@@ -188,17 +204,16 @@ impl MockSandbox {
     pub fn captured_command(&self) -> Option<String> {
         self.recorded()
             .last()
-            .and_then(|spec| spec.args.last().cloned())
+            .and_then(|spec| spec.argv.last().cloned())
     }
 
     /// The explicit variables of the last command as the caller passed them.
-    /// The driver's Bash helper records its own `BASH_ENV` blank on the
-    /// spec; that is not the caller's.
+    /// The policy's own `BASH_ENV` blank is not the caller's.
     pub fn captured_env_vars(&self) -> Option<HashMap<String, String>> {
         self.recorded().last().map(|spec| {
             spec.env
                 .iter()
-                .filter(|(key, _)| key.as_str() != BASH_ENV_VAR)
+                .filter(|(key, value)| key.as_str() != BASH_ENV_VAR || !value.is_empty())
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect()
         })
@@ -211,7 +226,6 @@ impl MockSandbox {
             .map(|built| {
                 built
                     .driver
-                    .memory_fs()
                     .writes()
                     .into_iter()
                     .map(|(path, bytes)| (path, String::from_utf8_lossy(&bytes).into_owned()))
@@ -221,10 +235,367 @@ impl MockSandbox {
     }
 }
 
+type Responder = Box<dyn Fn(&ExecSpec) -> Option<ExecResult> + Send + Sync>;
+
+/// How a [`ScriptedSandbox`] answers commands, and what it was asked.
+///
+/// A command is answered by the first responder that returns `Some` (newest
+/// first), then by the next queued result, then by the default.
+#[derive(Default)]
+pub struct ScriptedExec {
+    state: Mutex<ExecScript>,
+}
+
+#[derive(Default)]
+struct ExecScript {
+    responders:        Vec<Arc<Responder>>,
+    queue:             VecDeque<ExecResult>,
+    default:           Option<ExecResult>,
+    failure:           Option<String>,
+    streams_separated: bool,
+    recorded:          Vec<ExecSpec>,
+}
+
+impl ScriptedExec {
+    fn script(&self) -> MutexGuard<'_, ExecScript> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The answer when nothing else applies.
+    pub fn set_default(&self, result: ExecResult) {
+        let mut script = self.script();
+        script.default = Some(result);
+        script.failure = None;
+    }
+
+    /// Fails every command nothing else answers, as a transport error.
+    pub fn fail_by_default(&self, message: impl Into<String>) {
+        self.script().failure = Some(message.into());
+    }
+
+    /// Queues the answer to one command.
+    pub fn push_result(&self, result: ExecResult) {
+        self.script().queue.push_back(result);
+    }
+
+    /// Answers a command by its spec, ahead of the queue and the default.
+    pub fn respond_with(
+        &self,
+        responder: impl Fn(&ExecSpec) -> Option<ExecResult> + Send + Sync + 'static,
+    ) {
+        self.script().responders.push(Arc::new(Box::new(responder)));
+    }
+
+    /// Whether output arrives as stdout and stderr, or as one terminal
+    /// stream.
+    pub fn set_streams_separated(&self, separated: bool) {
+        self.script().streams_separated = separated;
+    }
+
+    /// Every command's spec, in order.
+    pub fn recorded(&self) -> Vec<ExecSpec> {
+        self.script().recorded.clone()
+    }
+
+    /// Every command, in order: a shell script's source, or the argv joined
+    /// by spaces.
+    pub fn commands(&self) -> Vec<String> {
+        self.recorded()
+            .iter()
+            .map(|spec| shell_source(spec).map_or_else(|| spec.argv.join(" "), str::to_string))
+            .collect()
+    }
+
+    fn answer(&self, spec: &ExecSpec) -> Result<(ExecResult, bool), DriverError> {
+        let responders = {
+            let mut script = self.script();
+            script.recorded.push(spec.clone());
+            script.responders.clone()
+        };
+        let separated = self.script().streams_separated;
+        for responder in responders.iter().rev() {
+            if let Some(result) = responder(spec) {
+                return Ok((result, separated));
+            }
+        }
+        let mut script = self.script();
+        if let Some(result) = script.queue.pop_front() {
+            return Ok((result, separated));
+        }
+        if let Some(message) = &script.failure {
+            return Err(DriverError::Transport {
+                message: message.clone(),
+                outcome: MutationOutcome::NotStarted,
+            });
+        }
+        Ok((
+            script
+                .default
+                .clone()
+                .unwrap_or_else(|| ExecResult::new(Termination::Exited, Some(0), Duration::ZERO)),
+            separated,
+        ))
+    }
+}
+
+/// A scripted sandbox-driver handle: an in-memory filesystem, commands
+/// answered by [`ScriptedExec`], and ports that refuse.
+pub struct ScriptedSandbox {
+    reference:   SandboxRef,
+    working_dir: PathBuf,
+    env:         BTreeMap<String, String>,
+    exec:        ScriptedExec,
+    files:       Mutex<BTreeMap<String, Vec<u8>>>,
+    writes:      Mutex<Vec<(String, Vec<u8>)>>,
+}
+
+impl ScriptedSandbox {
+    /// A running sandbox `id` working in `working_dir`.
+    ///
+    /// # Panics
+    /// When `id` is not a valid sandbox id.
+    #[must_use]
+    pub fn new(id: &str, working_dir: &str) -> Self {
+        Self {
+            reference:   SandboxRef {
+                provider:  ProviderName::try_new("mock").expect("constant name"),
+                namespace: NamespaceId::try_new("mock:1").expect("constant namespace"),
+                id:        SandboxId::try_new(id).expect("a valid sandbox id"),
+            },
+            working_dir: PathBuf::from(working_dir),
+            env:         BTreeMap::new(),
+            exec:        ScriptedExec::default(),
+            files:       Mutex::new(BTreeMap::new()),
+            writes:      Mutex::new(Vec::new()),
+        }
+    }
+
+    /// How commands are answered, and what ran.
+    pub fn scripted_exec(&self) -> &ScriptedExec {
+        &self.exec
+    }
+
+    /// Puts a file in place without recording it as written.
+    pub fn seed_file(&self, path: &str, content: &[u8]) {
+        let path = self.resolve(path);
+        self.lock_files().insert(path, content.to_vec());
+    }
+
+    /// Every file `put` so far as `(path, bytes)`, in order.
+    pub fn writes(&self) -> Vec<(String, Vec<u8>)> {
+        self.writes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn resolve(&self, path: &str) -> String {
+        resolve_path(path, &self.working_dir.to_string_lossy())
+    }
+
+    fn lock_files(&self) -> MutexGuard<'_, BTreeMap<String, Vec<u8>>> {
+        self.files.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The adapter tests a path with `[ -e '<path>' ]`; answering that from
+    /// the in-memory filesystem keeps file existence real in the mock.
+    fn exists_answer(&self, spec: &ExecSpec) -> Option<ExecResult> {
+        let quoted = shell_source(spec)?
+            .strip_prefix("[ -e '")?
+            .strip_suffix("' ]")?;
+        let path = quoted.replace("'\\''", "'");
+        let prefix = format!("{}/", path.trim_end_matches('/'));
+        let files = self.lock_files();
+        let exists = files.contains_key(&path) || files.keys().any(|key| key.starts_with(&prefix));
+        let code = i32::from(!exists);
+        Some(ExecResult::new(
+            Termination::Exited,
+            Some(code),
+            Duration::ZERO,
+        ))
+    }
+}
+
+#[async_trait]
+impl Sandbox for ScriptedSandbox {
+    fn reference(&self) -> SandboxRef {
+        self.reference.clone()
+    }
+
+    fn working_directory(&self) -> &Path {
+        &self.working_dir
+    }
+
+    fn env(&self) -> &BTreeMap<String, String> {
+        &self.env
+    }
+
+    async fn status(&self) -> Result<Status, DriverError> {
+        Ok(Status {
+            reference: self.reference(),
+            state:     SandboxState::Running,
+            name:      None,
+            labels:    BTreeMap::new(),
+            image:     None,
+            snapshot:  None,
+            resources: Resources::default(),
+            network:   None,
+            services:  BTreeMap::new(),
+            web_url:   None,
+        })
+    }
+
+    async fn start(&self) -> Result<(), DriverError> {
+        Ok(())
+    }
+
+    async fn stop(&self) -> Result<(), DriverError> {
+        Ok(())
+    }
+
+    async fn exec(
+        &self,
+        spec: ExecSpec,
+        controls: ExecControls,
+    ) -> Result<ExecOutcome, DriverError> {
+        let (result, separated) = match self.exists_answer(&spec) {
+            Some(result) => {
+                self.exec.script().recorded.push(spec);
+                (result, true)
+            }
+            None => self.exec.answer(&spec)?,
+        };
+        if let Some(mut stdin) = controls.stdin {
+            let mut ignored = Vec::new();
+            let _ = stdin.read_to_end(&mut ignored).await;
+        }
+        if let Some(sink) = controls.sink {
+            if separated {
+                for (stream, bytes) in [
+                    (OutputStream::Stdout, result.stdout),
+                    (OutputStream::Stderr, result.stderr),
+                ] {
+                    if !bytes.is_empty() {
+                        sink(stream, bytes).await?;
+                    }
+                }
+            } else {
+                let mut combined = result.stdout;
+                combined.extend(result.stderr);
+                if !combined.is_empty() {
+                    sink(OutputStream::Terminal, combined).await?;
+                }
+            }
+        }
+        Ok(ExecOutcome {
+            termination: result.termination,
+            exit_code:   result.exit_code,
+            signal:      result.signal,
+            output_loss: OutputLoss::default(),
+        })
+    }
+
+    fn files(&self) -> &dyn Files {
+        self
+    }
+
+    fn ports(&self) -> &dyn Ports {
+        self
+    }
+}
+
+#[async_trait]
+impl Files for ScriptedSandbox {
+    async fn get(&self, path: &str, range: Option<FileRange>) -> Result<ByteStream, DriverError> {
+        let path = self.resolve(path);
+        let bytes = self
+            .lock_files()
+            .get(&path)
+            .cloned()
+            .ok_or_else(|| DriverError::NotFound {
+                resource: "file".into(),
+                id:       path,
+            })?;
+        let start = range.map_or(0, |range| {
+            usize::try_from(range.offset)
+                .unwrap_or(usize::MAX)
+                .min(bytes.len())
+        });
+        let end = range
+            .and_then(|range| range.length)
+            .map_or(bytes.len(), |length| {
+                start
+                    .saturating_add(usize::try_from(length).unwrap_or(usize::MAX))
+                    .min(bytes.len())
+            });
+        Ok(Box::pin(Cursor::new(bytes[start..end].to_vec())))
+    }
+
+    async fn put(&self, path: &str, mut bytes: ByteStream) -> Result<(), DriverError> {
+        let path = self.resolve(path);
+        let mut content = Vec::new();
+        bytes
+            .read_to_end(&mut content)
+            .await
+            .map_err(|error| DriverError::Transport {
+                message: format!("reading the upload failed: {error}"),
+                outcome: MutationOutcome::NotStarted,
+            })?;
+        self.lock_files().insert(path.clone(), content.clone());
+        self.writes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((path, content));
+        Ok(())
+    }
+
+    async fn list(&self, path: &str, depth: u32) -> Result<Vec<FileEntry>, DriverError> {
+        let path = self.resolve(path);
+        let prefix = format!("{}/", path.trim_end_matches('/'));
+        let mut entries = BTreeMap::new();
+        for (file, bytes) in self.lock_files().iter() {
+            let Some(relative) = file.strip_prefix(&prefix) else {
+                continue;
+            };
+            let parts: Vec<_> = relative.split('/').collect();
+            let levels = parts.len().min((depth as usize).saturating_add(1));
+            for index in 0..levels {
+                let entry_path = format!("{prefix}{}", parts[..=index].join("/"));
+                let (kind, size) = if index + 1 == parts.len() {
+                    (FileKind::File, bytes.len() as u64)
+                } else {
+                    (FileKind::Directory, 0)
+                };
+                entries.insert(entry_path.clone(), FileEntry {
+                    path: entry_path,
+                    kind,
+                    size,
+                });
+            }
+        }
+        Ok(entries.into_values().collect())
+    }
+}
+
+#[async_trait]
+impl Ports for ScriptedSandbox {
+    async fn expose(&self, _: NonZeroU16, _: Expose) -> Result<Exposure, DriverError> {
+        Err(DriverError::Unsupported {
+            capability: "ports".into(),
+        })
+    }
+
+    async fn release(&self, _: NonZeroU16) -> Result<(), DriverError> {
+        Err(DriverError::Unsupported {
+            capability: "ports".into(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::environment::Environment;
+    use crate::environment::{Environment, GrepOptions};
 
     #[tokio::test]
     async fn the_mock_answers_commands_and_records_what_ran() {
@@ -239,6 +610,16 @@ mod tests {
                 .await
                 .unwrap(),
             b"hello"
+        );
+        assert!(
+            Environment::file_exists(&*sandbox, "README.md")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !Environment::file_exists(&*sandbox, "missing.md")
+                .await
+                .unwrap()
         );
         Environment::write_file(&*sandbox, "notes.txt", "written")
             .await
@@ -256,5 +637,65 @@ mod tests {
         assert_eq!(result.stdout_lossy(), "mock output");
         assert_eq!(mock.captured_command().as_deref(), Some("echo hi"));
         assert_eq!(mock.captured_env_vars(), Some(env));
+    }
+
+    #[tokio::test]
+    async fn responders_come_before_the_queue_and_the_queue_before_the_default() {
+        let mock = MockSandbox {
+            exec_error: Some("unexpected command".into()),
+            ..MockSandbox::default()
+        };
+        mock.respond_with(|command| {
+            (command == "special")
+                .then(|| exec_result("answered", "", Some(0), Termination::Exited, 0))
+        });
+        mock.driver().scripted_exec().push_result(exec_result(
+            "queued",
+            "",
+            Some(0),
+            Termination::Exited,
+            0,
+        ));
+        let exec = mock.sandbox();
+        let run = |command: &'static str| {
+            let exec = Arc::clone(&exec);
+            async move { exec.exec().run(command, None, None, None, None).await }
+        };
+        assert_eq!(run("special").await.unwrap().stdout_lossy(), "answered");
+        assert_eq!(run("first").await.unwrap().stdout_lossy(), "queued");
+        assert!(run("second").await.is_err());
+        assert_eq!(mock.driver().scripted_exec().commands(), [
+            "special", "first", "second"
+        ]);
+    }
+
+    #[tokio::test]
+    async fn grep_results_come_back_through_the_derived_search() {
+        let mock = MockSandbox {
+            grep_results: vec!["/work/a.rs:3:let x = 1;".to_string()],
+            ..MockSandbox::linux()
+        };
+        let lines = Environment::grep(&*mock.sandbox(), "x", ".", &GrepOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(lines, ["/work/a.rs:3:let x = 1;"]);
+    }
+
+    #[tokio::test]
+    async fn a_combined_stream_is_stdout() {
+        let mock = MockSandbox {
+            exec_result: exec_result("out ", "err", Some(0), Termination::Exited, 0),
+            streams_separated: false,
+            ..MockSandbox::default()
+        };
+        let streaming = mock
+            .sandbox()
+            .exec()
+            .run_streaming(ExecSpec::shell("x"), ExecControls::default(), None)
+            .await
+            .unwrap();
+        assert!(!streaming.streams_separated);
+        assert_eq!(streaming.result.stdout_lossy(), "out err");
+        assert!(streaming.result.stderr.is_empty());
     }
 }

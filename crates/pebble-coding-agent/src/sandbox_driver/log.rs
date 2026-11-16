@@ -1,22 +1,22 @@
 //! A sandbox failure rendered for a log or an error response: the cause
-//! chain, and the redacted tail of the output a failed command or git
-//! operation left behind.
+//! chain, and the redacted tail of the output a failed command left behind.
+//!
+//! Parity gap: the old driver's errors carried that output
+//! (`Error::Exec`, `Error::Git`); the new driver's carry none. The tail now
+//! comes from a [`CommandFailure`] anywhere in the chain, which the adapter's
+//! own commands fail with and an application can wrap its own in.
 
 use std::error::Error as StdError;
 use std::fmt::Write as _;
 
-use sandbox_driver::Error as DriverError;
-
-use super::exec::redacted_output_tail;
+use super::exec::{CommandFailure, redacted_output_tail};
 use crate::environment::DEFAULT_EXEC_OUTPUT_TAIL_BYTES;
 use crate::redact::Redactor;
 use crate::types::ExecOutputTail;
 
-/// The output tail of the first sandbox-driver failure in `err`'s cause
-/// chain that carries command output (a command that ran and failed, or a
-/// git operation whose command output the driver kept as evidence), passed
-/// through `redactor` and capped to [`DEFAULT_EXEC_OUTPUT_TAIL_BYTES`] per
-/// stream.
+/// The output tail of the first [`CommandFailure`] in `err`'s cause chain,
+/// passed through `redactor` and capped to [`DEFAULT_EXEC_OUTPUT_TAIL_BYTES`]
+/// per stream.
 #[must_use]
 pub fn default_redacted_output_tail(
     err: &(dyn StdError + 'static),
@@ -24,33 +24,21 @@ pub fn default_redacted_output_tail(
 ) -> Option<ExecOutputTail> {
     let mut current = Some(err);
     while let Some(err) = current {
-        if let Some(tail) = err
-            .downcast_ref::<DriverError>()
-            .and_then(|driver| driver_output_tail(driver, redactor))
-        {
-            return Some(tail);
+        if let Some(failure) = err.downcast_ref::<CommandFailure>() {
+            return redacted_output_tail(
+                &String::from_utf8_lossy(&failure.stdout),
+                &String::from_utf8_lossy(&failure.stderr),
+                DEFAULT_EXEC_OUTPUT_TAIL_BYTES,
+                redactor,
+            );
         }
         current = err.source();
     }
     None
 }
 
-fn driver_output_tail(error: &DriverError, redactor: &dyn Redactor) -> Option<ExecOutputTail> {
-    let failure = match error {
-        DriverError::Exec(failure) => failure,
-        DriverError::Git(git) => git.output()?,
-        _ => return None,
-    };
-    redacted_output_tail(
-        &String::from_utf8_lossy(failure.stdout()),
-        &String::from_utf8_lossy(failure.stderr()),
-        DEFAULT_EXEC_OUTPUT_TAIL_BYTES,
-        redactor,
-    )
-}
-
 /// `err` with its causes, followed by the redacted output tail when a
-/// driver failure in the chain carries one.
+/// [`CommandFailure`] in the chain carries one.
 #[must_use]
 pub fn display_for_log(err: &(dyn StdError + 'static), redactor: &dyn Redactor) -> String {
     let mut rendered = render_with_causes(err);
@@ -94,28 +82,23 @@ fn append_tail_for_log(rendered: &mut String, stream: &str, tail: Option<&str>, 
 
 #[cfg(test)]
 mod tests {
-    use std::io;
     use std::time::Duration;
 
-    use sandbox_driver::{ExecFailure, Termination};
+    use sandbox_driver::{Error as DriverError, MutationOutcome, Termination};
 
     use super::*;
     use crate::redact::NoRedaction;
+    use crate::sandbox_driver::ExecResult;
     use crate::sandbox_driver::testing::MaskToken;
 
     const SECRET: &str = "ghs_xK9mZ2vL8nQ5rT1wY4bC7dF0gH3jE6pA";
 
-    fn failed_push(stdout: &str, stderr: &str) -> DriverError {
-        DriverError::from(
-            ExecFailure::new(
-                "git push origin refs/heads/run",
-                Termination::Exited,
-                Some(128),
-                stdout.as_bytes().to_vec(),
-                stderr.as_bytes().to_vec(),
-            )
-            .with_duration(Duration::from_millis(210)),
-        )
+    fn failed_push(stdout: &str, stderr: &str) -> CommandFailure {
+        let mut result =
+            ExecResult::new(Termination::Exited, Some(128), Duration::from_millis(210));
+        result.stdout = stdout.as_bytes().to_vec();
+        result.stderr = stderr.as_bytes().to_vec();
+        CommandFailure::new("git push origin refs/heads/run", result)
     }
 
     #[derive(Debug, thiserror::Error)]
@@ -123,7 +106,7 @@ mod tests {
     struct Wrapped {
         message: String,
         #[source]
-        source:  DriverError,
+        source:  CommandFailure,
     }
 
     #[test]
@@ -162,7 +145,10 @@ mod tests {
 
     #[test]
     fn display_for_log_for_a_plain_error_is_the_chain_alone() {
-        let error = DriverError::io("reading the file", io::Error::other("leaf failure"));
+        let error = DriverError::Transport {
+            message: "leaf failure".into(),
+            outcome: MutationOutcome::Unknown,
+        };
 
         let rendered = display_for_log(&error, &NoRedaction);
 

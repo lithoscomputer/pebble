@@ -31,6 +31,11 @@ pub fn join_sandbox_path(base: &str, relative_path: &str) -> String {
     format!("{}/{relative_path}", base.trim_end_matches('/'))
 }
 
+/// `text` as one single-quoted word of Bash source.
+pub(crate) fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -48,5 +53,12 @@ mod tests {
         assert_eq!(join_sandbox_path("/", "a"), "/a");
         assert_eq!(join_sandbox_path("", "a"), "a");
         assert_eq!(join_sandbox_path("/work", ""), "/work");
+    }
+
+    #[test]
+    fn a_quoted_word_survives_quotes_and_metacharacters() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote("a b;c$d"), "'a b;c$d'");
     }
 }

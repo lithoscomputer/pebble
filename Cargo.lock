@@ -1798,7 +1798,6 @@ dependencies = [
  "rustix",
  "sandbox-driver",
  "sandbox-driver-host",
- "sandbox-driver-testing",
  "serde",
  "serde_json",
  "sha2",
@@ -2264,7 +2263,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#0a073809773b0ae007b316973d8c0993ca6a5d21"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=parity-captured-exec#add93ca320dcd1112a0ca81734c8916830c82d6e"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -2284,7 +2283,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver-host"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#0a073809773b0ae007b316973d8c0993ca6a5d21"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=parity-captured-exec#add93ca320dcd1112a0ca81734c8916830c82d6e"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2302,7 +2301,7 @@ dependencies = [
 [[package]]
 name = "sandbox-driver-protocol"
 version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#0a073809773b0ae007b316973d8c0993ca6a5d21"
+source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=parity-captured-exec#add93ca320dcd1112a0ca81734c8916830c82d6e"
 dependencies = [
  "async-trait",
  "base64",
@@ -2315,18 +2314,6 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
-]
-
-[[package]]
-name = "sandbox-driver-testing"
-version = "0.1.0"
-source = "git+https://github.com/lithoscomputer/sandbox-driver?branch=main#0a073809773b0ae007b316973d8c0993ca6a5d21"
-dependencies = [
- "async-trait",
- "sandbox-driver",
- "serde_json",
- "tokio",
- "tokio-util",
 ]
 
 [[package]]
@@ -2691,7 +2678,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
  "windows-sys 0.52.0",
