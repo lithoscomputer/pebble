@@ -101,6 +101,24 @@ whose connection closes during the session is reported once as
 `McpServerDisconnected`, and every later call to its tools fails. The
 servers close when the agent shuts down. See `pebble_coding_agent::mcp`.
 
+### Session identity headers
+
+Every model request a session makes carries `x-pebble-session-id`, the
+session's ID, and a subagent's also carry `x-pebble-parent-session-id`, its
+parent's. The values are spelled exactly as the event envelope's `session_id`
+and `parent_session_id`, so a proxy that records the exchange can match it to
+the session's events. Pebble adds them per session to the client it was given,
+so children name themselves although the whole tree shares one client. Every
+request to an HTTP MCP server (`McpPlacement::Http`) carries the agent's
+`x-pebble-session-id` too; children call the same connection, so their MCP
+requests name the root. A header the server's configuration already names, in
+any case, is sent as configured. On model requests, a client default header of
+the same name is replaced, since one client value cannot name every session,
+while lithos-llm still lets catalog, codec, and credential headers win. The
+headers are always sent; the IDs are opaque and already on every event. The
+names are
+`SESSION_ID_HEADER` and `PARENT_SESSION_ID_HEADER`.
+
 ### Model fallback routes
 
 `CodingAgentBuilder::fallback_routes` names the routes a prompt continues on

@@ -39,7 +39,9 @@ use pebble_coding_agent::mcp::{
 use pebble_coding_agent::test_support::{
     MockEnvironment, ScriptedCall, ScriptedProvider, client_from, text_response, tool_call_response,
 };
-use pebble_coding_agent::{CodingAgent, CodingAgentOptions, ShutdownReason};
+use pebble_coding_agent::{
+    CodingAgent, CodingAgentOptions, PARENT_SESSION_ID_HEADER, SESSION_ID_HEADER, ShutdownReason,
+};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -474,18 +476,28 @@ async fn a_server_that_does_not_start_is_reported_and_skipped() {
 
 /// A streamable-HTTP MCP server with one echo tool, which insists on a
 /// header and records what it saw.
+/// The session and parent session one request named.
+type SeenSession = (Option<String>, Option<String>);
+
 #[derive(Clone, Default)]
 struct HttpEcho {
-    seen_token: Arc<Mutex<Vec<Option<String>>>>,
+    seen_token:    Arc<Mutex<Vec<Option<String>>>>,
+    seen_sessions: Arc<Mutex<Vec<SeenSession>>>,
 }
 
 async fn streamable(State(state): State<HttpEcho>, headers: HeaderMap, body: Bytes) -> Response {
-    state.seen_token.lock().await.push(
+    let header = |name: &str| {
         headers
-            .get("x-test-token")
+            .get(name)
             .and_then(|value| value.to_str().ok())
-            .map(str::to_owned),
-    );
+            .map(str::to_owned)
+    };
+    state.seen_token.lock().await.push(header("x-test-token"));
+    state
+        .seen_sessions
+        .lock()
+        .await
+        .push((header(SESSION_ID_HEADER), header(PARENT_SESSION_ID_HEADER)));
     let message: Value = serde_json::from_slice(&body).expect("JSON-RPC body");
     let Some(id) = message.get("id").cloned() else {
         return StatusCode::ACCEPTED.into_response();
@@ -564,6 +576,69 @@ async fn a_streamable_http_server_is_reached_with_its_headers() {
     assert!(
         seen.iter().all(|token| token.as_deref() == Some("secret")),
         "every request carried the header: {seen:?}"
+    );
+    agent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the agent shuts down");
+}
+
+#[tokio::test]
+async fn an_http_server_is_told_the_session_unless_its_configuration_names_one() {
+    let told = HttpEcho::default();
+    let pinned = HttpEcho::default();
+    let addr = serve(
+        Router::new()
+            .route("/told", post(streamable).with_state(told.clone()))
+            .route("/pinned", post(streamable).with_state(pinned.clone())),
+    )
+    .await;
+    let http = |name: &str, path: &str, headers: BTreeMap<String, String>| {
+        McpServer::new(name, McpPlacement::Http {
+            url: format!("http://{addr}/{path}"),
+            headers,
+            protocol: McpHttpProtocol::StreamableHttp,
+        })
+    };
+    let (mut agent, _events) = agent_with(
+        vec![
+            ScriptedCall::response(tool_call_response(
+                "mcp__told__echo",
+                "call_1",
+                json!({"message": "who am I"}),
+            )),
+            ScriptedCall::response(text_response("done")),
+        ],
+        vec![
+            http("told", "told", BTreeMap::new()),
+            http(
+                "pinned",
+                "pinned",
+                BTreeMap::from([("X-Pebble-Session-Id".to_owned(), "configured".to_owned())]),
+            ),
+        ],
+    )
+    .await;
+
+    let report = agent.prompt("echo").await;
+
+    assert!(report.result.is_ok(), "{report:?}");
+    let session = agent.id().to_owned();
+    let told = told.seen_sessions.lock().await;
+    // The handshake, the tool listing, and the call all name the session.
+    assert!(told.len() >= 3, "{told:?}");
+    assert!(
+        told.iter()
+            .all(|seen| *seen == (Some(session.clone()), None)),
+        "every request named the root session and no parent: {told:?}"
+    );
+    let pinned = pinned.seen_sessions.lock().await;
+    assert!(!pinned.is_empty());
+    assert!(
+        pinned
+            .iter()
+            .all(|seen| *seen == (Some("configured".to_owned()), None)),
+        "the configured header was sent instead of pebble's: {pinned:?}"
     );
     agent
         .shutdown(ShutdownReason::Completed)

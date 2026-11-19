@@ -30,7 +30,6 @@ use tokio::time::{sleep, timeout};
 
 use super::super::testing::{TestProfile, builder, wait_for_event};
 use super::*;
-use crate::SessionId;
 use crate::event::{EventSink, EventSinkError};
 use crate::human_input::{Answer, HumanInputError, HumanInputProvider, Question};
 use crate::projection::SessionProjection;
@@ -43,6 +42,7 @@ use crate::test_support::{
     multi_tool_call_response, routed_client, scripted_client,
 };
 use crate::types::ToolErrorKind;
+use crate::{PARENT_SESSION_ID_HEADER, SESSION_ID_HEADER, SessionId};
 
 /// The identifier the blocked child is supervised under, so a script can name
 /// it before it exists.
@@ -1396,6 +1396,70 @@ async fn a_request_that_names_two_lanes_fails_loudly() {
         .shutdown(ShutdownReason::Completed)
         .await
         .expect("the session shuts down");
+}
+
+/// Each session's model requests name that session, and a child's also name
+/// its parent, though the whole tree shares the application's one client.
+#[tokio::test]
+async fn each_sessions_model_requests_carry_its_own_identity_headers() {
+    let task = "child: count the files";
+    let (client, provider) = routed_client(
+        ScriptedProvider::new(vec![
+            ScriptedCall::response(tool_call_response(
+                "spawn_agent",
+                "spawn",
+                json!({ "task": task }),
+            )),
+            ScriptedCall::response(tool_call_response("wait", "wait", json!({}))),
+            ScriptedCall::response(text_response("parent done")),
+        ]),
+        vec![(task, ScriptedProvider::new(answers("counted 3 files")))],
+    );
+    let children = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&children);
+    let mut parent = builder(client)
+        .observe_children(Arc::new(move |child: &CodingRuntime| {
+            recorder
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(child.id().to_owned());
+        }))
+        .build()
+        .expect("the parent builds");
+    parent.initialize().await.expect("initialization succeeds");
+
+    let output = parent
+        .prompt("delegate the count")
+        .await
+        .expect("the prompt succeeds");
+
+    assert_eq!(output.as_deref(), Some("parent done"));
+    let root_id = parent.id().to_owned();
+    let child_id = children
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .first()
+        .cloned()
+        .expect("the parent built a child");
+    assert_ne!(child_id, root_id);
+    let root = provider.root().request_headers();
+    assert_eq!(root.len(), 3);
+    for headers in &root {
+        assert_eq!(
+            headers.get(SESSION_ID_HEADER),
+            Some(&root_id),
+            "{headers:?}"
+        );
+        assert_eq!(headers.get(PARENT_SESSION_ID_HEADER), None, "{headers:?}");
+    }
+    let child = provider.lane(task).request_headers();
+    assert_eq!(child.len(), 1);
+    assert_eq!(child[0].get(SESSION_ID_HEADER), Some(&child_id));
+    assert_eq!(child[0].get(PARENT_SESSION_ID_HEADER), Some(&root_id));
+    parent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the parent shuts down");
 }
 
 /// A parent that compacts after spawning a child sends a transcript quoting
