@@ -23,10 +23,15 @@ optional `models.toml` over the upstream catalog and supplies an application-own
 
 ## Setup
 
-Pebble is a library crate. It depends on `lithos-llm`, `sandbox-driver`, and
-(for tests) `twins` as git dependencies on exactly `branch = "main"`: not a
-`rev`, and not an omitted ref, which Cargo treats as a different source, so an
-application would link two copies. Pick up upstream changes with
+Pebble is a library crate. Its unfrozen Git dependencies use exactly
+`branch = "main"`; a different ref is a different Cargo source and can make an
+application link two copies. During the sandbox API migration, every
+`sandbox-driver` dependency instead uses the exact v2 revision
+`0a073809773b0ae007b316973d8c0993ca6a5d21` in `Cargo.toml`, shared with Petri and
+Fabro. A library's lockfile does not constrain downstream consumers. Keep this
+manifest pin and the nightly guard until all three migrate together.
+
+Pick up changes to the unfrozen dependencies with
 `cargo update -p <crate>` and commit `Cargo.lock`; an application's own
 `Cargo.lock` decides what it ships. If you change an API another Lithos
 repository uses, fix that repository promptly. Do not use a `[patch]` section.
