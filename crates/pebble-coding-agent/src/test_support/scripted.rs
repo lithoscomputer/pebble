@@ -17,6 +17,7 @@
 //! Every [`Request`] the script was asked with is captured, so a test can
 //! assert on what the session sent as well as on what it did with the answer.
 
+use std::collections::BTreeMap;
 use std::future::pending;
 use std::result::Result as StdResult;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -252,6 +253,7 @@ pub struct ScriptedProvider {
     completions:         Vec<ScriptedCompletion>,
     delay:               Duration,
     requests:            Mutex<Vec<Request>>,
+    request_headers:     Mutex<Vec<BTreeMap<String, String>>>,
     completion_requests: Mutex<Vec<Request>>,
     call_index:          AtomicUsize,
     completion_index:    AtomicUsize,
@@ -316,6 +318,7 @@ impl ScriptedProvider {
             completions: Vec::new(),
             delay: Duration::ZERO,
             requests: Mutex::new(Vec::new()),
+            request_headers: Mutex::new(Vec::new()),
             completion_requests: Mutex::new(Vec::new()),
             call_index: AtomicUsize::new(0),
             completion_index: AtomicUsize::new(0),
@@ -354,6 +357,16 @@ impl ScriptedProvider {
     #[must_use]
     pub fn requests(&self) -> Vec<Request> {
         self.requests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The default HTTP headers the client gave each streaming request, in
+    /// the order the requests arrived, with lowercase names.
+    #[must_use]
+    pub fn request_headers(&self) -> Vec<BTreeMap<String, String>> {
+        self.request_headers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -433,6 +446,21 @@ impl ProviderAdapter for ScriptedProvider {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(call.request().clone());
+        self.request_headers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(
+                call.context()
+                    .default_headers()
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.as_str().to_owned(),
+                            value.to_str().unwrap_or_default().to_owned(),
+                        )
+                    })
+                    .collect(),
+            );
         let index = self.call_index.fetch_add(1, Ordering::SeqCst);
         self.started.notify_one();
 

@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, PoisonError, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use lithos_llm::Client;
 use lithos_llm::catalog::MetadataError;
@@ -18,7 +18,6 @@ use pebble_agent::{
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
-use crate::SessionScope;
 use crate::compaction::{
     CompactionAccount, CompactionControl, CompactionOptions, CompactionOutcome,
 };
@@ -47,6 +46,7 @@ use crate::types::{
     ContextWindowSnapshot, FailoverContinuation, FailoverStop, InputContent, InputSource,
     McpServerStatus, MemoryFileSummary, Message, PermissionLevel, SkillSummary, ToolSummary, Usage,
 };
+use crate::{SessionId, SessionScope};
 
 /// A route a prompt continues on when its model fails for a reason another
 /// route might not share.
@@ -942,6 +942,14 @@ impl CodingAgentBuilder {
         if self.resume.is_some() && self.inner.has_model() {
             return Err(CodingAgentBuildError::ModelConflictsWithResume);
         }
+        // Named before anything starts, so the servers' requests carry the
+        // identity the session's events will: a resumed session keeps its
+        // record's, and a failover replacement resumes that same record.
+        let session_scope = match &self.resume {
+            Some(ResumeSource::Record(record, _)) => record.scope.clone(),
+            Some(ResumeSource::Export(state)) => state.record.scope.clone(),
+            None => SessionScope::root(SessionId::fresh()),
+        };
         // The servers start first, so their tools are in the registry every
         // runtime built from here — the first and any failover replacement —
         // is given.
@@ -953,8 +961,13 @@ impl CodingAgentBuilder {
                 .inner
                 .environment_ref()
                 .ok_or(CodingAgentBuildError::MissingEnvironment)?;
-            let servers =
-                McpServers::start(&self.mcp_servers, environment, self.port_routes.as_ref()).await;
+            let servers = McpServers::start(
+                &self.mcp_servers,
+                environment,
+                self.port_routes.as_ref(),
+                &session_scope,
+            )
+            .await;
             self.inner = self.inner.tools(servers.tools());
             Some(servers)
         };
@@ -969,7 +982,7 @@ impl CodingAgentBuilder {
                 recipe: self.inner.clone(),
             })
         });
-        let mut inner = match Self::build_runtime(self.resume, self.inner).await {
+        let mut inner = match Self::build_runtime(self.resume, self.inner, session_scope).await {
             Ok(inner) => inner,
             Err(error) => {
                 // The servers were started for an agent that will not exist:
@@ -1012,11 +1025,13 @@ impl CodingAgentBuilder {
         })
     }
 
-    /// Builds and initializes the runtime, fresh or from `resume`. A runtime
-    /// whose initialization fails is shut down before the error is returned.
+    /// Builds and initializes the runtime, fresh in `fresh_scope` or from
+    /// `resume`. A runtime whose initialization fails is shut down before the
+    /// error is returned.
     async fn build_runtime(
         resume: Option<ResumeSource>,
         inner: CodingRuntimeBuilder,
+        fresh_scope: SessionScope,
     ) -> Result<CodingRuntime, CodingAgentBuildError> {
         let (mut runtime, started) = match resume {
             Some(ResumeSource::Record(record, mode)) => {
@@ -1030,7 +1045,7 @@ impl CodingAgentBuilder {
                 (runtime, started)
             }
             None => {
-                let mut runtime = inner.build()?;
+                let mut runtime = inner.build_with_scope(fresh_scope, SystemTime::now())?;
                 let started = runtime.initialize().await;
                 (runtime, started)
             }

@@ -39,6 +39,7 @@ use crate::profiles::{FileEditToolKind, ProfileDeps};
 use crate::prompt_transform::SystemPromptTransform;
 use crate::redact::{NoRedaction, Redactor};
 use crate::search::seam::SearchProvider;
+use crate::session_headers::session_headers;
 use crate::subagent::{
     ChildDeps, ChildIdentity, ChildObserver, OpenSessions, SubagentOptions, SubagentSupervisor,
 };
@@ -407,7 +408,7 @@ impl CodingRuntimeBuilder {
     /// model is resolved, the profile chosen, the event pipeline opened, the
     /// supervisor spawned when children are allowed, and the tool registry
     /// assembled, in that order.
-    pub(super) fn build_with_scope(
+    pub(crate) fn build_with_scope(
         mut self,
         session_scope: SessionScope,
         created_at: SystemTime,
@@ -437,6 +438,14 @@ impl CodingRuntimeBuilder {
             .take()
             .ok_or(CodingAgentBuildError::MissingEnvironment)?;
 
+        // Every model request this session makes names it. A child is handed
+        // the client as the application gave it and names itself the same
+        // way, rather than inheriting this session's headers.
+        let application_client = self.client.clone();
+        self.client = self
+            .client
+            .with_default_headers(session_headers(&session_scope))
+            .expect("session headers keep only IDs that are valid header values");
         let model = ResolvedModel::resolve(&self.client, &selector)?;
         // Built here rather than inside the profile: the tool is the
         // application's answer — someone to ask — crossed with the harness's,
@@ -477,7 +486,7 @@ impl CodingRuntimeBuilder {
         let supervisor = self.subagents.is_enabled().then(|| {
             SubagentSupervisor::new(Arc::new(ChildDeps {
                 parent_files: prompt_files.clone(),
-                client: self.client.clone(),
+                client: application_client,
                 model_selector: model.handle.to_string(),
                 profile: Arc::clone(&profile),
                 environment: Arc::clone(&environment),
