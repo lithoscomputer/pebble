@@ -48,6 +48,7 @@ use crate::tool::{
     ToolEnvProvider, ToolRegistry,
 };
 use crate::tools::{WebFetchSummarizer, make_question_tool, make_web_search_tool};
+use crate::trace_context::{SessionTrace, TraceContext};
 use crate::types::{AgentProfileKind, CodingAgentEvent, PermissionLevel};
 use crate::{SessionId, SessionScope};
 
@@ -101,6 +102,8 @@ pub(crate) struct CodingRuntimeBuilder {
     subagents:            SubagentOptions,
     child_observer:       Option<ChildObserver>,
     child:                Option<ChildIdentity>,
+    /// The trace this session's spans join; a fresh one when absent.
+    trace_context:        Option<TraceContext>,
 }
 
 impl CodingRuntimeBuilder {
@@ -128,7 +131,21 @@ impl CodingRuntimeBuilder {
             subagents: SubagentOptions::disabled(),
             child_observer: None,
             child: None,
+            trace_context: None,
         }
+    }
+
+    /// Places every span this session and its children start in `context`.
+    pub(crate) fn trace_context(mut self, context: TraceContext) -> Self {
+        self.trace_context = Some(context);
+        self
+    }
+
+    /// Starts the session's own trace now, when it was given none, so every
+    /// runtime built from this builder joins the same one.
+    pub(crate) fn settle_trace_context(mut self) -> Self {
+        self.trace_context.get_or_insert_with(TraceContext::new);
+        self
     }
 
     /// Lets the application adjust the system prompt the profile writes.
@@ -447,6 +464,8 @@ impl CodingRuntimeBuilder {
             .with_default_headers(session_headers(&session_scope))
             .expect("session headers keep only IDs that are valid header values");
         let model = ResolvedModel::resolve(&self.client, &selector)?;
+        let trace_context = self.trace_context.take().unwrap_or_default();
+        let trace = SessionTrace::new(trace_context.clone(), id.as_str());
         // Built here rather than inside the profile: the tool is the
         // application's answer — someone to ask — crossed with the harness's,
         // and a harness with no question tool of its own, Gemini, answers
@@ -502,6 +521,7 @@ impl CodingRuntimeBuilder {
                 event_emitter: emitter.clone(),
                 observer,
                 open_sessions,
+                trace_context,
             }))
         });
         let registry = self.assemble_registry(
@@ -522,6 +542,7 @@ impl CodingRuntimeBuilder {
                 skills_tokens: 0,
             }),
             session_scope,
+            trace,
             created_at,
             config: self.options,
             conversation: Arc::new(Mutex::new(ConversationState::new(

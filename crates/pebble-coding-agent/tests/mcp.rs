@@ -41,6 +41,7 @@ use pebble_coding_agent::test_support::{
 };
 use pebble_coding_agent::{
     CodingAgent, CodingAgentOptions, PARENT_SESSION_ID_HEADER, SESSION_ID_HEADER, ShutdownReason,
+    TraceContext,
 };
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -483,6 +484,8 @@ type SeenSession = (Option<String>, Option<String>);
 struct HttpEcho {
     seen_token:    Arc<Mutex<Vec<Option<String>>>>,
     seen_sessions: Arc<Mutex<Vec<SeenSession>>>,
+    /// The `params._meta` of each `tools/call`.
+    call_meta:     Arc<Mutex<Vec<Value>>>,
 }
 
 async fn streamable(State(state): State<HttpEcho>, headers: HeaderMap, body: Bytes) -> Response {
@@ -515,6 +518,11 @@ async fn streamable(State(state): State<HttpEcho>, headers: HeaderMap, body: Byt
             "inputSchema": {"type": "object", "properties": {"message": {"type": "string"}}, "required": ["message"]}
         }]}),
         "tools/call" => {
+            state
+                .call_meta
+                .lock()
+                .await
+                .push(message["params"]["_meta"].clone());
             let text = message["params"]["arguments"]["message"]
                 .as_str()
                 .unwrap_or("")
@@ -640,6 +648,123 @@ async fn an_http_server_is_told_the_session_unless_its_configuration_names_one()
             .all(|seen| *seen == (Some("configured".to_owned()), None)),
         "the configured header was sent instead of pebble's: {pinned:?}"
     );
+    agent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the agent shuts down");
+}
+
+/// The span an envelope records, as `(trace_id, span_id)`.
+fn recorded_span(event: &CodingAgentEvent) -> (String, String) {
+    assert_eq!(
+        event.parent_span_id.as_deref(),
+        Some("00f067aa0ba902b7"),
+        "the span's parent is the caller's: {event:?}"
+    );
+    (
+        event.trace_id.clone().expect("the event records its trace"),
+        event.span_id.clone().expect("the event records its span"),
+    )
+}
+
+#[tokio::test]
+async fn a_tools_call_carries_the_calls_span_and_tool_call_id_in_its_meta() {
+    let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+    let parent = format!("00-{trace_id}-00f067aa0ba902b7-01");
+    let state = HttpEcho::default();
+    let addr = serve(
+        Router::new()
+            .route("/mcp", post(streamable))
+            .with_state(state.clone()),
+    )
+    .await;
+    let server = McpServer::new("web", McpPlacement::Http {
+        url:      format!("http://{addr}/mcp"),
+        headers:  BTreeMap::new(),
+        protocol: McpHttpProtocol::StreamableHttp,
+    });
+    let (client, provider) = client_from(ScriptedProvider::new(vec![
+        ScriptedCall::response(tool_call_response(
+            "mcp__web__echo",
+            "call_1",
+            json!({"message": "traced"}),
+        )),
+        ScriptedCall::response(text_response("done")),
+    ]));
+    let context = TraceContext::from_traceparent(&parent)
+        .and_then(|context| context.with_baggage("run_id", "run 7"))
+        .expect("a valid context");
+    let mut agent = CodingAgent::builder(client, Arc::new(MockEnvironment::linux()))
+        .model("test/model")
+        .permission_level(PermissionLevel::Full)
+        .mcp_servers(vec![server])
+        .trace_context(context)
+        .build()
+        .await
+        .expect("the coding agent builds");
+    let mut events = agent.subscribe();
+
+    let report = agent.prompt("echo").await;
+
+    assert!(report.result.is_ok(), "{report:?}");
+    let session = agent.id().to_owned();
+    let mut published = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        published.push(event);
+    }
+    // The call's events all record one span in the caller's trace.
+    let call_spans: Vec<_> = published
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event,
+                CodingEvent::ToolCallStarted { .. } | CodingEvent::ToolCallCompleted { .. }
+            )
+        })
+        .map(recorded_span)
+        .collect();
+    assert_eq!(call_spans.len(), 2, "{published:?}");
+    assert_eq!(call_spans[0], call_spans[1]);
+    let (recorded_trace, call_span) = call_spans[0].clone();
+    assert_eq!(recorded_trace, trace_id);
+    assert_ne!(call_span, "00f067aa0ba902b7");
+    // The server was sent that span, with the call's ID in the baggage.
+    // rmcp's own `progressToken` rides alongside.
+    let meta = state.call_meta.lock().await;
+    assert_eq!(meta.len(), 1, "{meta:?}");
+    assert_eq!(
+        meta[0]["traceparent"],
+        json!(format!("00-{trace_id}-{call_span}-01"))
+    );
+    assert_eq!(
+        meta[0]["baggage"],
+        json!(format!(
+            "run_id=run%207,session_id={session},tool_call_id=call_1"
+        ))
+    );
+    assert_eq!(meta[0].get("tracestate"), None);
+    // Each model request was sent its own span, the one its events record.
+    let model_spans: Vec<_> = published
+        .iter()
+        .filter(|event| matches!(event.event, CodingEvent::LlmRequestStarted { .. }))
+        .map(recorded_span)
+        .collect();
+    let sent = provider.request_headers();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(model_spans.len(), 2, "{published:?}");
+    for (headers, (_, span)) in sent.iter().zip(&model_spans) {
+        assert_ne!(span, &call_span);
+        assert_eq!(
+            headers.get("traceparent"),
+            Some(&format!("00-{trace_id}-{span}-01")),
+            "{headers:?}"
+        );
+        assert_eq!(
+            headers.get("baggage"),
+            Some(&format!("run_id=run%207,session_id={session}")),
+            "{headers:?}"
+        );
+    }
     agent
         .shutdown(ShutdownReason::Completed)
         .await

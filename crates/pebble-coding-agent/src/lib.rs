@@ -59,6 +59,7 @@ mod task_reminder;
 mod template;
 mod tool;
 pub mod tools;
+pub mod trace_context;
 mod truncation;
 mod types;
 
@@ -94,4 +95,5 @@ pub use self::error::{CompactionError, Error, InterruptReason, Result, TaskKind}
 pub use self::memory::{MemoryDocument, ProjectMemory};
 pub use self::session_headers::{PARENT_SESSION_ID_HEADER, SESSION_ID_HEADER};
 pub use self::skills::SkillExpansionError;
+pub use self::trace_context::{TraceContext, TraceContextError};
 pub use self::types::{InputContent, InputSource};

@@ -59,6 +59,7 @@ use crate::SessionScope;
 use crate::environment::Environment;
 use crate::session_headers::session_headers;
 use crate::tool::{RegisteredTool, ToolContext, ToolError};
+use crate::trace_context::Span;
 use crate::types::{
     CodingEvent, McpServerStatus, McpToolSummary, ToolSource, parse_qualified_name as parse_name,
     sanitize_mcp_name,
@@ -432,8 +433,12 @@ fn registered_tool(
         let server_name = server_name.clone();
         let original = original.clone();
         Box::pin(async move {
+            // The call's span travels in `params._meta`, per the OpenTelemetry
+            // MCP convention: the only place a per-call trace context and tool
+            // call ID fit, since HTTP headers belong to the connection.
+            let meta = context.span.as_ref().map(Span::entries).unwrap_or_default();
             let outcome = connection
-                .call(&original, arguments, context.cancel())
+                .call(&original, arguments, meta, context.cancel())
                 .await;
             // The close is reported by the call that first observed it, on
             // the stream of whichever session made that call; the flag on the

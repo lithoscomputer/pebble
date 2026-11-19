@@ -46,7 +46,7 @@ use crate::types::{
     ContextWindowSnapshot, FailoverContinuation, FailoverStop, InputContent, InputSource,
     McpServerStatus, MemoryFileSummary, Message, PermissionLevel, SkillSummary, ToolSummary, Usage,
 };
-use crate::{SessionId, SessionScope};
+use crate::{SessionId, SessionScope, TraceContext};
 
 /// A route a prompt continues on when its model fails for a reason another
 /// route might not share.
@@ -771,6 +771,31 @@ impl CodingAgentBuilder {
         self
     }
 
+    /// Places this agent's model requests and tool calls in the caller's W3C
+    /// trace.
+    ///
+    /// Each model request and each tool call is a span whose parent is the
+    /// span `context` names, when it names one. Every model request sends the
+    /// span as `traceparent` (with `tracestate`, when given) and the context's
+    /// baggage plus `session_id` as `baggage`. Every MCP `tools/call` carries
+    /// the same entries, with `tool_call_id` added to the baggage, in
+    /// `params._meta`. The events of each call record its span in
+    /// [`CodingAgentEvent::trace_id`](crate::events::CodingAgentEvent::trace_id)
+    /// and [`span_id`](crate::events::CodingAgentEvent::span_id).
+    ///
+    /// Subagents inherit the context, and so does a failover replacement. It
+    /// is not part of a record or an export: a resumed agent joins whatever
+    /// trace its builder is given. Without one, the agent starts a trace of
+    /// its own.
+    ///
+    /// Pebble owns the `traceparent`, `tracestate`, and `baggage` headers on
+    /// model requests and replaces client default headers with those names,
+    /// so pass the caller's context here rather than on the client.
+    pub fn trace_context(mut self, context: TraceContext) -> Self {
+        self.inner = self.inner.trace_context(context);
+        self
+    }
+
     /// Adds tools on top of the selected coding profile.
     /// Duplicate visible names or stable identities are build errors. Use
     /// [`replace_tool`](Self::replace_tool) for an intentional replacement.
@@ -950,6 +975,8 @@ impl CodingAgentBuilder {
             Some(ResumeSource::Export(state)) => state.record.scope.clone(),
             None => SessionScope::root(SessionId::fresh()),
         };
+        // Settled once, so a failover replacement joins the same trace.
+        self.inner = self.inner.settle_trace_context();
         // The servers start first, so their tools are in the registry every
         // runtime built from here — the first and any failover replacement —
         // is given.

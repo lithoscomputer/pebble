@@ -58,6 +58,7 @@ use crate::skills::{Skill, SkillExpansion, discover_skills};
 use crate::subagent::{SubagentEventCallback, SubagentSupervisor};
 use crate::tool::{ToolDefinitionWithSource, ToolEnvProvider, ToolRegistry};
 use crate::tools::skill::make_use_skill_tool_for_vocabulary;
+use crate::trace_context::SessionTrace;
 #[cfg(test)]
 use crate::types::PermissionLevel;
 use crate::types::{
@@ -186,6 +187,8 @@ pub(crate) struct CodingRuntime {
     model_context:     Arc<SessionModel>,
     resources:         Arc<PromptResources>,
     session_scope:     SessionScope,
+    /// The trace each model request and tool call of this session joins.
+    trace:             Arc<SessionTrace>,
     created_at:        SystemTime,
     config:            CodingAgentOptions,
     /// The conversation and what the current prompt has accumulated, shared

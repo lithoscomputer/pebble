@@ -21,9 +21,10 @@
 //! act on.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::mem::take;
 use std::result::Result as StdResult;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use async_trait::async_trait;
 use lithos_llm::types::{ContentPart, ToolCall, ToolResult};
@@ -42,6 +43,7 @@ use crate::environment::Environment;
 use crate::event::{Emitter, OutputCaptureStats, SessionBoundEmitter};
 use crate::human_input::HumanInputProvider;
 use crate::redact::Redactor;
+use crate::trace_context::{SessionTrace, Span};
 use crate::truncation::{
     OutputBudgets, ToolOutputLimits, preview_tool_output, serialized_json_bytes,
     truncate_tool_output,
@@ -72,6 +74,11 @@ pub(crate) struct CodingToolService {
     /// the message of every failed call, which can carry an OS error naming a
     /// path the model asked for.
     redactor:          Arc<dyn Redactor>,
+    /// The trace each call's span joins; absent for a standalone runner.
+    trace:             Option<Arc<SessionTrace>>,
+    /// The span of each call in flight, by tool call ID, from its start to
+    /// its result.
+    spans:             Arc<Mutex<HashMap<String, Span>>>,
 }
 
 impl CodingToolService {
@@ -94,7 +101,25 @@ impl CodingToolService {
             tool_env_provider: None,
             human_input: None,
             redactor,
+            trace: None,
+            spans: Arc::default(),
         }
+    }
+
+    /// Starts a span in `trace` for every call.
+    #[must_use]
+    pub(crate) fn with_trace(mut self, trace: Arc<SessionTrace>) -> Self {
+        self.trace = Some(trace);
+        self
+    }
+
+    /// The span of the call `tool_call_id`, while it is in flight.
+    fn span(&self, tool_call_id: &str) -> Option<Span> {
+        self.spans
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(tool_call_id)
+            .cloned()
     }
 
     /// Sets where a call gets its extra environment variables.
@@ -232,15 +257,20 @@ impl CodingToolService {
             );
         };
 
-        let bound = Arc::new(SessionBoundEmitter::new(
-            self.emitter.clone(),
-            self.session_scope.session_id().as_str(),
-            Some(call.id.clone()),
-        ));
+        let span = self.span(&call.id);
+        let bound = Arc::new(
+            SessionBoundEmitter::new(
+                self.emitter.clone(),
+                self.session_scope.session_id().as_str(),
+                Some(call.id.clone()),
+            )
+            .in_span(span.clone()),
+        );
         let mut context = ToolContext::new(Arc::clone(&self.env))
             .with_cancel(cancel.clone())
             .with_session(self.session_scope.clone())
             .with_tool_call_id(call.id.clone())
+            .with_span(span)
             .with_coding_event_emitter(Arc::clone(&bound) as Arc<dyn CodingEventEmitter>)
             .with_redactor(Arc::clone(&self.redactor));
         if let Some(provider) = &self.tool_env_provider {
@@ -362,7 +392,14 @@ impl CodingToolService {
 
     /// Publishes that a call started.
     pub(crate) fn emit_started(&self, call: &ToolCall) {
-        self.emit(&call.id, CodingEvent::ToolCallStarted {
+        let span = self.trace.as_ref().map(|trace| trace.tool_span(&call.id));
+        if let Some(span) = &span {
+            self.spans
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(call.id.clone(), span.clone());
+        }
+        self.emit(&call.id, span.as_ref(), CodingEvent::ToolCallStarted {
             tool_name:    call.name.clone(),
             tool_call_id: call.id.clone(),
             arguments:    call
@@ -387,6 +424,13 @@ impl CodingToolService {
         let output = output_value(result);
         let text = result_text(result);
         let stats = output_stats.unwrap_or_else(|| OutputCaptureStats::complete(text.len()));
+        // The call's span ends with its result.
+        let span = self
+            .spans
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&result.tool_call_id);
+        let span = span.as_ref();
         // The same bounded output goes out twice on purpose: the delta is the
         // live-streaming feed and `ToolCallCompleted` is the durable record,
         // so a store keeps the completed event and drops deltas as ephemeral.
@@ -394,10 +438,14 @@ impl CodingToolService {
         // chunk of process output) has already fed the live feed; this last
         // delta is the rendered result in the same channel, so a reader that
         // follows only deltas still sees how the call ended.
-        self.emit(&result.tool_call_id, CodingEvent::ToolCallOutputDelta {
-            delta: text.into_owned(),
-        });
-        self.emit(&result.tool_call_id, CodingEvent::ToolCallCompleted {
+        self.emit(
+            &result.tool_call_id,
+            span,
+            CodingEvent::ToolCallOutputDelta {
+                delta: text.into_owned(),
+            },
+        );
+        self.emit(&result.tool_call_id, span, CodingEvent::ToolCallCompleted {
             tool_name: result.name.clone().unwrap_or_default(),
             tool_call_id: result.tool_call_id.clone(),
             output,
@@ -412,11 +460,12 @@ impl CodingToolService {
 
     /// Publishes an event about one call, stamping the call on the envelope so
     /// a fragment with no identity of its own is still attributable.
-    fn emit(&self, tool_call_id: &str, event: CodingEvent) {
-        self.emitter.emit_with_tool_call_id(
+    fn emit(&self, tool_call_id: &str, span: Option<&Span>, event: CodingEvent) {
+        self.emitter.emit_in_span(
             self.session_scope.session_id().as_str(),
             event,
             Some(tool_call_id.to_owned()),
+            span,
         );
     }
 }
