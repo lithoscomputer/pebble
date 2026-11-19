@@ -594,6 +594,7 @@ impl CodingAgentBridge {
             tool_call_count: tool_calls.len(),
             context_window,
             reasoning,
+            response_id: response.id.clone(),
         });
     }
 
