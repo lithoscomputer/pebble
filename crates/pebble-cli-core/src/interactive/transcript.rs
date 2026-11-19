@@ -454,6 +454,7 @@ mod tests {
                 tool_call_count: 0,
                 context_window:  None,
                 reasoning:       None,
+                response_id:     None,
             }),
             false,
         );

@@ -129,6 +129,7 @@ fn every_variant() -> Vec<CodingEvent> {
             tool_call_count: 2,
             context_window:  Some(context_window()),
             reasoning:       Some(ReasoningOutput::new("checked the parser", "step one")),
+            response_id:     Some("msg_01XFDUDYJgAACzvnptvVoYEL".into()),
         },
         CodingEvent::TextDelta {
             delta: "I up".into(),

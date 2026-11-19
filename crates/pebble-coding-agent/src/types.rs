@@ -1093,6 +1093,13 @@ pub enum CodingEvent {
         /// streaming buffers never become durable reasoning.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning:       Option<ReasoningOutput>,
+        /// The provider's identifier for this response, such as `msg_…` or
+        /// `resp_…`, when the provider reported one.
+        ///
+        /// Lets a consumer match the turn to the same exchange recorded
+        /// elsewhere, such as by a proxy in front of the provider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id:     Option<String>,
     },
     /// A fragment of assistant text.
     TextDelta {
@@ -2498,6 +2505,7 @@ mod tests {
             tool_call_count: 2,
             context_window:  None,
             reasoning:       None,
+            response_id:     None,
         };
         let value = serde_json::to_value(&event).expect("serializes");
         let payload = &value["AssistantMessage"];
@@ -2508,6 +2516,10 @@ mod tests {
         assert_eq!(payload["usage"]["cost"]["source"], json!("catalog"));
         assert!(payload.get("context_window").is_none());
         assert!(payload.get("reasoning").is_none());
+        assert!(
+            payload.get("response_id").is_none(),
+            "an absent response id is omitted, matching events recorded before the field"
+        );
         assert_eq!(
             serde_json::from_value::<CodingEvent>(value).expect("parses"),
             event

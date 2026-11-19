@@ -41,6 +41,7 @@ pub(super) fn message(input: u64, output: u64, cost: Option<u64>) -> CodingEvent
         tool_call_count: 0,
         context_window:  None,
         reasoning:       None,
+        response_id:     None,
     }
 }
 
@@ -96,6 +97,7 @@ pub(super) fn turn(text: &str, reasoning: Option<ReasoningOutput>) -> CodingEven
         tool_call_count: 0,
         context_window: None,
         reasoning,
+        response_id: None,
     }
 }
 

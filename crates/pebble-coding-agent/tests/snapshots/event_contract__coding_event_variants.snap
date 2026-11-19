@@ -81,7 +81,8 @@ expression: render(&every_variant())
       "reasoning": {
         "summary": "checked the parser",
         "trace": "step one"
-      }
+      },
+      "response_id": "msg_01XFDUDYJgAACzvnptvVoYEL"
     }
   },
   {
