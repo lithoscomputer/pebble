@@ -31,7 +31,7 @@ use sandbox_driver::{
 use tokio::io::AsyncReadExt as _;
 
 use super::environment::SandboxEnvironment;
-use super::exec::{BASH_ENV_VAR, ExecResult, shell_source};
+use super::exec::{BASH_ENV_VAR, ExecResult, bash_source};
 use super::path::resolve_path;
 
 /// A driver-facing [`ExecResult`] with the given streams, for scripting a
@@ -182,7 +182,7 @@ impl MockSandbox {
             grep_stdout.push('\n');
         }
         exec.respond_with(move |spec| {
-            let source = shell_source(spec)?;
+            let source = bash_source(spec)?;
             if source.starts_with("command -v rg") {
                 return Some(exec_result("", "", Some(0), Termination::Exited, 0));
             }
@@ -297,12 +297,12 @@ impl ScriptedExec {
         self.script().recorded.clone()
     }
 
-    /// Every command, in order: a shell script's source, or the argv joined
+    /// Every command, in order: a Bash script's source, or the argv joined
     /// by spaces.
     pub fn commands(&self) -> Vec<String> {
         self.recorded()
             .iter()
-            .map(|spec| shell_source(spec).map_or_else(|| spec.argv.join(" "), str::to_string))
+            .map(|spec| bash_source(spec).map_or_else(|| spec.argv.join(" "), str::to_string))
             .collect()
     }
 
@@ -400,7 +400,7 @@ impl ScriptedSandbox {
     /// The adapter tests a path with `[ -e '<path>' ]`; answering that from
     /// the in-memory filesystem keeps file existence real in the mock.
     fn exists_answer(&self, spec: &ExecSpec) -> Option<ExecResult> {
-        let quoted = shell_source(spec)?
+        let quoted = bash_source(spec)?
             .strip_prefix("[ -e '")?
             .strip_suffix("' ]")?;
         let path = quoted.replace("'\\''", "'");
@@ -691,7 +691,7 @@ mod tests {
         let streaming = mock
             .sandbox()
             .exec()
-            .run_streaming(ExecSpec::shell("x"), ExecControls::default(), None)
+            .run_streaming(ExecSpec::bash("x"), ExecControls::default(), None)
             .await
             .unwrap();
         assert!(!streaming.streams_separated);

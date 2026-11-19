@@ -14,7 +14,6 @@ use sandbox_driver::{ExecControls, ExecSpec};
 
 use super::exec::{CommandFailure, ExecResult, SandboxExec};
 use super::path::shell_quote;
-use super::sanitize::OutputSanitization;
 use crate::environment::{EnvResult, EnvironmentError, EnvironmentErrorKind, GrepOptions};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -27,7 +26,7 @@ const SIGPIPE_EXIT: i32 = 141;
 
 /// Whether `rg` is on the sandbox's `PATH`. A failed probe is "no".
 pub(super) async fn ripgrep_available(exec: &SandboxExec<'_>) -> bool {
-    let mut spec = ExecSpec::shell("command -v rg >/dev/null 2>&1");
+    let mut spec = ExecSpec::bash("command -v rg >/dev/null 2>&1");
     spec.timeout_ms = Some(duration_ms(PROBE_TIMEOUT));
     exec.run_streaming(spec, ExecControls::default(), None)
         .await
@@ -173,17 +172,15 @@ fn nul_separated(stdout: &[u8], strip: &str) -> Vec<String> {
         .collect()
 }
 
-/// Runs a search command with its output raw: the NUL separators it parses
-/// are control characters the policy would otherwise strip.
+/// Runs a search command for parsing: raw, since the NUL separators it
+/// parses are control characters the policy would strip, and whole, since a
+/// short read would be a wrong list of matches.
 async fn run(exec: &SandboxExec<'_>, command: &str, timeout: Duration) -> EnvResult<ExecResult> {
-    let mut spec = ExecSpec::shell(command);
+    let mut spec = ExecSpec::bash(command);
     spec.timeout_ms = Some(duration_ms(timeout));
-    exec.clone()
-        .with_output_sanitization(OutputSanitization::Raw)
-        .run_streaming(spec, ExecControls::default(), None)
+    exec.run_for_parsing(spec)
         .await
-        .map(|streaming| streaming.result)
-        .map_err(|error| super::environment::environment_error("Failed to run a search", error))
+        .map_err(|error| super::environment::parse_error("Failed to run a search", error))
 }
 
 fn failed(message: &str, label: &str, result: ExecResult) -> EnvironmentError {

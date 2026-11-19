@@ -7,9 +7,9 @@
 //! [`ExecResult`] and [`ExecStreamingResult`]. This module adds the policy on
 //! the way in and keeps what pebble reads on the way out.
 //!
-//! A command is shell source run by [`ExecSpec::shell`]: Bash when the
-//! sandbox has it (POSIX `sh` otherwise), never a login shell, with
-//! `BASH_ENV` unset whatever the caller passed. It ends in one of three ways:
+//! A command is Bash source run by [`ExecSpec::bash`]: `bash -c <script>`,
+//! never a login shell, with `BASH_ENV` blank whatever the caller passed. A
+//! sandbox without Bash fails the command. It ends in one of three ways:
 //!
 //! - **timeout**: the policy's own deadline passes and the policy runs the stop
 //!   ladder: the driver's `term` stop, then its `kill` stop after
@@ -33,7 +33,7 @@
 //! API has neither, so they live here. The new Host provider kills a command
 //! outright when the spec's `timeout_ms` passes, so the policy never sets it
 //! and keeps the deadline itself, to keep the `TERM` grace on a timeout.
-//! `Captured` has no duration, so the policy times the call. The driver keeps
+//! The driver keeps
 //! output raw, so the retained head and tail are sanitized after capture: the
 //! counts are of the raw bytes, and an escape sequence cut by the gap between
 //! head and tail is dropped up to its terminator.
@@ -44,11 +44,12 @@ use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use sandbox_driver::{
     Captured, CapturedOutput, DEFAULT_CAPTURE_BYTES, Error as DriverError, ExecControls, ExecSpec,
-    OutputLoss, OutputSink, OutputStream, Sandbox, Termination, run_captured_with, stop_signal,
+    OutputLoss, OutputSink, OutputStream, Sandbox, Termination, run_captured, run_captured_with,
+    stop_signal,
 };
 use tokio::time;
 use tokio_util::sync::CancellationToken;
@@ -71,13 +72,11 @@ pub const DEFAULT_RETAINED_OUTPUT_BYTES: usize = DEFAULT_CAPTURE_BYTES;
 /// it for every shell script.
 pub const BASH_ENV_VAR: &str = "BASH_ENV";
 
-/// The script of a spec [`ExecSpec::shell`] built: its last argument.
+/// The script of a spec [`ExecSpec::bash`] built: `bash -c <script>`.
 #[must_use]
-pub fn shell_source(spec: &ExecSpec) -> Option<&str> {
+pub fn bash_source(spec: &ExecSpec) -> Option<&str> {
     match spec.argv.as_slice() {
-        [program, flag, .., script] if program == "sh" && flag == "-c" && spec.argv.len() == 5 => {
-            Some(script)
-        }
+        [program, flag, script] if program == "bash" && flag == "-c" => Some(script),
         _ => None,
     }
 }
@@ -97,7 +96,7 @@ pub struct ExecResult {
     pub stdout:      Vec<u8>,
     /// Retained standard error, after sanitization.
     pub stderr:      Vec<u8>,
-    /// Time from starting the command to its end, measured by the policy.
+    /// How long the caller waited for the command, as the driver measured it.
     pub duration:    Duration,
 }
 
@@ -233,11 +232,11 @@ impl<'a> SandboxExec<'a> {
         self.stop_grace
     }
 
-    /// Runs shell source to completion and returns its captured output.
+    /// Runs Bash source to completion and returns its captured output.
     ///
-    /// The script runs as [`ExecSpec::shell`] runs it: under Bash when the
-    /// sandbox has it, never a login shell, `BASH_ENV` unset, no `errexit`
-    /// or `pipefail`. `None` for `timeout` runs without a deadline.
+    /// The script runs as [`ExecSpec::bash`] runs it: `bash -c`, never a
+    /// login shell, `BASH_ENV` blank, no `errexit` or `pipefail`. `None` for
+    /// `timeout` runs without a deadline.
     pub async fn run(
         &self,
         command: &str,
@@ -246,7 +245,7 @@ impl<'a> SandboxExec<'a> {
         env_vars: Option<&HashMap<String, String>>,
         cancel_token: Option<CancellationToken>,
     ) -> Result<ExecResult, DriverError> {
-        let mut spec = ExecSpec::shell(command);
+        let mut spec = ExecSpec::bash(command);
         spec.timeout_ms = timeout.map(duration_ms);
         spec.working_directory = working_dir.map(str::to_string);
         for (key, value) in env_vars.into_iter().flatten() {
@@ -309,7 +308,6 @@ impl<'a> SandboxExec<'a> {
             kill.cancel();
             future::pending::<()>().await;
         };
-        let started = Instant::now();
         let captured = tokio::select! {
             captured = run_captured_with(
                 self.sandbox,
@@ -320,7 +318,6 @@ impl<'a> SandboxExec<'a> {
             () = ladder => unreachable!("the ladder never finishes"),
             () = forward_kill => unreachable!("forwarding never finishes"),
         };
-        let duration = started.elapsed();
         let (tail, streams_separated) = {
             let mut live = live.lock().unwrap_or_else(PoisonError::into_inner);
             (live.finish(), live.streams_separated)
@@ -330,12 +327,7 @@ impl<'a> SandboxExec<'a> {
                 sink(stream, bytes).await?;
             }
         }
-        Ok(self.to_result(
-            captured,
-            timed_out.into_inner(),
-            streams_separated,
-            duration,
-        ))
+        Ok(self.to_result(captured, timed_out.into_inner(), streams_separated))
     }
 
     /// Fills what a spec leaves open and takes its deadline for the policy.
@@ -343,17 +335,42 @@ impl<'a> SandboxExec<'a> {
         if spec.working_directory.is_none() {
             spec.working_directory.clone_from(&self.working_dir);
         }
-        // Parity gap: `ExecSpec::shell` unsets `BASH_ENV` in its launcher,
-        // but Host starts every command under a `/bin/bash -c` sentinel that
-        // already sourced a `BASH_ENV` the spec passed. Blanking it keeps a
-        // caller's startup file from running ahead of the script anywhere.
+        // Parity gap: `ExecSpec::bash` starts with a blank `BASH_ENV`, but a
+        // caller's env is added after it, and Host starts every command
+        // under a `/bin/bash -c` sentinel that sources a `BASH_ENV` the spec
+        // passes. Blanking it again keeps a caller's startup file from
+        // running ahead of the script.
         // TODO(parity): drop this once sandbox-driver#100 (Host blanks
         // `BASH_ENV` for every command) merges.
-        if shell_source(&spec).is_some() {
+        if bash_source(&spec).is_some() {
             spec.env.insert(BASH_ENV_VAR.to_string(), String::new());
         }
         let deadline = spec.timeout_ms.take().map(Duration::from_millis);
         (spec, deadline)
+    }
+
+    /// Runs `spec` for output the adapter parses: raw, under the provider's
+    /// own deadline (no stop grace), in the policy's working directory, and
+    /// whole: a capture that lost or omitted output is [`IncompleteOutput`],
+    /// so a short read is an error and not a wrong answer.
+    ///
+    /// [`IncompleteOutput`]: sandbox_driver::IncompleteOutput
+    pub(super) async fn run_for_parsing(
+        &self,
+        mut spec: ExecSpec,
+    ) -> Result<ExecResult, ParseError> {
+        if spec.working_directory.is_none() {
+            spec.working_directory.clone_from(&self.working_dir);
+        }
+        if bash_source(&spec).is_some() {
+            spec.env.insert(BASH_ENV_VAR.to_string(), String::new());
+        }
+        let captured = run_captured(self.sandbox, spec)
+            .await
+            .map_err(ParseError::Driver)?
+            .into_complete()
+            .map_err(ParseError::Incomplete)?;
+        Ok(raw_result(captured))
     }
 
     fn to_result(
@@ -361,12 +378,12 @@ impl<'a> SandboxExec<'a> {
         captured: Captured,
         timed_out: bool,
         streams_separated: bool,
-        duration: Duration,
     ) -> ExecStreamingResult {
         let Captured {
             outcome,
             stdout,
             stderr,
+            duration,
         } = captured;
         let (stdout, stdout_capture) = self.retained(&stdout);
         let (stderr, stderr_capture) = self.retained(&stderr);
@@ -403,6 +420,31 @@ impl<'a> SandboxExec<'a> {
             omitted_bytes,
         };
         (bytes, stats)
+    }
+}
+
+/// Why output the adapter meant to parse is not there to parse.
+#[derive(Debug)]
+pub(super) enum ParseError {
+    Driver(DriverError),
+    Incomplete(sandbox_driver::IncompleteOutput),
+}
+
+/// A capture read as is, without sanitization.
+fn raw_result(captured: Captured) -> ExecResult {
+    let Captured {
+        outcome,
+        stdout,
+        stderr,
+        duration,
+    } = captured;
+    ExecResult {
+        termination: outcome.termination,
+        exit_code: outcome.exit_code,
+        signal: outcome.signal,
+        stdout: stdout.bytes,
+        stderr: stderr.bytes,
+        duration,
     }
 }
 
@@ -634,7 +676,7 @@ mod tests {
     }
 
     fn timed(command: &str, timeout: Duration) -> ExecSpec {
-        let mut spec = ExecSpec::shell(command);
+        let mut spec = ExecSpec::bash(command);
         spec.timeout_ms = Some(duration_ms(timeout));
         spec
     }
@@ -943,10 +985,14 @@ mod tests {
     }
 
     #[test]
-    fn a_shell_spec_names_its_source() {
-        assert_eq!(shell_source(&ExecSpec::shell("echo hi")), Some("echo hi"));
-        assert_eq!(shell_source(&ExecSpec::argv(["echo", "hi"])), None);
-        assert_eq!(shell_source(&ExecSpec::argv(["sh", "-c", "echo hi"])), None);
+    fn a_bash_spec_names_its_source() {
+        assert_eq!(bash_source(&ExecSpec::bash("echo hi")), Some("echo hi"));
+        assert_eq!(bash_source(&ExecSpec::argv(["echo", "hi"])), None);
+        assert_eq!(bash_source(&ExecSpec::argv(["sh", "-c", "echo hi"])), None);
+        assert_eq!(
+            bash_source(&ExecSpec::argv(["bash", "-c", "echo hi", "extra"])),
+            None
+        );
     }
 
     #[test]

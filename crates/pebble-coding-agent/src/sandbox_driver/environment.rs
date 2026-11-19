@@ -22,7 +22,7 @@
 //! runs those as commands in the sandbox: `[ -e ]`, `rm`/`rmdir`, `mkdir -p`
 //! and `mv`, the derived search in [`super::search`], and `uname -sr` once at
 //! [`SandboxEnvironment::attach`]. So file existence, moves and deletes now
-//! need a POSIX shell in the sandbox, which reads and writes do not.
+//! need Bash in the sandbox, which reads and writes do not.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,7 +39,7 @@ use tokio::sync::OnceCell;
 use tracing::warn;
 
 use super::exec::{
-    CommandFailure, ExecResult as DriverExecResult, ExecStreamingResult, SandboxExec,
+    CommandFailure, ExecResult as DriverExecResult, ExecStreamingResult, ParseError, SandboxExec,
     command_termination, program_exit_code,
 };
 use super::path::{join_sandbox_path, resolve_path, shell_quote};
@@ -87,13 +87,17 @@ impl SandboxEnvironment {
         working_dir: impl Into<String>,
     ) -> EnvResult<Self> {
         let working_dir = working_dir.into();
-        let result = run_fs_command(
-            &SandboxExec::new(&*handle).with_working_dir(working_dir.clone()),
-            "uname -sr",
-            "Failed to read the sandbox platform",
-            "uname",
-        )
-        .await?;
+        let message = "Failed to read the sandbox platform";
+        let mut spec = ExecSpec::bash("uname -sr");
+        spec.timeout_ms = Some(duration_ms(FS_TIMEOUT));
+        let result = SandboxExec::new(&*handle)
+            .with_working_dir(working_dir.clone())
+            .run_for_parsing(spec)
+            .await
+            .map_err(|error| parse_error(message, error))?;
+        if !result.success() {
+            return Err(command_error(message, CommandFailure::new("uname", result)));
+        }
         let uname = result.stdout_lossy();
         let mut words = uname.split_whitespace();
         let platform = words.next().unwrap_or_default().to_ascii_lowercase();
@@ -163,7 +167,7 @@ impl SandboxEnvironment {
     }
 
     async fn file_exists(&self, path: &str) -> EnvResult<bool> {
-        let mut spec = ExecSpec::shell(format!("[ -e {} ]", shell_quote(&self.resolve(path))));
+        let mut spec = ExecSpec::bash(format!("[ -e {} ]", shell_quote(&self.resolve(path))));
         spec.timeout_ms = Some(duration_ms(FS_TIMEOUT));
         let result = self
             .exec()
@@ -384,7 +388,7 @@ impl Environment for SandboxEnvironment {
             output_bytes_cap,
             output_sink,
         } = request;
-        let mut spec = ExecSpec::shell(command);
+        let mut spec = ExecSpec::bash(command);
         spec.timeout_ms = timeout_ms;
         spec.working_directory = working_dir.map(str::to_string);
         for (key, value) in env_vars.into_iter().flatten() {
@@ -424,7 +428,7 @@ async fn run_fs_command(
     message: &str,
     label: &str,
 ) -> EnvResult<DriverExecResult> {
-    let mut spec = ExecSpec::shell(command);
+    let mut spec = ExecSpec::bash(command);
     spec.timeout_ms = Some(duration_ms(FS_TIMEOUT));
     let result = exec
         .run_streaming(spec, ExecControls::default(), None)
@@ -486,10 +490,18 @@ fn exec_outcome(streaming: ExecStreamingResult, program: &str) -> ExecOutcome {
 
 /// The line stderr ends with when the provider dropped output.
 fn output_loss_line(loss: OutputLoss) -> String {
-    format!(
-        "[sandbox] {} output frame(s), {} bytes dropped by the provider\n",
+    if loss.dropped_frames == 0 && loss.dropped_bytes == 0 {
+        return "[sandbox] the provider stopped reading output before it ended\n".to_string();
+    }
+    let mut line = format!(
+        "[sandbox] {} output frame(s), {} bytes dropped by the provider",
         loss.dropped_frames, loss.dropped_bytes
-    )
+    );
+    if loss.truncated {
+        line.push_str(", and it stopped reading output before it ended");
+    }
+    line.push('\n');
+    line
 }
 
 /// Bytes of a command's first word a log event carries.
@@ -540,6 +552,16 @@ fn adapt_output_sink(sink: ExecOutputSink) -> OutputSink {
         sink(stream, &chunk);
         Box::pin(async { Ok(()) })
     })
+}
+
+/// Output the adapter meant to parse that could not be read whole.
+pub(super) fn parse_error(message: &str, error: ParseError) -> EnvironmentError {
+    match error {
+        ParseError::Driver(error) => environment_error(message, error),
+        ParseError::Incomplete(error) => {
+            EnvironmentError::with_source(EnvironmentErrorKind::Io, message, error)
+        }
+    }
 }
 
 /// A sandbox failure as pebble classifies it, keeping the driver cause.
@@ -826,6 +848,23 @@ mod tests {
         assert_eq!(
             outcome.result.stderr,
             "[sandbox] 1 output frame(s), 80 bytes dropped by the provider\n"
+        );
+    }
+
+    #[test]
+    fn a_provider_that_stopped_reading_says_so_without_counts() {
+        let mut loss = OutputLoss::default();
+        loss.truncated = true;
+        assert_eq!(
+            output_loss_line(loss),
+            "[sandbox] the provider stopped reading output before it ended\n"
+        );
+        loss.dropped_frames = 1;
+        loss.dropped_bytes = 80;
+        assert_eq!(
+            output_loss_line(loss),
+            "[sandbox] 1 output frame(s), 80 bytes dropped by the provider, and it stopped reading \
+             output before it ended\n"
         );
     }
 

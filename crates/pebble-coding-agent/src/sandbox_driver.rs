@@ -23,7 +23,7 @@
 //!
 //! - the `TERM` then `KILL` stop grace and output sanitization
 //!   ([`SandboxExec`], which captures through the driver's `run_captured_with`
-//!   and runs scripts with `ExecSpec::shell`);
+//!   and runs scripts with `ExecSpec::bash`);
 //! - stat, exists, rename, remove, mkdir (in [`SandboxEnvironment`]);
 //! - grep and file walks (the derived search, run as commands);
 //! - platform information (`uname -sr` at [`SandboxEnvironment::attach`]);
@@ -49,8 +49,8 @@ pub mod test_support;
 pub use self::environment::SandboxEnvironment;
 pub use self::exec::{
     BASH_ENV_VAR, CommandFailure, DEFAULT_RETAINED_OUTPUT_BYTES, DEFAULT_STOP_GRACE, ExecResult,
-    ExecStreamingResult, SandboxExec, command_termination, program_exit_code, redacted_output_tail,
-    shell_source, stdin_bytes,
+    ExecStreamingResult, SandboxExec, bash_source, command_termination, program_exit_code,
+    redacted_output_tail, stdin_bytes,
 };
 pub use self::log::{default_redacted_output_tail, display_for_log};
 pub use self::path::{join_sandbox_path, resolve_path};

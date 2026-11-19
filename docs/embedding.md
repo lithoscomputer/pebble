@@ -334,7 +334,7 @@ grace, text-only output), answers pebble's MCP port routes from the driver's
 port exposures when `mcp` is on too (`port_routes` takes the provider
 descriptor's `ports`), and renders a failure for a log with `display_for_log`.
 File existence, moves and deletes, grep, glob, and the platform run as
-commands in the sandbox, so they need a POSIX shell there. The sandbox stays
+commands in the sandbox, so they need Bash there. The sandbox stays
 the application's to start and dispose of, and the places that render process
 output take the application's `Redactor`.
 `sandbox_driver::test_support::MockSandbox`, behind
