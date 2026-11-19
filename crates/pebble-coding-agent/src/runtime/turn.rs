@@ -37,6 +37,7 @@ use crate::skills::{ExpandedInput, SkillExpansion, expand_skill};
 use crate::subagent::SubagentSupervisor;
 use crate::task_reminder::maybe_task_reminder;
 use crate::tool::{CodingToolService, NativeTool, canonical_tool_name};
+use crate::trace_context::{SessionTrace, Span};
 use crate::types::{
     CodingAgentState, CodingEvent, ContextWindowSnapshot, ContextWindowStaleness, InputContent,
     InputSource, LlmOutputKind, LlmRetryPhase, Message, SkillActivationSource, Usage,
@@ -88,6 +89,11 @@ pub(super) struct CodingAgentBridge {
     context_policy:    Option<Arc<dyn ContextPolicy>>,
     compaction_policy: Option<Arc<dyn CompactionPolicy>>,
     subagents:         Option<SubagentSupervisor>,
+    /// The span of the model request in flight, from its
+    /// `ModelRequestStarted` to its committed answer. Shared with the model
+    /// service, which sends it on every attempt of that request.
+    model_span:        Arc<Mutex<Option<Span>>>,
+    trace:             Arc<SessionTrace>,
 }
 
 /// The conversation and what one prompt accumulates around it.
@@ -316,7 +322,8 @@ impl CodingAgentBridge {
             runtime.emitter.clone(),
             runtime.session_scope.clone(),
             Arc::clone(&runtime.redactor),
-        );
+        )
+        .with_trace(Arc::clone(&runtime.trace));
         if let Some(provider) = runtime.tool_env_provider.as_ref() {
             tools = tools.with_tool_env_provider(Arc::clone(provider));
         }
@@ -338,6 +345,8 @@ impl CodingAgentBridge {
             context_policy: runtime.context_policy.clone(),
             compaction_policy: runtime.compaction_policy.clone(),
             subagents: runtime.subagents.clone(),
+            model_span: Arc::default(),
+            trace: Arc::clone(&runtime.trace),
         }
     }
 
@@ -412,11 +421,28 @@ impl CodingAgentBridge {
             .map_err(|failure| self.record_boundary_error(failure.into_runtime_error()))
     }
 
+    /// Publishes an event, in the span of the model request in flight when
+    /// there is one.
     fn emit(&self, event: CodingEvent) {
-        self.emitter.emit(self.session_id.to_string(), event);
+        let span = self
+            .model_span
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        self.emit_in_span(event, span.as_ref());
     }
 
+    fn emit_in_span(&self, event: CodingEvent, span: Option<&Span>) {
+        self.emitter
+            .emit_in_span(self.session_id.to_string(), event, None, span);
+    }
+
+    /// Ends the model request in flight, answered or not.
     pub(super) fn finish_inference(&self) {
+        self.model_span
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
         self.state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -553,7 +579,15 @@ impl CodingAgentBridge {
     }
 
     fn commit_assistant(&self, response: &Response) {
+        // The answer and what the response carried belong to the request's
+        // span, which ends here.
+        let span = self
+            .model_span
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         self.finish_inference();
+        let span = span.as_ref();
         let text = response.text();
         let tool_calls = tool_calls_of(response);
         let reasoning = response.reasoning();
@@ -575,26 +609,32 @@ impl CodingAgentBridge {
         // short, an option the protocol could not carry — ride the response
         // and are reported the way pebble reports its own.
         for warning in &response.warnings {
-            self.emit(CodingEvent::Warning {
-                kind:    warning.code.clone(),
-                message: warning.message.clone(),
-                details: Value::Null,
-            });
+            self.emit_in_span(
+                CodingEvent::Warning {
+                    kind:    warning.code.clone(),
+                    message: warning.message.clone(),
+                    details: Value::Null,
+                },
+                span,
+            );
         }
 
         let answering_model = response.model.model().as_str();
-        self.emit(CodingEvent::AssistantMessage {
-            text,
-            model: if answering_model.is_empty() {
-                self.model_context.model.clone()
-            } else {
-                answering_model.to_owned()
+        self.emit_in_span(
+            CodingEvent::AssistantMessage {
+                text,
+                model: if answering_model.is_empty() {
+                    self.model_context.model.clone()
+                } else {
+                    answering_model.to_owned()
+                },
+                usage,
+                tool_call_count: tool_calls.len(),
+                context_window,
+                reasoning,
             },
-            usage,
-            tool_call_count: tool_calls.len(),
-            context_window,
-            reasoning,
-        });
+            span,
+        );
     }
 
     fn commit_tool_results(&self, calls: &[ToolCall], results: &[ToolResult], cancelled: bool) {
@@ -648,6 +688,12 @@ impl agent::EventProjection for CodingAgentBridge {
                 let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
                 state.begin_inference(local);
                 drop(state);
+                // One span per request: the model service sends it on every
+                // attempt, replays included, until the answer is committed.
+                *self
+                    .model_span
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(self.trace.model_span());
                 self.emit(CodingEvent::LlmRequestStarted {
                     requested_model: self.model_context.model.clone(),
                 });
@@ -891,6 +937,8 @@ struct CodingModelService {
     model_context: Arc<SessionModel>,
     emitter:       Emitter,
     session_id:    SessionId,
+    /// The bridge's span for the request in flight.
+    model_span:    Arc<Mutex<Option<Span>>>,
 }
 
 #[async_trait]
@@ -906,10 +954,21 @@ impl agent::ModelService for CodingModelService {
             self.model_context.provider.clone(),
             self.model_context.model.clone(),
         ));
-        self.model_context
-            .client
-            .stream_with_context(request, context)
-            .await
+        let span = self
+            .model_span
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        // A client default replaces one the application set under the same
+        // name: these headers name Pebble's span, which only Pebble knows.
+        let client = match span {
+            Some(span) => &self
+                .model_context
+                .client
+                .with_default_headers(span.entries())?,
+            None => &self.model_context.client,
+        };
+        client.stream_with_context(request, context).await
     }
 }
 
@@ -1033,6 +1092,7 @@ impl CodingRuntime {
             model_context: self.model_context.clone(),
             emitter:       self.emitter.clone(),
             session_id:    self.session_scope.session_id().clone(),
+            model_span:    Arc::clone(&bridge.model_span),
         };
         let messages = bridge
             .state

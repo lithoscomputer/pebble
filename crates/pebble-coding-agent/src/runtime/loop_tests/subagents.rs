@@ -16,7 +16,7 @@
 //! lacked), what a tree may hold open, where a grandchild's news arrives, and
 //! what a closed tree leaves running.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::iter;
 use std::result::Result as StdResult;
 use std::sync::{Mutex, PoisonError};
@@ -30,7 +30,6 @@ use tokio::time::{sleep, timeout};
 
 use super::super::testing::{TestProfile, builder, wait_for_event};
 use super::*;
-use crate::SessionId;
 use crate::event::{EventSink, EventSinkError};
 use crate::human_input::{Answer, HumanInputError, HumanInputProvider, Question};
 use crate::projection::SessionProjection;
@@ -43,6 +42,7 @@ use crate::test_support::{
     multi_tool_call_response, routed_client, scripted_client,
 };
 use crate::types::ToolErrorKind;
+use crate::{PARENT_SESSION_ID_HEADER, SESSION_ID_HEADER, SessionId, TraceContext};
 
 /// The identifier the blocked child is supervised under, so a script can name
 /// it before it exists.
@@ -1396,6 +1396,182 @@ async fn a_request_that_names_two_lanes_fails_loudly() {
         .shutdown(ShutdownReason::Completed)
         .await
         .expect("the session shuts down");
+}
+
+/// Each session's model requests name that session, and a child's also name
+/// its parent, though the whole tree shares the application's one client.
+#[tokio::test]
+async fn each_sessions_model_requests_carry_its_own_identity_headers() {
+    let task = "child: count the files";
+    let (client, provider) = routed_client(
+        ScriptedProvider::new(vec![
+            ScriptedCall::response(tool_call_response(
+                "spawn_agent",
+                "spawn",
+                json!({ "task": task }),
+            )),
+            ScriptedCall::response(tool_call_response("wait", "wait", json!({}))),
+            ScriptedCall::response(text_response("parent done")),
+        ]),
+        vec![(task, ScriptedProvider::new(answers("counted 3 files")))],
+    );
+    let children = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&children);
+    let mut parent = builder(client)
+        .observe_children(Arc::new(move |child: &CodingRuntime| {
+            recorder
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(child.id().to_owned());
+        }))
+        .build()
+        .expect("the parent builds");
+    parent.initialize().await.expect("initialization succeeds");
+
+    let output = parent
+        .prompt("delegate the count")
+        .await
+        .expect("the prompt succeeds");
+
+    assert_eq!(output.as_deref(), Some("parent done"));
+    let root_id = parent.id().to_owned();
+    let child_id = children
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .first()
+        .cloned()
+        .expect("the parent built a child");
+    assert_ne!(child_id, root_id);
+    let root = provider.root().request_headers();
+    assert_eq!(root.len(), 3);
+    for headers in &root {
+        assert_eq!(
+            headers.get(SESSION_ID_HEADER),
+            Some(&root_id),
+            "{headers:?}"
+        );
+        assert_eq!(headers.get(PARENT_SESSION_ID_HEADER), None, "{headers:?}");
+    }
+    let child = provider.lane(task).request_headers();
+    assert_eq!(child.len(), 1);
+    assert_eq!(child[0].get(SESSION_ID_HEADER), Some(&child_id));
+    assert_eq!(child[0].get(PARENT_SESSION_ID_HEADER), Some(&root_id));
+    parent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the parent shuts down");
+}
+
+/// Every model request in a tree is a child span of the caller's span: the
+/// root's and a child's alike send a `traceparent` in the caller's trace and
+/// their own session in the baggage, and record the span they sent on the
+/// request's events.
+#[tokio::test]
+async fn each_sessions_model_requests_carry_a_span_of_the_callers_trace() {
+    let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+    let caller_span = "00f067aa0ba902b7";
+    let task = "child: count the files";
+    let (client, provider) = routed_client(
+        ScriptedProvider::new(vec![
+            ScriptedCall::response(tool_call_response(
+                "spawn_agent",
+                "spawn",
+                json!({ "task": task }),
+            )),
+            ScriptedCall::response(tool_call_response("wait", "wait", json!({}))),
+            ScriptedCall::response(text_response("parent done")),
+        ]),
+        vec![(task, ScriptedProvider::new(answers("counted 3 files")))],
+    );
+    let context = TraceContext::from_traceparent(&format!("00-{trace_id}-{caller_span}-01"))
+        .and_then(|context| context.with_tracestate("petri=step"))
+        .and_then(|context| context.with_baggage("run_id", "run_1"))
+        .and_then(|context| context.with_baggage("run_step", "build#2"))
+        .expect("a valid context");
+    let sink = Arc::new(TreeSink::default());
+    let mut parent = builder(client)
+        .event_sink(Arc::clone(&sink) as Arc<dyn EventSink>)
+        .subagents(SubagentOptions::enabled())
+        .trace_context(context)
+        .build()
+        .expect("the parent builds");
+    parent.initialize().await.expect("initialization succeeds");
+
+    let output = parent
+        .prompt("delegate the count")
+        .await
+        .expect("the prompt succeeds");
+    parent
+        .shutdown(ShutdownReason::Completed)
+        .await
+        .expect("the parent shuts down");
+
+    assert_eq!(output.as_deref(), Some("parent done"));
+    let recorded = sink.recorded();
+    let root_id = parent.id().to_owned();
+    let child_id = recorded
+        .iter()
+        .find(|event| event.session_id != root_id)
+        .map(|event| event.session_id.clone())
+        .expect("the child published events");
+    // What each session recorded for its requests, in order: the span on
+    // `LlmRequestStarted`, which its `AssistantMessage` repeats.
+    let spans_of = |session: &str| -> Vec<String> {
+        let mut started = Vec::new();
+        let mut answered = Vec::new();
+        for event in recorded.iter().filter(|event| event.session_id == session) {
+            let list = match event.event {
+                CodingEvent::LlmRequestStarted { .. } => &mut started,
+                CodingEvent::AssistantMessage { .. } => &mut answered,
+                _ => continue,
+            };
+            assert_eq!(event.trace_id.as_deref(), Some(trace_id), "{event:?}");
+            assert_eq!(
+                event.parent_span_id.as_deref(),
+                Some(caller_span),
+                "{event:?}"
+            );
+            list.push(event.span_id.clone().expect("the event records its span"));
+        }
+        assert_eq!(started, answered);
+        started
+    };
+    let sent = |headers: &[BTreeMap<String, String>], session: &str| -> Vec<String> {
+        headers
+            .iter()
+            .map(|headers| {
+                assert_eq!(
+                    headers.get("tracestate").map(String::as_str),
+                    Some("petri=step")
+                );
+                assert_eq!(
+                    headers.get("baggage"),
+                    Some(&format!(
+                        "run_id=run_1,run_step=build#2,session_id={session}"
+                    )),
+                );
+                let traceparent = headers.get("traceparent").expect("a traceparent");
+                let fields: Vec<&str> = traceparent.split('-').collect();
+                assert_eq!(fields.len(), 4, "{traceparent}");
+                assert_eq!((fields[0], fields[1], fields[3]), ("00", trace_id, "01"));
+                assert_eq!(fields[2].len(), 16, "{traceparent}");
+                fields[2].to_owned()
+            })
+            .collect()
+    };
+
+    let root_sent = sent(&provider.root().request_headers(), &root_id);
+    let child_sent = sent(&provider.lane(task).request_headers(), &child_id);
+    assert_eq!(root_sent.len(), 3);
+    assert_eq!(child_sent.len(), 1);
+    assert_eq!(root_sent, spans_of(&root_id));
+    assert_eq!(child_sent, spans_of(&child_id));
+    let mut every = root_sent.clone();
+    every.extend(child_sent);
+    every.push(caller_span.to_owned());
+    every.sort();
+    every.dedup();
+    assert_eq!(every.len(), 5, "every request has a span of its own");
 }
 
 /// A parent that compacts after spawning a child sends a transcript quoting

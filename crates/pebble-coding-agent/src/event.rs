@@ -42,6 +42,7 @@ use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 
 use crate::error::{Error, Result};
+use crate::trace_context::Span;
 use crate::types::{CodingAgentEvent, CodingEvent};
 
 /// The broadcast capacity a pipeline uses when the caller names none.
@@ -408,6 +409,17 @@ impl Emitter {
         event: CodingEvent,
         tool_call_id: Option<String>,
     ) {
+        self.emit_in_span(session_id, event, tool_call_id, None);
+    }
+
+    /// Publishes an event that belongs to `span`, when it belongs to one.
+    pub(crate) fn emit_in_span(
+        &self,
+        session_id: impl Into<String>,
+        event: CodingEvent,
+        tool_call_id: Option<String>,
+        span: Option<&Span>,
+    ) {
         let session_id = session_id.into();
         event.trace(&session_id);
         self.queue(CodingAgentEvent {
@@ -418,6 +430,9 @@ impl Emitter {
             session_id,
             parent_session_id: self.parent_session_id.as_deref().map(ToOwned::to_owned),
             tool_call_id,
+            trace_id: span.map(Span::trace_id),
+            span_id: span.map(Span::span_id),
+            parent_span_id: span.and_then(Span::parent_span_id),
         });
     }
 
@@ -729,6 +744,7 @@ pub(crate) struct SessionBoundEmitter {
     emitter:      Emitter,
     session_id:   String,
     tool_call_id: Option<String>,
+    span:         Option<Span>,
     output_stats: Arc<Mutex<Option<OutputCaptureStats>>>,
 }
 
@@ -744,16 +760,25 @@ impl SessionBoundEmitter {
             emitter,
             session_id: session_id.into(),
             tool_call_id,
+            span: None,
             output_stats: Arc::new(Mutex::new(None)),
         }
     }
 
+    /// Stamps the tool call's span on every event, too.
+    #[must_use]
+    pub(crate) fn in_span(mut self, span: Option<Span>) -> Self {
+        self.span = span;
+        self
+    }
+
     /// Publishes an event stamped with the bound identities.
     pub(crate) fn emit(&self, event: CodingEvent) {
-        self.emitter.emit_with_tool_call_id(
+        self.emitter.emit_in_span(
             self.session_id.clone(),
             event,
             self.tool_call_id.clone(),
+            self.span.as_ref(),
         );
     }
 

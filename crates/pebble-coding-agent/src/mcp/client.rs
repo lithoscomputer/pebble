@@ -20,7 +20,7 @@ use reqwest::header::{CONNECTION, HeaderMap, HeaderName, HeaderValue};
 use rmcp::model::{
     CallToolRequest, CallToolRequestParams, CallToolResult, CancelledNotification,
     CancelledNotificationParam, ClientCapabilities, ClientInfo, ClientRequest, Implementation,
-    ProtocolVersion, RawContent, RequestId, ServerResult,
+    Meta, ProtocolVersion, RawContent, RequestId, ServerResult,
 };
 use rmcp::service::{
     Peer, PeerRequestOptions, RequestHandle, RoleClient, RunningService, ServiceError,
@@ -299,13 +299,14 @@ impl Connection {
         }
     }
 
-    /// Forwards one call. The server's tool timeout and the caller's
-    /// cancellation both end the wait with a `notifications/cancelled` to the
-    /// server.
+    /// Forwards one call, with `meta` as the request's `params._meta`. The
+    /// server's tool timeout and the caller's cancellation both end the wait
+    /// with a `notifications/cancelled` to the server.
     pub(super) async fn call(
         &self,
         tool: &str,
         arguments: Value,
+        meta: Vec<(&'static str, String)>,
         cancel: &CancellationToken,
     ) -> CallOutcome {
         if self.disconnect.get().is_some() {
@@ -323,6 +324,13 @@ impl Connection {
         let mut params = CallToolRequestParams::new(tool.to_owned());
         if let Some(arguments) = arguments {
             params = params.with_arguments(arguments);
+        }
+        if !meta.is_empty() {
+            params.meta = Some(Meta(
+                meta.into_iter()
+                    .map(|(key, value)| (key.to_owned(), Value::String(value)))
+                    .collect(),
+            ));
         }
         let request = ClientRequest::CallToolRequest(CallToolRequest::new(params));
         let handle = match self

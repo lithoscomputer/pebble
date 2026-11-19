@@ -1973,6 +1973,26 @@ pub struct CodingAgentEvent {
     /// The tool call the event belongs to, when it belongs to one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id:      Option<String>,
+    /// The W3C trace the event's span belongs to, as 32 lowercase hex digits.
+    ///
+    /// Set together with `span_id` on the events of a model request and of a
+    /// tool call; see [`span_id`](Self::span_id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_id:          Option<String>,
+    /// The span of the model request or tool call the event belongs to, as
+    /// 16 lowercase hex digits: the parent ID of the `traceparent` that
+    /// request carried.
+    ///
+    /// A model request's span is on [`CodingEvent::LlmRequestStarted`],
+    /// [`CodingEvent::AssistantMessage`], and the events between them for
+    /// that request. A tool call's span is on every event of that call, from
+    /// [`CodingEvent::ToolCallStarted`] to [`CodingEvent::ToolCallCompleted`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_id:           Option<String>,
+    /// The parent of `span_id`: the caller's span from the session's
+    /// [`TraceContext`](crate::TraceContext), when it named one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_span_id:    Option<String>,
 }
 
 impl CodingAgentEvent {
@@ -1991,6 +2011,9 @@ impl CodingAgentEvent {
             session_id,
             parent_session_id: None,
             tool_call_id: None,
+            trace_id: None,
+            span_id: None,
+            parent_span_id: None,
         }
     }
 
@@ -2032,6 +2055,21 @@ impl CodingAgentEvent {
     #[must_use]
     pub fn with_tool_call_id(mut self, tool_call_id: impl Into<String>) -> Self {
         self.tool_call_id = Some(tool_call_id.into());
+        self
+    }
+
+    /// Records the W3C trace and span this event belongs to, and the span's
+    /// parent when it has one.
+    #[must_use]
+    pub fn with_span(
+        mut self,
+        trace_id: impl Into<String>,
+        span_id: impl Into<String>,
+        parent_span_id: Option<String>,
+    ) -> Self {
+        self.trace_id = Some(trace_id.into());
+        self.span_id = Some(span_id.into());
+        self.parent_span_id = parent_span_id;
         self
     }
 }
@@ -2402,6 +2440,31 @@ mod tests {
         assert_eq!(event.seq, 0);
         assert!(event.stream_id.is_empty());
         assert_eq!(event.stream_id(), "ses_1");
+        assert_eq!(
+            (event.trace_id, event.span_id, event.parent_session_id),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn an_envelopes_span_is_written_only_when_it_has_one() {
+        let plain = CodingAgentEvent::new("ses_1", CodingEvent::SessionEnded, moment());
+        let value = serde_json::to_value(&plain).expect("serializes");
+        assert!(value.get("trace_id").is_none(), "{value}");
+        assert!(value.get("span_id").is_none(), "{value}");
+        assert!(value.get("parent_span_id").is_none(), "{value}");
+
+        let traced = plain.with_span(
+            "4bf92f3577b34da6a3ce929d0e0e4736",
+            "b7ad6b7169203331",
+            Some("00f067aa0ba902b7".to_owned()),
+        );
+        let value = serde_json::to_value(&traced).expect("serializes");
+        assert_eq!(value["trace_id"], json!("4bf92f3577b34da6a3ce929d0e0e4736"));
+        assert_eq!(value["span_id"], json!("b7ad6b7169203331"));
+        assert_eq!(value["parent_span_id"], json!("00f067aa0ba902b7"));
+        let restored: CodingAgentEvent = serde_json::from_value(value).expect("parses");
+        assert_eq!(restored, traced);
     }
 
     // --- Event vocabulary ---

@@ -21,6 +21,7 @@ use crate::environment::Environment;
 use crate::event::{OutputCaptureStats, SessionBoundEmitter};
 use crate::human_input::HumanInputProvider;
 use crate::redact::{NoRedaction, Redactor};
+use crate::trace_context::Span;
 use crate::types::{CodingEvent, ToolCategory, ToolSource, ToolSummary};
 
 /// The narrow handle a running tool publishes events through.
@@ -112,6 +113,9 @@ pub struct ToolContext {
     pub(crate) human_input:          Option<Arc<dyn HumanInputProvider>>,
     /// What strips secrets out of text the tool publishes.
     pub(crate) redactor:             Arc<dyn Redactor>,
+    /// This call's span, which a tool that makes a request on the call's
+    /// behalf (an MCP tool) sends as its trace context.
+    pub(crate) span:                 Option<Span>,
 }
 
 impl ToolContext {
@@ -178,7 +182,15 @@ impl ToolContext {
             coding_event_emitter: None,
             human_input: None,
             redactor: Arc::new(NoRedaction),
+            span: None,
         }
+    }
+
+    /// Sets this call's span.
+    #[must_use]
+    pub(crate) fn with_span(mut self, span: Option<Span>) -> Self {
+        self.span = span;
+        self
     }
 
     /// Sets the token that stops this call.

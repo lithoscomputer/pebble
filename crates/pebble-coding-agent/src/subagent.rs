@@ -64,6 +64,7 @@ use crate::redact::Redactor;
 use crate::runtime::{CodingAgentBuildError, CodingRuntime, ShutdownReason};
 use crate::search::seam::SearchProvider;
 use crate::tool::{RegisteredTool, ToolEnvProvider, ToolError};
+use crate::trace_context::TraceContext;
 use crate::types::{
     CodingAgentState, CodingEvent, INITIAL_SUBAGENT_GENERATION, InputSource, ToolErrorKind,
 };
@@ -352,6 +353,7 @@ fn build_child(
         .tools(inherited)
         .options(deps.options.clone())
         .subagents(SubagentOptions::enabled())
+        .trace_context(deps.trace_context.clone())
         .child_of(ChildIdentity {
             event_emitter: deps.event_emitter.for_child(parent.session_id().as_str()),
             parent,
@@ -414,6 +416,9 @@ pub(crate) struct ChildDeps {
     /// What sees each child as it is built, for the crate's own tests.
     pub(crate) observer:          Option<ChildObserver>,
     pub(crate) open_sessions:     Arc<OpenSessions>,
+    /// The trace a child's spans join: its parent's, so a child's calls sit
+    /// under the same caller span its parent's do.
+    pub(crate) trace_context:     TraceContext,
 }
 
 /// Where a child sits in its tree, and which budget it spends.

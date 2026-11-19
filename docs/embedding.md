@@ -101,6 +101,51 @@ whose connection closes during the session is reported once as
 `McpServerDisconnected`, and every later call to its tools fails. The
 servers close when the agent shuts down. See `pebble_coding_agent::mcp`.
 
+### Session identity headers
+
+Every model request a session makes carries `x-pebble-session-id`, the
+session's ID, and a subagent's also carry `x-pebble-parent-session-id`, its
+parent's. The values are spelled exactly as the event envelope's `session_id`
+and `parent_session_id`, so a proxy that records the exchange can match it to
+the session's events. Pebble adds them per session to the client it was given,
+so children name themselves although the whole tree shares one client. Every
+request to an HTTP MCP server (`McpPlacement::Http`) carries the agent's
+`x-pebble-session-id` too; children call the same connection, so their MCP
+requests name the root. A header the server's configuration already names, in
+any case, is sent as configured. On model requests, a client default header of
+the same name is replaced, since one client value cannot name every session,
+while lithos-llm still lets catalog, codec, and credential headers win. The
+headers are always sent; the IDs are opaque and already on every event. The
+names are
+`SESSION_ID_HEADER` and `PARENT_SESSION_ID_HEADER`.
+
+### W3C trace context
+
+Each model request and each tool call is a span. To place a session in the
+caller's trace, build a `TraceContext` from the caller's `traceparent` with
+`TraceContext::from_traceparent`, add entries with `with_baggage` (values are
+percent-encoded on the wire) and optionally `with_tracestate`, and pass it to
+`CodingAgentBuilder::trace_context`.
+
+Every model request carries `traceparent` naming the request's span (one span
+per request, kept across stream replays), the caller's `tracestate` when it was
+given, and `baggage` with the application's entries and the acting session's
+`session_id`. Every MCP `tools/call` carries the same entries for the tool
+call's span in `params._meta`, following the OpenTelemetry MCP semantic
+conventions, with `tool_call_id` added to the baggage. A span's parent is the
+span the `traceparent` named, so a proxy that stores the caller's span as
+`parent_span_id` can join it to the event envelope's `span_id`. The events of a
+model request (`LlmRequestStarted` through `AssistantMessage`) and of a tool
+call (`ToolCallStarted` through `ToolCallCompleted`) record `trace_id`,
+`span_id`, and the caller's span as `parent_span_id` on their envelope.
+
+Subagents and failover replacements inherit the context; records and exports
+do not keep it. A session without one starts a trace of its own. Pebble owns
+the `traceparent`, `tracestate`, and `baggage` headers on model requests and
+replaces client default headers with those names, so pass the caller's context
+through the builder rather than on the client. `session_id` and `tool_call_id`
+are Pebble's baggage keys, and `with_baggage` refuses them.
+
 ### Model fallback routes
 
 `CodingAgentBuilder::fallback_routes` names the routes a prompt continues on

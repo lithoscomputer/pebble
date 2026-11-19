@@ -55,8 +55,11 @@ use lithos_llm::types::ToolDefinition;
 pub use routes::{PortRoute, PortRouteError, PortRoutes};
 use serde_json::Value;
 
+use crate::SessionScope;
 use crate::environment::Environment;
+use crate::session_headers::session_headers;
 use crate::tool::{RegisteredTool, ToolContext, ToolError};
+use crate::trace_context::Span;
 use crate::types::{
     CodingEvent, McpServerStatus, McpToolSummary, ToolSource, parse_qualified_name as parse_name,
     sanitize_mcp_name,
@@ -125,6 +128,25 @@ impl McpServer {
     pub const fn tool_timeout(&self) -> Duration {
         self.tool_timeout
     }
+
+    /// This server with the session's identity headers added to an HTTP
+    /// placement's, where the configuration does not already name them: a
+    /// header the application configured, in any case, is sent as configured.
+    ///
+    /// Only [`McpPlacement::Http`] is changed. A server in the environment is
+    /// reached through the application's route, whose headers are that
+    /// route's, and a stdio server has no headers.
+    fn naming_session(&self, identity: &[(&'static str, String)]) -> Self {
+        let mut server = self.clone();
+        if let McpPlacement::Http { headers, .. } = &mut server.placement {
+            for (name, value) in identity {
+                if !headers.keys().any(|key| key.eq_ignore_ascii_case(name)) {
+                    headers.insert((*name).to_owned(), value.clone());
+                }
+            }
+        }
+        server
+    }
 }
 
 /// Where an MCP server runs and how pebble reaches it.
@@ -150,6 +172,9 @@ pub enum McpPlacement {
         /// The endpoint URL.
         url:      String,
         /// Headers every request carries, such as an authorization token.
+        /// Pebble adds the agent's
+        /// [`SESSION_ID_HEADER`](crate::SESSION_ID_HEADER) unless these
+        /// already name it.
         headers:  BTreeMap<String, String>,
         /// Which HTTP transport the server speaks.
         protocol: McpHttpProtocol,
@@ -290,12 +315,15 @@ pub(crate) struct McpServers {
 
 impl McpServers {
     /// Starts every configured server in order and discovers its tools. A
-    /// server that fails is recorded and skipped.
+    /// server that fails is recorded and skipped. A server reached over HTTP
+    /// from the application is told which session in `session` it serves.
     pub(crate) async fn start(
         servers: &[McpServer],
         environment: &Arc<dyn Environment>,
         routes: Option<&Arc<dyn PortRoutes>>,
+        session: &SessionScope,
     ) -> Self {
+        let identity = session_headers(session);
         let mut started = Self {
             connections: Vec::with_capacity(servers.len()),
             tools:       Vec::new(),
@@ -305,6 +333,7 @@ impl McpServers {
             let launched = Instant::now();
             // Boxed: the start future carries the readiness probe and the
             // route, and would otherwise weigh on every future above it.
+            let server = &server.naming_session(&identity);
             let started_in = Box::pin(Connection::start(server, environment, routes)).await;
             let startup = launched.elapsed();
             match started_in {
@@ -404,8 +433,12 @@ fn registered_tool(
         let server_name = server_name.clone();
         let original = original.clone();
         Box::pin(async move {
+            // The call's span travels in `params._meta`, per the OpenTelemetry
+            // MCP convention: the only place a per-call trace context and tool
+            // call ID fit, since HTTP headers belong to the connection.
+            let meta = context.span.as_ref().map(Span::entries).unwrap_or_default();
             let outcome = connection
-                .call(&original, arguments, context.cancel())
+                .call(&original, arguments, meta, context.cancel())
                 .await;
             // The close is reported by the call that first observed it, on
             // the stream of whichever session made that call; the flag on the
