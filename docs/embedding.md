@@ -325,17 +325,21 @@ so an adapter built on them passes the `EnvironmentContract` checks they cover.
 
 One such adapter ships with the crate, behind the `sandbox-driver` feature:
 `pebble_coding_agent::sandbox_driver::SandboxEnvironment` is the trait over a
-[sandbox-driver](https://github.com/lithoscomputer/sandbox-driver) handle, for
-an application whose sandboxes (a host directory, a container, a remote
-workspace) come from that driver. It resolves paths against the working
-directory the application names, runs commands under `SandboxExec`'s policy
-(a stop grace, text-only output), answers pebble's MCP port routes from the
-driver's preview URLs when `mcp` is on too, and renders a driver failure for a
-log with `display_for_log`. The sandbox stays the application's to start and
-dispose of, and the places that render process output take the application's
-`Redactor`. `sandbox_driver::test_support::MockSandbox`, behind
-`sandbox-driver-test-util`, is the adapter over the driver's scripted doubles
-for an application's tests.
+[sandbox-driver](https://github.com/lithoscomputer/sandbox-driver) `Sandbox`
+handle from its `Sandboxes` catalog, for an application whose sandboxes (a
+host directory, a container, a remote workspace) come from that driver. It
+resolves paths against the working directory the application names, runs
+commands under `SandboxExec`'s policy (the driver's captured exec, a stop
+grace, text-only output), answers pebble's MCP port routes from the driver's
+port exposures when `mcp` is on too (`port_routes` takes the provider
+descriptor's `ports`), and renders a failure for a log with `display_for_log`.
+File existence, moves and deletes, grep, glob, and the platform run as
+commands in the sandbox, so they need Bash there. The sandbox stays
+the application's to start and dispose of, and the places that render process
+output take the application's `Redactor`.
+`sandbox_driver::test_support::MockSandbox`, behind
+`sandbox-driver-test-util`, is the adapter over a scripted driver handle for
+an application's tests.
 
 ### Events and durability
 

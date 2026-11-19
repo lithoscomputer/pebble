@@ -24,7 +24,8 @@ optional `models.toml` over the upstream catalog and supplies an application-own
 ## Setup
 
 Pebble is a library crate. It depends on `lithos-llm`, `sandbox-driver`, and
-(for tests) `twins` as git dependencies on exactly `branch = "main"`: not a
+(for tests) `twins` as git dependencies on exactly `branch = "main"`
+(sandbox-driver follows a pull request's branch for now; see `Cargo.toml`): not a
 `rev`, and not an omitted ref, which Cargo treats as a different source, so an
 application would link two copies. Pick up upstream changes with
 `cargo update -p <crate>` and commit `Cargo.lock`; an application's own
@@ -106,7 +107,8 @@ Tests that reach `pebble_coding_agent::test_support` need the `test-util`
 feature, the search providers in `pebble_coding_agent::search::providers`
 need `search-providers` along with their tests, and the sandbox-driver
 adapter in `pebble_coding_agent::sandbox_driver` needs `sandbox-driver` (its
-tests run over the driver's Host provider in a temporary directory), which is
+tests run over the driver's built-in Host provider, through its `Sandboxes`
+catalog, in a temporary directory), which is
 why the test tasks pass `--all-features`. The provider tests answer each search from a fake engine
 served by axum in the test process, so they need no key and no network.
 
