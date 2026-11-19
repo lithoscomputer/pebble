@@ -384,6 +384,7 @@ impl<'a> SandboxExec<'a> {
             stdout,
             stderr,
             duration,
+            ..
         } = captured;
         let (stdout, stdout_capture) = self.retained(&stdout);
         let (stderr, stderr_capture) = self.retained(&stderr);
@@ -437,6 +438,7 @@ fn raw_result(captured: Captured) -> ExecResult {
         stdout,
         stderr,
         duration,
+        ..
     } = captured;
     ExecResult {
         termination: outcome.termination,

@@ -24,8 +24,7 @@ optional `models.toml` over the upstream catalog and supplies an application-own
 ## Setup
 
 Pebble is a library crate. It depends on `lithos-llm`, `sandbox-driver`, and
-(for tests) `twins` as git dependencies on exactly `branch = "main"`
-(sandbox-driver follows a pull request's branch for now; see `Cargo.toml`): not a
+(for tests) `twins` as git dependencies on exactly `branch = "main"`: not a
 `rev`, and not an omitted ref, which Cargo treats as a different source, so an
 application would link two copies. Pick up upstream changes with
 `cargo update -p <crate>` and commit `Cargo.lock`; an application's own

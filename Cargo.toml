@@ -12,12 +12,10 @@ publish = false
 lithos-llm = { git = "https://github.com/lithoscomputer/lithos-llm", branch = "main", default-features = false }
 # sandbox-driver: the sandbox provider layer `pebble_coding_agent::sandbox_driver`
 # adapts to the `Environment` contract, behind the `sandbox-driver` feature.
-# TODO(parity B1): back to `branch = "main"` once sandbox-driver#96 merges.
-# Until then this follows its branch for `run_captured_with` and
-# `ExecSpec::shell`, which the exec policy is built on. Fabro and Petri must
-# name the same source, or Cargo builds two sandbox-drivers.
-sandbox-driver = { git = "https://github.com/lithoscomputer/sandbox-driver", branch = "parity-captured-exec" }
-sandbox-driver-host = { git = "https://github.com/lithoscomputer/sandbox-driver", branch = "parity-captured-exec" }
+# Keep `branch = "main"` so Fabro's and Petri's declarations stay the same
+# source; Cargo.lock picks the commit.
+sandbox-driver = { git = "https://github.com/lithoscomputer/sandbox-driver", branch = "main" }
+sandbox-driver-host = { git = "https://github.com/lithoscomputer/sandbox-driver", branch = "main" }
 async-trait = "0.1.89"
 futures-util = "0.3.32"
 serde = { version = "1.0.228", features = ["derive"] }
