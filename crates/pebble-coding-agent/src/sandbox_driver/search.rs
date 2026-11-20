@@ -2,7 +2,7 @@
 //!
 //! Parity gap: the old driver gave every sandbox a search facet, native or
 //! derived over exec (`DerivedSearch`). sandbox-driver's new API has no search
-//! (parity plan B3), so this is that derived search, moved onto the new exec:
+//! at all, so this is that derived search, moved onto the new exec:
 //! ripgrep when the sandbox has it, `grep` otherwise; GNU `find -printf` with
 //! a POSIX `find -print0` fallback for walks. A walk refuses a symlinked
 //! traversal root.

@@ -341,7 +341,7 @@ impl<'a> SandboxExec<'a> {
         // under a `/bin/bash -c` sentinel that sources a `BASH_ENV` the spec
         // passes. Blanking it again keeps a caller's startup file from
         // running ahead of the script.
-        // TODO(parity): drop this once sandbox-driver#100 (Host blanks
+        // TODO: drop this once sandbox-driver#100 (Host blanks
         // `BASH_ENV` for every command) merges.
         if bash_source(&spec).is_some() {
             spec.env.insert(BASH_ENV_VAR.to_string(), String::new());

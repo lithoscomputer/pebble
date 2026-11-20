@@ -18,7 +18,7 @@
 //! stderr.
 //!
 //! Parity gaps: the new API has no stat, exists, remove, rename or mkdir
-//! (parity plan B2), no search (B3), and no platform information. The adapter
+//! operations, no search, and no platform information. The adapter
 //! runs those as commands in the sandbox: `[ -e ]`, `rm`/`rmdir`, `mkdir -p`
 //! and `mv`, the derived search in [`super::search`], and `uname -sr` once at
 //! [`SandboxEnvironment::attach`]. So file existence, moves and deletes now
