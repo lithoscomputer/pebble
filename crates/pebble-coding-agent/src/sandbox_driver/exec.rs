@@ -28,15 +28,17 @@
 //! ([`redacted_output_tail`]). The explicit environment reaches the provider
 //! as the caller composed it.
 //!
-//! Parity gaps: the old driver ran the stop grace and the output policy
-//! itself (`ExecSpec::stop_grace`, `ExecSpec::output_sanitization`); the new
-//! API has neither, so they live here. The new Host provider kills a command
-//! outright when the spec's `timeout_ms` passes, so the policy never sets it
-//! and keeps the deadline itself, to keep the `TERM` grace on a timeout.
-//! The driver keeps
-//! output raw, so the retained head and tail are sanitized after capture: the
-//! counts are of the raw bytes, and an escape sequence cut by the gap between
-//! head and tail is dropped up to its terminator.
+//! Parity gap: the old driver ran the stop grace itself
+//! (`ExecSpec::stop_grace`); the new API has none, so it lives here. The new
+//! Host provider kills a command outright when the spec's `timeout_ms`
+//! passes, so the policy never sets it and keeps the deadline itself, to keep
+//! the `TERM` grace on a timeout.
+//!
+//! Providers deliver output raw and leave the output policy to the client,
+//! so this policy applies the driver's [`OutputSanitizer`] itself: chunk by
+//! chunk for the live sink, and to the retained head and tail after capture.
+//! The counts are of the raw bytes, and an escape sequence cut by the gap
+//! between head and tail is dropped up to its terminator.
 
 use std::collections::HashMap;
 use std::future::{self, Future};
@@ -48,13 +50,12 @@ use std::time::Duration;
 
 use sandbox_driver::{
     Captured, CapturedOutput, DEFAULT_CAPTURE_BYTES, Error as DriverError, ExecControls, ExecSpec,
-    OutputLoss, OutputSink, OutputStream, Sandbox, Termination, run_captured, run_captured_with,
-    stop_signal,
+    OutputLoss, OutputSanitization, OutputSanitizer, OutputSink, OutputStream, Sandbox,
+    Termination, run_captured, run_captured_with, stop_signal,
 };
 use tokio::time;
 use tokio_util::sync::CancellationToken;
 
-use super::sanitize::{OutputSanitization, OutputSanitizer};
 use crate::char_boundary::floor_char_boundary;
 use crate::event::OutputCaptureStats;
 use crate::redact::Redactor;

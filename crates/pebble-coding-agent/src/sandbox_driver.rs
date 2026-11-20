@@ -21,9 +21,9 @@
 //! against. What Pebble needs and the new API lacks is done here, over exec,
 //! until the library carries it; each place says so in its own docs:
 //!
-//! - the `TERM` then `KILL` stop grace and output sanitization
-//!   ([`SandboxExec`], which captures through the driver's `run_captured_with`
-//!   and runs scripts with `ExecSpec::bash`);
+//! - the `TERM` then `KILL` stop grace ([`SandboxExec`], which captures through
+//!   the driver's `run_captured_with`, runs scripts with `ExecSpec::bash`, and
+//!   applies the driver's [`OutputSanitizer`] to the output it shows);
 //! - stat, exists, rename, remove, mkdir (in [`SandboxEnvironment`]);
 //! - grep and file walks (the derived search, run as commands);
 //! - platform information (`uname -sr` at [`SandboxEnvironment::attach`]);
@@ -40,11 +40,12 @@ mod log;
 mod path;
 #[cfg(feature = "mcp")]
 mod ports;
-mod sanitize;
 mod search;
 
 #[cfg(any(test, feature = "sandbox-driver-test-util"))]
 pub mod test_support;
+
+pub use sandbox_driver::{OutputSanitization, OutputSanitizer};
 
 pub use self::environment::SandboxEnvironment;
 pub use self::exec::{
@@ -56,7 +57,6 @@ pub use self::log::{default_redacted_output_tail, display_for_log};
 pub use self::path::{join_sandbox_path, resolve_path};
 #[cfg(feature = "mcp")]
 pub use self::ports::{SandboxPortRoutes, port_routes};
-pub use self::sanitize::{OutputSanitization, OutputSanitizer};
 
 /// Shared fixtures for this module's tests.
 #[cfg(test)]
