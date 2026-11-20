@@ -1985,8 +1985,12 @@ pub struct CodingAgentEvent {
     ///
     /// A model request's span is on [`CodingEvent::LlmRequestStarted`],
     /// [`CodingEvent::AssistantMessage`], and the events between them for
-    /// that request. A tool call's span is on every event of that call, from
-    /// [`CodingEvent::ToolCallStarted`] to [`CodingEvent::ToolCallCompleted`].
+    /// that request. A compaction's summary request has a span of its own,
+    /// on [`CodingEvent::CompactionStarted`] and the event that ends it
+    /// ([`CodingEvent::CompactionCompleted`], `CompactionFailed`, or
+    /// `CompactionCancelled`). A tool call's span is on every event of that
+    /// call, from [`CodingEvent::ToolCallStarted`] to
+    /// [`CodingEvent::ToolCallCompleted`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span_id:           Option<String>,
     /// The parent of `span_id`: the caller's span from the session's

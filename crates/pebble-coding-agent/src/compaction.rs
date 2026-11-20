@@ -41,6 +41,7 @@ use crate::history::{APPROX_CHARS_PER_TOKEN, History};
 use crate::policy::{CompactionPolicy, CompactionPreparation, CompactionSummary};
 use crate::profile::ModelFacts;
 use crate::tool::result_text;
+use crate::trace_context::Span;
 use crate::types::{CodingEvent, Message, Usage};
 
 /// The output budget for the summary text itself.
@@ -437,6 +438,9 @@ pub(crate) struct CompactionRequest<'a> {
     pub(crate) instructions:   Option<&'a str>,
     /// Cancels this compaction without cancelling its surrounding prompt.
     pub(crate) cancel:         &'a CancellationToken,
+    /// The summarization request's span: sent as its trace context when
+    /// Pebble makes the call, and recorded on the compaction's events.
+    pub(crate) span:           Option<&'a Span>,
 }
 
 /// Whether the session has crossed the compaction threshold, and by how much.
@@ -516,12 +520,18 @@ pub(crate) async fn compact_context(
         return Ok(CompactionOutcome::Unchanged);
     }
     let preserved_turn_count = original_turn_count - preserve_start;
+    let span = request.span;
 
-    emitter.emit(session_id.to_owned(), CodingEvent::CompactionStarted {
-        estimated_tokens:    request.estimate.tokens,
-        context_window_size: request.facts.context_window_tokens,
-        reason:              request.reason,
-    });
+    emitter.emit_in_span(
+        session_id.to_owned(),
+        CodingEvent::CompactionStarted {
+            estimated_tokens:    request.estimate.tokens,
+            context_window_size: request.facts.context_window_tokens,
+            reason:              request.reason,
+        },
+        None,
+        span,
+    );
 
     let max_tokens = summary_max_tokens(
         request.facts.reasons_by_default,
@@ -545,7 +555,7 @@ pub(crate) async fn compact_context(
         Ok(request) => request,
         Err(source) => {
             let error = Error::from(source);
-            emit_compaction_failure(emitter, session_id, request.reason, &error, None);
+            emit_compaction_failure(emitter, session_id, span, request.reason, &error, None);
             return Err(error);
         }
     };
@@ -553,6 +563,7 @@ pub(crate) async fn compact_context(
     let mut drop_guard = CompactionDropGuard {
         emitter,
         session_id,
+        span,
         reason: request.reason,
         finished: false,
     };
@@ -572,6 +583,14 @@ pub(crate) async fn compact_context(
                 .await
                 .map_err(CompactionError::Policy)
         } else {
+            // The summary is a model request like the turn loop's, sent in the
+            // compaction's span.
+            let client = match span {
+                Some(span) => &client
+                    .with_default_headers(span.entries())
+                    .map_err(CompactionError::Llm)?,
+                None => client,
+            };
             let response = client
                 .complete(summary_request)
                 .await
@@ -586,9 +605,9 @@ pub(crate) async fn compact_context(
         biased;
         () = request.cancel.cancelled() => {
             drop_guard.finished = true;
-            emitter.emit(session_id.to_owned(), CodingEvent::CompactionCancelled {
+            emitter.emit_in_span(session_id.to_owned(), CodingEvent::CompactionCancelled {
                 reason: request.reason,
-            });
+            }, None, span);
             return Err(Error::Interrupted(InterruptReason::Cancelled));
         }
         response = generate => {
@@ -597,7 +616,7 @@ pub(crate) async fn compact_context(
                 Err(source) => {
                     drop_guard.finished = true;
                     let error = Error::from(source);
-                    emit_compaction_failure(emitter, session_id, request.reason, &error, None);
+                    emit_compaction_failure(emitter, session_id, span, request.reason, &error, None);
                     return Err(error);
                 }
             }
@@ -606,9 +625,14 @@ pub(crate) async fn compact_context(
 
     drop_guard.finished = true;
     if request.cancel.is_cancelled() {
-        emitter.emit(session_id.to_owned(), CodingEvent::CompactionCancelled {
-            reason: request.reason,
-        });
+        emitter.emit_in_span(
+            session_id.to_owned(),
+            CodingEvent::CompactionCancelled {
+                reason: request.reason,
+            },
+            None,
+            span,
+        );
         return Err(Error::Interrupted(InterruptReason::Cancelled));
     }
 
@@ -620,7 +644,14 @@ pub(crate) async fn compact_context(
         let error = Error::from(CompactionError::EmptySummary {
             summarized_turn_count: preserve_start,
         });
-        emit_compaction_failure(emitter, session_id, request.reason, &error, Some(&response));
+        emit_compaction_failure(
+            emitter,
+            session_id,
+            span,
+            request.reason,
+            &error,
+            Some(&response),
+        );
         return Err(error);
     }
 
@@ -650,14 +681,19 @@ pub(crate) async fn compact_context(
 
     history.compact_from(preserve_start, &result);
 
-    emitter.emit(session_id.to_owned(), CodingEvent::CompactionCompleted {
-        original_turn_count,
-        preserved_turn_count,
-        summary_token_estimate,
-        tracked_file_count: file_tracker.file_count(),
-        reason: request.reason,
-        usage: result.usage(),
-    });
+    emitter.emit_in_span(
+        session_id.to_owned(),
+        CodingEvent::CompactionCompleted {
+            original_turn_count,
+            preserved_turn_count,
+            summary_token_estimate,
+            tracked_file_count: file_tracker.file_count(),
+            reason: request.reason,
+            usage: result.usage(),
+        },
+        None,
+        span,
+    );
 
     Ok(CompactionOutcome::Compacted(result))
 }
@@ -667,6 +703,7 @@ pub(crate) async fn compact_context(
 struct CompactionDropGuard<'a> {
     emitter:    &'a Emitter,
     session_id: &'a str,
+    span:       Option<&'a Span>,
     reason:     CompactionReason,
     finished:   bool,
 }
@@ -674,11 +711,13 @@ struct CompactionDropGuard<'a> {
 impl Drop for CompactionDropGuard<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            self.emitter.emit(
+            self.emitter.emit_in_span(
                 self.session_id.to_owned(),
                 CodingEvent::CompactionCancelled {
                     reason: self.reason,
                 },
+                None,
+                self.span,
             );
         }
     }
@@ -690,15 +729,21 @@ impl Drop for CompactionDropGuard<'_> {
 fn emit_compaction_failure(
     emitter: &Emitter,
     session_id: &str,
+    span: Option<&Span>,
     reason: CompactionReason,
     error: &Error,
     answered: Option<&CompactionSummary>,
 ) {
-    emitter.emit(session_id.to_owned(), CodingEvent::CompactionFailed {
-        reason,
-        error: ErrorData::from(error),
-        usage: answered.map(|summary| summary.usage),
-    });
+    emitter.emit_in_span(
+        session_id.to_owned(),
+        CodingEvent::CompactionFailed {
+            reason,
+            error: ErrorData::from(error),
+            usage: answered.map(|summary| summary.usage),
+        },
+        None,
+        span,
+    );
 }
 
 /// The instructions the summarizing call is given.
@@ -1106,6 +1151,7 @@ mod tests {
             reason:         CompactionReason::Threshold,
             instructions:   None,
             cancel:         &NEVER_CANCEL,
+            span:           None,
         }
     }
 

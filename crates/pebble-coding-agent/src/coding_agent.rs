@@ -774,7 +774,8 @@ impl CodingAgentBuilder {
     /// Places this agent's model requests and tool calls in the caller's W3C
     /// trace.
     ///
-    /// Each model request and each tool call is a span whose parent is the
+    /// Each model request (compaction's summary request included) and each
+    /// tool call is a span whose parent is the
     /// span `context` names, when it names one. Every model request sends the
     /// span as `traceparent` (with `tracestate`, when given) and the context's
     /// baggage plus `session_id` as `baggage`. Every MCP `tools/call` carries
