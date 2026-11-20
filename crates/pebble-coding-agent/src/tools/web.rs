@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::char_boundary::floor_char_boundary;
 use crate::environment::ExecRequest;
 use crate::tool::{NativeTool, RegisteredTool, ToolError, optional_integer_arg, required_str};
+use crate::trace_context::Span;
 use crate::types::{ToolErrorKind, ToolSource};
 
 mod markdown;
@@ -56,12 +57,14 @@ impl WebFetchSummarizer {
         &self.model
     }
 
-    /// Answers `prompt` about the content of `url`.
+    /// Answers `prompt` about the content of `url`, sending `span` (the
+    /// `web_fetch` call's) as the request's trace context.
     async fn summarize(
         &self,
         url: &str,
         content: &str,
         prompt: &str,
+        span: Option<&Span>,
         cancel: &CancellationToken,
     ) -> Result<String, ToolError> {
         let request = Request::builder()
@@ -72,11 +75,21 @@ impl WebFetchSummarizer {
             ))
             .build()
             .map_err(|error| self.failed(error))?;
+        // The summary is part of the tool call, so it is sent in the call's
+        // span: the gateway's parent span is then one the call's events
+        // already record, with `tool_call_id` in the baggage.
+        let client = match span {
+            Some(span) => &self
+                .client
+                .with_default_headers(span.entries())
+                .map_err(|error| self.failed(error))?,
+            None => &self.client,
+        };
 
         let response = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(ToolError::cancelled("Cancelled")),
-            response = self.client.complete(request) => response.map_err(|error| self.failed(error))?,
+            response = client.complete(request) => response.map_err(|error| self.failed(error))?,
         };
         Ok(response.text())
     }
@@ -170,7 +183,9 @@ pub fn make_web_fetch_tool(summarizer: Option<Arc<WebFetchSummarizer>>) -> Regis
 
                 match (prompt, summarizer.as_ref()) {
                     (Some(prompt), Some(summarizer)) => {
-                        summarizer.summarize(url, &content, prompt, &ctx.cancel).await
+                        summarizer
+                            .summarize(url, &content, prompt, ctx.span.as_ref(), &ctx.cancel)
+                            .await
                     }
                     (Some(_), None) => Ok(format!(
                         "[Note: prompt summarization unavailable, returning full \
