@@ -1990,7 +1990,8 @@ pub struct CodingAgentEvent {
     /// ([`CodingEvent::CompactionCompleted`], `CompactionFailed`, or
     /// `CompactionCancelled`). A tool call's span is on every event of that
     /// call, from [`CodingEvent::ToolCallStarted`] to
-    /// [`CodingEvent::ToolCallCompleted`].
+    /// [`CodingEvent::ToolCallCompleted`]; a request the call makes, such as
+    /// `web_fetch`'s summary, is sent in it too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub span_id:           Option<String>,
     /// The parent of `span_id`: the caller's span from the session's

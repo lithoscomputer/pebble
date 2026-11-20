@@ -141,8 +141,9 @@ call (`ToolCallStarted` through `ToolCallCompleted`) record `trace_id`,
 Compaction's summary request is a model request too: it is sent a span of its
 own, recorded on `CompactionStarted` and the event that ends the compaction.
 A `CompactionPolicy` that summarizes makes its own call, so Pebble sends
-nothing for it, though the events still record the span. The web-fetch
-summarizer's model calls do not carry trace context yet.
+nothing for it, though the events still record the span. The `web_fetch`
+summarizer's model call is part of its tool call, so it is sent in the tool
+call's span, with `tool_call_id` in the baggage.
 
 Subagents and failover replacements inherit the context; records and exports
 do not keep it. A session without one starts a trace of its own. Pebble owns
