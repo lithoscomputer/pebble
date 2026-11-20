@@ -1039,6 +1039,8 @@ impl CodingRuntime {
         let event_link = link_cancellation(&event_failure, &compaction_cancel);
         let operation = self.compaction.begin(&compaction_cancel);
         self.state.transition(CodingAgentState::Compacting);
+        // The summary is a model request of its own, in a span of its own.
+        let span = self.trace.model_span();
         let request = CompactionRequest {
             policy: self.compaction_policy.as_deref(),
             model: &self.model_context.model_selector,
@@ -1048,6 +1050,7 @@ impl CodingRuntime {
             reason: CompactionReason::Manual,
             instructions: options.instructions_ref(),
             cancel: operation.token(),
+            span: Some(&span),
         };
         let result = compact_context(
             &mut history,

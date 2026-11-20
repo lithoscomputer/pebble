@@ -255,6 +255,7 @@ pub struct ScriptedProvider {
     requests:            Mutex<Vec<Request>>,
     request_headers:     Mutex<Vec<BTreeMap<String, String>>>,
     completion_requests: Mutex<Vec<Request>>,
+    completion_headers:  Mutex<Vec<BTreeMap<String, String>>>,
     call_index:          AtomicUsize,
     completion_index:    AtomicUsize,
     started:             Notify,
@@ -320,6 +321,7 @@ impl ScriptedProvider {
             requests: Mutex::new(Vec::new()),
             request_headers: Mutex::new(Vec::new()),
             completion_requests: Mutex::new(Vec::new()),
+            completion_headers: Mutex::new(Vec::new()),
             call_index: AtomicUsize::new(0),
             completion_index: AtomicUsize::new(0),
             started: Notify::new(),
@@ -381,6 +383,16 @@ impl ScriptedProvider {
             .clone()
     }
 
+    /// The default HTTP headers the client gave each non-streaming request,
+    /// in order, with lowercase names.
+    #[must_use]
+    pub fn completion_request_headers(&self) -> Vec<BTreeMap<String, String>> {
+        self.completion_headers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     /// Waits until a streaming call has begun.
     ///
     /// One permit per call is kept, so a test that asks after the fact is not
@@ -403,6 +415,20 @@ impl ScriptedProvider {
     }
 }
 
+/// The client default headers `call` was given, with lowercase names.
+fn default_headers_of(call: &ResolvedCall) -> BTreeMap<String, String> {
+    call.context()
+        .default_headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_owned(),
+                value.to_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect()
+}
+
 #[async_trait]
 impl ProviderAdapter for ScriptedProvider {
     fn id(&self) -> &AdapterId {
@@ -414,6 +440,10 @@ impl ProviderAdapter for ScriptedProvider {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(call.request().clone());
+        self.completion_headers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(default_headers_of(call));
         let index = self.completion_index.fetch_add(1, Ordering::SeqCst);
         let scripted = self
             .completions
@@ -449,18 +479,7 @@ impl ProviderAdapter for ScriptedProvider {
         self.request_headers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(
-                call.context()
-                    .default_headers()
-                    .iter()
-                    .map(|(name, value)| {
-                        (
-                            name.as_str().to_owned(),
-                            value.to_str().unwrap_or_default().to_owned(),
-                        )
-                    })
-                    .collect(),
-            );
+            .push(default_headers_of(call));
         let index = self.call_index.fetch_add(1, Ordering::SeqCst);
         self.started.notify_one();
 

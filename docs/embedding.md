@@ -138,6 +138,11 @@ span the `traceparent` named, so a proxy that stores the caller's span as
 model request (`LlmRequestStarted` through `AssistantMessage`) and of a tool
 call (`ToolCallStarted` through `ToolCallCompleted`) record `trace_id`,
 `span_id`, and the caller's span as `parent_span_id` on their envelope.
+Compaction's summary request is a model request too: it is sent a span of its
+own, recorded on `CompactionStarted` and the event that ends the compaction.
+A `CompactionPolicy` that summarizes makes its own call, so Pebble sends
+nothing for it, though the events still record the span. The web-fetch
+summarizer's model calls do not carry trace context yet.
 
 Subagents and failover replacements inherit the context; records and exports
 do not keep it. A session without one starts a trace of its own. Pebble owns
