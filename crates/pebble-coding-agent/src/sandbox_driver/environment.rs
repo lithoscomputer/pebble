@@ -17,12 +17,15 @@
 //! it is written where the model already reads: one line at the end of
 //! stderr.
 //!
-//! Parity gaps: the new API has no stat, exists, remove, rename or mkdir
-//! operations, no search, and no platform information. The adapter
-//! runs those as commands in the sandbox: `[ -e ]`, `rm`/`rmdir`, `mkdir -p`
-//! and `mv`, the derived search in [`super::search`], and `uname -sr` once at
-//! [`SandboxEnvironment::attach`]. So file existence, moves and deletes now
-//! need Bash in the sandbox, which reads and writes do not.
+//! The new API has no exists, remove or rename: those are the client's by
+//! design, so the adapter runs them as commands in the sandbox (`[ -e ]`,
+//! `rm`/`rmdir`, `mkdir -p` and `mv`). A delete removes a symbolic link as a
+//! link. File existence, moves and deletes therefore need Bash in the
+//! sandbox, which reads and writes do not.
+//!
+//! Parity gaps: the new API also has no search and no platform information.
+//! The adapter runs the derived search in [`super::search`] and `uname -sr`
+//! once at [`SandboxEnvironment::attach`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -167,7 +170,21 @@ impl SandboxEnvironment {
     }
 
     async fn file_exists(&self, path: &str) -> EnvResult<bool> {
-        let mut spec = ExecSpec::bash(format!("[ -e {} ]", shell_quote(&self.resolve(path))));
+        let quoted = shell_quote(&self.resolve(path));
+        self.path_test(path, format!("[ -e {quoted} ]")).await
+    }
+
+    /// Whether anything is at `path`, a dangling symbolic link included.
+    async fn link_or_file_exists(&self, path: &str) -> EnvResult<bool> {
+        let quoted = shell_quote(&self.resolve(path));
+        self.path_test(path, format!("[ -e {quoted} ] || [ -L {quoted} ]"))
+            .await
+    }
+
+    /// Runs `test`, a script that exits 0 when `path` is there and 1 when
+    /// it is not.
+    async fn path_test(&self, path: &str, test: String) -> EnvResult<bool> {
+        let mut spec = ExecSpec::bash(test);
         spec.timeout_ms = Some(duration_ms(FS_TIMEOUT));
         let result = self
             .exec()
@@ -287,8 +304,10 @@ impl Environment for SandboxEnvironment {
 
     async fn delete_file(&self, path: &str) -> EnvResult<()> {
         // Pebble's delete is a `remove_file`, which reports a path that is
-        // not there.
-        if !self.file_exists(path).await? {
+        // not there. A symbolic link is removed as a link, so a dangling one
+        // is there to delete, and a link to a directory goes to `rm`, not
+        // `rmdir`.
+        if !self.link_or_file_exists(path).await? {
             return Err(EnvironmentError::new(
                 EnvironmentErrorKind::NotFound,
                 format!("Failed to delete {path}: file does not exist"),
@@ -297,7 +316,10 @@ impl Environment for SandboxEnvironment {
         let quoted = shell_quote(&self.resolve(path));
         run_fs_command(
             &self.exec(),
-            &format!("if [ -d {quoted} ]; then rmdir -- {quoted}; else rm -f -- {quoted}; fi"),
+            &format!(
+                "if [ -d {quoted} ] && [ ! -L {quoted} ]; then rmdir -- {quoted}; else rm -f -- \
+                 {quoted}; fi"
+            ),
             &format!("Failed to delete {path}"),
             "delete",
         )
@@ -672,6 +694,42 @@ mod tests {
             .map(|entry| entry.name)
             .collect();
         assert_eq!(top, ["x.txt"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_removes_a_symlink_as_a_link() {
+        use std::os::unix::fs::symlink;
+
+        let (_catalog, sandbox) = host_environment().await;
+        let root = PathBuf::from(sandbox.working_directory());
+        fs::create_dir_all(root.join("target/inner")).await.unwrap();
+        fs::write(root.join("target/inner/kept.txt"), "kept")
+            .await
+            .unwrap();
+        symlink(root.join("target"), root.join("to-dir")).unwrap();
+        symlink(root.join("gone"), root.join("dangling")).unwrap();
+
+        for link in ["to-dir", "dangling"] {
+            Environment::delete_file(&sandbox, link)
+                .await
+                .unwrap_or_else(|error| panic!("delete {link}: {error}"));
+            assert!(
+                fs::symlink_metadata(root.join(link)).await.is_err(),
+                "{link} is still there"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(root.join("target/inner/kept.txt"))
+                .await
+                .unwrap(),
+            "kept",
+            "the link's target is untouched"
+        );
+        let missing = Environment::delete_file(&sandbox, "dangling")
+            .await
+            .expect_err("the link is gone now");
+        assert_eq!(missing.kind(), EnvironmentErrorKind::NotFound);
     }
 
     #[tokio::test]

@@ -397,12 +397,14 @@ impl ScriptedSandbox {
         self.files.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The adapter tests a path with `[ -e '<path>' ]`; answering that from
-    /// the in-memory filesystem keeps file existence real in the mock.
+    /// The adapter tests a path with `[ -e '<path>' ]`, followed by
+    /// `|| [ -L '<path>' ]` before a delete; answering that from the
+    /// in-memory filesystem, which has no links, keeps file existence real
+    /// in the mock.
     fn exists_answer(&self, spec: &ExecSpec) -> Option<ExecResult> {
-        let quoted = bash_source(spec)?
-            .strip_prefix("[ -e '")?
-            .strip_suffix("' ]")?;
+        let source = bash_source(spec)?;
+        let test = source.split(" || [ -L ").next()?;
+        let quoted = test.strip_prefix("[ -e '")?.strip_suffix("' ]")?;
         let path = quoted.replace("'\\''", "'");
         let prefix = format!("{}/", path.trim_end_matches('/'));
         let files = self.lock_files();

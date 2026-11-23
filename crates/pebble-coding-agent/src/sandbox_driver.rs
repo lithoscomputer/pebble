@@ -24,12 +24,14 @@
 //! - the `TERM` then `KILL` stop grace ([`SandboxExec`], which captures through
 //!   the driver's `run_captured_with`, runs scripts with `ExecSpec::bash`, and
 //!   applies the driver's [`OutputSanitizer`] to the output it shows);
-//! - stat, exists, rename, remove, mkdir (in [`SandboxEnvironment`]);
 //! - grep and file walks (the derived search, run as commands);
 //! - platform information (`uname -sr` at [`SandboxEnvironment::attach`]);
 //! - command output on errors ([`CommandFailure`]);
 //! - whether a handle can route ports (the descriptor's `ports`, passed to
 //!   [`port_routes`]).
+//!
+//! Exists, rename and remove are run as commands in [`SandboxEnvironment`]
+//! too, but they stay there: the library leaves them to its clients.
 //!
 //! [`Environment`]: crate::environment::Environment
 //! [`Redactor`]: crate::extensions::Redactor
