@@ -9,19 +9,23 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::str;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
+use std::{mem, str};
 
 use lithos_llm::types::ToolDefinition;
 use pebble_agent::ToolScheduling;
+use tokio::runtime::Handle;
 use tokio::task;
+use tokio::time::sleep;
 use tracing::{debug, warn};
 
 use crate::char_boundary::floor_char_boundary;
 use crate::config::NativeToolOptions;
 use crate::environment::{ExecOutcome, ExecOutputSink, ExecOutputStream, ExecRequest};
 use crate::tool::{
-    NativeTool, RegisteredTool, ToolContext, ToolError, optional_integer_arg, required_str,
+    CodingEventEmitter, NativeTool, RegisteredTool, ToolContext, ToolError, optional_integer_arg,
+    required_str,
 };
 use crate::truncation::{DEFAULT_TOOL_OUTPUT_RETENTION_BYTES, retain_tool_output};
 use crate::types::{CodingEvent, CommandTermination, ToolSource};
@@ -31,6 +35,11 @@ use crate::types::{CodingEvent, CommandTermination, ToolSource};
 /// The model reads it as the head of the message, so it can tell a command
 /// that ran and failed from an environment that never ran one.
 const SHELL_NO_PROCESS_RESULT: &str = "Shell command produced no process result";
+
+/// Small pipe reads are combined before reaching the bounded event pipeline.
+const LIVE_OUTPUT_DELTA_BYTES: usize = 8 * 1024;
+/// A quiet command still updates a live consumer promptly.
+const LIVE_OUTPUT_MAX_LATENCY: Duration = Duration::from_millis(50);
 
 /// Runs a command with pebble's default timeouts.
 #[must_use]
@@ -89,30 +98,36 @@ pub(crate) async fn execute_shell_command(
         env_var_count = tool_env.as_ref().map_or(0, HashMap::len),
         "Injecting environment variables into a tool call"
     );
-    ctx.env
+    let live_output = live_output_sink(ctx);
+    let outcome = ctx
+        .env
         .exec(ExecRequest {
             timeout_ms: Some(timeout_ms),
             working_dir: cwd,
             env_vars: tool_env.as_ref(),
             cancel_token: Some(ctx.cancel.clone()),
             output_bytes_cap: Some(DEFAULT_TOOL_OUTPUT_RETENTION_BYTES),
-            output_sink: live_output_sink(ctx),
+            output_sink: live_output.as_ref().map(|output| output.0.sink()),
             ..ExecRequest::new(command)
         })
         .await
-        .map_err(|error| no_process_result(ToolError::from(error)))
+        .map_err(|error| no_process_result(ToolError::from(error)));
+    drop(live_output);
+    outcome
 }
 
 /// A sink that publishes the command's output as it is produced, when there is
 /// anywhere to publish it.
 ///
-/// Each chunk becomes one [`CodingEvent::ToolCallOutputDelta`], stamped with
-/// the call by the context's emitter. The bytes are decoded per stream, so a
-/// multi-byte character the pipe split across two reads arrives whole, and
-/// the two streams keep their own decoders because a read of one never
-/// completes a character of the other. The deltas are the live feed: the
-/// rendered result the model reads is published once more on the call's
-/// completion, as for every other tool.
+/// Small chunks are coalesced into bounded deltas, stamped with the call by
+/// the context's emitter. A timer publishes a partial delta within
+/// [`LIVE_OUTPUT_MAX_LATENCY`]; completion flushes its final partial delta
+/// before the process-completed event. The bytes are decoded per stream, so a
+/// multi-byte character the pipe split across two reads arrives whole, and the
+/// two streams keep their own decoders because a read of one never completes a
+/// character of the other. The deltas are the live feed: the rendered result
+/// the model reads is published once more on the call's completion, as for
+/// every other tool.
 ///
 /// The feed is bounded by [`DEFAULT_TOOL_OUTPUT_RETENTION_BYTES`], the same
 /// budget the environment retains the process output against, so the event
@@ -120,15 +135,96 @@ pub(crate) async fn execute_shell_command(
 /// keep. A command that writes past it streams its first budget's worth and
 /// then nothing; the completion event carries the head-and-tail rendering with
 /// the omitted count, which is where a reader learns how much more there was.
-fn live_output_sink(ctx: &ToolContext) -> Option<ExecOutputSink> {
+fn live_output_sink(ctx: &ToolContext) -> Option<LiveOutputGuard> {
     let emitter = Arc::clone(ctx.coding_event_emitter.as_ref()?);
-    let state = Mutex::new(LiveOutput::default());
-    Some(Arc::new(move |stream: ExecOutputStream, chunk: &[u8]| {
-        let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(delta) = state.push(stream, chunk) {
-            emitter.emit(CodingEvent::ToolCallOutputDelta { delta });
-        }
+    Some(LiveOutputGuard(LiveOutputSink {
+        state: Arc::new(Mutex::new(LiveOutputState::default())),
+        emitter,
+        runtime: Handle::current(),
     }))
+}
+
+/// Owns the flush boundary even when the command future is dropped.
+struct LiveOutputGuard(LiveOutputSink);
+
+impl Drop for LiveOutputGuard {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+
+/// The non-blocking pipe callback and its short-lived timer share this handle.
+/// The captured runtime also supports callbacks from an environment's own
+/// threads.
+///
+/// Output is emitted while holding the small state lock. That preserves the
+/// order in which pipe drains reached the sink and makes completion's final
+/// flush a hard boundary: a timer cannot publish after it.
+#[derive(Clone)]
+struct LiveOutputSink {
+    state:   Arc<Mutex<LiveOutputState>>,
+    emitter: Arc<dyn CodingEventEmitter>,
+    runtime: Handle,
+}
+
+impl LiveOutputSink {
+    fn sink(&self) -> ExecOutputSink {
+        let this = self.clone();
+        Arc::new(move |stream, chunk| this.push(stream, chunk))
+    }
+
+    fn push(&self, stream: ExecOutputStream, chunk: &[u8]) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if state.closed {
+            return;
+        }
+        if let Some(delta) = state.output.push(stream, chunk) {
+            state.pending.push_str(&delta);
+        }
+        if state.pending.len() >= LIVE_OUTPUT_DELTA_BYTES {
+            self.emit_pending(&mut state);
+        }
+        if !state.pending.is_empty() && state.timer.is_none() {
+            let this = self.clone();
+            state.timer = Some(
+                self.runtime
+                    .spawn(async move {
+                        sleep(LIVE_OUTPUT_MAX_LATENCY).await;
+                        let mut state = this.state.lock().unwrap_or_else(PoisonError::into_inner);
+                        state.timer = None;
+                        if !state.closed {
+                            this.emit_pending(&mut state);
+                        }
+                    })
+                    .abort_handle(),
+            );
+        }
+    }
+
+    fn finish(&self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.closed = true;
+        if let Some(timer) = state.timer.take() {
+            timer.abort();
+        }
+        self.emit_pending(&mut state);
+    }
+
+    fn emit_pending(&self, state: &mut LiveOutputState) {
+        if !state.pending.is_empty() {
+            self.emitter.emit(CodingEvent::ToolCallOutputDelta {
+                delta: mem::take(&mut state.pending),
+            });
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct LiveOutputState {
+    output:  LiveOutput,
+    pending: String,
+    timer:   Option<task::AbortHandle>,
+    closed:  bool,
 }
 
 /// What the live feed of one command carries between chunks: a decoder per
@@ -360,17 +456,22 @@ fn no_process_result(error: ToolError) -> ToolError {
 mod tests {
     use std::borrow::Cow;
     use std::env::current_dir;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
 
     use async_trait::async_trait;
     use serde_json::json;
-    use tokio::sync::broadcast;
+    use tokio::sync::{Notify, broadcast};
     use tokio::task::JoinHandle;
+    use tokio::time::advance;
 
     use super::*;
     use crate::Result as PumpResult;
     use crate::environment::{ExecResult, LocalEnvironment};
-    use crate::event::{Emitter, EventOptions, EventPump, SessionBoundEmitter};
+    use crate::event::{
+        Emitter, EventCapacity, EventOptions, EventPump, EventSink, EventSinkError,
+        SessionBoundEmitter,
+    };
     use crate::redact::Redactor;
     use crate::test_support::MockEnvironment;
     use crate::tool::{CodingEventEmitter, StaticEnvProvider, ToolEnvProvider};
@@ -384,6 +485,33 @@ mod tests {
         emitter:  Emitter,
         receiver: broadcast::Receiver<CodingAgentEvent>,
         pump:     JoinHandle<PumpResult<()>>,
+    }
+
+    /// Holds the first durable write until the test releases it, modelling a
+    /// recorder that applies backpressure while a command emits many chunks.
+    struct GatedSink {
+        started: Notify,
+        release: Notify,
+        events:  Mutex<Vec<CodingAgentEvent>>,
+    }
+
+    #[async_trait]
+    impl EventSink for GatedSink {
+        async fn record(&self, event: &CodingAgentEvent) -> Result<(), EventSinkError> {
+            let is_first = {
+                let mut events = self
+                    .events
+                    .lock()
+                    .expect("recorded events lock is not poisoned");
+                events.push(event.clone());
+                events.len() == 1
+            };
+            if is_first {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            Ok(())
+        }
     }
 
     impl Events {
@@ -1057,10 +1185,10 @@ mod tests {
         );
     }
 
-    /// The output a command produces is published while it runs, one delta
-    /// per chunk the environment read, on the same session and call as the
-    /// completion that follows. The environment here is a real process, so
-    /// the bytes travel the whole path from the pipe to the event.
+    /// The output a command produces is published while it runs, in bounded
+    /// deltas on the same session and call as the completion that follows.
+    /// The environment here is a real process, so the bytes travel the whole
+    /// path from the pipe to the event.
     #[tokio::test]
     async fn a_running_command_publishes_its_output_as_deltas() {
         let tool = make_shell_tool();
@@ -1092,6 +1220,158 @@ mod tests {
             "the process event is the only other event: {others:?}"
         );
         events.finish().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_partial_delta_is_published_while_the_command_is_still_running() {
+        let mut events = Events::new();
+        let context = context(MockEnvironment::default()).with_coding_event_emitter(events.bound());
+        let output = live_output_sink(&context).expect("an emitter supplies a sink");
+        output.0.push(ExecOutputStream::Stdout, b"still running");
+        // Poll the timer once so its deadline is registered before advancing.
+        task::yield_now().await;
+        advance(LIVE_OUTPUT_MAX_LATENCY).await;
+        task::yield_now().await;
+        events
+            .emitter
+            .flush()
+            .await
+            .expect("the event pump flushes");
+        assert_eq!(
+            events
+                .receiver
+                .try_recv()
+                .expect("the timer publishes output")
+                .event,
+            CodingEvent::ToolCallOutputDelta {
+                delta: "still running".to_owned(),
+            },
+        );
+        drop(output);
+        drop(context);
+        events.finish().await;
+    }
+
+    #[tokio::test]
+    async fn output_callbacks_can_run_outside_the_tokio_runtime() {
+        let mut events = Events::new();
+        let context = context(MockEnvironment::default()).with_coding_event_emitter(events.bound());
+        let output = live_output_sink(&context).expect("an emitter supplies a sink");
+        let callback = output.0.sink();
+        task::spawn_blocking(move || {
+            // A custom environment may drain pipes on its own ordinary thread.
+            thread::spawn(move || {
+                assert!(Handle::try_current().is_err());
+                callback(ExecOutputStream::Stdout, b"foreign thread");
+            })
+            .join()
+            .expect("the callback does not require an entered runtime");
+        })
+        .await
+        .expect("the blocking test task joins");
+        drop(output);
+        let (deltas, others) = events.live_output().await;
+        assert_eq!(deltas, "foreign thread");
+        assert!(others.is_empty());
+        drop(context);
+        events.finish().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_the_output_owner_flushes_once_and_closes_late_callbacks() {
+        let mut events = Events::new();
+        let context = context(MockEnvironment::default()).with_coding_event_emitter(events.bound());
+        let output = live_output_sink(&context).expect("an emitter supplies a sink");
+        let callback = output.0.sink();
+        callback(ExecOutputStream::Stdout, b"h\xc3");
+        callback(ExecOutputStream::Stderr, b"!");
+        callback(ExecOutputStream::Stdout, b"\xa9");
+        // Dropping the command future takes this path on cancellation too.
+        drop(output);
+        callback(ExecOutputStream::Stderr, b"late");
+        advance(LIVE_OUTPUT_MAX_LATENCY * 2).await;
+        let (deltas, others) = events.live_output().await;
+        assert_eq!(deltas, "h!é");
+        assert!(others.is_empty());
+        drop(callback);
+        drop(context);
+        events.finish().await;
+    }
+
+    #[tokio::test]
+    async fn tiny_warning_chunks_do_not_overflow_a_slow_durable_event_queue() {
+        const CHUNK_COUNT: usize = 10_000;
+        let warning = b"warning\n".to_vec();
+        let stderr = "warning\n".repeat(CHUNK_COUNT);
+        let environment = Arc::new(MockEnvironment {
+            exec_result: exited("", &stderr, 0, 1),
+            exec_output_chunks: (0..CHUNK_COUNT)
+                .map(|_| (ExecOutputStream::Stderr, warning.clone()))
+                .collect(),
+            ..MockEnvironment::default()
+        });
+        let sink = Arc::new(GatedSink {
+            started: Notify::new(),
+            release: Notify::new(),
+            events:  Mutex::new(Vec::new()),
+        });
+        let (emitter, pump) = EventPump::new(EventOptions {
+            capacity: EventCapacity::new(16),
+            sink: Some(sink.clone()),
+            ..EventOptions::default()
+        });
+        let pump = tokio::spawn(pump.run());
+        let context = context_for(environment).with_coding_event_emitter(Arc::new(
+            SessionBoundEmitter::new(emitter.clone(), "test-session", Some("call_1".to_owned())),
+        ));
+
+        let output = run_shell_command(&context, "synthetic warnings", 1_000, None)
+            .await
+            .expect("coalesced output leaves room for the process completion event");
+        assert!(output.contains("stderr:\nwarning"), "got: {output}");
+
+        sink.started.notified().await;
+        sink.release.notify_one();
+        emitter
+            .flush()
+            .await
+            .expect("the durable stream stays healthy after the gated write");
+        let events = sink
+            .events
+            .lock()
+            .expect("recorded events lock is not poisoned")
+            .clone();
+        let delta_count = events
+            .iter()
+            .filter(|event| matches!(event.event, CodingEvent::ToolCallOutputDelta { .. }))
+            .count();
+        assert!(
+            delta_count < 16,
+            "{CHUNK_COUNT} tiny chunks should fit a 16-event queue after coalescing; got {delta_count}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    CodingEvent::ToolCallOutputDelta { delta } => Some(delta.as_str()),
+                    _ => None,
+                })
+                .collect::<String>(),
+            stderr
+        );
+        assert!(
+            matches!(
+                events.last().map(|event| &event.event),
+                Some(CodingEvent::ToolProcessCompleted { .. })
+            ),
+            "the completion must follow the final live-output flush: {events:?}"
+        );
+
+        drop(context);
+        drop(emitter);
+        pump.await
+            .expect("the pump task joins")
+            .expect("the pump finishes");
     }
 
     #[tokio::test]

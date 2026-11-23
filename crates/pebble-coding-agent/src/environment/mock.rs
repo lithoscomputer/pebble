@@ -56,6 +56,10 @@ pub struct MockEnvironment {
     /// process would have run, modelling a transport failure rather than a
     /// command that exited badly.
     pub exec_error:            Option<String>,
+    /// Pipe-sized pieces sent to the output sink before the captured result.
+    ///
+    /// Empty preserves the ordinary fixture behavior of one chunk per stream.
+    pub exec_output_chunks:    Vec<(ExecOutputStream, Vec<u8>)>,
     /// The `(path, content)` pair of every write.
     pub written_files:         Mutex<Vec<(String, String)>>,
     /// How many times [`write_existing_file`](Environment::write_existing_file)
@@ -117,6 +121,7 @@ impl Default for MockEnvironment {
             os_version_str:        "Darwin 24.0.0".to_owned(),
             streams_separated:     true,
             exec_error:            None,
+            exec_output_chunks:    Vec::new(),
             written_files:         Mutex::new(Vec::new()),
             existing_file_writes:  AtomicUsize::new(0),
             captured_timeout:      Mutex::new(None),
@@ -253,11 +258,17 @@ impl Environment for MockEnvironment {
         // The fixture is what the command "wrote", so the sink sees all of it
         // before the cap does, the way a drained pipe would deliver it.
         if let Some(sink) = output_sink {
-            if !result.stdout.is_empty() {
-                sink(ExecOutputStream::Stdout, result.stdout.as_bytes());
-            }
-            if !result.stderr.is_empty() {
-                sink(ExecOutputStream::Stderr, result.stderr.as_bytes());
+            if self.exec_output_chunks.is_empty() {
+                if !result.stdout.is_empty() {
+                    sink(ExecOutputStream::Stdout, result.stdout.as_bytes());
+                }
+                if !result.stderr.is_empty() {
+                    sink(ExecOutputStream::Stderr, result.stderr.as_bytes());
+                }
+            } else {
+                for (stream, chunk) in &self.exec_output_chunks {
+                    sink(*stream, chunk);
+                }
             }
         }
         let stdout_capture = capture_collected_stream(&mut result.stdout, output_bytes_cap);
