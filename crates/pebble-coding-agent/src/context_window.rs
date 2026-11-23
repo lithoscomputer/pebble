@@ -772,11 +772,12 @@ mod tests {
         ]);
 
         let updated = context_window_from_response_usage(&local, TokenCounts {
-            input:       100,
-            output:      7,
-            cache_read:  20,
-            cache_write: 5,
-            reasoning:   3,
+            input:            100,
+            output:           7,
+            cache_read:       20,
+            cache_write:      5,
+            long_cache_write: 3,
+            reasoning:        3,
         });
 
         // Prompt tokens only: output and reasoning never occupied the window.

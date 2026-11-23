@@ -1312,11 +1312,12 @@ mod tests {
     #[test]
     fn every_reported_bucket_counts_toward_the_baseline() {
         let history = history_from(vec![assistant("short", TokenCounts {
-            input:       10,
-            output:      20,
-            reasoning:   30,
-            cache_read:  40,
-            cache_write: 50,
+            input:            10,
+            output:           20,
+            reasoning:        30,
+            cache_read:       40,
+            cache_write:      50,
+            long_cache_write: 25,
         })]);
 
         let estimate = estimate_active_context_usage("", &history);

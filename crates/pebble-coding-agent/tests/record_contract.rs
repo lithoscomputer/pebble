@@ -29,11 +29,12 @@ fn moment() -> SystemTime {
 
 fn usage() -> TokenCounts {
     TokenCounts {
-        input:       1_200,
-        output:      340,
-        reasoning:   96,
-        cache_read:  800,
-        cache_write: 64,
+        input:            1_200,
+        output:           340,
+        reasoning:        96,
+        cache_read:       800,
+        cache_write:      64,
+        long_cache_write: 0,
     }
 }
 
