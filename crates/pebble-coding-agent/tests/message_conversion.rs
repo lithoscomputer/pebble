@@ -76,11 +76,12 @@ fn every_variant() -> Vec<Message> {
             ],
             usage:          Usage {
                 tokens: TokenCounts {
-                    input:       1_200,
-                    output:      340,
-                    reasoning:   96,
-                    cache_read:  800,
-                    cache_write: 64,
+                    input:            1_200,
+                    output:           340,
+                    reasoning:        96,
+                    cache_read:       800,
+                    cache_write:      64,
+                    long_cache_write: 0,
                 },
                 cost:   Some(Cost {
                     usd_micros: 12_500,

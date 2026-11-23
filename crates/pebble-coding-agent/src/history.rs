@@ -797,11 +797,12 @@ mod tests {
             provider_parts: vec![thinking.clone()],
             usage:          Usage {
                 tokens: TokenCounts {
-                    input:       10,
-                    output:      20,
-                    reasoning:   30,
-                    cache_read:  40,
-                    cache_write: 50,
+                    input:            10,
+                    output:           20,
+                    reasoning:        30,
+                    cache_read:       40,
+                    cache_write:      50,
+                    long_cache_write: 25,
                 },
                 cost:   Some(Cost {
                     usd_micros: 60,

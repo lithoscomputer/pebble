@@ -2484,11 +2484,12 @@ mod tests {
             model:           "claude-sonnet-5".into(),
             usage:           Usage {
                 tokens: TokenCounts {
-                    input:       100,
-                    output:      50,
-                    reasoning:   20,
-                    cache_read:  80,
-                    cache_write: 10,
+                    input:            100,
+                    output:           50,
+                    reasoning:        20,
+                    cache_read:       80,
+                    cache_write:      10,
+                    long_cache_write: 5,
                 },
                 cost:   Some(Cost {
                     usd_micros: 125_000,
@@ -2504,6 +2505,7 @@ mod tests {
 
         assert_eq!(payload["model"], json!("claude-sonnet-5"));
         assert_eq!(payload["usage"]["tokens"]["cache_read"], json!(80));
+        assert_eq!(payload["usage"]["tokens"]["long_cache_write"], json!(5));
         assert_eq!(payload["usage"]["cost"]["usd_micros"], json!(125_000));
         assert_eq!(payload["usage"]["cost"]["source"], json!("catalog"));
         assert!(payload.get("context_window").is_none());
